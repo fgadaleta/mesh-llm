@@ -877,7 +877,10 @@ impl Node {
         eprintln!("⚠️  Peer {} died — removing and broadcasting", dead_id.fmt_short());
         {
             let mut state = self.state.lock().await;
-            state.connections.remove(&dead_id);
+            // Keep the connection alive — if the peer recovers, their inbound
+            // gossip will arrive on the existing connection and trigger recovery
+            // via handle_gossip_stream → add_peer → clear dead_peers.
+            // Don't remove: state.connections.remove(&dead_id);
             state.dead_peers.insert(dead_id);
         }
         self.remove_peer(dead_id).await;
