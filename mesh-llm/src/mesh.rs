@@ -73,7 +73,7 @@ impl Default for NodeRole {
 
 /// Gossip payload — extends EndpointAddr with role metadata.
 /// Backward-compatible: old nodes that don't send role default to Worker.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PeerAnnouncement {
     addr: EndpointAddr,
     #[serde(default)]
@@ -97,21 +97,16 @@ struct PeerAnnouncement {
     /// Models this node wants the mesh to serve (from --model flags)
     #[serde(default)]
     requested_models: Vec<String>,
-    /// Requests per minute by model (from API proxy routing)
-    /// Kept for backward compat — new nodes use model_demand instead.
-    #[serde(default)]
-    request_rates: std::collections::HashMap<String, u64>,
-    /// Demand signals for models — replaces request_rates and mesh_wanted.
-    /// Merged across peers via max(last_active, request_count).
-    #[serde(default)]
-    model_demand: HashMap<String, ModelDemand>,
-    /// Stable mesh identity — shared by all nodes in the same mesh.
-    /// Generated once by the originator, propagated via gossip.
-    #[serde(default)]
-    mesh_id: Option<String>,
     /// mesh-llm version string (e.g. "0.23.0")
     #[serde(default)]
     version: Option<String>,
+    /// Mesh-wide demand map — only populated on the self entry.
+    /// Other entries default to empty (serde default).
+    #[serde(default)]
+    model_demand: HashMap<String, ModelDemand>,
+    /// Stable mesh identity — only populated on the self entry.
+    #[serde(default)]
+    mesh_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,11 +125,6 @@ pub struct PeerInfo {
     pub available_models: Vec<String>,
     /// Models this node has requested the mesh to serve
     pub requested_models: Vec<String>,
-    /// Requests per minute by model (gossipped from API proxy)
-    /// Kept for backward compat — new nodes use model_demand.
-    pub request_rates: std::collections::HashMap<String, u64>,
-    /// Demand signals for models — the unified "what does this peer want?"
-    pub model_demand: HashMap<String, ModelDemand>,
     /// Last time we directly communicated with this peer (gossip, heartbeat, tunnel).
     /// Peers not seen in PEER_STALE_SECS are pruned from gossip and eventually removed.
     pub last_seen: std::time::Instant,
@@ -775,16 +765,6 @@ impl Node {
             .filter(|(model, d)| {
                 pinned.contains(model) || (now - d.last_active) < DEMAND_TTL_SECS
             })
-            .collect()
-    }
-
-    /// Snapshot request rates for backward compat with old nodes.
-    /// Returns rates derived from the demand map.
-    pub fn snapshot_request_rates(&self) -> std::collections::HashMap<String, u64> {
-        let demand = self.model_demand.lock().unwrap();
-        demand.iter()
-            .filter(|(_, d)| d.request_count > 0)
-            .map(|(m, d)| (m.clone(), d.request_count))
             .collect()
     }
 
@@ -1608,7 +1588,7 @@ impl Node {
         let (mut send, mut recv) = conn.open_bi().await?;
         send.write_all(&[STREAM_GOSSIP]).await?;
 
-        // Send our peer announcements (length-prefixed JSON)
+        // Send our announcements (length-prefixed JSON)
         let our_announcements = self.collect_announcements().await;
         let msg = serde_json::to_vec(&our_announcements)?;
         send.write_all(&(msg.len() as u32).to_le_bytes()).await?;
@@ -1628,9 +1608,13 @@ impl Node {
         let _ = recv.read_to_end(0).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Register peer — find their own announcement for role + models + vram
+        // Find the direct peer's self-announcement — carries mesh-wide fields
         let peer_ann = their_announcements.iter().find(|a| a.addr.id == remote);
         if let Some(ann) = peer_ann {
+            if let Some(ref their_id) = ann.mesh_id {
+                self.set_mesh_id(their_id.clone()).await;
+            }
+            self.merge_remote_demand(&ann.model_demand);
             self.add_peer(remote, ann.addr.clone(), ann).await;
             // Store RTT
             let mut state = self.state.lock().await;
@@ -1689,9 +1673,13 @@ impl Node {
         // Wait for the remote to finish their send
         let _ = recv.read_to_end(0).await;
 
-        // Register peer with role + models + vram
+        // Find the direct peer's self-announcement — carries mesh-wide fields
         for ann in &their_announcements {
             if ann.addr.id == remote {
+                if let Some(ref their_id) = ann.mesh_id {
+                    self.set_mesh_id(their_id.clone()).await;
+                }
+                self.merge_remote_demand(&ann.model_demand);
                 self.add_peer(remote, ann.addr.clone(), ann).await;
             }
         }
@@ -1721,12 +1709,10 @@ impl Node {
         }
 
         // Discover new peers mentioned in gossip — but only try to connect
-        // to peers we don't already know about. Skip peers we've recently removed
-        // (they'll be rediscovered via the rejoin loop if they come back).
+        // to peers we don't already know about.
         for ann in their_announcements {
             let peer_id = ann.addr.id;
             if peer_id == self.endpoint.id() { continue; }
-            // Only discover if we don't already have this peer
             let already_known = self.state.lock().await.peers.contains_key(&peer_id);
             if !already_known {
                 if let Err(e) = Box::pin(self.connect_to_peer(ann.addr)).await {
@@ -1788,35 +1774,12 @@ impl Node {
     }
 
     async fn add_peer(&self, id: EndpointId, addr: EndpointAddr, ann: &PeerAnnouncement) {
-        // Adopt mesh_id from gossip if we don't have one yet
-        if let Some(ref their_id) = ann.mesh_id {
-            self.set_mesh_id(their_id.clone()).await;
-        }
         let mut state = self.state.lock().await;
         if id == self.endpoint.id() { return; }
         // If this peer was previously dead, clear it — add_peer is only called
         // after a successful gossip exchange, which is proof of life.
         if state.dead_peers.remove(&id) {
             eprintln!("🔄 Peer {} back from the dead (successful gossip)", id.fmt_short());
-        }
-        // Merge demand from this peer into our mesh-wide demand map.
-        // If the peer sends model_demand (new node), use that directly.
-        // If model_demand is empty but requested_models has entries (old node),
-        // synthesize demand entries for backward compat.
-        {
-            let mut incoming_demand = ann.model_demand.clone();
-            if incoming_demand.is_empty() && !ann.requested_models.is_empty() {
-                // Old node — synthesize from requested_models + request_rates
-                let now = now_secs();
-                for m in &ann.requested_models {
-                    let entry = incoming_demand.entry(m.clone()).or_default();
-                    entry.last_active = entry.last_active.max(now);
-                    if let Some(&rate) = ann.request_rates.get(m) {
-                        entry.request_count = entry.request_count.max(rate);
-                    }
-                }
-            }
-            self.merge_remote_demand(&incoming_demand);
         }
         if let Some(existing) = state.peers.get_mut(&id) {
             let role_changed = existing.role != ann.role;
@@ -1837,8 +1800,6 @@ impl Node {
             existing.serving = ann.serving.clone();
             existing.available_models = ann.available_models.clone();
             existing.requested_models = ann.requested_models.clone();
-            existing.request_rates = ann.request_rates.clone();
-            existing.model_demand = ann.model_demand.clone();
             existing.last_seen = std::time::Instant::now();
             if ann.version.is_some() { existing.version = ann.version.clone(); }
             if role_changed || serving_changed {
@@ -1860,8 +1821,6 @@ impl Node {
             serving: ann.serving.clone(),
             available_models: ann.available_models.clone(),
             requested_models: ann.requested_models.clone(),
-            request_rates: ann.request_rates.clone(),
-            model_demand: ann.model_demand.clone(),
             last_seen: std::time::Instant::now(),
             version: ann.version.clone(),
         });
@@ -1879,11 +1838,10 @@ impl Node {
         let my_available = self.available_models.lock().await.clone();
         let my_requested = self.requested_models.lock().await.clone();
         let my_mesh_id = self.mesh_id.lock().await.clone();
-        // Every node sends the full mesh-wide demand map so it propagates infectiously.
         let my_demand = self.get_demand();
         let stale_cutoff = std::time::Instant::now() - std::time::Duration::from_secs(PEER_STALE_SECS);
         let mut announcements: Vec<PeerAnnouncement> = state.peers.values()
-            .filter(|p| p.last_seen >= stale_cutoff) // skip stale peers
+            .filter(|p| p.last_seen >= stale_cutoff)
             .map(|p| PeerAnnouncement {
                 addr: p.addr.clone(),
                 role: p.role.clone(),
@@ -1893,13 +1851,13 @@ impl Node {
                 serving: p.serving.clone(),
                 available_models: p.available_models.clone(),
                 requested_models: p.requested_models.clone(),
-                request_rates: p.request_rates.clone(),
-                model_demand: my_demand.clone(),
-                mesh_id: my_mesh_id.clone(),
                 version: p.version.clone(),
+                // Mesh-wide fields left as default (empty) on non-self entries
+                model_demand: HashMap::new(),
+                mesh_id: None,
             })
             .collect();
-        let my_rates = self.snapshot_request_rates();
+        // Self entry carries the mesh-wide fields once
         announcements.push(PeerAnnouncement {
             addr: self.endpoint.addr(),
             role: my_role,
@@ -1909,10 +1867,9 @@ impl Node {
             serving: my_serving,
             available_models: my_available,
             requested_models: my_requested,
-            request_rates: my_rates,
+            version: Some(crate::VERSION.to_string()),
             model_demand: my_demand,
             mesh_id: my_mesh_id,
-            version: Some(crate::VERSION.to_string()),
         });
         announcements
     }
@@ -1994,35 +1951,6 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert!(filtered.contains_key("Recent"));
         assert!(!filtered.contains_key("Stale"));
-    }
-
-    #[test]
-    fn test_backward_compat_synthesis() {
-        // Simulate receiving from an old node: model_demand is empty,
-        // but requested_models and request_rates have data
-        let ann_requested = vec!["GLM".to_string(), "Hermes".to_string()];
-        let mut ann_rates = std::collections::HashMap::new();
-        ann_rates.insert("GLM".to_string(), 42u64);
-        let ann_demand: HashMap<String, ModelDemand> = HashMap::new(); // empty — old node
-
-        // Synthesize
-        let mut incoming_demand = ann_demand.clone();
-        if incoming_demand.is_empty() && !ann_requested.is_empty() {
-            let now = now_secs();
-            for m in &ann_requested {
-                let entry = incoming_demand.entry(m.clone()).or_default();
-                entry.last_active = entry.last_active.max(now);
-                if let Some(&rate) = ann_rates.get(m) {
-                    entry.request_count = entry.request_count.max(rate);
-                }
-            }
-        }
-
-        assert_eq!(incoming_demand.len(), 2);
-        assert!(incoming_demand["GLM"].last_active > 0);
-        assert_eq!(incoming_demand["GLM"].request_count, 42);
-        assert!(incoming_demand["Hermes"].last_active > 0);
-        assert_eq!(incoming_demand["Hermes"].request_count, 0); // no rate for Hermes
     }
 
     #[test]

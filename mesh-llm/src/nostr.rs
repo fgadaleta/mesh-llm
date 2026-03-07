@@ -844,15 +844,19 @@ pub fn default_models_for_vram(vram_gb: f64) -> Vec<String> {
 
     let mut models = vec![primary.clone()];
 
-    // Add a small model as secondary (for other nodes to serve)
-    if !models.contains(&"Qwen2.5-3B-Instruct-Q4_K_M".into()) {
-        models.push("Qwen2.5-3B-Instruct-Q4_K_M".into());
-    }
-
-    // Add a coder model as tertiary if we have room in the mesh
-    let coder = "Qwen2.5-Coder-7B-Instruct-Q4_K_M".to_string();
-    if !models.contains(&coder) && models.len() < 3 {
-        models.push(coder);
+    // Seed demand for a range of known-good models (verified for agentic tool calling).
+    // Nodes pick the largest they can fit — this gives every VRAM tier something useful.
+    const AGENT_MODELS: &[&str] = &[
+        "GLM-4.7-Flash-Q4_K_M",       // 17GB MoE — fast, best default
+        "Qwen3-30B-A3B-Q4_K_M",       // 17GB MoE — strong reasoning
+        "Qwen3-8B-Q4_K_M",            // 4.7GB — solid mid-range
+        "Qwen2.5-3B-Instruct-Q4_K_M", // 2GB — small but capable
+        "Qwen3-0.6B-Q4_K_M",          // 378MB — fits anywhere
+    ];
+    for &m in AGENT_MODELS {
+        if !models.contains(&m.to_string()) {
+            models.push(m.to_string());
+        }
     }
 
     models
