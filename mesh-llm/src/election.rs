@@ -669,9 +669,11 @@ async fn moe_election_loop(
             };
 
             if !shard_path.exists() {
+                let mut shard_ok = false;
+
+                // Try exploded download first (if available)
                 if let Some(ref repo) = exploded_repo {
-                    // Download trunk + expert files, then assemble
-                    eprintln!("  📥 Downloading exploded experts from HF...");
+                    eprintln!("  📥 Trying exploded expert download from HF...");
                     let expert_ids: Vec<u32> = my_assignment.experts.clone();
                     match download::download_exploded_experts(repo, &expert_ids, &model_name).await {
                         Ok(exploded_dir) => {
@@ -679,37 +681,58 @@ async fn moe_election_loop(
                                 Ok(()) => {
                                     let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
                                     eprintln!("  ✅ Assembled shard: {:.1} GB", size as f64 / 1e9);
+                                    shard_ok = true;
                                 }
                                 Err(e) => {
-                                    eprintln!("  ❌ Assemble failed: {e}");
-                                    if peer_rx.changed().await.is_err() { break; }
-                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                    continue;
+                                    eprintln!("  ⚠ Assemble failed: {e}, falling back to moe-split");
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("  ❌ Expert download failed: {e}");
-                            if peer_rx.changed().await.is_err() { break; }
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            continue;
+                            eprintln!("  ⚠ Expert download failed: {e}, falling back to moe-split");
                         }
                     }
-                } else {
-                    // Local split from full model
-                    eprintln!("  Splitting GGUF → {} ...", shard_path.display());
-                    match moe::run_split(&bin_dir, &model, my_assignment, &shard_path) {
-                        Ok(()) => {
-                            let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
-                            eprintln!("  Split complete: {:.1} GB", size as f64 / 1e9);
+                }
+
+                // Fallback: local split from full model
+                if !shard_ok {
+                    let local_shard = moe::split_path(&model, n_nodes, my_shard_index);
+                    if local_shard.exists() {
+                        // Use cached local split (may be at different path than exploded shard)
+                        if local_shard != shard_path {
+                            if let Some(parent) = shard_path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            // Symlink or copy
+                            let _ = std::fs::copy(&local_shard, &shard_path);
                         }
-                        Err(e) => {
-                            eprintln!("  ❌ moe-split failed: {e}");
-                            if peer_rx.changed().await.is_err() { break; }
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            continue;
+                        shard_ok = true;
+                    } else {
+                        eprintln!("  Splitting GGUF → {} ...", local_shard.display());
+                        match moe::run_split(&bin_dir, &model, my_assignment, &local_shard) {
+                            Ok(()) => {
+                                let size = std::fs::metadata(&local_shard).map(|m| m.len()).unwrap_or(0);
+                                eprintln!("  Split complete: {:.1} GB", size as f64 / 1e9);
+                                if local_shard != shard_path {
+                                    if let Some(parent) = shard_path.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    let _ = std::fs::copy(&local_shard, &shard_path);
+                                }
+                                shard_ok = true;
+                            }
+                            Err(e) => {
+                                eprintln!("  ❌ moe-split failed: {e}");
+                            }
                         }
                     }
+                }
+
+                if !shard_ok {
+                    eprintln!("  ❌ All shard creation methods failed, retrying...");
+                    if peer_rx.changed().await.is_err() { break; }
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    continue;
                 }
             } else {
                 let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
