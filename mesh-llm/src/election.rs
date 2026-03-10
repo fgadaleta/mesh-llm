@@ -283,13 +283,9 @@ pub async fn election_loop(
     if let Some(ref moe_cfg) = moe_config {
         let need_moe_split = force_split || !model_fits_locally;
         if need_moe_split {
-            // Check if this model has exploded expert files on HF
-            let exploded_repo = download::find_model(&model_name)
-                .and_then(|m| m.exploded_repo)
-                .map(|s| s.to_string());
             moe_election_loop(
                 node, tunnel_mgr, bin_dir, model, model_name, moe_cfg.clone(),
-                exploded_repo,
+                my_vram, model_bytes as u64,
                 target_tx, &mut on_change,
             ).await;
             return;
@@ -569,7 +565,8 @@ async fn moe_election_loop(
     model: std::path::PathBuf,
     model_name: String,
     moe_cfg: download::MoeConfig,
-    exploded_repo: Option<String>,
+    my_vram: u64,
+    model_bytes: u64,
     target_tx: watch::Sender<ModelTargets>,
     on_change: &mut impl FnMut(bool, bool),
 ) {
@@ -610,35 +607,44 @@ async fn moe_election_loop(
         last_n_nodes = n_nodes;
 
         if n_nodes == 1 {
-            // Solo: just load the full model, no splitting needed
-            eprintln!("🧩 [{}] MoE solo mode — loading full model", model_name);
-            on_change(true, false);
+            // Solo: check if the full model fits in VRAM
+            let model_fits = my_vram >= (model_bytes as f64 * 1.1) as u64;
+            if model_fits {
+                eprintln!("🧩 [{}] MoE solo mode — loading full model ({:.1}GB fits in {:.1}GB VRAM)",
+                    model_name, model_bytes as f64 / 1e9, my_vram as f64 / 1e9);
+                on_change(true, false);
 
-            let llama_port = match find_free_port().await {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("  Failed to find free port: {e}");
-                    if peer_rx.changed().await.is_err() { break; }
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    continue;
-                }
-            };
+                let llama_port = match find_free_port().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("  Failed to find free port: {e}");
+                        if peer_rx.changed().await.is_err() { break; }
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        continue;
+                    }
+                };
 
-            let model_bytes = total_model_bytes(&model);
-            match launch::start_llama_server(
-                &bin_dir, &model, llama_port, &[], None, None, 0, model_bytes,
-            ).await {
-                Ok(_death_rx) => {
-                    node.set_role(NodeRole::Host { http_port: llama_port }).await;
-                    tunnel_mgr.set_http_port(llama_port);
-                    currently_running = true;
-                    update_targets(&node, &model_name, InferenceTarget::Local(llama_port), &target_tx).await;
-                    on_change(true, true);
-                    eprintln!("✅ [{}] MoE solo — llama-server ready on port {llama_port}", model_name);
+                let mb = total_model_bytes(&model);
+                match launch::start_llama_server(
+                    &bin_dir, &model, llama_port, &[], None, None, 0, mb,
+                ).await {
+                    Ok(_death_rx) => {
+                        node.set_role(NodeRole::Host { http_port: llama_port }).await;
+                        tunnel_mgr.set_http_port(llama_port);
+                        currently_running = true;
+                        update_targets(&node, &model_name, InferenceTarget::Local(llama_port), &target_tx).await;
+                        on_change(true, true);
+                        eprintln!("✅ [{}] MoE solo — llama-server ready on port {llama_port}", model_name);
+                    }
+                    Err(e) => {
+                        eprintln!("  Failed to start llama-server: {e}");
+                    }
                 }
-                Err(e) => {
-                    eprintln!("  Failed to start llama-server: {e}");
-                }
+            } else {
+                // Model too large even for solo — wait for peers to join so we can split
+                eprintln!("⚠️  [{}] MoE model too large for solo ({:.1}GB model, {:.1}GB VRAM) — waiting for peers",
+                    model_name, model_bytes as f64 / 1e9, my_vram as f64 / 1e9);
+                on_change(false, false);
             }
         } else {
             // Multi-node MoE: split and load our shard
@@ -646,93 +652,32 @@ async fn moe_election_loop(
                 model_name, n_nodes, my_shard_index, n_nodes);
             on_change(true, false);
 
-            // Use 2× overlap when using exploded downloads (redundancy for node loss),
-            // 1× for local split (all nodes have the full model anyway).
-            let overlap = if exploded_repo.is_some() { 2 } else { 1 };
-
             // Compute assignments and get our shard
-            let assignments = moe::compute_assignments_with_overlap(
+            let assignments = moe::compute_assignments(
                 moe_cfg.ranking,
                 n_nodes,
                 moe_cfg.min_experts_per_node,
-                overlap,
             );
             let my_assignment = &assignments[my_shard_index];
-            eprintln!("  My experts: {} ({} shared + {} unique, {}× overlap)",
-                my_assignment.experts.len(), my_assignment.n_shared, my_assignment.n_unique, overlap);
+            eprintln!("  My experts: {} ({} shared + {} unique)",
+                my_assignment.experts.len(), my_assignment.n_shared, my_assignment.n_unique);
 
-            // Get or create the shard GGUF — either from exploded download or local split
-            let shard_path = if exploded_repo.is_some() {
-                download::exploded_shard_path(&model_name, n_nodes, my_shard_index)
-            } else {
-                moe::split_path(&model, n_nodes, my_shard_index)
-            };
+            // Get or create the shard GGUF via local split
+            let shard_path = moe::split_path(&model, n_nodes, my_shard_index);
 
             if !shard_path.exists() {
-                let mut shard_ok = false;
-
-                // Try exploded download first (if available)
-                if let Some(ref repo) = exploded_repo {
-                    eprintln!("  📥 Trying exploded expert download from HF...");
-                    let expert_ids: Vec<u32> = my_assignment.experts.clone();
-                    match download::download_exploded_experts(repo, &expert_ids, &model_name).await {
-                        Ok(exploded_dir) => {
-                            match download::assemble_shard(&exploded_dir, &expert_ids, &shard_path) {
-                                Ok(()) => {
-                                    let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
-                                    eprintln!("  ✅ Assembled shard: {:.1} GB", size as f64 / 1e9);
-                                    shard_ok = true;
-                                }
-                                Err(e) => {
-                                    eprintln!("  ⚠ Assemble failed: {e}, falling back to moe-split");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("  ⚠ Expert download failed: {e}, falling back to moe-split");
-                        }
+                eprintln!("  Splitting GGUF → {} ...", shard_path.display());
+                match moe::run_split(&bin_dir, &model, my_assignment, &shard_path) {
+                    Ok(()) => {
+                        let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
+                        eprintln!("  Split complete: {:.1} GB", size as f64 / 1e9);
                     }
-                }
-
-                // Fallback: local split from full model
-                if !shard_ok {
-                    let local_shard = moe::split_path(&model, n_nodes, my_shard_index);
-                    if local_shard.exists() {
-                        // Use cached local split (may be at different path than exploded shard)
-                        if local_shard != shard_path {
-                            if let Some(parent) = shard_path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            // Symlink or copy
-                            let _ = std::fs::copy(&local_shard, &shard_path);
-                        }
-                        shard_ok = true;
-                    } else {
-                        eprintln!("  Splitting GGUF → {} ...", local_shard.display());
-                        match moe::run_split(&bin_dir, &model, my_assignment, &local_shard) {
-                            Ok(()) => {
-                                let size = std::fs::metadata(&local_shard).map(|m| m.len()).unwrap_or(0);
-                                eprintln!("  Split complete: {:.1} GB", size as f64 / 1e9);
-                                if local_shard != shard_path {
-                                    if let Some(parent) = shard_path.parent() {
-                                        let _ = std::fs::create_dir_all(parent);
-                                    }
-                                    let _ = std::fs::copy(&local_shard, &shard_path);
-                                }
-                                shard_ok = true;
-                            }
-                            Err(e) => {
-                                eprintln!("  ❌ moe-split failed: {e}");
-                            }
-                        }
+                    Err(e) => {
+                        eprintln!("  ❌ moe-split failed: {e}");
+                        if peer_rx.changed().await.is_err() { break; }
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        continue;
                     }
-                }
-
-                if !shard_ok {
-                    eprintln!("  ❌ All shard creation methods failed, retrying...");
-                    if peer_rx.changed().await.is_err() { break; }
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    continue;
                 }
             } else {
                 let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);

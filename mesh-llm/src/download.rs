@@ -19,10 +19,6 @@ pub struct CatalogModel {
     /// Each entry is (filename, url). llama.cpp auto-discovers splits from the
     /// first file, but all parts must be present in the same directory.
     pub extra_files: &'static [(&'static str, &'static str)],
-    /// Exploded MoE expert repo: HuggingFace base URL for per-expert files.
-    /// Contains trunk.gguf + expert-NNN.gguf. Enables partial downloads where
-    /// each node fetches only its assigned experts instead of the full model.
-    pub exploded_repo: Option<&'static str>,
 }
 
 /// Pre-computed MoE expert sharding configuration for a model.
@@ -68,7 +64,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen3-0.6B-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Qwen2.5-3B-Instruct-Q4_K_M",
@@ -79,7 +74,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen2.5-0.5B-Instruct-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Llama-3.2-3B-Instruct-Q4_K_M",
@@ -90,7 +84,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Llama-3.2-1B-Instruct-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     // ── Small (6-8GB VRAM) ──────────────────────────────────────────
     CatalogModel {
@@ -102,7 +95,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen3-0.6B-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Qwen2.5-Coder-7B-Instruct-Q4_K_M",
@@ -113,7 +105,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen2.5-0.5B-Instruct-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Gemma-3-12B-it-Q4_K_M",
@@ -124,7 +115,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Gemma-3-1B-it-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Hermes-2-Pro-Mistral-7B-Q4_K_M",
@@ -135,7 +125,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: None,
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     // ── Medium (11-17GB VRAM) ───────────────────────────────────────
     CatalogModel {
@@ -147,7 +136,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen3-0.6B-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Qwen2.5-14B-Instruct-Q4_K_M",
@@ -158,7 +146,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen2.5-0.5B-Instruct-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Qwen2.5-Coder-14B-Instruct-Q4_K_M",
@@ -169,7 +156,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen2.5-0.5B-Instruct-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M",
@@ -180,7 +166,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen2.5-0.5B-Instruct-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Devstral-Small-2505-Q4_K_M",
@@ -191,7 +176,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: None,
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Mistral-Small-3.1-24B-Instruct-Q4_K_M",
@@ -202,7 +186,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: None,
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     // ── Large (20-24GB VRAM) ────────────────────────────────────────
     CatalogModel {
@@ -219,7 +202,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
             ranking: &[], // no pre-baked ranking — uses GGUF auto-detect + fallback
         }),
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Qwen3-30B-A3B-Q4_K_M",
@@ -235,7 +217,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
             ranking: QWEN3_30B_A3B_RANKING, // same arch as Coder variant
         }),
         extra_files: &[],
-        exploded_repo: Some("https://huggingface.co/michaelneale/Qwen3-30B-A3B-Q4_K_M-exploded/resolve/main"),
     },
     CatalogModel {
         name: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M",
@@ -251,7 +232,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
             ranking: QWEN3_30B_A3B_RANKING, // same arch as Qwen3-30B-A3B
         }),
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "GLM-4-32B-0414-Q4_K_M",
@@ -262,7 +242,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: None,
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Qwen3-32B-Q4_K_M",
@@ -273,7 +252,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen3-0.6B-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M",
@@ -284,7 +262,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen2.5-0.5B-Instruct-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Qwen2.5-32B-Instruct-Q4_K_M",
@@ -295,7 +272,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen2.5-0.5B-Instruct-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Qwen2.5-Coder-32B-Instruct-Q4_K_M",
@@ -306,7 +282,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen2.5-0.5B-Instruct-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Llama-4-Scout-Q4_K_M",
@@ -322,7 +297,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
             ranking: &[], // no pre-baked ranking — uses GGUF auto-detect
         }),
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Gemma-3-27B-it-Q4_K_M",
@@ -333,7 +307,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Gemma-3-1B-it-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     // ── XL (48-53GB VRAM, tensor split candidates) ──────────────────
     CatalogModel {
@@ -345,7 +318,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Llama-3.2-1B-Instruct-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Qwen2.5-72B-Instruct-Q4_K_M",
@@ -356,30 +328,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: Some("Qwen2.5-0.5B-Instruct-Q4_K_M"),
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
-    },
-    // ── XXL (100GB+ VRAM, split GGUF) ─────────────────────────────
-    CatalogModel {
-        name: "GLM-5-UD-IQ2_XXS",
-        file: "GLM-5-UD-IQ2_XXS-00001-of-00006.gguf",
-        url: "https://huggingface.co/unsloth/GLM-5-GGUF/resolve/main/UD-IQ2_XXS/GLM-5-UD-IQ2_XXS-00001-of-00006.gguf",
-        size: "224GB",
-        description: "GLM-5 MoE 300B/24B active, 256 experts top-8, ultra-quantised IQ2_XXS",
-        draft: None,
-        moe: Some(MoeConfig {
-            n_expert: 256,
-            n_expert_used: 8,
-            min_experts_per_node: 96,
-            ranking: &[],
-        }),
-        extra_files: &[
-            ("GLM-5-UD-IQ2_XXS-00002-of-00006.gguf", "https://huggingface.co/unsloth/GLM-5-GGUF/resolve/main/UD-IQ2_XXS/GLM-5-UD-IQ2_XXS-00002-of-00006.gguf"),
-            ("GLM-5-UD-IQ2_XXS-00003-of-00006.gguf", "https://huggingface.co/unsloth/GLM-5-GGUF/resolve/main/UD-IQ2_XXS/GLM-5-UD-IQ2_XXS-00003-of-00006.gguf"),
-            ("GLM-5-UD-IQ2_XXS-00004-of-00006.gguf", "https://huggingface.co/unsloth/GLM-5-GGUF/resolve/main/UD-IQ2_XXS/GLM-5-UD-IQ2_XXS-00004-of-00006.gguf"),
-            ("GLM-5-UD-IQ2_XXS-00005-of-00006.gguf", "https://huggingface.co/unsloth/GLM-5-GGUF/resolve/main/UD-IQ2_XXS/GLM-5-UD-IQ2_XXS-00005-of-00006.gguf"),
-            ("GLM-5-UD-IQ2_XXS-00006-of-00006.gguf", "https://huggingface.co/unsloth/GLM-5-GGUF/resolve/main/UD-IQ2_XXS/GLM-5-UD-IQ2_XXS-00006-of-00006.gguf"),
-        ],
-        exploded_repo: None,
     },
     // ── Draft models ────────────────────────────────────────────────
     CatalogModel {
@@ -391,7 +339,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: None,
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Qwen3-0.6B-Q4_K_M",
@@ -402,7 +349,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: None,
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Llama-3.2-1B-Instruct-Q4_K_M",
@@ -413,7 +359,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: None,
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
     CatalogModel {
         name: "Gemma-3-1B-it-Q4_K_M",
@@ -424,7 +369,6 @@ pub const MODEL_CATALOG: &[CatalogModel] = &[
         draft: None,
         moe: None,
         extra_files: &[],
-        exploded_repo: None,
     },
 ];
 
@@ -540,90 +484,6 @@ pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
 
     eprintln!("✅ Downloaded {} to {}", model.name, dir.display());
     Ok(dest)
-}
-
-/// Download an exploded MoE shard: trunk + assigned expert files from HF repo.
-///
-/// - `repo_base`: HF base URL (e.g. `https://huggingface.co/.../resolve/main`)
-/// - `expert_ids`: which expert files to download (from compute_assignments)
-/// - `model_name`: used for the local directory name
-///
-/// Downloads to `~/.models/exploded/<model_name>/trunk.gguf` + `expert-NNN.gguf`.
-/// Returns the directory path containing the downloaded files.
-pub async fn download_exploded_experts(
-    repo_base: &str,
-    expert_ids: &[u32],
-    model_name: &str,
-) -> Result<PathBuf> {
-    let dir = models_dir().join("exploded").join(model_name);
-    tokio::fs::create_dir_all(&dir).await?;
-
-    // Download trunk
-    let trunk_path = dir.join("trunk.gguf");
-    let trunk_url = format!("{repo_base}/trunk.gguf");
-    if trunk_path.exists() {
-        let size = tokio::fs::metadata(&trunk_path).await.map(|m| m.len()).unwrap_or(0);
-        if size > 1_000_000 {
-            eprintln!("  ✅ trunk.gguf already exists ({:.1}GB)", size as f64 / 1e9);
-        } else {
-            eprintln!("  📥 trunk.gguf...");
-            download_with_resume(&trunk_path, &trunk_url).await?;
-        }
-    } else {
-        eprintln!("  📥 trunk.gguf...");
-        download_with_resume(&trunk_path, &trunk_url).await?;
-    }
-
-    // Download assigned expert files
-    for (i, &eid) in expert_ids.iter().enumerate() {
-        let fname = format!("expert-{:03}.gguf", eid);
-        let expert_path = dir.join(&fname);
-        let expert_url = format!("{repo_base}/{fname}");
-
-        if expert_path.exists() {
-            let size = tokio::fs::metadata(&expert_path).await.map(|m| m.len()).unwrap_or(0);
-            if size > 1_000_000 {
-                continue; // already have it
-            }
-        }
-        eprintln!("  📥 [{}/{}] {fname}...", i + 1, expert_ids.len());
-        download_with_resume(&expert_path, &expert_url).await?;
-    }
-
-    let trunk_size = tokio::fs::metadata(&trunk_path).await.map(|m| m.len()).unwrap_or(0);
-    eprintln!("✅ Exploded shard ready: trunk ({:.1}GB) + {} experts in {}",
-        trunk_size as f64 / 1e9, expert_ids.len(), dir.display());
-    Ok(dir)
-}
-
-/// Assemble a shard GGUF from exploded expert files.
-///
-/// Assemble a shard GGUF from trunk + expert files using the Rust assembler.
-///
-/// - `exploded_dir`: directory with trunk.gguf + expert-NNN.gguf files
-/// - `expert_ids`: which experts to include (must exist in exploded_dir)
-/// - `output_path`: where to write the assembled shard GGUF
-pub fn assemble_shard(
-    exploded_dir: &Path,
-    expert_ids: &[u32],
-    output_path: &Path,
-) -> Result<()> {
-    let trunk = exploded_dir.join("trunk.gguf");
-    let expert_paths: Vec<PathBuf> = expert_ids.iter()
-        .map(|&eid| exploded_dir.join(format!("expert-{:03}.gguf", eid)))
-        .collect();
-
-    crate::moe::assemble_shard(&trunk, &expert_paths, output_path)
-}
-
-/// Path to a cached assembled shard for exploded models.
-pub fn exploded_shard_path(model_name: &str, n_nodes: usize, node_index: usize) -> PathBuf {
-    models_dir()
-        .join("exploded")
-        .join(model_name)
-        .join("shards")
-        .join(format!("{n_nodes}-nodes"))
-        .join(format!("node-{node_index}.gguf"))
 }
 
 /// Download any URL to a destination path with resume support.
