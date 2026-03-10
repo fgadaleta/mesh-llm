@@ -242,16 +242,40 @@ pub struct NodeAssignment {
 /// - `min_experts`: minimum experts per node for coherent output
 ///
 /// Returns one NodeAssignment per node. Every expert appears in at least one node.
+/// Convenience wrapper for compute_assignments_with_overlap with overlap=1.
+/// Used by tests and external callers that don't need redundancy.
+#[allow(dead_code)]
 pub fn compute_assignments(
     ranking: &[u32],
     n_nodes: usize,
     min_experts: u32,
 ) -> Vec<NodeAssignment> {
+    compute_assignments_with_overlap(ranking, n_nodes, min_experts, 1)
+}
+
+/// Compute expert assignments with a configurable overlap factor.
+///
+/// - `overlap`: how many nodes each expert should live on (1 = no redundancy,
+///   2 = every expert on at least 2 nodes, etc.). Capped at n_nodes.
+///
+/// Strategy:
+/// 1. Shared core = top `min_experts` by gate mass → replicated to every node
+/// 2. Remaining experts distributed with `overlap` copies each
+///
+/// With overlap=2, losing any single node doesn't orphan any expert —
+/// at least one other node still has it.
+pub fn compute_assignments_with_overlap(
+    ranking: &[u32],
+    n_nodes: usize,
+    min_experts: u32,
+    overlap: usize,
+) -> Vec<NodeAssignment> {
     let n_expert = ranking.len();
     let min_exp = min_experts as usize;
+    let overlap = overlap.min(n_nodes).max(1);
 
     if n_nodes <= 1 || min_exp >= n_expert {
-        // Single node or core covers everything — just give everyone all experts
+        // Single node or core covers everything — give everyone all experts
         return vec![NodeAssignment {
             experts: ranking.to_vec(),
             n_shared: n_expert,
@@ -259,26 +283,31 @@ pub fn compute_assignments(
         }; n_nodes.max(1)];
     }
 
-    // Shared core = top min_experts by gate mass
+    // Shared core = top min_experts by gate mass (replicated to every node)
     let shared_core: Vec<u32> = ranking[..min_exp].to_vec();
 
-    // Remaining experts to distribute
+    // Remaining experts to distribute with overlap
     let remaining: Vec<u32> = ranking[min_exp..].to_vec();
-    let unique_per_node = remaining.len() / n_nodes;
-    let leftover = remaining.len() % n_nodes;
+
+    // With overlap, each expert goes to `overlap` nodes.
+    // Total expert-slots = remaining.len() * overlap, distributed round-robin.
+    let mut node_experts: Vec<Vec<u32>> = vec![Vec::new(); n_nodes];
+
+    for (i, &expert_id) in remaining.iter().enumerate() {
+        // Assign to `overlap` consecutive nodes (wrapping)
+        for j in 0..overlap {
+            let node = (i + j) % n_nodes;
+            node_experts[node].push(expert_id);
+        }
+    }
 
     let mut assignments = Vec::with_capacity(n_nodes);
-    let mut offset = 0;
-
-    for i in 0..n_nodes {
-        // Distribute leftover experts to first nodes (one extra each)
-        let n_unique = unique_per_node + if i < leftover { 1 } else { 0 };
-        let unique_shard: Vec<u32> = remaining[offset..offset + n_unique].to_vec();
-        offset += n_unique;
-
+    for node_exps in node_experts {
+        let n_unique = node_exps.len();
         let mut experts = shared_core.clone();
-        experts.extend_from_slice(&unique_shard);
+        experts.extend_from_slice(&node_exps);
         experts.sort();
+        experts.dedup(); // in case overlap wraps and duplicates with shared core
 
         assignments.push(NodeAssignment {
             experts,
@@ -463,5 +492,106 @@ mod tests {
         let assignments = compute_assignments(&ranking, 1, 4);
         assert_eq!(assignments.len(), 1);
         assert_eq!(assignments[0].experts.len(), 8); // gets everything
+    }
+
+    // ── Overlap tests ──
+
+    #[test]
+    fn test_overlap_2x_3_nodes() {
+        // 128 experts, min 46, 3 nodes, 2× overlap
+        let ranking: Vec<u32> = (0..128).collect();
+        let assignments = compute_assignments_with_overlap(&ranking, 3, 46, 2);
+
+        assert_eq!(assignments.len(), 3);
+
+        // Every expert should appear in at least 2 nodes
+        let mut expert_count: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for a in &assignments {
+            for &e in &a.experts {
+                *expert_count.entry(e).or_default() += 1;
+            }
+        }
+
+        // Shared core (0..46) in all 3 nodes
+        for e in 0..46 {
+            assert!(*expert_count.get(&e).unwrap() >= 3,
+                "Shared expert {e} should be in all nodes");
+        }
+        // Remaining experts (46..128) in at least 2 nodes
+        for e in 46..128 {
+            assert!(*expert_count.get(&e).unwrap() >= 2,
+                "Expert {e} should be in at least 2 nodes, got {}", expert_count[&e]);
+        }
+        // Full coverage
+        assert_eq!(expert_count.len(), 128);
+    }
+
+    #[test]
+    fn test_overlap_2x_2_nodes() {
+        // With 2 nodes and 2× overlap, every remaining expert is on both nodes
+        let ranking: Vec<u32> = (0..10).collect();
+        let assignments = compute_assignments_with_overlap(&ranking, 2, 4, 2);
+
+        assert_eq!(assignments.len(), 2);
+        // Both nodes should have all 10 experts (4 shared + 6 remaining × 2× = both)
+        assert_eq!(assignments[0].experts.len(), 10);
+        assert_eq!(assignments[1].experts.len(), 10);
+    }
+
+    #[test]
+    fn test_overlap_1x_same_as_original() {
+        // overlap=1 should give same results as compute_assignments
+        let ranking: Vec<u32> = (0..128).collect();
+        let a1 = compute_assignments(&ranking, 3, 46);
+        let a2 = compute_assignments_with_overlap(&ranking, 3, 46, 1);
+
+        for i in 0..3 {
+            assert_eq!(a1[i].experts, a2[i].experts);
+        }
+    }
+
+    #[test]
+    fn test_overlap_capped_at_n_nodes() {
+        // overlap=10 with 3 nodes should cap to 3 (every expert on every node)
+        let ranking: Vec<u32> = (0..20).collect();
+        let assignments = compute_assignments_with_overlap(&ranking, 3, 5, 10);
+
+        // All 3 nodes should have all 20 experts
+        for a in &assignments {
+            assert_eq!(a.experts.len(), 20);
+        }
+    }
+
+    #[test]
+    fn test_overlap_glm5_10_nodes() {
+        // GLM-5: 256 experts, min 96, 10 nodes, 2× overlap
+        let ranking: Vec<u32> = (0..256).collect();
+        let assignments = compute_assignments_with_overlap(&ranking, 10, 96, 2);
+
+        assert_eq!(assignments.len(), 10);
+
+        // Full coverage
+        let mut all: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for a in &assignments {
+            all.extend(&a.experts);
+        }
+        assert_eq!(all.len(), 256);
+
+        // Every remaining expert on at least 2 nodes
+        let mut expert_count: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for a in &assignments {
+            for &e in &a.experts {
+                *expert_count.entry(e).or_default() += 1;
+            }
+        }
+        for e in 96..256 {
+            assert!(*expert_count.get(&e).unwrap() >= 2);
+        }
+
+        // Print sizes for verification
+        for (i, a) in assignments.iter().enumerate() {
+            eprintln!("  Node {i}: {} experts ({} shared + {} unique)",
+                a.experts.len(), a.n_shared, a.n_unique);
+        }
     }
 }

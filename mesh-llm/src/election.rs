@@ -283,8 +283,13 @@ pub async fn election_loop(
     if let Some(ref moe_cfg) = moe_config {
         let need_moe_split = force_split || !model_fits_locally;
         if need_moe_split {
+            // Check if this model has exploded expert files on HF
+            let exploded_repo = download::find_model(&model_name)
+                .and_then(|m| m.exploded_repo)
+                .map(|s| s.to_string());
             moe_election_loop(
                 node, tunnel_mgr, bin_dir, model, model_name, moe_cfg.clone(),
+                exploded_repo,
                 target_tx, &mut on_change,
             ).await;
             return;
@@ -564,6 +569,7 @@ async fn moe_election_loop(
     model: std::path::PathBuf,
     model_name: String,
     moe_cfg: download::MoeConfig,
+    exploded_repo: Option<String>,
     target_tx: watch::Sender<ModelTargets>,
     on_change: &mut impl FnMut(bool, bool),
 ) {
@@ -640,30 +646,69 @@ async fn moe_election_loop(
                 model_name, n_nodes, my_shard_index, n_nodes);
             on_change(true, false);
 
+            // Use 2× overlap when using exploded downloads (redundancy for node loss),
+            // 1× for local split (all nodes have the full model anyway).
+            let overlap = if exploded_repo.is_some() { 2 } else { 1 };
+
             // Compute assignments and get our shard
-            let assignments = moe::compute_assignments(
+            let assignments = moe::compute_assignments_with_overlap(
                 moe_cfg.ranking,
                 n_nodes,
                 moe_cfg.min_experts_per_node,
+                overlap,
             );
             let my_assignment = &assignments[my_shard_index];
-            eprintln!("  My experts: {} ({} shared + {} unique)",
-                my_assignment.experts.len(), my_assignment.n_shared, my_assignment.n_unique);
+            eprintln!("  My experts: {} ({} shared + {} unique, {}× overlap)",
+                my_assignment.experts.len(), my_assignment.n_shared, my_assignment.n_unique, overlap);
 
-            // Ensure our split GGUF exists (cached)
-            let shard_path = moe::split_path(&model, n_nodes, my_shard_index);
+            // Get or create the shard GGUF — either from exploded download or local split
+            let shard_path = if exploded_repo.is_some() {
+                download::exploded_shard_path(&model_name, n_nodes, my_shard_index)
+            } else {
+                moe::split_path(&model, n_nodes, my_shard_index)
+            };
+
             if !shard_path.exists() {
-                eprintln!("  Splitting GGUF → {} ...", shard_path.display());
-                match moe::run_split(&bin_dir, &model, my_assignment, &shard_path) {
-                    Ok(()) => {
-                        let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
-                        eprintln!("  Split complete: {:.1} GB", size as f64 / 1e9);
+                if let Some(ref repo) = exploded_repo {
+                    // Download trunk + expert files, then assemble
+                    eprintln!("  📥 Downloading exploded experts from HF...");
+                    let expert_ids: Vec<u32> = my_assignment.experts.clone();
+                    match download::download_exploded_experts(repo, &expert_ids, &model_name).await {
+                        Ok(exploded_dir) => {
+                            match download::assemble_shard(&bin_dir, &exploded_dir, &expert_ids, &shard_path) {
+                                Ok(()) => {
+                                    let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
+                                    eprintln!("  ✅ Assembled shard: {:.1} GB", size as f64 / 1e9);
+                                }
+                                Err(e) => {
+                                    eprintln!("  ❌ Assemble failed: {e}");
+                                    if peer_rx.changed().await.is_err() { break; }
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  ❌ Expert download failed: {e}");
+                            if peer_rx.changed().await.is_err() { break; }
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("  ❌ moe-split failed: {e}");
-                        if peer_rx.changed().await.is_err() { break; }
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        continue;
+                } else {
+                    // Local split from full model
+                    eprintln!("  Splitting GGUF → {} ...", shard_path.display());
+                    match moe::run_split(&bin_dir, &model, my_assignment, &shard_path) {
+                        Ok(()) => {
+                            let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
+                            eprintln!("  Split complete: {:.1} GB", size as f64 / 1e9);
+                        }
+                        Err(e) => {
+                            eprintln!("  ❌ moe-split failed: {e}");
+                            if peer_rx.changed().await.is_err() { break; }
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
                     }
                 }
             } else {
