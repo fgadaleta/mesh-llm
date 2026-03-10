@@ -487,243 +487,18 @@ pub async fn download_url(url: &str, dest: &Path) -> Result<()> {
     download_with_resume(dest, url).await
 }
 
-/// Number of parallel connections for large downloads.
-const PARALLEL_CHUNKS: usize = 8;
-
-/// Minimum file size to use parallel downloads (100MB).
-const PARALLEL_THRESHOLD: u64 = 100_000_000;
-
-/// Download with parallel chunked connections for large files, single-stream for small.
-/// Supports resume: each chunk tracks its own progress via marker files.
+/// Download with resume support and retries using reqwest.
 async fn download_with_resume(dest: &Path, url: &str) -> Result<()> {
+    use tokio_stream::StreamExt;
+
+    let tmp = dest.with_extension("gguf.part");
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3600))
+        .timeout(std::time::Duration::from_secs(3600)) // 1h overall timeout
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    // Probe file size and Range support with HEAD
-    let total_bytes = probe_size(&client, url).await;
-
-    if let Some(total) = total_bytes {
-        if total >= PARALLEL_THRESHOLD {
-            return download_parallel(dest, url, &client, total).await;
-        }
-    }
-
-    // Small file or no Content-Length — single stream
-    download_single_stream(dest, url, &client).await
-}
-
-/// Probe file size using a minimal Range GET request.
-/// HEAD doesn't reliably return Content-Length through CDN redirects (e.g. HF's xet-bridge),
-/// so we request "bytes=0-0" and parse the Content-Range header for the total size.
-async fn probe_size(client: &reqwest::Client, url: &str) -> Option<u64> {
-    // Try Range GET first — most reliable through CDNs
-    let resp = client.get(url)
-        .header("Range", "bytes=0-0")
-        .send().await.ok()?;
-
-    if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-        // Content-Range: bytes 0-0/396705472
-        if let Some(cr) = resp.headers().get("content-range") {
-            if let Ok(s) = cr.to_str() {
-                if let Some(total) = s.rsplit('/').next().and_then(|s| s.parse::<u64>().ok()) {
-                    return Some(total);
-                }
-            }
-        }
-    }
-
-    // Fallback: check Content-Length from a normal HEAD
-    let resp = client.head(url).send().await.ok()?;
-    resp.content_length().filter(|&cl| cl > 0)
-}
-
-/// Parallel chunked download: split file into N ranges, download concurrently.
-async fn download_parallel(
-    dest: &Path,
-    url: &str,
-    client: &reqwest::Client,
-    total_bytes: u64,
-) -> Result<()> {
-    use tokio_stream::StreamExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
-
-    let tmp = dest.with_extension("gguf.part");
-    let n_chunks = PARALLEL_CHUNKS;
-    let chunk_size = total_bytes / n_chunks as u64;
-
-    eprintln!("  ⚡ Parallel download: {:.1}GB in {} chunks",
-        total_bytes as f64 / 1e9, n_chunks);
-
-    // Pre-allocate the output file to full size
-    {
-        let f = tokio::fs::OpenOptions::new()
-            .create(true).write(true).open(&tmp).await?;
-        f.set_len(total_bytes).await?;
-    }
-
-    // Shared progress counter
-    let progress = Arc::new(AtomicU64::new(0));
-    let start_time = std::time::Instant::now();
-
-    // Each chunk has a marker file: dest.part.chunk-N.done
-    let chunk_done = |i: usize| -> PathBuf {
-        dest.with_extension(format!("part.chunk-{i}.done"))
-    };
-
-    let mut handles = Vec::new();
-
-    for i in 0..n_chunks {
-        let start = i as u64 * chunk_size;
-        let end = if i == n_chunks - 1 { total_bytes - 1 } else { (i as u64 + 1) * chunk_size - 1 };
-        let this_chunk_size = end - start + 1;
-
-        // Skip completed chunks (resume from previous run)
-        let marker = chunk_done(i);
-        if marker.exists() {
-            progress.fetch_add(this_chunk_size, Ordering::Relaxed);
-            continue;
-        }
-
-        let client = client.clone();
-        let url = url.to_string();
-        let tmp = tmp.clone();
-        let progress = progress.clone();
-        let marker = marker.clone();
-
-        let handle = tokio::spawn(async move {
-            for attempt in 1..=5 {
-                let resp = match client.get(&url)
-                    .header("Range", format!("bytes={start}-{end}"))
-                    .send().await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("  chunk {i}: connection failed (attempt {attempt}): {e}");
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        continue;
-                    }
-                };
-
-                if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-                    eprintln!("  chunk {i}: unexpected status {} (attempt {attempt})", resp.status());
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    continue;
-                }
-
-                // Write directly to offset in file using pwrite (no seek contention)
-                let file = match std::fs::OpenOptions::new().write(true).open(&tmp) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("  chunk {i}: file open failed: {e}");
-                        return Err(anyhow::anyhow!("chunk {i} file open: {e}"));
-                    }
-                };
-
-                #[cfg(unix)]
-                use std::os::unix::fs::FileExt;
-
-                let mut stream = resp.bytes_stream();
-                let mut offset = start;
-
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(chunk) => {
-                            #[cfg(unix)]
-                            file.write_at(&chunk, offset)?;
-                            #[cfg(not(unix))]
-                            {
-                                use std::io::{Seek, Write};
-                                let mut f = &file;
-                                f.seek(std::io::SeekFrom::Start(offset))?;
-                                f.write_all(&chunk)?;
-                            }
-                            offset += chunk.len() as u64;
-                            progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            eprintln!("  chunk {i}: stream error (attempt {attempt}): {e}");
-                            break;
-                        }
-                    }
-                }
-
-                if offset == end + 1 {
-                    // Chunk complete — write marker
-                    let _ = std::fs::write(&marker, b"done");
-                    return Ok(());
-                }
-                // Didn't finish — retry
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            }
-            Err(anyhow::anyhow!("chunk {i} failed after 5 attempts"))
-        });
-
-        handles.push(handle);
-    }
-
-    // Progress display loop
-    let progress_display = progress.clone();
-    let display_handle = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let done = progress_display.load(Ordering::Relaxed);
-            let elapsed = start_time.elapsed().as_secs_f64();
-            let speed = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
-            let pct = done as f64 / total_bytes as f64 * 100.0;
-            let eta = if speed > 0.0 { (total_bytes - done) as f64 / speed } else { 0.0 };
-            eprint!("\r  {:.1}/{:.1}GB ({:.1}%) {:.0}MB/s ETA {:.0}s    ",
-                done as f64 / 1e9, total_bytes as f64 / 1e9, pct, speed / 1e6, eta);
-            if done >= total_bytes { break; }
-        }
-    });
-
-    // Wait for all chunks
-    let mut all_ok = true;
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {},
-            Ok(Err(e)) => { eprintln!("\n  chunk failed: {e}"); all_ok = false; }
-            Err(e) => { eprintln!("\n  chunk panicked: {e}"); all_ok = false; }
-        }
-    }
-
-    display_handle.abort();
-    eprintln!(); // newline after progress
-
-    if !all_ok {
-        anyhow::bail!("parallel download failed — some chunks did not complete");
-    }
-
-    // Clean up chunk markers
-    for i in 0..n_chunks {
-        let _ = tokio::fs::remove_file(chunk_done(i)).await;
-    }
-
-    // Rename to final destination
-    tokio::fs::rename(&tmp, dest).await
-        .context("Failed to move downloaded file")?;
-
-    let elapsed = start_time.elapsed().as_secs_f64();
-    eprintln!("  ✅ {:.1}GB in {:.0}s ({:.0}MB/s, {} connections)",
-        total_bytes as f64 / 1e9, elapsed, total_bytes as f64 / elapsed / 1e6, n_chunks);
-
-    Ok(())
-}
-
-/// Single-stream download with resume (for small files or servers without Range).
-async fn download_single_stream(
-    dest: &Path,
-    url: &str,
-    client: &reqwest::Client,
-) -> Result<()> {
-    use tokio_stream::StreamExt;
-
-    let tmp = dest.with_extension("gguf.part");
-
     for attempt in 1..=5 {
+        // Check how much we already have (for resume)
         let existing_bytes = if tmp.exists() {
             tokio::fs::metadata(&tmp).await?.len()
         } else {
@@ -758,6 +533,7 @@ async fn download_single_stream(
 
         let status = response.status();
         if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            // If server doesn't support resume (416 Range Not Satisfiable), start fresh
             if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 eprintln!("  server rejected resume, starting fresh...");
@@ -766,7 +542,9 @@ async fn download_single_stream(
             anyhow::bail!("HTTP {status} downloading {url}");
         }
 
+        // Total size from Content-Length (or Content-Range)
         let total_bytes = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            // Content-Range: bytes 1234-5678/9999
             response
                 .headers()
                 .get("content-range")
@@ -777,6 +555,7 @@ async fn download_single_stream(
             response.content_length().map(|cl| cl + existing_bytes)
         };
 
+        // Open file for append (resume) or create
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -788,6 +567,7 @@ async fn download_single_stream(
         let mut downloaded = existing_bytes;
         let mut last_progress = std::time::Instant::now();
 
+        // Print initial progress
         print_progress(downloaded, total_bytes);
 
         loop {
@@ -798,6 +578,7 @@ async fn download_single_stream(
                         .context("Failed to write chunk")?;
                     downloaded += chunk.len() as u64;
 
+                    // Update progress every 500ms
                     if last_progress.elapsed() >= std::time::Duration::from_millis(500) {
                         print_progress(downloaded, total_bytes);
                         last_progress = std::time::Instant::now();
@@ -817,6 +598,7 @@ async fn download_single_stream(
                     break;
                 }
                 None => {
+                    // Stream complete
                     file.flush().await?;
                     eprint!("\r");
                     print_progress(downloaded, total_bytes);
@@ -830,6 +612,7 @@ async fn download_single_stream(
         }
     }
 
+    // Clean up partial on total failure
     let _ = tokio::fs::remove_file(&tmp).await;
     anyhow::bail!("Download failed after 5 attempts");
 }
