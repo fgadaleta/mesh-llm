@@ -3,7 +3,7 @@
 //! Used by the API proxy (port 9337), bootstrap proxy, and passive mode.
 //! All inference traffic flows through these functions.
 
-use crate::{election, mesh, tunnel};
+use crate::{election, mesh, router, tunnel};
 use anyhow::Result;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -55,6 +55,14 @@ pub fn extract_session_hint(buf: &[u8]) -> Option<String> {
     None
 }
 
+/// Try to parse the JSON body from a peeked HTTP request buffer.
+pub fn extract_body_json(buf: &[u8]) -> Option<serde_json::Value> {
+    let s = std::str::from_utf8(buf).ok()?;
+    let body_start = s.find("\r\n\r\n")? + 4;
+    let body = &s[body_start..];
+    serde_json::from_str(body).ok()
+}
+
 pub fn is_models_list_request(buf: &[u8]) -> bool {
     let s = String::from_utf8_lossy(buf);
     s.starts_with("GET ") && (s.contains("/v1/models") || s.contains("/models"))
@@ -88,15 +96,42 @@ pub async fn handle_mesh_request(node: mesh::Node, tcp_stream: TcpStream, track_
         return;
     }
 
+    // Demand tracking for rebalancing (done after routing so we track the actual model used)
+    // We'll track below after routing resolves the effective model
+
+    // Smart routing: if no model specified (or model="auto"), classify and pick
+    let routed_model = if model_name.is_none() || model_name.as_deref() == Some("auto") {
+        if let Some(body_json) = extract_body_json(&buf[..n]) {
+            let category = router::classify(&body_json);
+            let served = node.models_being_served().await;
+            // Build available models with placeholder speed (TODO: track real tok/s)
+            let available: Vec<(&str, f64)> = served.iter()
+                .map(|name| (name.as_str(), 0.0))
+                .collect();
+            let picked = router::pick_model(category, &available);
+            if let Some(name) = picked {
+                tracing::info!("router: {:?} → {name}", category);
+                Some(name.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let effective_model = routed_model.or(model_name);
+
     // Demand tracking for rebalancing
     if track_demand {
-        if let Some(ref name) = model_name {
+        if let Some(ref name) = effective_model {
             node.record_request(name);
         }
     }
 
     // Resolve target hosts by model name, fall back to any host
-    let target_hosts = if let Some(ref name) = model_name {
+    let target_hosts = if let Some(ref name) = effective_model {
         node.hosts_for_model(name).await
     } else {
         vec![]
@@ -140,7 +175,7 @@ pub async fn handle_mesh_request(node: mesh::Node, tcp_stream: TcpStream, track_
     }
     // All hosts failed
     if let Some(e) = last_err {
-        tracing::warn!("All hosts failed for model {:?}: {e}", model_name);
+        tracing::warn!("All hosts failed for model {:?}: {e}", effective_model);
     }
     let _ = send_503(tcp_stream).await;
 }

@@ -7,6 +7,7 @@ mod moe;
 mod nostr;
 mod proxy;
 mod rewrite;
+mod router;
 mod tunnel;
 
 use anyhow::{Context, Result};
