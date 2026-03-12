@@ -41,7 +41,7 @@ pub static MODEL_PROFILES: &[ModelProfile] = &[
     },
     ModelProfile {
         name: "MiniMax-M2.5-Q4_K_M",
-        strengths: &[Category::Chat, Category::Creative, Category::Reasoning],
+        strengths: &[Category::Code, Category::Reasoning, Category::Chat, Category::Creative, Category::ToolCall],
         tier: 4,
     },
     // ── Tier 3: Strong ──────────────────────────────────────────
@@ -195,7 +195,35 @@ pub static MODEL_PROFILES: &[ModelProfile] = &[
 ];
 
 pub fn profile_for(model_name: &str) -> Option<&'static ModelProfile> {
-    MODEL_PROFILES.iter().find(|p| p.name == model_name)
+    // Direct match first
+    if let Some(p) = MODEL_PROFILES.iter().find(|p| p.name == model_name) {
+        return Some(p);
+    }
+    // Strip split GGUF suffix: "Model-00001-of-00004" → "Model"
+    let clean = strip_split_suffix(model_name);
+    if clean != model_name {
+        return MODEL_PROFILES.iter().find(|p| p.name == clean);
+    }
+    None
+}
+
+/// Strip split GGUF suffix like "-00001-of-00004" from a model name.
+fn strip_split_suffix(name: &str) -> &str {
+    // Pattern: -NNNNN-of-NNNNN at the end
+    if let Some(idx) = name.rfind("-of-") {
+        // Check that what follows is digits and what precedes is -digits
+        let after = &name[idx + 4..];
+        if after.chars().all(|c| c.is_ascii_digit()) && !after.is_empty() {
+            // Find the preceding -NNNNN
+            if let Some(dash) = name[..idx].rfind('-') {
+                let between = &name[dash + 1..idx];
+                if between.chars().all(|c| c.is_ascii_digit()) && !between.is_empty() {
+                    return &name[..dash];
+                }
+            }
+        }
+    }
+    name
 }
 
 // ── Request classification ──────────────────────────────────────────
@@ -470,5 +498,21 @@ mod tests {
             "tools": []
         });
         assert_eq!(classify(&body), Category::Chat);
+    }
+
+    #[test]
+    fn test_strip_split_suffix() {
+        assert_eq!(strip_split_suffix("MiniMax-M2.5-Q4_K_M-00001-of-00004"), "MiniMax-M2.5-Q4_K_M");
+        assert_eq!(strip_split_suffix("Qwen3-Coder-Next-Q4_K_M-00001-of-00004"), "Qwen3-Coder-Next-Q4_K_M");
+        assert_eq!(strip_split_suffix("Hermes-2-Pro-Mistral-7B-Q4_K_M"), "Hermes-2-Pro-Mistral-7B-Q4_K_M");
+        assert_eq!(strip_split_suffix(""), "");
+    }
+
+    #[test]
+    fn test_profile_for_split_gguf() {
+        let p = profile_for("MiniMax-M2.5-Q4_K_M-00001-of-00004");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().name, "MiniMax-M2.5-Q4_K_M");
+        assert_eq!(p.unwrap().tier, 4);
     }
 }
