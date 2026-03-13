@@ -6,3 +6,4 @@ private-note.txt
 mesh-bundle.tar.gz
 .idea/
 mesh-llm/ui/dist/
+evals/results/

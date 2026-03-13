@@ -187,8 +187,8 @@ pub static MODEL_PROFILES: &[ModelProfile] = &[
     },
     ModelProfile {
         name: "Hermes-2-Pro-Mistral-7B-Q4_K_M",
-        strengths: &[Category::ToolCall, Category::Chat],
-        tier: 2, tools: true,
+        strengths: &[Category::Chat],
+        tier: 2, tools: false,
     },
     ModelProfile {
         name: "Qwen2.5-Coder-7B-Instruct-Q4_K_M",
@@ -705,14 +705,14 @@ mod tests {
     fn test_tools_filter_prefers_capable() {
         let available = vec![
             ("DeepSeek-R1-Distill-Qwen-32B-Q4_K_M", 10.0), // tools: false, Reasoning only
-            ("Hermes-2-Pro-Mistral-7B-Q4_K_M", 50.0),       // tools: true
+            ("Qwen2.5-32B-Instruct-Q4_K_M", 50.0),          // tools: true, Chat+Reasoning+Code
         ];
         // Without tools, Reasoning request: DeepSeek wins (primary strength match + higher tier)
         let result = pick_model_with_tools(Category::Reasoning, &available, false);
         assert_eq!(result, Some("DeepSeek-R1-Distill-Qwen-32B-Q4_K_M"));
-        // With tools, Reasoning request: Hermes wins (DeepSeek filtered out — can't do tools)
+        // With tools, Reasoning request: Qwen wins (DeepSeek filtered out — can't do tools)
         let result = pick_model_with_tools(Category::Reasoning, &available, true);
-        assert_eq!(result, Some("Hermes-2-Pro-Mistral-7B-Q4_K_M"));
+        assert_eq!(result, Some("Qwen2.5-32B-Instruct-Q4_K_M"));
     }
 
     #[test]
