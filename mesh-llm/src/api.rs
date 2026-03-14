@@ -517,9 +517,24 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             state.inner.lock().await.sse_clients.push(tx);
 
-            while let Some(event) = rx.recv().await {
-                if stream.write_all(event.as_bytes()).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    event = rx.recv() => {
+                        match event {
+                            Some(data) => {
+                                if stream.write_all(data.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
+                        // SSE keepalive comment to prevent proxy/browser timeout
+                        if stream.write_all(b": keepalive\n\n").await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }

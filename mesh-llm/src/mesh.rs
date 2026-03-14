@@ -874,7 +874,34 @@ impl Node {
                             node.initiate_gossip_inner(conn, peer_id, false),
                         ).await.map(|r| r.is_ok()).unwrap_or(false)
                     } else {
-                        false
+                        // No connection — try to reconnect using stored address
+                        let addr = {
+                            let state = node.state.lock().await;
+                            state.peers.get(&peer_id).map(|p| p.addr.clone())
+                        };
+                        if let Some(addr) = addr {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                node.endpoint.connect(addr, ALPN),
+                            ).await {
+                                Ok(Ok(new_conn)) => {
+                                    eprintln!("💚 Heartbeat: reconnected to {}", peer_id.fmt_short());
+                                    node.state.lock().await.connections.insert(peer_id, new_conn.clone());
+                                    // Spawn dispatch_streams for the new connection
+                                    let n2 = node.clone();
+                                    let nc = new_conn.clone();
+                                    tokio::spawn(async move { n2.dispatch_streams(nc, peer_id).await; });
+                                    // Try gossip on the new connection
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(10),
+                                        node.initiate_gossip_inner(new_conn, peer_id, false),
+                                    ).await.map(|r| r.is_ok()).unwrap_or(false)
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        }
                     };
 
                     if alive {
@@ -1411,13 +1438,15 @@ impl Node {
                                 });
                             }
                             _ => {
-                                tracing::info!("Reconnect to {} failed — removing peer", remote.fmt_short());
-                                self.remove_peer(remote).await;
+                                // Don't remove the peer — let heartbeat's 2-strike system
+                                // handle it. The peer may still be alive and reach us via
+                                // inbound gossip, or the next heartbeat cycle may succeed.
+                                eprintln!("⚠️  Reconnect to {} failed — keeping peer for heartbeat retry", remote.fmt_short());
                             }
                         }
                     } else {
-                        // No address on file, can't reconnect
-                        self.remove_peer(remote).await;
+                        // No address on file — peer was already removed elsewhere
+                        tracing::info!("No address for {} — already cleaned up", remote.fmt_short());
                     }
                     break;
                 }
@@ -1604,27 +1633,37 @@ impl Node {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Find the direct peer's self-announcement — carries mesh-wide fields
-        let peer_ann = their_announcements.iter().find(|a| a.addr.id == remote);
-        if let Some(ann) = peer_ann {
-            if let Some(ref their_id) = ann.mesh_id {
-                self.set_mesh_id(their_id.clone()).await;
-            }
-            self.merge_remote_demand(&ann.model_demand);
-            self.add_peer(remote, ann.addr.clone(), ann).await;
-            // Store RTT
-            let mut state = self.state.lock().await;
-            if let Some(peer) = state.peers.get_mut(&remote) {
-                peer.rtt_ms = Some(rtt_ms);
-                tracing::info!("Peer {} RTT: {}ms", remote.fmt_short(), rtt_ms);
+        // Process announcements: direct peer gets full add_peer (updates last_seen,
+        // triggers events). Other peers get transitive update (serving/role info only,
+        // no last_seen refresh) so their models appear in mesh_models but they still
+        // get pruned if they actually die.
+        for ann in &their_announcements {
+            if ann.addr.id == self.endpoint.id() { continue; }
+            if ann.addr.id == remote {
+                if let Some(ref their_id) = ann.mesh_id {
+                    self.set_mesh_id(their_id.clone()).await;
+                }
+                self.merge_remote_demand(&ann.model_demand);
+                self.add_peer(remote, ann.addr.clone(), ann).await;
+                let mut state = self.state.lock().await;
+                if let Some(peer) = state.peers.get_mut(&remote) {
+                    peer.rtt_ms = Some(rtt_ms);
+                    tracing::info!("Peer {} RTT: {}ms", remote.fmt_short(), rtt_ms);
+                }
+            } else {
+                self.update_transitive_peer(ann.addr.id, &ann.addr, ann).await;
             }
         }
 
-        // Discover new peers (only on initial join, not heartbeat)
+        // Try to establish direct connections to new peers (only on initial join)
         if discover_peers {
-            for ann in their_announcements {
+            for ann in &their_announcements {
                 if ann.addr.id != self.endpoint.id() {
-                    if let Err(e) = Box::pin(self.connect_to_peer(ann.addr)).await {
-                        tracing::warn!("Failed to discover peer: {e}");
+                    let has_conn = self.state.lock().await.connections.contains_key(&ann.addr.id);
+                    if !has_conn {
+                        if let Err(e) = Box::pin(self.connect_to_peer(ann.addr.clone())).await {
+                            tracing::debug!("Could not connect to discovered peer {}: {e}", ann.addr.id.fmt_short());
+                        }
                     }
                 }
             }
@@ -1668,14 +1707,18 @@ impl Node {
         // Wait for the remote to finish their send
         let _ = recv.read_to_end(0).await;
 
-        // Find the direct peer's self-announcement — carries mesh-wide fields
+        // Process all announcements: direct peer gets full add_peer,
+        // others get transitive update (serving info without last_seen refresh).
         for ann in &their_announcements {
+            if ann.addr.id == self.endpoint.id() { continue; }
             if ann.addr.id == remote {
                 if let Some(ref their_id) = ann.mesh_id {
                     self.set_mesh_id(their_id.clone()).await;
                 }
                 self.merge_remote_demand(&ann.model_demand);
                 self.add_peer(remote, ann.addr.clone(), ann).await;
+            } else {
+                self.update_transitive_peer(ann.addr.id, &ann.addr, ann).await;
             }
         }
 
@@ -1824,6 +1867,50 @@ impl Node {
         let count = state.peers.len();
         drop(state);
         let _ = self.peer_change_tx.send(count);
+    }
+
+    /// Update a peer learned transitively through gossip (not directly connected).
+    /// Updates serving/role info so models_being_served() includes their models,
+    /// but does NOT refresh last_seen — transitive peers still get pruned if the
+    /// bridge node stops mentioning them. Does NOT trigger peer_change events
+    /// for new transitive peers (avoids re-election storms at scale).
+    async fn update_transitive_peer(&self, id: EndpointId, addr: &EndpointAddr, ann: &PeerAnnouncement) {
+        let mut state = self.state.lock().await;
+        if id == self.endpoint.id() { return; }
+        if state.dead_peers.contains(&id) { return; }
+        if let Some(existing) = state.peers.get_mut(&id) {
+            // Update serving info only — don't touch last_seen
+            let serving_changed = existing.serving != ann.serving
+                || existing.serving_models != ann.serving_models;
+            existing.serving = ann.serving.clone();
+            existing.serving_models = ann.serving_models.clone();
+            existing.role = ann.role.clone();
+            existing.vram_bytes = ann.vram_bytes;
+            if !addr.addrs.is_empty() { existing.addr = addr.clone(); }
+            if ann.version.is_some() { existing.version = ann.version.clone(); }
+            if serving_changed {
+                let count = state.peers.len();
+                drop(state);
+                let _ = self.peer_change_tx.send(count);
+            }
+        } else {
+            // New transitive peer — add with last_seen = now but no peer_change event.
+            // It will get pruned after PEER_STALE_SECS*2 if never directly contacted.
+            state.peers.insert(id, PeerInfo {
+                id, addr: addr.clone(), tunnel_port: None,
+                role: ann.role.clone(),
+                models: ann.models.clone(),
+                vram_bytes: ann.vram_bytes,
+                rtt_ms: None,
+                model_source: ann.model_source.clone(),
+                serving: ann.serving.clone(),
+                serving_models: ann.serving_models.clone(),
+                available_models: ann.available_models.clone(),
+                requested_models: ann.requested_models.clone(),
+                last_seen: std::time::Instant::now(),
+                version: ann.version.clone(),
+            });
+        }
     }
 
     async fn collect_announcements(&self) -> Vec<PeerAnnouncement> {

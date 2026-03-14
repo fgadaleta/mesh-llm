@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 use mesh::NodeRole;
 use std::path::PathBuf;
 
-pub const VERSION: &str = "0.34.5";
+pub const VERSION: &str = "0.34.6";
 
 #[derive(Parser, Debug)]
 #[command(name = "mesh-llm", version = VERSION, about = "P2P mesh for distributed llama.cpp inference over QUIC")]
@@ -296,35 +296,30 @@ async fn main() -> Result<()> {
                         mesh.listing.region.as_ref().map(|r| format!(", region: {r}")).unwrap_or_default());
                     cli.join.push(token.clone());
                 } else {
-                    // GPU nodes: probe each candidate in order until one responds
+                    // GPU nodes: try to join each candidate directly.
+                    // No ephemeral probe — it fails when the target has a firewall
+                    // even though the real join (via relay) would succeed.
                     let mut joined = false;
                     for (i, (token, mesh)) in candidates.iter().enumerate() {
-                        eprintln!("  Probing mesh {}{}...",
+                        eprintln!("  Trying mesh {}{}...",
                             mesh.listing.name.as_deref().unwrap_or("unnamed"),
                             if candidates.len() > 1 { format!(" ({}/{})", i + 1, candidates.len()) } else { String::new() });
-                        match probe_mesh_health(token, &cli.relay).await {
-                            Ok(()) => {
-                                if cli.mesh_name.is_none() {
-                                    if let Some(ref name) = mesh.listing.name {
-                                        cli.mesh_name = Some(name.clone());
-                                    }
-                                }
-                                eprintln!("✅ Joining: {} ({} nodes, {} models{})",
-                                    mesh.listing.name.as_deref().unwrap_or("unnamed"),
-                                    mesh.listing.node_count,
-                                    mesh.listing.serving.len(),
-                                    mesh.listing.region.as_ref().map(|r| format!(", region: {r}")).unwrap_or_default());
-                                cli.join.push(token.clone());
-                                joined = true;
-                                break;
-                            }
-                            Err(e) => {
-                                eprintln!("⚠️  Mesh unreachable: {e}");
+                        if cli.mesh_name.is_none() {
+                            if let Some(ref name) = mesh.listing.name {
+                                cli.mesh_name = Some(name.clone());
                             }
                         }
+                        eprintln!("✅ Joining: {} ({} nodes, {} models{})",
+                            mesh.listing.name.as_deref().unwrap_or("unnamed"),
+                            mesh.listing.node_count,
+                            mesh.listing.serving.len(),
+                            mesh.listing.region.as_ref().map(|r| format!(", region: {r}")).unwrap_or_default());
+                        cli.join.push(token.clone());
+                        joined = true;
+                        break;
                     }
                     if !joined {
-                        eprintln!("⚠️  All {} mesh(es) unreachable — starting new", candidates.len());
+                        eprintln!("⚠️  No meshes found — starting new");
                         let models = nostr::default_models_for_vram(my_vram_gb);
                         start_new_mesh(&mut cli, &models, my_vram_gb);
                     }
@@ -1617,7 +1612,7 @@ fn update_pi_models_json(model_id: &str, port: u16) {
 async fn nostr_rediscovery(
     node: mesh::Node,
     nostr_relays: Vec<String>,
-    relay_urls: Vec<String>,
+    _relay_urls: Vec<String>,
     mesh_name: Option<String>,
 ) {
     const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1707,23 +1702,19 @@ async fn nostr_rediscovery(
                 if ours == theirs { continue; }
             }
             let token = &mesh.listing.invite_token;
-            match probe_mesh_health(token, &relay_urls).await {
+            eprintln!("✅ Re-joining: {} ({} nodes)",
+                mesh.listing.name.as_deref().unwrap_or("unnamed"),
+                mesh.listing.node_count);
+            // Join directly — no probe. The probe uses a separate ephemeral endpoint
+            // which can fail due to firewalls even when the real node.join() would
+            // succeed (our persistent endpoint may already have a relay path).
+            match node.join(token).await {
                 Ok(()) => {
-                    eprintln!("✅ Re-joining: {} ({} nodes)",
-                        mesh.listing.name.as_deref().unwrap_or("unnamed"),
-                        mesh.listing.node_count);
-                    match node.join(token).await {
-                        Ok(()) => {
-                            eprintln!("📡 Re-joined mesh via Nostr re-discovery");
-                            rejoined = true;
-                        }
-                        Err(e) => {
-                            eprintln!("⚠️  Re-join failed: {e}");
-                        }
-                    }
+                    eprintln!("📡 Re-joined mesh via Nostr re-discovery");
+                    rejoined = true;
                 }
                 Err(e) => {
-                    tracing::debug!("Mesh probe failed during rediscovery: {e}");
+                    eprintln!("⚠️  Re-join failed: {e}");
                 }
             }
             if rejoined { break; }
@@ -1735,43 +1726,6 @@ async fn nostr_rediscovery(
         } else {
             eprintln!("⚠️  Could not re-join any mesh — will retry");
             alone_since = Some(std::time::Instant::now());
-        }
-    }
-}
-
-async fn probe_mesh_health(invite_token: &str, relay_urls: &[String]) -> Result<()> {
-    use base64::Engine;
-    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(invite_token)?;
-    let addr: iroh::EndpointAddr = serde_json::from_slice(&json)?;
-
-    let key = iroh::SecretKey::generate(&mut rand::rng());
-    let mut builder = iroh::Endpoint::builder()
-        .secret_key(key);
-    if !relay_urls.is_empty() {
-        use iroh::{RelayConfig, RelayMap};
-        let configs: Vec<RelayConfig> = relay_urls.iter().map(|url| {
-            RelayConfig { url: url.parse().expect("invalid relay URL"), quic: None }
-        }).collect();
-        let relay_map = RelayMap::from_iter(configs);
-        builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(relay_map));
-    }
-    let ep = builder.bind().await?;
-
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        ep.connect(addr, mesh::ALPN),
-    ).await {
-        Ok(Ok(_conn)) => {
-            ep.close().await;
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            ep.close().await;
-            anyhow::bail!("Connection failed: {e}")
-        }
-        Err(_) => {
-            ep.close().await;
-            anyhow::bail!("Connection timed out (10s)")
         }
     }
 }
