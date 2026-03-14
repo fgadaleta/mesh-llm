@@ -1506,9 +1506,7 @@ impl Node {
                             if let Ok(pk) = iroh::PublicKey::from_bytes(&id_bytes) {
                                 let dead_id = EndpointId::from(pk);
                                 if dead_id != node.endpoint.id() {
-                                    // Verify: try to reach the dead peer ourselves before removing.
-                                    // Don't auto-confirm just because we lack a connection — the peer
-                                    // may be alive and reaching us via inbound gossip.
+                                    // Verify: try to reach the dead peer ourselves before removing
                                     let should_remove = {
                                         let state = node.state.lock().await;
                                         if let Some(conn) = state.connections.get(&dead_id) {
@@ -1517,10 +1515,7 @@ impl Node {
                                                 conn.open_bi(),
                                             ).await.is_err()
                                         } else {
-                                            // No connection — but check last_seen before confirming death
-                                            state.peers.get(&dead_id)
-                                                .map(|p| p.last_seen.elapsed().as_secs() > PEER_STALE_SECS)
-                                                .unwrap_or(true)
+                                            true // no connection = already gone
                                         }
                                     };
                                     if should_remove {
