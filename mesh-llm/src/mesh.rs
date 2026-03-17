@@ -516,17 +516,18 @@ impl Node {
         {
             use iroh::{RelayConfig, RelayMap};
             let urls: Vec<String> = if relay_urls.is_empty() {
-                vec!["https://usw1-2.relay.michaelneale.mesh-llm.iroh.link./".into()]
+                vec![
+                    "https://usw1-2.relay.michaelneale.mesh-llm.iroh.link./".into(),
+                    "https://mesh-llm-relay.fly.dev./".into(),
+                ]
             } else {
                 relay_urls.to_vec()
             };
-            // Dedicated iroh relay — proper QUIC relay with STUN support.
-            // Also include iroh's default relays for additional STUN/UDP discovery.
+            // Two relays: dedicated iroh relay (proper QUIC + STUN) and Fly relay (fallback).
             let configs: Vec<RelayConfig> = urls.iter().map(|url| {
                 RelayConfig { url: url.parse().expect("invalid relay URL"), quic: None }
             }).collect();
             let relay_map = RelayMap::from_iter(configs);
-            relay_map.extend(&iroh::defaults::prod::default_relay_map());
             tracing::info!("Relay: {:?}", urls);
             builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(relay_map));
         }

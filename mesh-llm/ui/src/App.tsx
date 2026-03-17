@@ -63,6 +63,7 @@ import { Separator } from './components/ui/separator';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './components/ui/table';
 import { Textarea } from './components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from './components/ui/tooltip';
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from './components/ui/sheet';
 import { BrandIcon } from './components/brand-icon';
 import { MeshLlmWordmark } from './components/mesh-llm-wordmark';
 import { cn } from './lib/utils';
@@ -984,7 +985,7 @@ export function App() {
 
         <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
           {section === 'chat' ? (
-            <div className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col p-4">
+            <div className="mx-auto flex min-h-0 w-full max-w-7xl flex-1 flex-col p-2 md:p-4">
               <ChatPage
                 inviteToken={status?.token ?? ''}
                 warmModels={warmModels}
@@ -1554,6 +1555,7 @@ function ChatPage(props: {
   const selectedModelValue = selectedModel || warmModels[0] || '';
   const [editingConversationId, setEditingConversationId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState('');
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
@@ -1587,14 +1589,121 @@ function ChatPage(props: {
     onConversationsClear();
   }
 
+  // Conversation list content — reused in desktop sidebar and mobile sheet
+  const conversationListContent = (
+    <div className="space-y-3 p-3">
+      <Button type="button" size="sm" className="w-full" onClick={() => { onConversationCreate(); setMobileSidebarOpen(false); }} disabled={isSending}>
+        <MessageSquarePlus className="mr-1.5 h-4 w-4" />
+        New chat
+      </Button>
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-xs text-muted-foreground">Conversations</div>
+        <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={handleClearAll} disabled={!hasChats || isSending}>
+          <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+          Clear
+        </Button>
+      </div>
+      <ScrollArea className="h-[calc(100svh_-_14rem)] md:h-[calc(100svh_-_24rem)]">
+        <div className="space-y-1">
+          {conversations.map((conversation) => {
+            const isActive = conversation.id === activeConversationId;
+            const isEditing = editingConversationId === conversation.id;
+            return (
+              <div key={conversation.id} className={cn('group flex items-center gap-2 rounded-md border p-2', isActive ? 'border-primary/40 bg-muted/40' : 'border-transparent')}>
+                {isEditing ? (
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <input
+                      value={editingTitle}
+                      onChange={(e) => setEditingTitle(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          saveInlineRename();
+                        } else if (e.key === 'Escape') {
+                          e.preventDefault();
+                          cancelInlineRename();
+                        }
+                      }}
+                      className="h-7 w-full rounded-md border bg-background px-2 text-sm outline-none ring-offset-background focus:ring-2 focus:ring-ring"
+                      autoFocus
+                    />
+                    <div className="text-xs text-muted-foreground">{conversation.messages.length} message{conversation.messages.length === 1 ? '' : 's'}</div>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 text-left"
+                    onClick={() => { onConversationSelect(conversation.id); setMobileSidebarOpen(false); }}
+                    disabled={isSending}
+                  >
+                    <div className="text-sm font-medium leading-5 [display:-webkit-box] [overflow:hidden] [-webkit-box-orient:vertical] [-webkit-line-clamp:3] [overflow-wrap:anywhere]">
+                      {conversation.title}
+                    </div>
+                    <div className="text-xs text-muted-foreground">{conversation.messages.length} message{conversation.messages.length === 1 ? '' : 's'}</div>
+                  </button>
+                )}
+                {isEditing ? (
+                  <>
+                    <Button type="button" variant="ghost" size="icon" className="h-7 w-7 shrink-0 opacity-70 hover:opacity-100" onClick={saveInlineRename} aria-label="Save conversation name">
+                      <Check className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button type="button" variant="ghost" size="icon" className="h-7 w-7 shrink-0 opacity-70 hover:opacity-100" onClick={cancelInlineRename} aria-label="Cancel rename">
+                      <X className="h-3.5 w-3.5" />
+                    </Button>
+                  </>
+                ) : (
+                  <Button type="button" variant="ghost" size="icon" className="h-7 w-7 shrink-0 opacity-70 hover:opacity-100" onClick={() => startInlineRename(conversation)} disabled={isSending} aria-label="Rename conversation">
+                    <Pencil className="h-3.5 w-3.5" />
+                  </Button>
+                )}
+                <Button type="button" variant="ghost" size="icon" className="h-7 w-7 shrink-0 opacity-70 hover:opacity-100" onClick={() => handleDelete(conversation)} disabled={isSending} aria-label="Delete conversation">
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            );
+          })}
+        </div>
+      </ScrollArea>
+    </div>
+  );
+
   return (
     <Card className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
-      <CardHeader>
-        <div className="flex flex-wrap items-center gap-3">
-          <CardTitle className="text-base">Chat</CardTitle>
+      <CardHeader className="px-3 py-2 md:px-6 md:py-4">
+        <div className="flex items-center gap-2 md:gap-3">
+          {/* Mobile: chats button (opens sheet) + new chat */}
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-8 shrink-0 gap-1.5 md:hidden"
+            onClick={() => hasChats ? setMobileSidebarOpen(true) : onConversationCreate()}
+            aria-label={hasChats ? 'Chats' : 'New chat'}
+          >
+            {hasChats ? (
+              <>
+                <Hash className="h-4 w-4" />
+                <span className="text-xs tabular-nums">{conversations.length}</span>
+              </>
+            ) : <MessageSquarePlus className="h-4 w-4" />}
+          </Button>
+          {hasChats ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 shrink-0 md:hidden"
+              onClick={onConversationCreate}
+              disabled={isSending}
+              aria-label="New chat"
+            >
+              <MessageSquarePlus className="h-4 w-4" />
+            </Button>
+          ) : null}
+          <CardTitle className="hidden md:block text-base shrink-0">Chat</CardTitle>
           <div className="ml-auto flex items-center gap-2">
             {selectedModelNodeCount != null ? (
-              <div className="flex h-8 items-center gap-1.5 rounded-md border bg-muted/40 px-2">
+              <div className="hidden md:flex h-8 items-center gap-1.5 rounded-md border bg-muted/40 px-2">
                 <Network className="h-3.5 w-3.5 text-muted-foreground" />
                 <div className="text-xs leading-none">
                   <span className="font-medium">{selectedModelNodeCount}</span>
@@ -1603,7 +1712,7 @@ function ChatPage(props: {
               </div>
             ) : null}
             {selectedModelVramGb != null ? (
-              <div className="flex h-8 items-center gap-1.5 rounded-md border bg-muted/40 px-2">
+              <div className="hidden md:flex h-8 items-center gap-1.5 rounded-md border bg-muted/40 px-2">
                 <Cpu className="h-3.5 w-3.5 text-muted-foreground" />
                 <div className="text-xs leading-none">
                   <span className="font-medium">{selectedModelVramGb.toFixed(1)}</span>
@@ -1611,9 +1720,9 @@ function ChatPage(props: {
                 </div>
               </div>
             ) : null}
-            <span className="text-xs text-muted-foreground">Model</span>
+            <span className="hidden md:inline text-xs text-muted-foreground">Model</span>
             <Select value={selectedModelValue} onValueChange={setSelectedModel} disabled={!warmModels.length}>
-              <SelectTrigger className="h-8 w-[320px]">
+              <SelectTrigger className="h-8 w-[180px] md:w-[320px]">
                 <SelectValue placeholder="Select model">
                   {selectedModelValue === 'auto' ? '✨ Auto (router picks best)' : selectedModelValue ? shortName(selectedModelValue) : undefined}
                 </SelectValue>
@@ -1667,114 +1776,22 @@ function ChatPage(props: {
         </div>
       </CardHeader>
       <Separator />
+      {/* Mobile conversation sheet */}
+      <Sheet open={mobileSidebarOpen} onOpenChange={setMobileSidebarOpen}>
+        <SheetContent side="left" className="w-72 p-0">
+          <SheetHeader className="sr-only">
+            <SheetTitle>Chats</SheetTitle>
+          </SheetHeader>
+          {conversationListContent}
+        </SheetContent>
+      </Sheet>
+
       <CardContent className="min-h-0 flex-1 p-0">
-        <div className="flex h-full min-h-0 flex-col md:flex-row">
+        <div className="flex h-full min-h-0 md:flex-row">
+          {/* Desktop sidebar — hidden on mobile */}
           {hasChats ? (
-            <aside className="shrink-0 border-b md:w-72 md:border-b-0 md:border-r">
-            <div className="space-y-3 p-3">
-              <Button type="button" size="sm" className="w-full" onClick={onConversationCreate} disabled={isSending}>
-                <MessageSquarePlus className="mr-1.5 h-4 w-4" />
-                New chat
-              </Button>
-              <div className="flex items-center justify-between gap-2">
-                <div className="text-xs text-muted-foreground">Conversations</div>
-                <Button type="button" variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={handleClearAll} disabled={!hasChats || isSending}>
-                  <Trash2 className="mr-1.5 h-3.5 w-3.5" />
-                  Clear
-                </Button>
-              </div>
-              <ScrollArea className="h-36 md:h-[calc(100svh_-_24rem)]">
-                <div className="space-y-1">
-                  {conversations.map((conversation) => {
-                    const isActive = conversation.id === activeConversationId;
-                    const isEditing = editingConversationId === conversation.id;
-                    return (
-                      <div key={conversation.id} className={cn('group flex items-center gap-2 rounded-md border p-2', isActive ? 'border-primary/40 bg-muted/40' : 'border-transparent')}>
-                        {isEditing ? (
-                          <div className="min-w-0 flex-1 space-y-1">
-                            <input
-                              value={editingTitle}
-                              onChange={(e) => setEditingTitle(e.target.value)}
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter') {
-                                  e.preventDefault();
-                                  saveInlineRename();
-                                } else if (e.key === 'Escape') {
-                                  e.preventDefault();
-                                  cancelInlineRename();
-                                }
-                              }}
-                              className="h-7 w-full rounded-md border bg-background px-2 text-sm outline-none ring-offset-background focus:ring-2 focus:ring-ring"
-                              autoFocus
-                            />
-                            <div className="text-xs text-muted-foreground">{conversation.messages.length} message{conversation.messages.length === 1 ? '' : 's'}</div>
-                          </div>
-                        ) : (
-                          <button
-                            type="button"
-                            className="min-w-0 flex-1 text-left"
-                            onClick={() => onConversationSelect(conversation.id)}
-                            disabled={isSending}
-                          >
-                            <div className="text-sm font-medium leading-5 [display:-webkit-box] [overflow:hidden] [-webkit-box-orient:vertical] [-webkit-line-clamp:3] [overflow-wrap:anywhere]">
-                              {conversation.title}
-                            </div>
-                            <div className="text-xs text-muted-foreground">{conversation.messages.length} message{conversation.messages.length === 1 ? '' : 's'}</div>
-                          </button>
-                        )}
-                        {isEditing ? (
-                          <>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              className="h-7 w-7 shrink-0 opacity-70 hover:opacity-100"
-                              onClick={saveInlineRename}
-                              aria-label="Save conversation name"
-                            >
-                              <Check className="h-3.5 w-3.5" />
-                            </Button>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              className="h-7 w-7 shrink-0 opacity-70 hover:opacity-100"
-                              onClick={cancelInlineRename}
-                              aria-label="Cancel rename"
-                            >
-                              <X className="h-3.5 w-3.5" />
-                            </Button>
-                          </>
-                        ) : (
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 shrink-0 opacity-70 hover:opacity-100"
-                            onClick={() => startInlineRename(conversation)}
-                            disabled={isSending}
-                            aria-label="Rename conversation"
-                          >
-                            <Pencil className="h-3.5 w-3.5" />
-                          </Button>
-                        )}
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7 shrink-0 opacity-70 hover:opacity-100"
-                          onClick={() => handleDelete(conversation)}
-                          disabled={isSending}
-                          aria-label="Delete conversation"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </Button>
-                      </div>
-                    );
-                  })}
-                </div>
-              </ScrollArea>
-            </div>
+            <aside className="hidden md:block shrink-0 md:w-72 md:border-r">
+              {conversationListContent}
             </aside>
           ) : null}
 
@@ -1810,7 +1827,7 @@ function ChatPage(props: {
               )}
             </div>
             <Separator />
-            <div className="space-y-3 p-4">
+            <div className="space-y-2 p-3 md:space-y-3 md:p-4">
               <Textarea
                 ref={chatInputRef}
                 value={input}
@@ -1821,13 +1838,13 @@ function ChatPage(props: {
                     onSubmit();
                   }
                 }}
-                rows={4}
+                rows={2}
                 placeholder={props.canChat ? 'Send a prompt to the mesh...' : 'Waiting for a warm model...'}
                 disabled={!props.canChat || isSending}
-                className="min-h-[112px] resize-none"
+                className="min-h-[56px] md:min-h-[112px] resize-none"
               />
               <div className="flex items-center justify-between gap-2">
-                <div className="text-xs text-muted-foreground">Enter to send. Shift+Enter for newline.</div>
+                <div className="hidden md:block text-xs text-muted-foreground">Enter to send. Shift+Enter for newline.</div>
                 <div className="flex items-center gap-2">
                   {isSending ? (
                     <Button type="button" variant="outline" size="icon" onClick={onStop} aria-label="Stop">
