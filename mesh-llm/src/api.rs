@@ -461,8 +461,8 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
             }
         }
 
-        // ── Frontend static assets ──
-        ("GET", p) if p.starts_with("/assets/") => {
+        // ── Frontend static assets (bundled UI dist) ──
+        ("GET", p) if p.starts_with("/assets/") || matches!(p.rsplit('.').next(), Some("png" | "ico" | "webmanifest")) || (p.ends_with(".json") && !p.starts_with("/api/")) => {
             if !respond_console_asset(&mut stream, p).await? {
                 respond_error(&mut stream, 404, "Not found").await?;
             }
