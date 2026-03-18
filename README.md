@@ -259,11 +259,34 @@ Draft pairings for speculative decoding:
 | Llama-3.3-70B | 43GB | Llama-3.2-1B | 760MB |
 | Gemma-3-27B | 17GB | Gemma-3-1B | 780MB |
 
+## Specifying models
+
+`--model` accepts several formats. Models are auto-downloaded to `~/.models/` on first use.
+
+```bash
+# Catalog name (fuzzy match — finds Qwen3-8B-Q4_K_M)
+mesh-llm --model Qwen3-8B
+
+# Full catalog name
+mesh-llm --model Qwen3-8B-Q4_K_M
+
+# HuggingFace URL (any GGUF)
+mesh-llm --model https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf
+
+# HuggingFace shorthand (org/repo/file.gguf)
+mesh-llm --model bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf
+
+# Local file path
+mesh-llm --model ~/my-models/custom-model.gguf
+```
+
+Catalog models are downloaded with resume support — if a download is interrupted, it picks up where it left off. Use `mesh-llm download` to browse the catalog.
+
 ## CLI Reference
 
 ```
 mesh-llm [OPTIONS]
-  --model NAME|PATH    Model to serve (can specify multiple)
+  --model NAME|PATH|URL  Model to serve (can specify multiple)
   --join TOKEN         Join mesh via invite token
   --auto               Discover and join via directory
   --client             API-only client (no GPU)
