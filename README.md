@@ -131,9 +131,36 @@ mesh-llm exposes an OpenAI-compatible API on `localhost:9337`. Any tool that sup
 
 ### goose
 
-```bash
-GOOSE_PROVIDER=openai OPENAI_API_KEY=dummy OPENAI_HOST=http://localhost:9337 GOOSE_MODEL=GLM-4.7-Flash-Q4_K_M goose session
+[Goose](https://github.com/block/goose) is an AI agent available as both a CLI (`goose session`) and a desktop app (Goose.app).
+
+1. Add a custom provider file at `~/.config/goose/custom_providers/mesh.json`:
+
+```json
+{
+  "name": "mesh",
+  "engine": "openai",
+  "display_name": "mesh-llm",
+  "description": "Distributed LLM inference via mesh-llm",
+  "api_key_env": "",
+  "base_url": "http://localhost:9337",
+  "models": [
+    { "name": "MiniMax-M2.5-Q4_K_M", "context_limit": 65536 },
+    { "name": "Qwen3-8B-Q4_K_M", "context_limit": 8192 }
+  ],
+  "timeout_seconds": 600,
+  "supports_streaming": true,
+  "requires_auth": false
+}
 ```
+
+Adjust model names to match what's running in your mesh (`curl localhost:9337/v1/models`).
+
+2. Run goose:
+```bash
+GOOSE_PROVIDER=mesh GOOSE_MODEL=MiniMax-M2.5-Q4_K_M goose session
+```
+
+In the desktop app, select "mesh-llm" as the provider in settings.
 
 ### pi
 
