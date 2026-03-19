@@ -1,78 +1,44 @@
 # mesh-llm TODO
 
-## Mac Native App
+## SSD Expert Streaming
 
-Simple native macOS app (SwiftUI) that starts or joins a mesh.
+Run giant MoE models on a single node by streaming active experts from NVMe instead of fitting everything in RAM. Trunk (attention, norms, embeddings) stays resident; expert weights live on disk, `pread()`'d on demand per token.
 
-- Menubar app or lightweight window
-- If machine has large VRAM (≥24GB): offer to **start** a mesh (runs mesh-llm --auto, shows invite QR)
-- If machine has small VRAM: offer to **join** a mesh (paste/scan invite token, client-only)
-- Shows mesh status: peers, models, throughput
-- Bundles mesh-llm binary, manages lifecycle (start/stop/restart)
-- First-class macOS citizen: signed, notarized, drag-to-Applications
+[flash-moe](https://github.com/danveloper/flash-moe) already does this. From-scratch C/Metal engine, runs Qwen3.5-397B-A17B (120GB 2-bit experts) at 5.5 tok/s on a 48GB M3 Max. 6GB resident memory. Complete working inference engine — 7K lines of C/ObjC/Metal. See also [ROADMAP.md](../ROADMAP.md).
 
-## Mobile Chat App (exemplar)
+**Plan:** Use flash-moe directly as an alternative backend. Mesh-llm spawns it like it spawns llama-server — process management, HTTP/SSE wrapper, kill on shutdown. Don't try to hack SSD streaming into llama.cpp; the `ggml_mul_mat_id` op assumes all expert weights are resident in one contiguous tensor per layer. Changing that is deep surgery across ggml, the Metal backend, and the model loader. Not worth it when a working engine exists.
 
-Build a delightful mobile chat app that connects to any mesh as a client-only node.
+**Limitation:** flash-moe only supports Qwen3.5-397B (GatedDeltaNet + full attention, 512 experts, hardcoded architecture). That's the model we want to run. More models = more forward pass implementations.
 
-- Scan a QR code (mesh invite token) to join
-- Client-only: no GPU, no model serving — just routes inference through mesh hosts
-- Uses iroh relay for connectivity (works through NAT, cellular, etc.)
-- Minimal native UI — conversation list, chat bubbles, model picker from mesh catalog
-- Target: iOS first (Swift + iroh-ffi), Android follow-up
-- Shows off mesh-llm's value: scan a code, get access to a GPU pool, no setup
-- Think "AirDrop for AI" — one scan and you're chatting with a 235B model
-- OpenAI-compatible API underneath, so could also power shortcuts/widgets
+**What flash-moe needs to integrate:**
+- HTTP/SSE endpoint (currently interactive CLI only — `chat.m`)
+- OpenAI-compatible `/v1/chat/completions` so mesh-llm's proxy can route to it
+- Model weight prep: `repack_experts.py` to convert safetensors → packed per-layer binary files
 
-## Smart Router
-- [x] Heuristic classifier: Code/Reasoning/Chat/Creative/ToolCall categories
-- [x] Complexity detection: Quick/Moderate/Deep from message signals
-- [x] Task-dominant scoring: match bonus + tier + position
-- [x] Tool capability filter: hard gate on `tools: bool` per model profile
-- [x] needs_tools as attribute, not category override
-- [ ] **Static speed estimates**: Add `tok_s: f64` to ModelProfile (known from benchmarks, no runtime measurement). Feed into scoring so Quick tasks prefer fast models.
-- [ ] **Response quality checks**: Detect empty/repetitive/truncated responses, trigger retry with different model. Needs proxy to inspect response bytes (currently raw TCP relay).
-- [ ] **Complexity → context budget**: Deep requests get larger `-n` (max tokens), Quick gets smaller. Currently all requests use llama-server defaults.
-
-## Multi-Model Serving
-- [x] `--model A --model B` runs separate election loops per model
-- [x] Auto model packs by VRAM tier
-- [x] `serving_models: Vec<String>` in gossip (backward compatible)
-- [x] Router picks best model per request
-- [ ] **Demand-based model upgrade**: Large-VRAM host serving a small model should upgrade when demand exists for a bigger model nobody is serving.
-
-## First-Time Experience
-- [ ] **Solo fallback — fast starter model**: When `--auto` finds no mesh, download a small starter model first (Qwen2.5-3B, 2GB, ~1 min), start serving immediately, then background-download a better model for the node's VRAM tier.
-- [ ] **Uptime signal**: Add `started_at: u64` to `MeshListing`. Score bonus for longer-running meshes.
-
-## Model Catalog
-- [ ] **Draft model completeness**: GLM-4.7 and DeepSeek have no draft pairing.
-- [ ] **Don't download what won't fit**: Check VRAM before downloading via `--model`.
-- [ ] `mesh-llm recommend`: CLI subcommand to suggest models for your hardware.
+**Key findings from flash-moe (don't repeat their mistakes):**
+- Trust the OS page cache — every custom cache made it worse. Deleting the cache was a 38% speedup.
+- `pread()` >> `mmap()` for expert loading (5×). mmap = 240 page faults per 3.9MB expert.
+- 2-bit expert quant preserves quality (RMSE ~0.001). 44% smaller, biggest throughput win.
+- Kernel I/O hints (F_RDADVISE, MADV_RANDOM, etc.) useless or harmful on Apple Silicon.
+- Speculative routing doesn't work — 65-80% wrong predictions, wastes bandwidth.
 
 ## MoE Expert Sharding
 
 Design: [MoE_PLAN.md](../MoE_PLAN.md) · Auto-deploy: [MoE_DEPLOY_DESIGN.md](../MoE_DEPLOY_DESIGN.md) · Validation: [MoE_SPLIT_REPORT.md](../MoE_SPLIT_REPORT.md)
 
 - [x] Phase 1–3: Routing analysis, expert masking, mesh integration. Tested OLMoE-1B-7B over WAN.
-- [ ] **Phase 4: lazy `moe-analyze`** — auto-run ranking for unknown MoE models. Currently unknown models fall through to PP.
-- [ ] **Phase 5: probe-based session placement** — parked on `moe-probe` branch.
+- [ ] **Phase 4: lazy `moe-analyze`** — auto-run ranking for unknown MoE models.
 - [ ] **Phase 6: scale testing** — Mixtral 8×22B, Qwen3-235B-A22B.
 
+## Smart Router
+- [ ] **Static speed estimates**: Add `tok_s: f64` to ModelProfile. Feed into scoring so Quick tasks prefer fast models.
+- [ ] **Response quality checks**: Detect empty/repetitive/truncated responses, trigger retry with different model.
+
 ## Resilience
-- [x] Nostr re-discovery on peer loss
-- [x] llama-server death watchdog
-- [x] Multi-host load balancing
-- [x] Demand-based duplicate hosting
-- [x] API deadlock fix (v0.35.1) — snapshot locks independently, never hold multiple
-- [x] VRAM-scaled context sizes — prevents OOM on small machines
 - [ ] **Multi-node tensor split recovery**: If one split peer dies, re-split across remaining.
 - [ ] **`kill_llama_server()` uses `pkill -f`**: Should kill by PID, not pattern match.
 
-## Discovery & Publishing
-- [ ] **Revisit `--publish` flag**: Bare `--publish` without `--mesh-name` is vestigial.
-
 ## Experiments
-- [ ] Qwen3.5-397B-A17B across 128GB M4 Max + second machine (MoE, ~219GB Q4)
+- [ ] Qwen3.5-397B-A17B on single 128GB M4 Max (SSD streaming)
+- [ ] Qwen3.5-397B-A17B across 128GB M4 Max + second machine (MoE split)
 - [ ] Largest dense models across 2+ machines (Llama-3.3-70B, Qwen2.5-72B)
-- [ ] MiniMax-M2.5 MoE split across Studio + second large machine

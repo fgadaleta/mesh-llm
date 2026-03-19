@@ -50,6 +50,37 @@ Implemented. Auto-detects MoE, computes overlapping expert assignments, splits l
 
 Remaining: optimized rankings for unknown models, scale testing on Mixtral 8×22B / Qwen3-235B.
 
+## SSD expert streaming
+
+Run MoE models that are far too large for memory on a single node by streaming only the active experts from NVMe SSD per token. The trunk (attention, norms, embeddings) stays resident in memory; expert weights live on disk and are `pread()`'d on demand.
+
+This is a single-node strategy. The goal is running e.g. Qwen3.5-397B-A17B (~209GB at Q4) on a 48GB Mac — no mesh needed.
+
+**Proven by [flash-moe](https://github.com/danveloper/flash-moe):** a from-scratch C/Metal inference engine that runs the full 397B model at 5.5 tok/s on a MacBook Pro M3 Max (48GB) by streaming experts from SSD. Key results:
+
+- 120GB of expert weights at 2-bit quant, streamed via parallel `pread()` (4 threads, one per active expert)
+- Only K=4 experts activated per layer per token → ~600MB read from SSD per token
+- Apple NVMe delivers 5.5 GB/s sustained random reads (17.5 GB/s sequential)
+- Custom Metal compute shaders for 2-bit and 4-bit dequantized matvec
+- Pipeline: GPU attention projections → CPU linear attention → GPU routing → SSD expert read → GPU expert forward, all overlapped
+
+**Key lessons from flash-moe that apply here:**
+
+- **Trust the OS page cache.** Every custom expert cache they built (Metal LRU, malloc, tiered I/O) made things worse — wired memory squeezes the OS page cache, triggers compressor thrashing. Deleting the custom cache was a 38% speedup. Same lesson as PostgreSQL's `shared_buffers`: don't take more than 25% of RAM.
+- **pread() >> mmap() for expert loading.** mmap triggers 240 individual page faults for a 3.9MB expert (240 × 16KB pages). One `pread()` call issues one NVMe command. 5× faster.
+- **2-bit expert quantization preserves quality.** 44% size reduction over 4-bit, RMSE ~0.001. Quality holds across math, code, reasoning. Biggest single throughput win (cuts I/O time per layer from 2.6ms to 1.5ms).
+- **Kernel I/O hints are useless or harmful on Apple Silicon.** F_RDADVISE, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED — all neutral or negative. The macOS kernel already optimizes for Apple's NVMe controller.
+- **2MB-aligned DMA buffers give 3.6× better throughput** for page-cache-resident reads (free optimization via `posix_memalign`).
+- **Speculative routing and prefetching don't work.** 65-80% of predictions are wrong, waste bandwidth.
+
+**How this fits mesh-llm:**
+
+Today mesh-llm has two MoE modes: **solo** (model fits in memory, run it whole) and **split** (model doesn't fit, shard experts across nodes). SSD streaming would be a third mode: model doesn't fit in memory but *does* fit on one node's SSD. No mesh coordination, no cross-node traffic, no splitting — just one machine streaming experts from disk.
+
+**Plan:** Use flash-moe directly as an alternative backend, not hack SSD streaming into llama.cpp. llama.cpp's `ggml_mul_mat_id` assumes all expert weights resident in one contiguous tensor — changing that is deep surgery across ggml, the Metal backend, and the model loader. Flash-moe is a working engine. Mesh-llm spawns it like it spawns llama-server — process management + HTTP wrapper.
+
+Only supports Qwen3.5-397B for now (hardcoded architecture). That's fine — it's the model we want to run.
+
 ## Demand-based rebalancing
 
 Partially done. Unified demand map via gossip, standby nodes promote to serve. Next: large-VRAM hosts auto-upgrade models when demand warrants it.
