@@ -149,8 +149,23 @@
     }
   }
 
+  @keyframes wiggle {
+    0%, 100% { transform: rotate(0deg); }
+    20% { transform: rotate(3deg); }
+    40% { transform: rotate(-3deg); }
+    60% { transform: rotate(2deg); }
+    80% { transform: rotate(-1deg); }
+  }
+
+  .animate-wiggle {
+    animation: wiggle 3s ease-in-out infinite;
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .react-flow__edge.mesh-edge .react-flow__edge-path {
+      animation: none;
+    }
+    .animate-wiggle {
       animation: none;
     }
   }

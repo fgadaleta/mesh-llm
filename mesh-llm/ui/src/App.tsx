@@ -1971,6 +1971,9 @@ function InviteFriendEmptyState({ inviteToken, selectedModel, isPublicMesh }: { 
   if (isPublicMesh) {
     return (
       <div className="mx-auto w-full max-w-md space-y-4 px-2 text-center">
+        <div className="flex justify-center">
+          <BrandIcon className="h-12 w-12 text-primary/50 animate-wiggle" />
+        </div>
         <p className="text-sm text-muted-foreground">
           A shared pool of compute, powered by the community. Chat away.
         </p>
@@ -2028,6 +2031,9 @@ function InviteFriendEmptyState({ inviteToken, selectedModel, isPublicMesh }: { 
   // Private mesh — invite a friend to join
   return (
     <div className="mx-auto w-full max-w-md space-y-3 px-2 text-center">
+      <div className="flex justify-center">
+        <BrandIcon className="h-12 w-12 text-primary/50 animate-wiggle" />
+      </div>
       <button
         type="button"
         onClick={() => setOpen(!open)}
