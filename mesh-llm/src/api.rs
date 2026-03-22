@@ -528,7 +528,7 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
 
         // ── SSE event stream ──
         ("GET", "/api/events") => {
-            let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n";
             stream.write_all(header.as_bytes()).await?;
 
             let status = state.status().await;
@@ -644,7 +644,14 @@ async fn respond_console_asset(stream: &mut TcpStream, path: &str) -> anyhow::Re
         "woff2" => "font/woff2",
         _ => "application/octet-stream",
     };
-    respond_bytes(stream, 200, "OK", content_type, file.contents()).await?;
+    // Hashed asset filenames (Vite output) are immutable — cache forever.
+    // Non-hashed assets (favicon, manifest) get short cache.
+    let cache_control = if rel.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=3600"
+    };
+    respond_bytes_cached(stream, 200, "OK", content_type, cache_control, file.contents()).await?;
     Ok(true)
 }
 
@@ -655,8 +662,19 @@ async fn respond_bytes(
     content_type: &str,
     body: &[u8],
 ) -> anyhow::Result<()> {
+    respond_bytes_cached(stream, code, status, content_type, "no-cache", body).await
+}
+
+async fn respond_bytes_cached(
+    stream: &mut TcpStream,
+    code: u16,
+    status: &str,
+    content_type: &str,
+    cache_control: &str,
+    body: &[u8],
+) -> anyhow::Result<()> {
     let header = format!(
-        "HTTP/1.1 {code} {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\n\r\n",
+        "HTTP/1.1 {code} {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: {cache_control}\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes()).await?;
