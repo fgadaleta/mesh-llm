@@ -53,6 +53,8 @@ Design: [MoE_PLAN.md](../MoE_PLAN.md) · Auto-deploy: [MoE_DEPLOY_DESIGN.md](../
 - [ ] **Scale testing** — Mixtral 8×22B, Qwen3-235B-A22B across multi-node.
 
 ## Smart Router
+- [ ] **Context-aware routing**: Hosts advertise `n_ctx` in gossip. Router estimates request token count and skips hosts that can't fit it. Today a long chat routed to a small-context host returns 400 with no fallback.
+- [ ] **Retry on 400**: If a host returns 400 (context overflow, bad request), try the next host instead of forwarding the error. Requires reading the response status before committing to the byte-pipe tunnel. Non-trivial — the current `relay_tcp_via_quic` is a blind bidirectional copy.
 - [ ] **Static speed estimates**: `tok_s: f64` on ModelProfile. Quick tasks prefer fast models.
 - [ ] **Response quality checks**: Detect empty/repetitive/truncated responses, retry with different model.
 - [ ] **MoM-aware routing**: Route by task type to best-suited model (see Mixture of Models above).

@@ -167,10 +167,12 @@ pub async fn start_llama_server(
         65536  // 30GB+ free: full 64K context
     } else if vram_after_model >= 12 * GB {
         32768  // 12-30GB free: 32K
-    } else if vram_after_model >= 4 * GB {
-        8192   // 4-12GB free: 8K
+    } else if vram_after_model >= 6 * GB {
+        16384  // 6-12GB free: 16K
+    } else if vram_after_model >= 3 * GB {
+        8192   // 3-6GB free: 8K
     } else {
-        4096   // <4GB free: minimal
+        4096   // <3GB free: minimal
     };
     tracing::info!("Context size: {ctx_size} tokens (model {:.1}GB, {:.0}GB VRAM, {:.1}GB free)", model_bytes as f64 / GB as f64, my_vram as f64 / GB as f64, vram_after_model as f64 / GB as f64);
 
