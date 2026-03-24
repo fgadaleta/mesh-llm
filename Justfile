@@ -12,17 +12,17 @@ build:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -d "{{llama_dir}}" ]; then
-        echo "Cloning michaelneale/llama.cpp (rpc-local-gguf branch)..."
-        git clone -b rpc-local-gguf https://github.com/michaelneale/llama.cpp.git "{{llama_dir}}"
+        echo "Cloning michaelneale/llama.cpp (rebase-upstream-master branch)..."
+        git clone -b rebase-upstream-master https://github.com/michaelneale/llama.cpp.git "{{llama_dir}}"
     else
         cd "{{llama_dir}}"
         current_branch=$(git branch --show-current)
-        if [ "$current_branch" != "rpc-local-gguf" ]; then
-            echo "⚠️  llama.cpp is on branch '$current_branch', switching to rpc-local-gguf..."
-            git checkout rpc-local-gguf
+        if [ "$current_branch" != "rebase-upstream-master" ]; then
+            echo "⚠️  llama.cpp is on branch '$current_branch', switching to rebase-upstream-master..."
+            git checkout rebase-upstream-master
         fi
-        echo "Pulling latest rpc-local-gguf from origin..."
-        git pull --ff-only origin rpc-local-gguf
+        echo "Pulling latest rebase-upstream-master from origin..."
+        git pull --ff-only origin rebase-upstream-master
         cd ..
     fi
     cmake -B "{{build_dir}}" -S "{{llama_dir}}" -DGGML_METAL=ON -DGGML_RPC=ON -DBUILD_SHARED_LIBS=OFF -DLLAMA_OPENSSL=OFF
@@ -168,4 +168,4 @@ test port="9337":
 
 # Show the diff from upstream llama.cpp
 diff:
-    cd {{llama_dir}} && git log --oneline master..rpc-local-gguf
+    cd {{llama_dir}} && git log --oneline master..rebase-upstream-master
