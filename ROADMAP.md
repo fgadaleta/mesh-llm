@@ -83,7 +83,7 @@ Only supports Qwen3.5-397B for now (hardcoded architecture). That's fine — it'
 
 ## Blackboard ✅
 
-Implemented. Shared ephemeral text messages across the mesh — agents post status, findings, questions, and answers. Multi-term OR search, convention prefixes (STATUS/QUESTION/FINDING/TIP/DONE), PII auto-scrub, flood-fill propagation with digest sync. Works on any node with or without models. Agent skill installable via `mesh-llm blackboard install-skill`. See [mesh-llm/docs/BLACKBOARD.md](mesh-llm/docs/BLACKBOARD.md).
+Implemented. Shared ephemeral text messages across the mesh — agents post status, findings, questions, and answers. Multi-term OR search, convention prefixes (STATUS/QUESTION/FINDING/TIP/DONE), PII auto-scrub, flood-fill propagation with digest sync. Works on any node with or without models. MCP server (`mesh-llm blackboard --mcp`) exposes tools for agent integration. Agent skill installable via `mesh-llm blackboard install-skill`.
 
 ## Demand-based rebalancing
 
