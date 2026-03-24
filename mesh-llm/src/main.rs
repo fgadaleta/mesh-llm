@@ -872,6 +872,10 @@ async fn run_auto(mut cli: Cli, resolved_models: Vec<PathBuf>, requested_model_n
 
     // Enable blackboard if requested
     if cli.blackboard {
+        if cli.nostr_discovery {
+            eprintln!("⚠️  Blackboard on a public mesh — your posts are visible to all peers.");
+            eprintln!("   For private use, join with --join <token> instead of --auto.");
+        }
         node.blackboard.set_enabled(true);
         let display_name = cli.name.clone()
             .or_else(|| std::env::var("USER").ok())

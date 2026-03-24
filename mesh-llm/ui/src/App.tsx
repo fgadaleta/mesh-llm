@@ -2524,12 +2524,9 @@ function DashboardPage({
           <div className="space-y-1.5">
             <div className="text-xs font-medium">1. Install</div>
             <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
-              <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
-                curl -fsSL https://mesh-llm.com/install | bash
-              </code>
-              <Button type="button" size="icon" variant="ghost" className="h-6 w-6 shrink-0" aria-label="Copy" onClick={() => void navigator.clipboard.writeText('curl -fsSL https://mesh-llm.com/install | bash')}>
-                <Copy className="h-3 w-3" />
-              </Button>
+              <a href="https://docs.anarchai.org/#install" target="_blank" rel="noopener noreferrer" className="min-w-0 flex-1 text-xs text-primary underline hover:text-foreground">
+                docs.anarchai.org/#install
+              </a>
             </div>
           </div>
           <div className="space-y-1.5">
