@@ -1091,6 +1091,28 @@ async fn run_auto(mut cli: Cli, resolved_models: Vec<PathBuf>, requested_model_n
     // Re-gossip so peers learn what we're serving
     node.regossip().await;
 
+    // ── Multi-model local mode ──
+    // If multiple models are specified and all fit locally, use llama-server's
+    // built-in router mode (--models-preset). No rpc-server, no splitting, no
+    // election — just one llama-server process serving all models directly.
+    let all_model_bytes: u64 = resolved_models.iter()
+        .map(|m| election::total_model_bytes(m))
+        .sum();
+    let my_vram = node.vram_bytes();
+    let multi_model_fits = resolved_models.len() > 1
+        && !cli.split
+        && my_vram >= (all_model_bytes as f64 * 1.2) as u64;
+
+    if multi_model_fits {
+        return run_multi_model(
+            node, &bin_dir, &resolved_models, &model_name, all_model_bytes,
+            my_vram, api_port, console_port, bootstrap_listener_tx,
+            &cli,
+        ).await;
+    }
+
+    // ── Single-model path (existing behaviour) ──
+
     // Ensure draft model is available (downloads if needed, <1GB)
     if cli.draft.is_none() && !cli.no_draft {
         if let Some(draft_path) = ensure_draft(&model).await {
@@ -1327,6 +1349,148 @@ async fn run_auto(mut cli: Cli, resolved_models: Vec<PathBuf>, requested_model_n
 
     launch::kill_llama_server().await;
     launch::kill_orphan_rpc_servers().await;
+    Ok(())
+}
+
+/// Multi-model local mode: serve multiple models from one llama-server process.
+/// No rpc-server, no splitting, no election — everything runs locally.
+#[allow(clippy::too_many_arguments)]
+async fn run_multi_model(
+    node: mesh::Node,
+    bin_dir: &std::path::Path,
+    resolved_models: &[PathBuf],
+    primary_name: &str,
+    total_model_bytes: u64,
+    my_vram: u64,
+    api_port: u16,
+    console_port: Option<u16>,
+    bootstrap_listener_tx: Option<tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<tokio::net::TcpListener>>>,
+    cli: &Cli,
+) -> Result<()> {
+    // Build (name, path) list for the preset INI
+    let models: Vec<(String, PathBuf)> = resolved_models.iter().map(|p| {
+        let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let name = router::strip_split_suffix_owned(&stem);
+        (name, p.clone())
+    }).collect();
+
+    let model_names: Vec<String> = models.iter().map(|(n, _)| n.clone()).collect();
+    eprintln!("🔀 Multi-model mode: {} models fit locally ({:.1}GB VRAM for {:.1}GB total)",
+        models.len(), my_vram as f64 / 1e9, total_model_bytes as f64 / 1e9);
+    for (name, path) in &models {
+        let size = election::total_model_bytes(path);
+        eprintln!("  • {name} ({:.1}GB)", size as f64 / 1e9);
+    }
+
+    // Clean up stale processes
+    launch::kill_llama_server().await;
+    launch::kill_orphan_rpc_servers().await;
+
+    // Launch llama-server with --models-preset
+    let (llama_port, mut death_rx) = launch::start_llama_server_multi(
+        bin_dir,
+        &models.iter().map(|(n, p)| (n.clone(), p.clone())).collect::<Vec<_>>(),
+        models.len(), // models_max = all of them
+        my_vram,
+        total_model_bytes,
+    ).await?;
+
+    eprintln!("✅ llama-server ready on internal port {llama_port} ({} models)", models.len());
+
+    // Set up routing: all models → local llama port
+    let (target_tx, target_rx) = tokio::sync::watch::channel(election::ModelTargets::default());
+    let target_tx = std::sync::Arc::new(target_tx);
+    {
+        let mut targets = target_tx.borrow().clone();
+        for name in &model_names {
+            targets.targets.insert(name.clone(), vec![election::InferenceTarget::Local(llama_port)]);
+        }
+        target_tx.send_replace(targets);
+    }
+
+    // Mark node as host
+    node.set_role(mesh::NodeRole::Host { http_port: llama_port }).await;
+    node.set_llama_ready(true).await;
+    node.regossip().await;
+
+    // Drop channel (for API proxy)
+    let (drop_tx, mut drop_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Take over listener from bootstrap proxy
+    let existing_listener = if let Some(tx) = bootstrap_listener_tx {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(resp_tx).await;
+        resp_rx.await.ok()
+    } else {
+        None
+    };
+
+    // API proxy
+    let proxy_node = node.clone();
+    let proxy_rx = target_rx.clone();
+    let listen_all = cli.listen_all;
+    tokio::spawn(async move {
+        api_proxy(proxy_node, api_port, proxy_rx, drop_tx, existing_listener, listen_all).await;
+    });
+
+    // Console
+    if let Some(cport) = console_port {
+        let model_size_bytes = total_model_bytes;
+        let cs = api::MeshApi::new(node.clone(), primary_name.to_string(), api_port, model_size_bytes);
+        cs.set_nostr_relays(nostr_relays(&cli.nostr_relay)).await;
+        cs.set_nostr_discovery(cli.nostr_discovery).await;
+        if let Some(ref name) = cli.mesh_name {
+            cs.set_mesh_name(name.clone()).await;
+        }
+        let cs2 = cs.clone();
+        let console_rx = target_rx.clone();
+        let mn = primary_name.to_string();
+        tokio::spawn(async move {
+            let (adapted_tx, adapted_rx) = tokio::sync::watch::channel(election::InferenceTarget::None);
+            tokio::spawn(async move {
+                let mut rx = console_rx;
+                loop {
+                    let targets = rx.borrow().clone();
+                    let target = targets.get(&mn);
+                    adapted_tx.send_replace(target);
+                    if rx.changed().await.is_err() { break; }
+                }
+            });
+            api::start(cport, cs2, adapted_rx, listen_all).await;
+        });
+        cs.update(true, true).await;
+    }
+
+    // Print connection info
+    let url = format!("http://localhost:{api_port}");
+    eprintln!("  API: {url}");
+    if let Some(cp) = console_port {
+        eprintln!("  Console: http://localhost:{cp}");
+    }
+    eprintln!();
+    for name in &model_names {
+        eprintln!("  pi:    pi --provider mesh --model {name}");
+    }
+    update_pi_models_json(&model_names[0], api_port);
+
+    // Wait for death or drop signal
+    loop {
+        tokio::select! {
+            _ = &mut death_rx => {
+                eprintln!("⚠️  llama-server (multi) died — exiting multi-model mode");
+                break;
+            }
+            Some(model) = drop_rx.recv() => {
+                eprintln!("📦 Drop requested for {model} — ignoring in multi-model mode");
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\n👋 Shutting down...");
+                break;
+            }
+        }
+    }
+
+    launch::kill_llama_server().await;
     Ok(())
 }
 

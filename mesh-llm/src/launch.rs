@@ -367,3 +367,102 @@ async fn reqwest_health_check(url: &str) -> bool {
 }
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Start llama-server in multi-model router mode.
+///
+/// Generates a preset INI listing exactly the requested models, then launches
+/// llama-server with `--models-preset`. No `--rpc` — all models served locally.
+///
+/// Returns (http_port, death_rx).
+pub async fn start_llama_server_multi(
+    bin_dir: &Path,
+    models: &[(String, std::path::PathBuf)], // (name, gguf_path)
+    models_max: usize,
+    my_vram: u64,
+    total_model_bytes: u64,
+) -> Result<(u16, tokio::sync::oneshot::Receiver<()>)> {
+    let llama_server = bin_dir.join("llama-server");
+    anyhow::ensure!(
+        llama_server.exists(),
+        "llama-server not found at {}",
+        llama_server.display()
+    );
+    anyhow::ensure!(!models.is_empty(), "No models specified for multi-model mode");
+
+    // Write preset INI
+    let preset_path = std::path::PathBuf::from("/tmp/mesh-llm-models.ini");
+    let mut ini = String::new();
+    for (name, path) in models {
+        anyhow::ensure!(path.exists(), "Model not found: {}", path.display());
+        ini.push_str(&format!("[{}]\n", name));
+        ini.push_str(&format!("LLAMA_ARG_MODEL = {}\n\n", path.display()));
+    }
+    std::fs::write(&preset_path, &ini)
+        .with_context(|| format!("Failed to write preset INI to {}", preset_path.display()))?;
+    tracing::info!("Multi-model preset: {}", preset_path.display());
+    for (name, path) in models {
+        tracing::info!("  {name} → {}", path.display());
+    }
+
+    // Context size based on remaining VRAM after all models
+    const GB: u64 = 1_000_000_000;
+    let vram_after = my_vram.saturating_sub(total_model_bytes);
+    let ctx_size: u32 = if vram_after >= 30 * GB {
+        65536
+    } else if vram_after >= 12 * GB {
+        32768
+    } else if vram_after >= 6 * GB {
+        16384
+    } else if vram_after >= 3 * GB {
+        8192
+    } else {
+        4096
+    };
+
+    let http_port = find_free_port().await?;
+
+    let log_file = std::fs::File::create("/tmp/mesh-llm-llama-server.log")
+        .context("Failed to create llama-server log file")?;
+    let log_file2 = log_file.try_clone()?;
+
+    let args = vec![
+        "--models-preset".to_string(), preset_path.to_string_lossy().to_string(),
+        "--models-max".to_string(), models_max.to_string(),
+        "-ngl".to_string(), "99".to_string(),
+        "--host".to_string(), "0.0.0.0".to_string(),
+        "--port".to_string(), http_port.to_string(),
+        "-c".to_string(), ctx_size.to_string(),
+        "--reasoning-format".to_string(), "deepseek".to_string(),
+        "--jinja".to_string(),
+    ];
+
+    eprintln!("🔀 Starting llama-server in multi-model mode ({} model(s), max {} loaded, ctx {})",
+        models.len(), models_max, ctx_size);
+
+    let mut child = Command::new(&llama_server)
+        .args(&args)
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(log_file2))
+        .spawn()
+        .with_context(|| format!("Failed to start llama-server at {}", llama_server.display()))?;
+
+    // Wait for health — router mode starts quickly (no model loaded yet)
+    let url = format!("http://localhost:{http_port}/health");
+    for i in 0..60 {
+        if reqwest_health_check(&url).await {
+            let (death_tx, death_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+                eprintln!("⚠️  llama-server (multi) process exited unexpectedly");
+                let _ = death_tx.send(());
+            });
+            return Ok((http_port, death_rx));
+        }
+        if i > 0 && i % 10 == 0 {
+            tracing::info!("Waiting for llama-server router to start... ({i}s)");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    anyhow::bail!("llama-server (multi) failed to start within 60s");
+}
