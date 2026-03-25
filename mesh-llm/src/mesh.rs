@@ -236,14 +236,16 @@ pub fn find_model_path(stem: &str) -> std::path::PathBuf {
 
 /// Detect available VRAM. On Apple Silicon, uses ~75% of system RAM
 /// (the rest is reserved for OS/apps on unified memory).
-/// Detect VRAM, capped by max_vram_gb if set.
+/// Detect available memory for model loading, capped by max_vram_gb if set.
+/// "VRAM" is a misnomer — on macOS unified memory and Linux CPU-only, this
+/// is system RAM. On Linux with a GPU, it's actual GPU VRAM.
 pub fn detect_vram_bytes_capped(max_vram_gb: Option<f64>) -> u64 {
-    let mut vram = detect_vram_bytes();
+    let mut detected = detect_vram_bytes();
     if let Some(cap) = max_vram_gb {
         let cap_bytes = (cap * 1e9) as u64;
-        if cap_bytes < vram { vram = cap_bytes; }
+        if cap_bytes < detected { detected = cap_bytes; }
     }
-    vram
+    detected
 }
 
 pub fn detect_vram_bytes() -> u64 {
@@ -299,6 +301,21 @@ pub fn detect_vram_bytes() -> u64 {
                             if let Ok(bytes) = total.trim().parse::<u64>() {
                                 return bytes;
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // No GPU found — fall back to system RAM for CPU inference.
+        // Use 75% of physical RAM (same heuristic as macOS unified memory).
+        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+            for line in meminfo.lines() {
+                if line.starts_with("MemTotal:") {
+                    if let Some(kb_str) = line.split_whitespace().nth(1) {
+                        if let Ok(kb) = kb_str.parse::<u64>() {
+                            let bytes = kb * 1024;
+                            return (bytes as f64 * 0.75) as u64;
                         }
                     }
                 }

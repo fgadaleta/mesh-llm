@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,12 +28,35 @@ jobs:
         with:
           workspaces: mesh-llm
 
-      - name: Run tests
+      - name: Build mesh-llm
+        working-directory: mesh-llm
+        run: cargo build --release
+
+      - name: Test mesh-llm
         working-directory: mesh-llm
         run: cargo test
 
-      # Formatting and clippy are advisory for now — codebase predates fmt.
-      # TODO: run cargo fmt across the project and enable these as blocking.
+      - name: Smoke test CLI
+        run: |
+          mesh-llm/target/release/mesh-llm --version
+          mesh-llm/target/release/mesh-llm --help | head -5
+
+      - name: Clone llama.cpp fork
+        run: git clone -b rebase-upstream-master --depth 1 https://github.com/michaelneale/llama.cpp.git
+
+      - name: Build llama.cpp (CPU + RPC)
+        run: |
+          cmake -B llama.cpp/build -S llama.cpp \
+            -DGGML_RPC=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_OPENSSL=OFF
+          cmake --build llama.cpp/build --config Release -j$(nproc)
+
+      - name: Verify llama.cpp binaries
+        run: |
+          ls -lh llama.cpp/build/bin/llama-server llama.cpp/build/bin/rpc-server
+          llama.cpp/build/bin/llama-server --version
+
       - name: Check formatting
         working-directory: mesh-llm
         run: cargo fmt -- --check || true
