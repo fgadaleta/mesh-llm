@@ -17,9 +17,9 @@ This repo (`mesh-llm`) contains mesh-llm — a Rust binary that pools GPUs over 
 | `mesh-llm/README.md` | Rust crate overview and file map |
 | `mesh-llm/docs/DESIGN.md` | Architecture, protocols, features |
 | `mesh-llm/docs/TESTING.md` | Test playbook, scenarios, remote deploy |
-| `MoE_PLAN.md` | MoE expert sharding design |
-| `MoE_DEPLOY_DESIGN.md` | MoE auto-deploy UX |
-| `MoE_SPLIT_REPORT.md` | MoE splitting validation results |
+| `mesh-llm/docs/MoE_PLAN.md` | MoE expert sharding design |
+| `mesh-llm/docs/MoE_DEPLOY_DESIGN.md` | MoE auto-deploy UX |
+| `mesh-llm/docs/MoE_SPLIT_REPORT.md` | MoE splitting validation results |
 | `fly/README.md` | Fly.io deployment (console + API apps) |
 | `relay/README.md` | Self-hosted iroh relay on Fly |
 
@@ -45,7 +45,7 @@ See `CONTRIBUTING.md` for full dev workflow.
 - `mesh-llm/docs/` — Design and testing docs
 - `fly/` — Fly.io deployment (console + API client apps)
 - `relay/` — Self-hosted iroh relay
-- `latency-benchmarking/` — Historical benchmark scripts
+- `evals/` — Benchmarking and evaluation scripts
 
 ## Key Source Files
 

@@ -4,9 +4,9 @@
 
 ![Mesh LLM](mesh.png)
 
-Pool spare GPU capacity to run LLMs at larger scale. Models that don't fit on one machine are automatically distributed — dense models via pipeline parallelism, MoE models via expert sharding with zero cross-node inference traffic. Have your agents gossip across the mesh — share status, findings, and questions without a central server.
+> ⚠️ **Built with caffeine and anger.** Harnesses used: [Goose](https://github.com/block/goose), [pi](https://github.com/mariozechner/pi-coding-agent), [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview). Models: Opus, GPT 5.x, some MiniMax M2.5 and GLM 4.7 Flash.
 
-**[Try it now](https://mesh-llm-console.fly.dev/)** — live console connected to a public mesh. Chat with models running on real hardware.
+Pool spare GPU capacity to run LLMs at larger scale. Models that don't fit on one machine are automatically distributed — dense models via pipeline parallelism, MoE models via expert sharding with zero cross-node inference traffic. Have your agents gossip across the mesh — share status, findings, and questions without a central server.
 
 ## Install (macOS Apple Silicon)
 
@@ -232,11 +232,10 @@ curl http://localhost:9337/v1/chat/completions \
 
 The mesh doesn't just share compute — it shares knowledge. Agents and people post status updates, findings, and questions to a shared blackboard that propagates across the mesh.
 
-Works standalone — you don't need to run models through the mesh. Using your own API keys or a cloud provider? Just run `mesh-llm --client --blackboard` to give your agents a gossip layer. No GPU needed, no model needed.
+Works standalone — you don't need to run models through the mesh. Using your own API keys or a cloud provider? Just run `mesh-llm --client` to give your agents a gossip layer. No GPU needed, no model needed.
 
 ```bash
-# Enable on any node (with or without a model)
-mesh-llm --client --blackboard
+mesh-llm --client
 
 # Install the agent skill (works with pi, Goose, others)
 mesh-llm blackboard install-skill
@@ -333,49 +332,6 @@ mesh-llm --model ~/my-models/custom-model.gguf
 
 Catalog models are downloaded with resume support — if a download is interrupted, it picks up where it left off. Use `mesh-llm download` to browse the catalog.
 
-## CLI Reference
-
-```
-mesh-llm [OPTIONS]
-  --model NAME|PATH|URL  Model to serve (can specify multiple)
-  --join TOKEN         Join mesh via invite token
-  --auto               Discover and join via directory
-  --client             API-only client (no GPU)
-  --blackboard         Enable the blackboard (works on any node)
-  --name NAME          Display name on the blackboard (default: $USER)
-  --mesh-name NAME     Name the mesh (implies --publish)
-  --publish            Publish mesh to directory
-  --region REGION      Geographic region tag (AU, US-West, EU-West, ...)
-  --max-clients N      Delist when N clients connected
-  --port PORT          API port (default: 9337)
-  --console PORT       Console port (default: 3131)
-  --bind-port PORT     Pin QUIC to fixed UDP port (for NAT)
-  --listen-all         Bind to 0.0.0.0 (for containers)
-  --max-vram GB        Cap VRAM advertised to mesh
-  --split              Force pipeline split (dense) or MoE expert split
-  --device DEV         GPU device (default: MTL0)
-  --draft PATH         Draft model for speculative decoding
-  --no-draft           Disable auto draft detection
-
-mesh-llm download [NAME] [--draft]
-mesh-llm discover [--model M] [--region R] [--auto]
-mesh-llm drop <model>
-mesh-llm rotate-key
-mesh-llm blackboard [TEXT] [--search Q] [--from NAME] [--since HOURS]
-mesh-llm blackboard --mcp           Run as MCP server (stdio) for agents
-mesh-llm blackboard install-skill
-```
-
-## Deploying
-
-```bash
-just bundle                                    # creates /tmp/mesh-bundle.tar.gz
-scp /tmp/mesh-bundle.tar.gz user@remote:
-ssh user@remote 'tar xzf mesh-bundle.tar.gz && mesh-bundle/mesh-llm --model Qwen2.5-3B'
-```
-
-Same architecture required (arm64 macOS → arm64 macOS). Bundle includes mesh-llm + llama.cpp binaries. For WAN: forward `--bind-port` UDP on the router — only the originator needs it.
-
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build and development workflows.
@@ -388,3 +344,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build and development workflows.
 | `mesh-llm/` | Rust QUIC mesh ([internals](mesh-llm/README.md)) |
 
 ## [Roadmap](ROADMAP.md)
+
+---
+
+> *"You are all a bunch of dirty hackers"*
+> — Author's CompSci 101 professor

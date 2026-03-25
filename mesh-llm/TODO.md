@@ -47,7 +47,7 @@ Run giant MoE models on a single node by streaming active experts from NVMe inst
 
 ## MoE Expert Sharding
 
-Design: [MoE_PLAN.md](../MoE_PLAN.md) · Auto-deploy: [MoE_DEPLOY_DESIGN.md](../MoE_DEPLOY_DESIGN.md) · Validation: [MoE_SPLIT_REPORT.md](../MoE_SPLIT_REPORT.md)
+Design: [MoE_PLAN.md](docs/MoE_PLAN.md) · Auto-deploy: [MoE_DEPLOY_DESIGN.md](docs/MoE_DEPLOY_DESIGN.md) · Validation: [MoE_SPLIT_REPORT.md](docs/MoE_SPLIT_REPORT.md)
 
 - [ ] **Lazy `moe-analyze`** — auto-run ranking for unknown MoE models.
 - [ ] **Scale testing** — Mixtral 8×22B, Qwen3-235B-A22B across multi-node.

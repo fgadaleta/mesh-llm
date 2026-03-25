@@ -2,7 +2,7 @@
 
 Distribute MoE models across mesh nodes using **overlapping expert shards** with zero cross-node inference traffic. Each node holds the full trunk plus a subset of experts. Sessions are hash-routed to nodes.
 
-See [ROADMAP.md](ROADMAP.md) for how this fits into mesh-llm.
+See [ROADMAP.md](../../ROADMAP.md) for how this fits into mesh-llm.
 
 ## What's Implemented
 

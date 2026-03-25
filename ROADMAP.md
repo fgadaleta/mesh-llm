@@ -46,7 +46,7 @@ Currently ships as a 3-binary bundle (`mesh-llm` + `llama-server` + `rpc-server`
 
 ## MoE expert sharding ✅
 
-Implemented. Auto-detects MoE, computes overlapping expert assignments, splits locally, session-sticky routing. Zero cross-node traffic. See [MoE_PLAN.md](MoE_PLAN.md).
+Implemented. Auto-detects MoE, computes overlapping expert assignments, splits locally, session-sticky routing. Zero cross-node traffic. See [MoE_PLAN.md](mesh-llm/docs/MoE_PLAN.md).
 
 Remaining: optimized rankings for unknown models, scale testing on Mixtral 8×22B / Qwen3-235B.
 

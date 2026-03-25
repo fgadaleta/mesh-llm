@@ -139,8 +139,8 @@ No changes to llama-server, llama.cpp, or the GGUF format.
 
 ## References
 
-- Current MoE implementation: [MoE_PLAN.md](../MoE_PLAN.md)
-- Expert ranking data: [MoE_SPLIT_REPORT.md](../MoE_SPLIT_REPORT.md)
+- Current MoE implementation: [MoE_PLAN.md](MoE_PLAN.md)
+- Expert ranking data: [MoE_SPLIT_REPORT.md](MoE_SPLIT_REPORT.md)
 - `moe-analyze` source: `llama.cpp/tools/moe-analyze/moe-analyze.cpp`
 - `moe-split` source: `llama.cpp/tools/moe-split/`
 - Expert mask API: `llama_model_set_expert_mask()` in `llama.h`
