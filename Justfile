@@ -60,7 +60,7 @@ release-build:
     @scripts/build-release.sh
 
 # Build a Linux CUDA release artifact with an explicit architecture list.
-release-build-cuda cuda_arch="75;80;86;89;90":
+release-build-cuda cuda_arch="75;80;86;89;90;120":
     @scripts/build-linux.sh "{{ cuda_arch }}"
 
 # Bump release version consistently across source and Cargo manifests.
