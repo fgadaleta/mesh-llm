@@ -139,7 +139,7 @@ Current release flow:
    git tag v0.X.Y
    git push origin main --tags
    ```
-5. Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the release artifacts on Linux CPU, Linux CUDA, Linux AMD ROCm, and macOS and creates the GitHub release automatically.
+5. Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the release artifacts on Linux CPU, Linux CUDA, and macOS and creates the GitHub release automatically.
 
 ## Credentials
 

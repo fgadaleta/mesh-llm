@@ -28,12 +28,6 @@ For NVIDIA CUDA, a separate prebuilt release asset is published:
 curl -fsSL https://github.com/michaelneale/mesh-llm/releases/latest/download/mesh-llm-x86_64-unknown-linux-gnu-cuda.tar.gz | tar xz && mkdir -p ~/.local/bin && mv mesh-bundle/* ~/.local/bin/
 ```
 
-For AMD ROCm/HIP, a separate prebuilt release asset is published:
-
-```bash
-curl -fsSL https://github.com/michaelneale/mesh-llm/releases/latest/download/mesh-llm-x86_64-unknown-linux-gnu-rocm.tar.gz | tar xz && mkdir -p ~/.local/bin && mv mesh-bundle/* ~/.local/bin/
-```
-
 If you want a local GPU build from source instead:
 
 ```bash

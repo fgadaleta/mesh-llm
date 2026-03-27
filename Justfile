@@ -63,10 +63,6 @@ release-build:
 release-build-cuda cuda_arch="75;80;86;89;90":
     @scripts/build-linux.sh "{{ cuda_arch }}"
 
-# Build a Linux AMD ROCm release artifact with an explicit architecture list.
-release-build-amd amd_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201":
-    @scripts/build-linux-amd.sh "{{ amd_arch }}"
-
 # Bump release version consistently across source and Cargo manifests.
 release-version version:
     @scripts/release-version.sh "{{ version }}"
@@ -177,10 +173,6 @@ release-bundle version output="dist":
 # Create Linux CUDA release archive(s).
 release-bundle-cuda version output="dist":
     MESH_RELEASE_FLAVOR=cuda scripts/package-release.sh "{{ version }}" "{{ output }}"
-
-# Create Linux AMD ROCm release archive(s).
-release-bundle-amd version output="dist":
-    MESH_RELEASE_FLAVOR=rocm scripts/package-release.sh "{{ version }}" "{{ output }}"
 
 # Run the UI with Vite HMR and proxy /api to mesh-llm (default: http://127.0.0.1:3131)
 ui-dev api="http://127.0.0.1:3131" port="5173":
