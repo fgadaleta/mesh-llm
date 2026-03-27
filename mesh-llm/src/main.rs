@@ -23,7 +23,7 @@ use clap::{Parser, Subcommand};
 use mesh::NodeRole;
 use std::path::PathBuf;
 
-pub const VERSION: &str = "0.48.0";
+pub const VERSION: &str = "0.49.0";
 
 #[derive(Parser, Debug)]
 #[command(name = "mesh-llm", version = VERSION,
