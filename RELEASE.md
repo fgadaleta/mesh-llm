@@ -74,14 +74,14 @@ Pushing a `v*` tag triggers `.github/workflows/release.yml`, which:
 - uploads CUDA-specific Linux assets such as `mesh-llm-x86_64-unknown-linux-gnu-cuda.tar.gz`
 - uploads ROCm-specific Linux assets such as `mesh-llm-x86_64-unknown-linux-gnu-rocm.tar.gz`
 - uploads Vulkan-specific Linux assets such as `mesh-llm-x86_64-unknown-linux-gnu-vulkan.tar.gz`
-- keeps the legacy macOS `mesh-bundle.tar.gz` asset for the README install one-liner
+- keeps the legacy macOS `mesh-bundle.tar.gz` asset available for direct archive installs
 - creates the GitHub release automatically with generated notes
 
 ### 7. Verify the release assets
 
 After the workflow finishes, verify:
 
-- `mesh-bundle.tar.gz` still exists for macOS latest installs
+- `mesh-bundle.tar.gz` still exists for direct macOS archive installs
 - `mesh-llm-aarch64-apple-darwin.tar.gz` exists
 - `mesh-llm-x86_64-unknown-linux-gnu.tar.gz` exists
 - `mesh-llm-x86_64-unknown-linux-gnu-cuda.tar.gz` exists
@@ -90,7 +90,7 @@ After the workflow finishes, verify:
 
 ## Notes
 
-- The unversioned asset name `mesh-bundle.tar.gz` is still required for the README's macOS install one-liner.
+- The unversioned asset name `mesh-bundle.tar.gz` is still kept for compatibility with direct archive installs.
 - The default Linux release bundle is a generic CPU build.
 - Release bundles use flavor-specific `rpc-server-<flavor>` and `llama-server-<flavor>` names so multiple flavors can coexist in one install directory. Use `mesh-llm --llama-flavor <flavor>` to force a specific pair.
 - The CUDA Linux release bundle is built in CI with an explicit multi-arch `CMAKE_CUDA_ARCHITECTURES` list and is not runtime-tested during the workflow.

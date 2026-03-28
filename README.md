@@ -8,32 +8,18 @@
 
 Pool spare GPU capacity to run LLMs at larger scale. Models that don't fit on one machine are automatically distributed — dense models via pipeline parallelism, MoE models via expert sharding with zero cross-node inference traffic. Have your agents gossip across the mesh — share status, findings, and questions without a central server.
 
-## Install (macOS Apple Silicon)
+## Install
 
 ```bash
-curl -fsSL https://github.com/michaelneale/mesh-llm/releases/latest/download/mesh-bundle.tar.gz | tar xz && mkdir -p ~/.local/bin && mv mesh-bundle/* ~/.local/bin/
+curl -fsSL https://raw.githubusercontent.com/michaelneale/mesh-llm/main/install.sh | bash
 ```
 
-## Install (Linux)
+The installer probes your machine, recommends a flavor, and asks what you want to install.
+
+For non-interactive installs, set the flavor explicitly:
 
 ```bash
-curl -fsSL https://github.com/michaelneale/mesh-llm/releases/latest/download/mesh-llm-x86_64-unknown-linux-gnu.tar.gz | tar xz && mkdir -p ~/.local/bin && mv mesh-bundle/* ~/.local/bin/
-```
-
-The default Linux release bundle is a generic CPU build.
-
-For GPU-specific Linux builds, separate prebuilt release assets are published:
-
-```bash
-curl -fsSL https://github.com/michaelneale/mesh-llm/releases/latest/download/mesh-llm-x86_64-unknown-linux-gnu-cuda.tar.gz | tar xz && mkdir -p ~/.local/bin && mv mesh-bundle/* ~/.local/bin/
-```
-
-```bash
-curl -fsSL https://github.com/michaelneale/mesh-llm/releases/latest/download/mesh-llm-x86_64-unknown-linux-gnu-rocm.tar.gz | tar xz && mkdir -p ~/.local/bin && mv mesh-bundle/* ~/.local/bin/
-```
-
-```bash
-curl -fsSL https://github.com/michaelneale/mesh-llm/releases/latest/download/mesh-llm-x86_64-unknown-linux-gnu-vulkan.tar.gz | tar xz && mkdir -p ~/.local/bin && mv mesh-bundle/* ~/.local/bin/
+curl -fsSL https://raw.githubusercontent.com/michaelneale/mesh-llm/main/install.sh | MESH_LLM_INSTALL_FLAVOR=vulkan bash
 ```
 
 Release bundles install flavor-specific llama.cpp binaries:
