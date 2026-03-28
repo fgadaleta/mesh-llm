@@ -340,15 +340,20 @@ function Ensure-RocmToolchain {
         if ($hipPackage) {
             $env:hip_DIR = $hipPackage.HipDir
         }
-        if (-not $env:HIPCXX) {
+        if (-not $env:HIPCC -or -not $env:HIPCXX) {
             foreach ($candidate in @(
                 (Join-Path $llvmBinDir "clang++.exe"),
                 (Join-Path $binDir "clang++.exe"),
                 (Join-Path $llvmBinDir "clang.exe"),
                 (Join-Path $binDir "clang.exe")
             )) {
-                if (Test-Path $candidate) {
+                if ($candidate -like "*clang++.exe" -and -not $env:HIPCXX -and (Test-Path $candidate)) {
                     $env:HIPCXX = $candidate
+                } elseif ($candidate -like "*clang.exe" -and -not $env:HIPCC -and (Test-Path $candidate)) {
+                    $env:HIPCC = $candidate
+                }
+
+                if ($env:HIPCC -and $env:HIPCXX) {
                     break
                 }
             }
@@ -364,8 +369,12 @@ function Ensure-RocmToolchain {
                 $clang = Join-Path $hipCompilerRoot "clang.exe"
                 if (Test-Path $clangxx) {
                     $env:HIPCXX = $clangxx
-                } elseif (Test-Path $clang) {
-                    $env:HIPCXX = $clang
+                }
+                if (Test-Path $clang) {
+                    $env:HIPCC = $clang
+                    if (-not $env:HIPCXX) {
+                        $env:HIPCXX = $clang
+                    }
                 }
             }
         } catch {
@@ -398,6 +407,12 @@ function Ensure-RocmToolchain {
         throw "HIP package config not found. Expected hip-config.cmake under the HIP SDK installation."
     }
     $env:hip_DIR = $hipPackage.HipDir
+    if (-not $env:HIPCC) {
+        throw "HIP C compiler not found. Expected clang.exe in the HIP SDK installation."
+    }
+    if (-not $env:HIPCXX) {
+        throw "HIP C++ compiler not found. Expected clang++.exe in the HIP SDK installation."
+    }
 }
 
 function Ensure-VulkanToolchain {
@@ -521,6 +536,9 @@ Invoke-InRepo {
         }
         "rocm" {
             $cmakeArgs += "-DGGML_HIP=ON"
+            if ($env:HIPCC) {
+                $cmakeArgs += "-DCMAKE_C_COMPILER=$env:HIPCC"
+            }
             if ($env:HIPCXX) {
                 $cmakeArgs += "-DCMAKE_CXX_COMPILER=$env:HIPCXX"
             }
