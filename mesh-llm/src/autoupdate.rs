@@ -432,10 +432,8 @@ fn exec_current_binary(_exe: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
-    use std::sync::Mutex;
+    use serial_test::serial;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = format!(
@@ -459,7 +457,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_latest_release_asset_url() {
+        std::env::remove_var(SELF_UPDATE_REPO_ENV);
         assert_eq!(
             latest_release_asset_url("mesh-llm-aarch64-apple-darwin.tar.gz"),
             "https://github.com/michaelneale/mesh-llm/releases/latest/download/mesh-llm-aarch64-apple-darwin.tar.gz"
@@ -467,8 +467,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_release_repo_defaults_to_main_repo() {
-        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var(SELF_UPDATE_REPO_ENV);
         assert_eq!(release_repo(), "michaelneale/mesh-llm");
         assert_eq!(
@@ -478,8 +478,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_release_repo_can_be_overridden_for_testing() {
-        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var(SELF_UPDATE_REPO_ENV, "jdumay/mesh-llm");
         assert_eq!(release_repo(), "jdumay/mesh-llm");
         assert_eq!(
@@ -523,8 +523,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_should_attempt_self_update_defaults_to_startup_only() {
-        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var(SELF_UPDATE_ATTEMPTED_ENV);
         std::env::remove_var(SELF_UPDATE_DISABLED_ENV);
         let cli = Cli::parse_from(["mesh-llm", "--auto"]);
@@ -535,8 +535,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_should_attempt_self_update_respects_disable_flags() {
-        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var(SELF_UPDATE_ATTEMPTED_ENV, "1");
         let cli = Cli::parse_from(["mesh-llm", "--auto"]);
         assert!(!should_attempt_self_update(&cli));
