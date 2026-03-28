@@ -59,6 +59,12 @@ For Vulkan builds, force the backend explicitly:
 just build backend=vulkan
 ```
 
+For CPU-only builds (no GPU acceleration):
+
+```bash
+just build backend=cpu
+```
+
 Create a portable bundle:
 
 ```bash

@@ -2,10 +2,11 @@
 # build-linux.sh — build llama.cpp + mesh-llm on Linux
 #
 # Usage:
-#   scripts/build-linux.sh [--clean] [--backend cuda|rocm|vulkan] [--cuda-arch SM_LIST] [--rocm-arch GFX_LIST]
+#   scripts/build-linux.sh [--clean] [--backend cpu|cuda|rocm|vulkan] [--cuda-arch SM_LIST] [--rocm-arch GFX_LIST]
 #
 # Examples:
 #   scripts/build-linux.sh
+#   scripts/build-linux.sh --backend cpu
 #   scripts/build-linux.sh --backend cuda --cuda-arch '120;86'
 #   scripts/build-linux.sh --backend rocm --rocm-arch 'gfx942;gfx90a'
 #   scripts/build-linux.sh --backend vulkan
@@ -96,7 +97,7 @@ detect_backend() {
             return 0
         fi
     fi
-    echo cuda
+    echo cpu
 }
 
 locate_nvcc() {
@@ -197,8 +198,11 @@ case "$BACKEND" in
         echo "Building Linux backend: Vulkan"
         echo "Using glslc: $(command -v glslc)"
         ;;
+    cpu)
+        echo "Building Linux backend: CPU only (no GPU acceleration)"
+        ;;
     *)
-        echo "Error: unsupported backend '$BACKEND' (expected 'cuda', 'rocm', or 'vulkan')." >&2
+        echo "Error: unsupported backend '$BACKEND' (expected 'cpu', 'cuda', 'rocm', or 'vulkan')." >&2
         exit 1
         ;;
 esac
@@ -224,7 +228,16 @@ if [[ "$CLEAN" -eq 1 && -d "$BUILD_DIR" ]]; then
     rm -rf "$BUILD_DIR"
 fi
 
-if [[ "$BACKEND" == "cuda" ]]; then
+if [[ "$BACKEND" == "cpu" ]]; then
+    cmake -B "$BUILD_DIR" -S "$LLAMA_DIR" \
+        -DGGML_CUDA=OFF \
+        -DGGML_HIP=OFF \
+        -DGGML_VULKAN=OFF \
+        -DGGML_METAL=OFF \
+        -DGGML_RPC=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DLLAMA_OPENSSL=OFF
+elif [[ "$BACKEND" == "cuda" ]]; then
     cmake -B "$BUILD_DIR" -S "$LLAMA_DIR" \
         -DGGML_CUDA=ON \
         -DGGML_HIP=OFF \

@@ -12,6 +12,7 @@ model := models_dir / "GLM-4.7-Flash-Q4_K_M.gguf"
 build: build-mac
 
 # Linux overrides:
+#   just build backend=cpu
 #   just build backend=cuda cuda_arch='120;86'
 #   just build backend=rocm rocm_arch='gfx942;gfx90a'
 #   just build backend=vulkan
