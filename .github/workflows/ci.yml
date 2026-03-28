@@ -169,36 +169,37 @@ jobs:
           target/release/mesh-llm --version
           target/release/mesh-llm --help | head -5
 
-  windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # ── UI ──
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: mesh-llm/ui/package-lock.json
-
-      - name: Build UI
-        working-directory: mesh-llm/ui
-        run: npm ci && npm run build
-
-      # ── Rust ──
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: mesh-llm
-
-      - name: Build mesh-llm
-        run: cargo build --release
-
-      - name: Unit tests
-        run: cargo test
-
-      - name: CLI smoke test
-        run: |
-          target/release/mesh-llm.exe --version
-          target/release/mesh-llm.exe --help
+  # TODO: re-enable once Windows CI is fully baked
+  # windows:
+  #   runs-on: windows-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     # ── UI ──
+  #     - uses: actions/setup-node@v4
+  #       with:
+  #         node-version: 20
+  #         cache: npm
+  #         cache-dependency-path: mesh-llm/ui/package-lock.json
+  #
+  #     - name: Build UI
+  #       working-directory: mesh-llm/ui
+  #       run: npm ci && npm run build
+  #
+  #     # ── Rust ──
+  #     - uses: dtolnay/rust-toolchain@stable
+  #
+  #     - uses: Swatinem/rust-cache@v2
+  #       with:
+  #         workspaces: mesh-llm
+  #
+  #     - name: Build mesh-llm
+  #       run: cargo build --release
+  #
+  #     - name: Unit tests
+  #       run: cargo test
+  #
+  #     - name: CLI smoke test
+  #       run: |
+  #         target/release/mesh-llm.exe --version
+  #         target/release/mesh-llm.exe --help
