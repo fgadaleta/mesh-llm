@@ -163,9 +163,104 @@ Agentic holds the line → keeps the best tool model even under load.
 - Named model still gets priority (fallback only on unreachable)
 - Never returns 503 when any host is reachable (soft penalties only)
 
+## Host-Side Request Interception (Cooperative Inference)
+
+### The Idea
+
+The host node sits between the mesh and llama-server. Right now it's a dumb TCP
+relay (`handle_inbound_http_stream` in `tunnel.rs`). It could be smarter — inspect
+the request, detect things llama-server can't handle, and call back into the mesh
+for help before forwarding.
+
+### Why the host, not the proxy?
+
+The proxy picks the model and host up front, then tunnels raw bytes. The host node
+is where llama-server actually runs — it knows:
+- What model is loaded (vision? tools? context limit?)
+- What the request contains (images? tool schemas? huge context?)
+- What the local llama-server's capacity is (slots, health)
+
+The host node also has a `Node` handle with full mesh access — it can route
+sub-requests to other models in the mesh.
+
+### Architecture
+
+```
+Current:
+  QUIC stream → TCP relay → llama-server → response streams back
+
+Proposed:
+  QUIC stream → parse request → [maybe rewrite] → TCP → llama-server
+                                      │                     │
+                                      │                     └─ response streams
+                                      │                        back untouched
+                                      │
+                                      └─ if needed: sub-request
+                                         to mesh (e.g. vision model)
+```
+
+No extra process, no extra TCP hop. The interception happens inline in
+`handle_inbound_http_stream`. Response streaming is never touched — SSE tokens
+flow straight through.
+
+### Latency Impact
+
+**Normal requests (no interception needed):** ~1ms added — parse the JSON request
+body, decide nothing special is needed, forward to llama-server. The request body
+is fully sent before streaming starts, so there's no streaming latency hit.
+
+**Intercepted requests (e.g. image rewrite):** Added latency of the sub-request
+(e.g. 2-5s for a vision model to describe an image). But without this, the request
+would have failed entirely, so it's latency vs failure.
+
+The response path is never in the critical loop — it's still a raw byte relay from
+llama-server back through QUIC.
+
+### Use Cases
+
+**Vision fallback (most concrete):**
+```
+User sends image + question → lands on Qwen3-Coder-Next (no vision)
+  Host intercepts: sees base64 image, model has no mmproj
+  Host calls mesh: POST /v1/chat/completions with image → Qwen3.5-27B (vision)
+  Vision model returns: "This is a screenshot of a React component with..."
+  Host rewrites: replaces image_url with text description in messages
+  Host forwards: rewritten request → local llama-server
+  Response streams back normally
+```
+
+**Tool schema adaptation:**
+- Request has tool schemas but model has `tools: false` in profile
+- Host could strip tools and reformulate as a system prompt instruction
+- Or call a tool-capable model in the mesh for the tool-calling part
+
+**Context overflow:**
+- Request exceeds the model's context window
+- Host could summarise earlier messages via a fast small model
+- Or truncate intelligently (keep system prompt + recent messages)
+
+**Draft/verification pattern:**
+- Small fast model drafts a response
+- Host routes to a bigger model to verify/refine
+- Returns the refined response
+
+### Implementation Path
+
+1. Replace the TCP relay in `handle_inbound_http_stream` with request parsing
+2. Buffer request headers + body (already small — JSON payload, not streamed)
+3. Check: does request need interception? (image on non-vision model, etc.)
+4. If no: forward to llama-server immediately, relay response — minimal overhead
+5. If yes: make sub-request via mesh, rewrite, then forward
+6. Response path unchanged — raw byte relay from llama-server through QUIC
+
+The host already has `Node` access. Sub-requests use the same mesh routing
+(model selection, host selection) as any other request.
+
 ### Open Questions
 
 - Should session bindings be shared across proxies (gossip them)? Probably not — adds complexity, and if a client switches proxy entry point, cold KV is the least of the problems.
 - Should we use `/slots` for richer signal (how many tokens generated per slot = how close to eviction)? Probably overkill for now.
 - llama-server with `--parallel 1` (default for big models): slots_total=1, slots_idle is 0 or 1. Binary signal. Is that enough? Probably yes — it means "busy or not."
 - What about split/tensor-parallel setups where one llama-server spans multiple nodes? The host election already handles this — the elected host is the one running llama-server, and it's the one that reports load.
+- For cooperative inference: how to avoid loops? (Host A intercepts, calls mesh, lands on Host B which intercepts again.) Tag the request with `X-Mesh-Rewritten: true` or similar.
+- Should the host advertise its capabilities (vision, tools, context length) in gossip so the proxy can make smarter choices up front? This would reduce the need for host-side interception but adds gossip complexity.
