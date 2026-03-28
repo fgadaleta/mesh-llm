@@ -2149,7 +2149,7 @@ fn detect_bin_dir() -> Result<PathBuf> {
     if dev.join("rpc-server").exists() && dev.join("llama-server").exists() {
         return Ok(dev.canonicalize()?);
     }
-    let cargo = dir.join("../../../llama.cpp/build/bin");
+    let cargo = dir.join("../../llama.cpp/build/bin");
     if cargo.join("rpc-server").exists() && cargo.join("llama-server").exists() {
         return Ok(cargo.canonicalize()?);
     }
