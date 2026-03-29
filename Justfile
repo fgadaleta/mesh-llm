@@ -180,11 +180,12 @@ bundle output="/tmp/mesh-bundle.tar.gz":
     cp {{ mesh_bin }} "$BUNDLE/"
     cp {{ build_dir }}/bin/rpc-server "$BUNDLE/$rpc_name"
     cp {{ build_dir }}/bin/llama-server "$BUNDLE/$llama_name"
+    cp {{ build_dir }}/bin/llama-moe-split "$BUNDLE/"
     for lib in {{ build_dir }}/bin/*.dylib; do
         cp "$lib" "$BUNDLE/" 2>/dev/null || true
     done
     # Fix rpaths for portability
-    for bin in "$BUNDLE/mesh-llm" "$BUNDLE/$rpc_name" "$BUNDLE/$llama_name"; do
+    for bin in "$BUNDLE/mesh-llm" "$BUNDLE/$rpc_name" "$BUNDLE/$llama_name" "$BUNDLE/llama-moe-split"; do
         [ -f "$bin" ] || continue
         install_name_tool -add_rpath @executable_path/ "$bin" 2>/dev/null || true
     done

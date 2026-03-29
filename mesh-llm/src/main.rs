@@ -124,7 +124,7 @@ struct Cli {
     #[arg(long, hide = true)]
     enumerate_host: bool,
 
-    /// Path to rpc-server and llama-server binaries.
+    /// Path to rpc-server, llama-server, and llama-moe-split binaries.
     #[arg(long, hide = true)]
     bin_dir: Option<PathBuf>,
 
