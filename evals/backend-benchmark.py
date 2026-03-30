@@ -279,12 +279,14 @@ def expand_path(raw: str) -> Path:
 
 
 def sidecar_comparison_key(model_path: Path) -> str | None:
-    sidecar = model_path.with_name(f"{model_path.name}.mesh.json")
+    sidecar = model_path.with_name(f"{model_path.name}.manifest.json")
     if not sidecar.exists():
         return None
     try:
         payload = json.loads(sidecar.read_text())
     except Exception:
+        return None
+    if payload.get("version") != 1:
         return None
 
     source = payload.get("source") or {}
