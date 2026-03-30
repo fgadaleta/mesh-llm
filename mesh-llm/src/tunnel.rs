@@ -340,19 +340,21 @@ pub async fn relay_bidirectional(
 ) -> Result<()> {
     let mut t1 = tokio::spawn(async move { relay_tcp_to_quic(tcp_read, quic_send).await });
     let mut t2 = tokio::spawn(async move { relay_quic_to_tcp(quic_recv, tcp_write).await });
-    // If the request side finishes first, keep draining the response side.
-    // This matters for HTTP where the client may finish sending the request
-    // before the server has produced the response.
+    // Either direction finishing first is normal for HTTP:
+    //   - Sender side: client finishes sending request → wait for response
+    //   - Receiver side: QUIC request delivered (EOF/finish) → wait for llama response
+    // In both cases, when one direction completes, we must keep the other
+    // alive to let the full HTTP exchange finish.
     tokio::select! {
         r1 = &mut t1 => {
             r1??;
-            tracing::debug!("relay_bidirectional: request side finished, waiting for response side");
+            tracing::debug!("relay_bidirectional: tcp→quic finished, waiting for quic→tcp");
             t2.await??;
         }
         r2 = &mut t2 => {
             r2??;
-            t1.abort();
-            let _ = t1.await;
+            tracing::debug!("relay_bidirectional: quic→tcp finished, waiting for tcp→quic");
+            t1.await??;
         }
     }
     Ok(())
