@@ -247,18 +247,22 @@ jobs:
       matrix:
         include:
           - name: CPU
+            backend: cpu
             build_recipe: release-build-windows
             bundle_recipe: release-bundle-windows
             artifact_name: release-windows-cpu
           - name: CUDA
+            backend: cuda
             build_recipe: release-build-cuda-windows
             bundle_recipe: release-bundle-cuda-windows
             artifact_name: release-windows-cuda
           - name: ROCm
+            backend: rocm
             build_recipe: release-build-amd-windows
             bundle_recipe: release-bundle-amd-windows
             artifact_name: release-windows-rocm
           - name: Vulkan
+            backend: vulkan
             build_recipe: release-build-vulkan-windows
             bundle_recipe: release-bundle-vulkan-windows
             artifact_name: release-windows-vulkan
@@ -283,12 +287,20 @@ jobs:
           workspaces: |
             . -> target
 
+      - name: Cache Windows SDK installers
+        if: matrix.backend != 'cpu'
+        uses: actions/cache@v5
+        with:
+          path: ~\sdk-installer-cache\${{ matrix.backend }}
+          key: windows-sdk-installers-${{ matrix.backend }}-${{ env.ROCM_HIP_SDK_FILENAME }}-${{ hashFiles('scripts/install-windows-sdk.ps1') }}
+
       - name: Install backend SDK
         shell: pwsh
         run: |
           .\scripts\install-windows-sdk.ps1 `
-            -Backend '${{ matrix.name }}'.ToLowerInvariant() `
-            -RocmHipSdkFilename $env:ROCM_HIP_SDK_FILENAME
+            -Backend '${{ matrix.backend }}' `
+            -RocmHipSdkFilename $env:ROCM_HIP_SDK_FILENAME `
+            -InstallerCacheDir (Join-Path $env:USERPROFILE 'sdk-installer-cache\${{ matrix.backend }}')
 
       - name: Build Windows release bundle
         shell: pwsh

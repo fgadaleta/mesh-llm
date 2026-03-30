@@ -2,7 +2,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Backend,
 
-    [string]$RocmHipSdkFilename = 'AMD-Software-PRO-Edition-25.Q3-WinSvr2022-For-HIP.exe'
+    [string]$RocmHipSdkFilename = 'AMD-Software-PRO-Edition-25.Q3-WinSvr2022-For-HIP.exe',
+
+    [string]$InstallerCacheDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -131,12 +133,24 @@ function Test-ExeHeader([string]$Path) {
 
 $Backend = Normalize-RecipeArgument $Backend @('backend')
 $RocmHipSdkFilename = Normalize-RecipeArgument $RocmHipSdkFilename @('rocm_hip_sdk_filename', 'rocmhipsdkfilename')
+$InstallerCacheDir = Normalize-RecipeArgument $InstallerCacheDir @('installer_cache_dir', 'installercachedir', 'cache_dir', 'cachedir')
+
+if (-not $InstallerCacheDir) {
+    $InstallerCacheDir = Join-Path $env:RUNNER_TEMP 'mesh-sdk-cache'
+} elseif (-not [System.IO.Path]::IsPathRooted($InstallerCacheDir)) {
+    $InstallerCacheDir = Join-Path (Get-Location) $InstallerCacheDir
+}
+
+New-Item -ItemType Directory -Path $InstallerCacheDir -Force | Out-Null
 
 switch ($Backend.ToLowerInvariant()) {
     'cpu' {
     }
     'cuda' {
-        Invoke-NativeCommand 'choco' @('install', 'cuda', '-y', '--no-progress')
+        $cudaCacheDir = Join-Path $InstallerCacheDir 'cuda'
+        New-Item -ItemType Directory -Path $cudaCacheDir -Force | Out-Null
+
+        Invoke-NativeCommand 'choco' @('install', 'cuda', '-y', '--no-progress', '--cache-location', $cudaCacheDir)
 
         $cudaRoot = $env:CUDA_PATH
         if (-not $cudaRoot -or -not (Test-Path $cudaRoot)) {
@@ -159,17 +173,28 @@ switch ($Backend.ToLowerInvariant()) {
             'AMD-Software-PRO-Edition-24.Q3-WinSvr2022-For-HIP.exe'
         ) | Where-Object { $_ } | Select-Object -Unique
 
-        $installer = Join-Path $env:RUNNER_TEMP 'hip-sdk-installer.exe'
+        $rocmCacheDir = Join-Path $InstallerCacheDir 'rocm'
+        New-Item -ItemType Directory -Path $rocmCacheDir -Force | Out-Null
+
+        $installer = $null
         $downloadErrors = @()
 
         foreach ($filename in $candidateFilenames) {
+            $cachedInstaller = Join-Path $rocmCacheDir $filename
+            if (Test-ExeHeader $cachedInstaller) {
+                Write-Host "Using cached HIP SDK installer $filename"
+                $installer = $cachedInstaller
+                break
+            }
+
             $url = "https://download.amd.com/developer/eula/rocm-hub/$filename"
             Write-Host "Trying HIP SDK download: $url"
 
             try {
-                Invoke-WebRequest -Uri $url -OutFile $installer
-                if (Test-ExeHeader $installer) {
+                Invoke-WebRequest -Uri $url -OutFile $cachedInstaller
+                if (Test-ExeHeader $cachedInstaller) {
                     Write-Host "Using HIP SDK installer $filename"
+                    $installer = $cachedInstaller
                     break
                 }
 
@@ -178,10 +203,10 @@ switch ($Backend.ToLowerInvariant()) {
                 $downloadErrors += "Failed to download ${filename}: $($_.Exception.Message)"
             }
 
-            Remove-Item -Path $installer -ErrorAction SilentlyContinue
+            Remove-Item -Path $cachedInstaller -ErrorAction SilentlyContinue
         }
 
-        if (-not (Test-ExeHeader $installer)) {
+        if (-not $installer -or -not (Test-ExeHeader $installer)) {
             $details = $downloadErrors -join "`n"
             throw "Unable to download a Windows HIP SDK installer.`n$details"
         }
@@ -204,7 +229,10 @@ switch ($Backend.ToLowerInvariant()) {
         Set-GitHubEnv 'HIP_PATH' $rocmRoot
     }
     'vulkan' {
-        Invoke-NativeCommand 'choco' @('install', 'vulkan-sdk', '-y', '--no-progress')
+        $vulkanCacheDir = Join-Path $InstallerCacheDir 'vulkan'
+        New-Item -ItemType Directory -Path $vulkanCacheDir -Force | Out-Null
+
+        Invoke-NativeCommand 'choco' @('install', 'vulkan-sdk', '-y', '--no-progress', '--cache-location', $vulkanCacheDir)
 
         $sdk = Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue |
             Sort-Object Name -Descending |

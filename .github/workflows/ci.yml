@@ -430,12 +430,20 @@ jobs:
           workspaces: |
             . -> target
 
+      - name: Cache Windows SDK installers
+        if: matrix.backend != 'cpu'
+        uses: actions/cache@v5
+        with:
+          path: ~\sdk-installer-cache\${{ matrix.backend }}
+          key: windows-sdk-installers-${{ matrix.backend }}-${{ env.ROCM_HIP_SDK_FILENAME }}-${{ hashFiles('scripts/install-windows-sdk.ps1') }}
+
       - name: Install backend SDK
         shell: pwsh
         run: |
           .\scripts\install-windows-sdk.ps1 `
             -Backend '${{ matrix.backend }}' `
-            -RocmHipSdkFilename $env:ROCM_HIP_SDK_FILENAME
+            -RocmHipSdkFilename $env:ROCM_HIP_SDK_FILENAME `
+            -InstallerCacheDir (Join-Path $env:USERPROFILE 'sdk-installer-cache\${{ matrix.backend }}')
 
       - name: Build Windows backend
         shell: pwsh
