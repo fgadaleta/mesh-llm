@@ -3107,6 +3107,7 @@ mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::path::PathBuf;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, oneshot, watch};
@@ -3151,6 +3152,48 @@ mod tests {
                 response
             );
             stream.write_all(resp.as_bytes()).await.unwrap();
+            let _ = stream.shutdown().await;
+        });
+        (port, request_rx, handle)
+    }
+
+    async fn spawn_streaming_upstream(
+        content_type: &str,
+        chunks: Vec<(Duration, Vec<u8>)>,
+    ) -> (u16, oneshot::Receiver<Vec<u8>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let content_type = content_type.to_string();
+        let (request_tx, request_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let raw = read_raw_http_request(&mut stream).await;
+            let _ = request_tx.send(raw);
+
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+
+            for (delay, chunk) in chunks {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let chunk_header = format!("{:x}\r\n", chunk.len());
+                if stream.write_all(chunk_header.as_bytes()).await.is_err() {
+                    return;
+                }
+                if stream.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                if stream.write_all(b"\r\n").await.is_err() {
+                    return;
+                }
+            }
+
+            let _ = stream.write_all(b"0\r\n\r\n").await;
             let _ = stream.shutdown().await;
         });
         (port, request_rx, handle)
@@ -3252,6 +3295,38 @@ mod tests {
         }
         out.extend_from_slice(b"0\r\n\r\n");
         out
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    async fn read_until_contains(
+        stream: &mut TcpStream,
+        needle: &[u8],
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut response = Vec::new();
+        while !contains_bytes(&response, needle) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for {:?} in response: {}",
+                String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(&response)
+            );
+            let mut chunk = [0u8; 8192];
+            let n = tokio::time::timeout(remaining, stream.read(&mut chunk))
+                .await
+                .expect("timed out waiting for response bytes")
+                .unwrap();
+            assert!(n > 0, "unexpected EOF while waiting for response bytes");
+            response.extend_from_slice(&chunk[..n]);
+        }
+        response
     }
 
     async fn send_request_and_read_response(addr: SocketAddr, parts: Vec<Vec<u8>>) -> String {
@@ -3420,6 +3495,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_api_proxy_integration_streaming_response_arrives_incrementally() {
+        let chunks = vec![
+            (Duration::ZERO, br#"data: {"delta":"one"}\n\n"#.to_vec()),
+            (
+                Duration::from_millis(150),
+                br#"data: {"delta":"two"}\n\n"#.to_vec(),
+            ),
+        ];
+        let (upstream_port, upstream_rx, upstream_handle) =
+            spawn_streaming_upstream("text/event-stream", chunks).await;
+        let (proxy_addr, proxy_handle) =
+            spawn_api_proxy_test_harness(local_targets(&[("test", upstream_port)])).await;
+
+        let body = json!({
+            "model": "test",
+            "stream": true,
+            "messages": [{"role": "user", "content": "stream directly"}],
+        })
+        .to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let first = read_until_contains(
+            &mut stream,
+            br#"data: {"delta":"one"}\n\n"#,
+            Duration::from_secs(2),
+        )
+        .await;
+        let first_text = String::from_utf8_lossy(&first);
+        assert!(first_text.contains("HTTP/1.1 200 OK"));
+        assert!(first_text.contains("Content-Type: text/event-stream"));
+        assert!(first_text.contains(r#"data: {"delta":"one"}\n\n"#));
+        assert!(tokio::time::timeout(Duration::from_millis(40), async {
+            let mut probe = [0u8; 32];
+            stream.read(&mut probe).await
+        })
+        .await
+        .is_err());
+
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await.unwrap();
+        let mut full = first;
+        full.extend_from_slice(&rest);
+        let full_text = String::from_utf8(full).unwrap();
+        assert!(full_text.contains(r#"data: {"delta":"two"}\n\n"#));
+        assert!(full_text.ends_with("0\r\n\r\n"));
+
+        let raw = String::from_utf8(upstream_rx.await.unwrap()).unwrap();
+        assert!(raw.contains("\"stream\":true"));
+        assert!(raw.contains("Connection: close"));
+
+        proxy_handle.abort();
+        let _ = upstream_handle.await;
+    }
+
+    #[tokio::test]
     async fn test_api_proxy_integration_pipeline_fallback_uses_direct_proxy() {
         let strong_model = "Qwen2.5-Coder-32B-Instruct-Q4_K_M";
         let planner_model = "Qwen2.5-3B-Instruct-Q4_K_M";
@@ -3477,6 +3615,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_api_proxy_integration_pipeline_streaming_response_arrives_incrementally() {
+        let strong_model = "Qwen2.5-Coder-32B-Instruct-Q4_K_M";
+        let planner_model = "Qwen2.5-3B-Instruct-Q4_K_M";
+        let body = json!({
+            "model": "auto",
+            "stream": true,
+            "messages": [
+                {"role": "user", "content": "Review this codebase, design a system-level fix for the HTTP proxy, debug the fragmented request bug, implement the code changes, update the tests, and explain the trade-offs around buffering, chunked transfer encoding, and connection reuse."}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "bash", "parameters": {"type": "object", "properties": {}}}}
+            ]
+        });
+        let classification = router::classify(&body);
+        assert!(pipeline::should_pipeline(&classification));
+
+        let planner_response = format!(
+            "{{\"model\":\"{planner_model}\",\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"- inspect proxy\\n- preserve streaming\"}}}}]}}"
+        );
+        let (planner_port, planner_rx, planner_handle) =
+            spawn_capturing_upstream(&planner_response).await;
+        let (strong_port, strong_rx, strong_handle) = spawn_streaming_upstream(
+            "text/event-stream",
+            vec![
+                (
+                    Duration::ZERO,
+                    br#"data: {"delta":"pipeline-one"}\n\n"#.to_vec(),
+                ),
+                (
+                    Duration::from_millis(150),
+                    br#"data: {"delta":"pipeline-two"}\n\n"#.to_vec(),
+                ),
+            ],
+        )
+        .await;
+
+        let (proxy_addr, proxy_handle) = spawn_api_proxy_test_harness(local_targets(&[
+            (strong_model, strong_port),
+            (planner_model, planner_port),
+        ]))
+        .await;
+
+        let request_body = body.to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            request_body.len(),
+            request_body
+        );
+
+        let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let first = read_until_contains(
+            &mut stream,
+            br#"data: {"delta":"pipeline-one"}\n\n"#,
+            Duration::from_secs(2),
+        )
+        .await;
+        let first_text = String::from_utf8_lossy(&first);
+        assert!(first_text.contains("HTTP/1.1 200 OK"));
+        assert!(first_text.contains("Transfer-Encoding: chunked"));
+        assert!(first_text.contains(r#"data: {"delta":"pipeline-one"}\n\n"#));
+        assert!(tokio::time::timeout(Duration::from_millis(40), async {
+            let mut probe = [0u8; 32];
+            stream.read(&mut probe).await
+        })
+        .await
+        .is_err());
+
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await.unwrap();
+        let mut full = first;
+        full.extend_from_slice(&rest);
+        let full_text = String::from_utf8(full).unwrap();
+        assert!(full_text.contains(r#"data: {"delta":"pipeline-two"}\n\n"#));
+        assert!(full_text.ends_with("0\r\n\r\n"));
+
+        let planner_raw = String::from_utf8(planner_rx.await.unwrap()).unwrap();
+        assert!(planner_raw.contains(&format!("\"model\":\"{planner_model}\"")));
+        assert!(planner_raw.contains("\"stream\":false"));
+
+        let strong_raw = String::from_utf8(strong_rx.await.unwrap()).unwrap();
+        assert!(strong_raw.contains("[Task Plan from"));
+        assert!(strong_raw.contains("- inspect proxy"));
+        assert!(strong_raw.contains("- preserve streaming"));
+
+        proxy_handle.abort();
+        let _ = planner_handle.await;
+        let _ = strong_handle.await;
+    }
+
+    #[tokio::test]
     async fn test_api_proxy_integration_pipelined_follow_up_is_not_forwarded() {
         let (upstream_port, upstream_rx, upstream_handle) =
             spawn_capturing_upstream(r#"{"ok":true}"#).await;
@@ -3508,5 +3739,56 @@ mod tests {
 
         proxy_handle.abort();
         let _ = upstream_handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_api_proxy_integration_streaming_client_disconnect_does_not_hang() {
+        let (upstream_port, upstream_rx, upstream_handle) = spawn_streaming_upstream(
+            "text/event-stream",
+            vec![
+                (Duration::ZERO, br#"data: {"delta":"hello"}\n\n"#.to_vec()),
+                (
+                    Duration::from_millis(150),
+                    br#"data: {"delta":"after-disconnect"}\n\n"#.to_vec(),
+                ),
+            ],
+        )
+        .await;
+        let (proxy_addr, proxy_handle) =
+            spawn_api_proxy_test_harness(local_targets(&[("test", upstream_port)])).await;
+
+        let body = json!({
+            "model": "test",
+            "stream": true,
+            "messages": [{"role": "user", "content": "disconnect me"}],
+        })
+        .to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let first = read_until_contains(
+            &mut stream,
+            br#"data: {"delta":"hello"}\n\n"#,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&first).contains(r#"data: {"delta":"hello"}\n\n"#));
+        drop(stream);
+
+        let raw = String::from_utf8(upstream_rx.await.unwrap()).unwrap();
+        assert!(raw.contains("\"disconnect me\""));
+        tokio::time::timeout(Duration::from_secs(1), upstream_handle)
+            .await
+            .expect("streaming upstream hung after client disconnect")
+            .unwrap();
+
+        proxy_handle.abort();
     }
 }

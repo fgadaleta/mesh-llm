@@ -512,4 +512,39 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
         );
     }
+
+    #[tokio::test]
+    async fn relay_response_allows_slow_follow_up_chunks_after_first_byte() {
+        let (mut upstream_write, upstream_read) = tokio::io::duplex(1024);
+        let (downstream_write, mut downstream_read) = tokio::io::duplex(1024);
+
+        let writer = tokio::spawn(async move {
+            upstream_write
+                .write_all(b"HTTP/1.1 200 OK\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            upstream_write
+                .write_all(b"Content-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+        });
+
+        relay_response_with_first_byte_timeout(
+            upstream_read,
+            downstream_write,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+
+        writer.await.unwrap();
+
+        let mut forwarded = Vec::new();
+        downstream_read.read_to_end(&mut forwarded).await.unwrap();
+        assert_eq!(
+            forwarded,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+        );
+    }
 }

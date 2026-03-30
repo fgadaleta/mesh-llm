@@ -1063,8 +1063,11 @@ async fn respond_bytes_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mesh_llm_plugin::MeshVisibility;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc;
 
     #[test]
     fn test_build_gpus_both_none() {
@@ -1179,6 +1182,81 @@ mod tests {
         assert_eq!(http_body_text(raw), "{\"a\":1}");
     }
 
+    async fn build_test_mesh_api() -> MeshApi {
+        let node = mesh::Node::new_for_tests(mesh::NodeRole::Worker)
+            .await
+            .unwrap();
+        let resolved_plugins = plugin::ResolvedPlugins {
+            externals: vec![],
+            inactive: vec![],
+        };
+        let (mesh_tx, _mesh_rx) = mpsc::channel(1);
+        let plugin_manager = plugin::PluginManager::start(
+            &resolved_plugins,
+            plugin::PluginHostMode {
+                mesh_visibility: MeshVisibility::Private,
+            },
+            mesh_tx,
+        )
+        .await
+        .unwrap();
+        MeshApi::new(
+            node,
+            "test-model".to_string(),
+            3131,
+            0,
+            plugin_manager,
+            affinity::AffinityRouter::default(),
+        )
+    }
+
+    async fn spawn_management_test_server(
+        state: MeshApi,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_request(stream, &state).await
+        });
+        (addr, handle)
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    async fn read_until_contains(
+        stream: &mut TcpStream,
+        needle: &[u8],
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut response = Vec::new();
+        while !contains_bytes(&response, needle) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for {:?} in response: {}",
+                String::from_utf8_lossy(needle),
+                String::from_utf8_lossy(&response)
+            );
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout(remaining, stream.read(&mut chunk))
+                .await
+                .expect("timed out waiting for response bytes")
+                .unwrap();
+            assert!(n > 0, "unexpected EOF while waiting for response bytes");
+            response.extend_from_slice(&chunk[..n]);
+        }
+        response
+    }
+
     #[tokio::test]
     async fn test_management_request_parser_handles_fragmented_post_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1215,5 +1293,33 @@ mod tests {
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/api/blackboard/post");
         assert_eq!(http_body_text(&request.raw), "{\"text\":\"fragmented\"}");
+    }
+
+    #[tokio::test]
+    async fn test_api_events_sends_initial_payload_and_updates() {
+        let state = build_test_mesh_api().await;
+        let (addr, handle) = spawn_management_test_server(state.clone()).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /api/events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        let initial = read_until_contains(&mut stream, b"data: {", Duration::from_secs(2)).await;
+        let initial_text = String::from_utf8_lossy(&initial);
+        assert!(initial_text.contains("HTTP/1.1 200 OK"));
+        assert!(initial_text.contains("Content-Type: text/event-stream"));
+        assert!(initial_text.contains("\"llama_ready\":false"));
+
+        state.update(true, true).await;
+        let updated =
+            read_until_contains(&mut stream, b"\"llama_ready\":true", Duration::from_secs(2)).await;
+        let updated_text = String::from_utf8_lossy(&updated);
+        assert!(updated_text.contains("\"llama_ready\":true"));
+        assert!(updated_text.contains("\"is_host\":true"));
+
+        drop(stream);
+        handle.abort();
     }
 }
