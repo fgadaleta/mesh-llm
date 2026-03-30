@@ -94,6 +94,14 @@ function Copy-RuntimeLibs {
     }
 }
 
+function Copy-BenchmarkBinaries {
+    param([string]$BundleDir)
+
+    Get-ChildItem -Path $releaseBinDir -Filter "membench-fingerprint*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item $_.FullName -Destination (Join-Path $BundleDir $_.Name) -Force
+    }
+}
+
 function New-ZipArchive {
     param(
         [string]$SourceDir,
@@ -165,6 +173,7 @@ try {
     Copy-Item $rpcBinary -Destination (Join-Path $bundleDir (Get-BundleBinaryName "rpc-server" $binaryFlavor)) -Force
     Copy-Item $llamaBinary -Destination (Join-Path $bundleDir (Get-BundleBinaryName "llama-server" $binaryFlavor)) -Force
     Copy-RuntimeLibs $bundleDir
+    Copy-BenchmarkBinaries $bundleDir
 
     $versionedPath = Join-Path $resolvedOutputDir $versionedAsset
     $stablePath = Join-Path $resolvedOutputDir $stableAsset

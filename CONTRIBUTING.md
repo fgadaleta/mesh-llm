@@ -7,7 +7,7 @@ This file covers local build and development workflows for this repository.
 - `just`
 - `cmake`
 - Rust toolchain (`cargo`)
-- Node.js + npm (for UI development)
+- Node.js 24 + npm (for UI development)
 
 **macOS**: Apple Silicon. Metal is used automatically.
 
@@ -140,3 +140,39 @@ just stop             # stop mesh/rpc/llama processes
 just test             # quick test against :9337
 just --list           # list all recipes
 ```
+
+## Benchmark Binaries
+
+Memory bandwidth benchmark source files live in `benchmarks/`. These are optional — they are **not** compiled by `just build`. Each target platform requires its own toolchain.
+
+### Building
+
+```bash
+just benchmark-build-apple    # macOS Apple Silicon — requires swiftc (ships with Xcode)
+just benchmark-build-cuda     # NVIDIA GPU — requires CUDA toolkit (nvcc)
+just benchmark-build-hip      # AMD GPU — requires ROCm (hipcc)
+just benchmark-build-intel    # Intel Arc GPU — requires Intel oneAPI (icpx) — UNVALIDATED
+```
+
+On Windows, the same `just benchmark-build-cuda`, `just benchmark-build-hip`, and `just benchmark-build-intel` recipes produce `.exe` binaries next to `mesh-llm.exe`.
+
+> **AMD note:** The AMD benchmark (`benchmarks/membench-fingerprint.hip`) has not been tested on real AMD hardware. The recipe is provided for reference only.
+
+> **Intel Arc note:** The Intel Arc benchmark (`benchmarks/membench-fingerprint-intel.cpp`) has not been tested on real Intel Arc hardware. The recipe is provided for reference only.
+
+### Output location
+
+All recipes output to `mesh-llm/target/release/`, the same directory as the `mesh-llm` binary. The `detect_bin_dir()` function in `mesh-llm` probes that directory at runtime, so benchmark binaries are discovered automatically.
+
+### Including in release bundles (Apple Silicon)
+
+The `just bundle` recipe automatically includes `membench-fingerprint` if it has been built:
+
+```bash
+just benchmark-build-apple && just bundle
+```
+
+If the binary is not present, `just bundle` prints a note and continues without it — the bundle is still valid.
+
+CUDA, HIP, and Intel binaries are **not** included in the Unix tarball bundle; they must be compiled on the target platform.
+On Windows release packaging, any `membench-fingerprint*.exe` binaries present in `mesh-llm/target/release/` are included automatically in the generated `.zip`.

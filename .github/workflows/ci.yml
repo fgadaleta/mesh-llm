@@ -15,12 +15,12 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # ── UI ──
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: mesh-llm/ui/package-lock.json
 
@@ -66,7 +66,7 @@ jobs:
       # ── Download model ──
       - name: Cache model
         id: cache-model
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.models/${{ env.MODEL_FILE }}
           key: model-${{ env.MODEL_FILE }}
@@ -94,12 +94,12 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # ── UI ──
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: mesh-llm/ui/package-lock.json
 
@@ -144,7 +144,7 @@ jobs:
       # ── Download model ──
       - name: Cache model
         id: cache-model
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.models/${{ env.MODEL_FILE }}
           key: model-${{ env.MODEL_FILE }}
@@ -191,13 +191,13 @@ jobs:
             python3
           rm -rf /var/lib/apt/lists/*
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: taiki-e/install-action@just
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: mesh-llm/ui/package-lock.json
 
@@ -248,13 +248,13 @@ jobs:
             python3
           rm -rf /var/lib/apt/lists/*
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: taiki-e/install-action@just
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: mesh-llm/ui/package-lock.json
 
@@ -305,13 +305,13 @@ jobs:
             python3
           sudo rm -rf /var/lib/apt/lists/*
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: taiki-e/install-action@just
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: mesh-llm/ui/package-lock.json
 
@@ -359,14 +359,14 @@ jobs:
             backend: vulkan
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: taiki-e/install-action@just
 
       # ── UI ──
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: mesh-llm/ui/package-lock.json
 
@@ -400,7 +400,7 @@ jobs:
       - name: Cache model
         if: matrix.backend == 'cpu'
         id: cache-model-windows
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~\.models\${{ env.MODEL_FILE }}
           key: windows-model-${{ env.MODEL_FILE }}

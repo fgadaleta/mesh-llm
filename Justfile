@@ -202,14 +202,23 @@ bundle output="/tmp/mesh-bundle.tar.gz":
     cp {{ mesh_bin }} "$BUNDLE/"
     cp {{ build_dir }}/bin/rpc-server "$BUNDLE/$rpc_name"
     cp {{ build_dir }}/bin/llama-server "$BUNDLE/$llama_name"
+    cp {{ build_dir }}/bin/llama-moe-split "$BUNDLE/"
     for lib in {{ build_dir }}/bin/*.dylib; do
         cp "$lib" "$BUNDLE/" 2>/dev/null || true
     done
     # Fix rpaths for portability
-    for bin in "$BUNDLE/mesh-llm" "$BUNDLE/$rpc_name" "$BUNDLE/$llama_name"; do
+    for bin in "$BUNDLE/mesh-llm" "$BUNDLE/$rpc_name" "$BUNDLE/$llama_name" "$BUNDLE/llama-moe-split"; do
         [ -f "$bin" ] || continue
         install_name_tool -add_rpath @executable_path/ "$bin" 2>/dev/null || true
     done
+    # Include Apple Silicon benchmark binary if built
+    BENCH="{{ mesh_dir }}/target/release/membench-fingerprint"
+    if [ -f "$BENCH" ]; then
+        cp "$BENCH" "$BUNDLE/"
+        echo "Included: membench-fingerprint"
+    else
+        echo "Note: membench-fingerprint not found — run 'just benchmark-build-apple' to include it"
+    fi
     tar czf {{ output }} -C "$DIR" mesh-bundle/
     rm -rf "$DIR"
     echo "Bundle: {{ output }} ($(du -sh {{ output }} | cut -f1))"
@@ -244,6 +253,43 @@ release-bundle-vulkan version output="dist":
 release-bundle-vulkan-windows version output="dist":
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}" -Flavor vulkan
 
+# ── Benchmark Binaries ────────────────────────────────────────────────────────
+
+# Build Apple Silicon memory bandwidth benchmark (macOS only)
+[macos]
+benchmark-build-apple:
+    swiftc -O benchmarks/membench-fingerprint.swift -o {{mesh_dir}}/target/release/membench-fingerprint
+    echo "Built: {{mesh_dir}}/target/release/membench-fingerprint"
+
+# Build NVIDIA CUDA memory bandwidth benchmark (requires CUDA toolkit)
+benchmark-build-cuda:
+    nvcc -O3 -o {{mesh_dir}}/target/release/membench-fingerprint-cuda benchmarks/membench-fingerprint.cu
+    echo "Built: {{mesh_dir}}/target/release/membench-fingerprint-cuda"
+
+[windows]
+benchmark-build-cuda:
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "nvcc -O3 -o '{{mesh_dir}}/target/release/membench-fingerprint-cuda.exe' 'benchmarks/membench-fingerprint.cu'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: {{mesh_dir}}/target/release/membench-fingerprint-cuda.exe'"
+
+# Build AMD ROCm/HIP memory bandwidth benchmark (requires ROCm)
+benchmark-build-hip:
+    hipcc -O3 -std=c++17 -o {{mesh_dir}}/target/release/membench-fingerprint-hip benchmarks/membench-fingerprint.hip
+    echo "Built: {{mesh_dir}}/target/release/membench-fingerprint-hip"
+
+[windows]
+benchmark-build-hip:
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "hipcc -O3 -std=c++17 -o '{{mesh_dir}}/target/release/membench-fingerprint-hip.exe' 'benchmarks/membench-fingerprint.hip'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: {{mesh_dir}}/target/release/membench-fingerprint-hip.exe'"
+
+# Build Intel Arc SYCL memory bandwidth benchmark (requires Intel oneAPI) — UNVALIDATED
+benchmark-build-intel:
+    @echo "WARNING: Intel Arc benchmark is unvalidated — no Intel Arc hardware has been tested"
+    icpx -O3 -fsycl -o {{mesh_dir}}/target/release/membench-fingerprint-intel benchmarks/membench-fingerprint-intel.cpp
+    echo "Built: {{mesh_dir}}/target/release/membench-fingerprint-intel"
+
+[windows]
+benchmark-build-intel:
+    @echo "WARNING: Intel Arc benchmark is unvalidated — no Intel Arc hardware has been tested"
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "icpx -O3 -fsycl -o '{{mesh_dir}}/target/release/membench-fingerprint-intel.exe' 'benchmarks/membench-fingerprint-intel.cpp'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: {{mesh_dir}}/target/release/membench-fingerprint-intel.exe'"
+
 # Run the UI with Vite HMR and proxy /api to mesh-llm (default: http://127.0.0.1:3131)
 ui-dev api="http://127.0.0.1:3131" port="5173":
     #!/usr/bin/env bash
@@ -276,6 +322,10 @@ test port="9337":
         -H 'Content-Type: application/json' \
         -d '{"model":"test","messages":[{"role":"user","content":"Hello! Write a haiku about distributed computing."}],"max_tokens":50}' \
         | python3 -c "import sys,json; d=json.load(sys.stdin); t=d['timings']; print(d['choices'][0]['message'].get('content','')[:200]); print(f\"  prompt: {t['prompt_per_second']:.1f} tok/s  gen: {t['predicted_per_second']:.1f} tok/s ({t['predicted_n']} tok)\")"
+
+# Benchmark sticky-only vs prefix-only affinity on a 3-node local mesh.
+bench-prefix-affinity:
+    @scripts/benchmark-prefix-affinity.sh
 
 # Show the diff from upstream llama.cpp
 diff:

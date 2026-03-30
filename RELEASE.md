@@ -43,7 +43,7 @@ Each should only show the binary name — no `/opt/homebrew/` paths.
 just bundle
 ```
 
-Creates `/tmp/mesh-bundle.tar.gz` containing `mesh-llm` plus flavor-specific llama.cpp binaries.
+Creates `/tmp/mesh-bundle.tar.gz` containing `mesh-llm`, flavor-specific llama.cpp runtime binaries, and `llama-moe-split` for MoE shard generation.
 
 Bundle naming now follows the same convention everywhere:
 
@@ -63,6 +63,7 @@ just release-bundle-vulkan-windows v0.X.0
 ```
 
 Those commands emit `.zip` assets in `dist/` with `mesh-llm.exe`, plus flavor-specific `rpc-server-<flavor>.exe` and `llama-server-<flavor>.exe`.
+If optional Windows benchmark binaries such as `membench-fingerprint-cuda.exe` or `membench-fingerprint-hip.exe` are present in `mesh-llm/target/release/`, the PowerShell packager also includes them in the `.zip`.
 
 ### 4. Smoke test the bundle
 
@@ -129,6 +130,6 @@ After the workflow finishes, verify:
 - The Windows release workflows are compile-and-package only. They do not run inference tests against real GPUs during the workflow.
 - `codesign` and `xattr` may be needed on the receiving machine if macOS Gatekeeper blocks unsigned binaries:
   ```bash
-  codesign -s - /usr/local/bin/mesh-llm /usr/local/bin/rpc-server /usr/local/bin/llama-server
-  xattr -cr /usr/local/bin/mesh-llm /usr/local/bin/rpc-server /usr/local/bin/llama-server
+  codesign -s - /usr/local/bin/mesh-llm /usr/local/bin/rpc-server /usr/local/bin/llama-server /usr/local/bin/llama-moe-split
+  xattr -cr /usr/local/bin/mesh-llm /usr/local/bin/rpc-server /usr/local/bin/llama-server /usr/local/bin/llama-moe-split
   ```
