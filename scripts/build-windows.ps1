@@ -11,6 +11,8 @@ $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir ".."))
 $llamaDir = Join-Path $repoRoot "llama.cpp"
 $buildDir = Join-Path $llamaDir "build"
 $meshUiDir = Join-Path $repoRoot "mesh-llm\ui"
+$compilerLauncherArgs = @()
+$compilerCacheBin = $null
 
 function Add-ToPath {
     param([string]$Directory)
@@ -49,6 +51,23 @@ function Resolve-CommandPath {
         return $command.Source
     }
     return $null
+}
+
+function Configure-CompilerCache {
+    $script:compilerCacheBin = Resolve-CommandPath "sccache"
+    if (-not $script:compilerCacheBin) {
+        $script:compilerCacheBin = Resolve-CommandPath "ccache"
+    }
+    if (-not $script:compilerCacheBin) {
+        $script:compilerLauncherArgs = @()
+        return
+    }
+
+    Write-Host "Using compiler cache: $script:compilerCacheBin"
+    $script:compilerLauncherArgs = @(
+        "-DCMAKE_C_COMPILER_LAUNCHER=$script:compilerCacheBin",
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=$script:compilerCacheBin"
+    )
 }
 
 function Import-CmdEnvironment {
@@ -463,6 +482,7 @@ $backendName = Resolve-Backend $Backend
 Write-Host "Using Windows backend: $backendName"
 
 Ensure-MsvcToolchain
+Configure-CompilerCache
 
 switch ($backendName) {
     "cuda" {
@@ -530,12 +550,18 @@ Invoke-InRepo {
     switch ($backendName) {
         "cuda" {
             $cmakeArgs += "-DGGML_CUDA=ON"
+            if ($compilerCacheBin) {
+                $cmakeArgs += "-DCMAKE_CUDA_COMPILER_LAUNCHER=$compilerCacheBin"
+            }
             if ($CudaArch) {
                 $cmakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch"
             }
         }
         "rocm" {
             $cmakeArgs += "-DGGML_HIP=ON"
+            if ($compilerCacheBin) {
+                $cmakeArgs += "-DCMAKE_HIP_COMPILER_LAUNCHER=$compilerCacheBin"
+            }
             if ($env:HIPCC) {
                 $cmakeArgs += "-DCMAKE_C_COMPILER=$env:HIPCC"
             }
@@ -558,6 +584,8 @@ Invoke-InRepo {
         "cpu" {
         }
     }
+
+    $cmakeArgs += $compilerLauncherArgs
 
     $parallelJobs = [Environment]::ProcessorCount
     Invoke-NativeCommand "cmake" $cmakeArgs
