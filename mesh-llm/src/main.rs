@@ -212,7 +212,7 @@ enum Command {
         #[arg(long)]
         relay: Vec<String>,
     },
-    /// Rotate the Nostr identity key.
+    /// Rotate all identity keys (node + Nostr).
     #[command(hide = true)]
     RotateKey,
     /// Launch Goose with mesh-llm as the inference provider.

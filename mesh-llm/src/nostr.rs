@@ -124,18 +124,31 @@ pub fn load_or_create_keys() -> Result<Keys> {
     }
 }
 
-/// Delete the Nostr key (forces a new identity on next publish).
+/// Delete the Nostr key and node identity key.  After rotation the
+/// node gets a fresh identity on next start.
 pub fn rotate_keys() -> Result<()> {
-    let path = nostr_key_path()?;
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-        eprintln!(
-            "🔑 Deleted {}. A new key will be generated on next --publish.",
-            path.display()
-        );
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let mesh_dir = home.join(".mesh-llm");
+
+    let nostr_path = nostr_key_path()?;
+    if nostr_path.exists() {
+        std::fs::remove_file(&nostr_path)?;
+        eprintln!("🔑 Deleted {}", nostr_path.display());
     } else {
-        eprintln!("No key to rotate (none exists yet).");
+        eprintln!("No Nostr key to rotate (none exists yet).");
     }
+
+    let node_key_path = mesh_dir.join("key");
+    if node_key_path.exists() {
+        std::fs::remove_file(&node_key_path)?;
+        eprintln!("🔑 Deleted {}", node_key_path.display());
+    } else {
+        eprintln!("No node key to rotate (none exists yet).");
+    }
+
+    eprintln!();
+    eprintln!("✅ Keys rotated. New identities will be generated on next start.");
     Ok(())
 }
 
