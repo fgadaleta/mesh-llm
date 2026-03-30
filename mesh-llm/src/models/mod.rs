@@ -30,6 +30,88 @@ pub struct RemoteAsset {
     pub url: &'static str,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelProvenance {
+    pub version: u32,
+    pub source: ProvenanceSource,
+    pub identity: ProvenanceIdentity,
+    #[serde(default)]
+    pub compatibility: ProvenanceCompatibility,
+    #[serde(default)]
+    pub local: ProvenanceLocal,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProvenanceSource {
+    pub provider: ProvenanceProvider,
+    pub repo: Option<String>,
+    pub revision: Option<String>,
+    pub file: Option<String>,
+    pub resolved_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceProvider {
+    HuggingFace,
+    DirectUrl,
+    Local,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProvenanceIdentity {
+    pub canonical_id: String,
+    pub display_name: String,
+    pub family: Option<String>,
+    pub architecture: Option<String>,
+    pub format: String,
+    pub quantization: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProvenanceCompatibility {
+    pub tokenizer_hash: Option<String>,
+    pub chat_template_hash: Option<String>,
+    pub base_model: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProvenanceLocal {
+    pub downloaded_at: Option<String>,
+    pub sha256: Option<String>,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProvenanceRepairReport {
+    pub entries: Vec<ProvenanceRepairEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ProvenanceRepairEntry {
+    pub path: PathBuf,
+    pub status: ProvenanceRepairStatus,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceRepairStatus {
+    Repaired,
+    SkippedExisting,
+    Ambiguous,
+    Unmatched,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProvenanceRepairSource {
+    HuggingFace,
+}
+
+const PROVENANCE_SIDECAR_SUFFIX: &str = ".mesh.json";
+const PROVENANCE_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct MoeConfig {
     pub n_expert: u32,
@@ -97,6 +179,8 @@ struct HuggingFaceRepoDetail {
     id: Option<String>,
     #[serde(default, rename = "modelId")]
     model_id: Option<String>,
+    #[serde(default)]
+    sha: Option<String>,
     #[serde(default)]
     siblings: Vec<HuggingFaceSibling>,
 }
@@ -181,6 +265,273 @@ pub fn primary_models_dir() -> PathBuf {
         .first()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn model_sidecar_path(path: &Path) -> PathBuf {
+    let filename = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "model".to_string());
+    path.with_file_name(format!("{filename}{PROVENANCE_SIDECAR_SUFFIX}"))
+}
+
+pub fn load_model_provenance(path: &Path) -> Option<ModelProvenance> {
+    let sidecar = model_sidecar_path(path);
+    let raw = std::fs::read_to_string(sidecar).ok()?;
+    let provenance: ModelProvenance = serde_json::from_str(&raw).ok()?;
+    if provenance.version == PROVENANCE_VERSION {
+        Some(provenance)
+    } else {
+        None
+    }
+}
+
+fn write_model_provenance(path: &Path, provenance: &ModelProvenance) -> Result<()> {
+    let sidecar = model_sidecar_path(path);
+    if let Some(parent) = sidecar.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Create provenance dir {}", parent.display()))?;
+    }
+    let tmp = sidecar.with_file_name(format!(
+        "{}.tmp-{}",
+        sidecar
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("model.mesh.json"),
+        std::process::id()
+    ));
+    let json = serde_json::to_string_pretty(provenance).context("Serialize model provenance")?;
+    std::fs::write(&tmp, json).with_context(|| format!("Write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &sidecar)
+        .with_context(|| format!("Move {} to {}", tmp.display(), sidecar.display()))?;
+    Ok(())
+}
+
+fn file_size_bytes(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|meta| meta.len())
+}
+
+fn now_timestamp_string() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn infer_format(path: &Path) -> String {
+    if path.is_dir() {
+        return "directory".to_string();
+    }
+    path.extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_lowercase())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn infer_quantization_hint(name: &str) -> Option<String> {
+    const TOKENS: &[&str] = &[
+        "Q2_K", "Q3_K_L", "Q3_K_M", "Q3_K_S", "Q4_0", "Q4_1", "Q4_K_M", "Q4_K_S", "Q5_0", "Q5_1",
+        "Q5_K_M", "Q5_K_S", "Q6_K", "Q8_0", "BF16", "F16", "F32", "IQ2_XXS", "IQ2_XS", "IQ2_S",
+        "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ4_XS", "IQ4_NL",
+    ];
+    let upper = name.to_ascii_uppercase();
+    TOKENS
+        .iter()
+        .find(|token| upper.contains(**token))
+        .map(|token| token.to_string())
+}
+
+fn infer_family_hint(name: &str) -> Option<String> {
+    let basename = Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name)
+        .trim_end_matches(".gguf");
+    let family = basename.split(['-', '_', ' ']).next().unwrap_or("").trim();
+    if family.is_empty() {
+        None
+    } else {
+        Some(family.to_lowercase())
+    }
+}
+
+fn display_name_for_path(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn build_identity(canonical_id: String, display_name: String, path: &Path) -> ProvenanceIdentity {
+    ProvenanceIdentity {
+        canonical_id,
+        display_name: display_name.clone(),
+        family: infer_family_hint(&display_name),
+        architecture: None,
+        format: infer_format(path),
+        quantization: infer_quantization_hint(&display_name),
+    }
+}
+
+fn build_huggingface_provenance(
+    path: &Path,
+    repo: &str,
+    revision: Option<&str>,
+    source_file: Option<&str>,
+    resolved_url: Option<String>,
+    display_name: String,
+) -> ModelProvenance {
+    let canonical = match source_file {
+        Some(source_file) => format!(
+            "huggingface:{}",
+            format_huggingface_exact_ref(repo, revision, source_file)
+        ),
+        None => match revision {
+            Some(revision) => format!("huggingface:{repo}@{revision}"),
+            None => format!("huggingface:{repo}"),
+        },
+    };
+    ModelProvenance {
+        version: PROVENANCE_VERSION,
+        source: ProvenanceSource {
+            provider: ProvenanceProvider::HuggingFace,
+            repo: Some(repo.to_string()),
+            revision: revision.map(str::to_string),
+            file: source_file.map(str::to_string),
+            resolved_url,
+        },
+        identity: build_identity(canonical, display_name, path),
+        compatibility: ProvenanceCompatibility::default(),
+        local: ProvenanceLocal {
+            downloaded_at: Some(now_timestamp_string()),
+            sha256: None,
+            size_bytes: file_size_bytes(path),
+        },
+    }
+}
+
+fn build_url_provenance(path: &Path, url: &str, display_name: String) -> ModelProvenance {
+    ModelProvenance {
+        version: PROVENANCE_VERSION,
+        source: ProvenanceSource {
+            provider: ProvenanceProvider::DirectUrl,
+            repo: None,
+            revision: None,
+            file: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string),
+            resolved_url: Some(url.to_string()),
+        },
+        identity: build_identity(format!("url:{url}"), display_name, path),
+        compatibility: ProvenanceCompatibility::default(),
+        local: ProvenanceLocal {
+            downloaded_at: Some(now_timestamp_string()),
+            sha256: None,
+            size_bytes: file_size_bytes(path),
+        },
+    }
+}
+
+async fn fetch_huggingface_repo_detail(repo: &str) -> Result<HuggingFaceRepoDetail> {
+    warn_if_missing_huggingface_token();
+    let client = http_client()?;
+    let mut request = client.get(format!("https://huggingface.co/api/models/{repo}"));
+    if let Some(token) = &runtime_config().huggingface_token {
+        request = request.bearer_auth(token);
+    }
+    request
+        .send()
+        .await
+        .with_context(|| format!("Fetch Hugging Face repo {repo}"))?
+        .error_for_status()
+        .with_context(|| format!("Hugging Face repo {repo} returned an error"))?
+        .json()
+        .await
+        .with_context(|| format!("Parse Hugging Face repo {repo}"))
+}
+
+async fn resolve_huggingface_revision(repo: &str, revision: Option<&str>) -> Option<String> {
+    match revision {
+        Some(revision) => Some(revision.to_string()),
+        None => fetch_huggingface_repo_detail(repo)
+            .await
+            .ok()
+            .and_then(|detail| detail.sha),
+    }
+}
+
+fn persist_huggingface_provenance(
+    path: &Path,
+    repo: &str,
+    revision: Option<&str>,
+    source_file: Option<&str>,
+    resolved_url: Option<String>,
+) -> Result<()> {
+    let provenance = build_huggingface_provenance(
+        path,
+        repo,
+        revision,
+        source_file,
+        resolved_url,
+        display_name_for_path(path),
+    );
+    write_model_provenance(path, &provenance)
+}
+
+fn persist_url_provenance(path: &Path, url: &str) -> Result<()> {
+    let provenance = build_url_provenance(path, url, display_name_for_path(path));
+    write_model_provenance(path, &provenance)
+}
+
+fn normalize_hf_repo(raw: &str) -> Option<String> {
+    let value = raw.trim().trim_end_matches('/');
+    if value.is_empty() || value == "." {
+        return None;
+    }
+    if value.starts_with('/') || value.starts_with('.') {
+        return None;
+    }
+
+    let parts: Vec<_> = value.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() == 2 {
+        return Some(format!("{}/{}", parts[0], parts[1]));
+    }
+
+    None
+}
+
+fn model_source_repo_from_config_path(path: &Path) -> Option<String> {
+    let config_path = path.join("config.json");
+    let text = std::fs::read_to_string(config_path).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let raw_name = config.get("_name_or_path")?.as_str()?.trim();
+    normalize_hf_repo(raw_name)
+}
+
+fn huggingface_source_identity_from_cache_path(path: &Path) -> Option<(String, Option<String>)> {
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        let name = dir.file_name()?.to_str()?;
+        if name == "snapshots" {
+            let revision = path
+                .strip_prefix(dir)
+                .ok()?
+                .components()
+                .next()
+                .and_then(|component| component.as_os_str().to_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let model_dir = dir.parent()?;
+            let model_dir_name = model_dir.file_name()?.to_str()?;
+            if let Some(repo) = model_dir_name.strip_prefix("models--") {
+                return Some((repo.replace("--", "/"), revision));
+            }
+        }
+        current = dir.parent();
+    }
+    None
 }
 
 pub fn parse_size_gb(s: &str) -> f64 {
@@ -343,10 +694,12 @@ pub async fn resolve_model_input(input: &Path) -> Result<PathBuf> {
         let filename = remote_filename(&text)?;
         let dest = primary_models_dir().join(filename);
         if existing_download(&dest).await {
+            persist_url_provenance(&dest, &text)?;
             return Ok(dest);
         }
         eprintln!("📥 Downloading {}...", dest.display());
         download_url(&text, &dest).await?;
+        persist_url_provenance(&dest, &text)?;
         return Ok(dest);
     }
 
@@ -364,10 +717,12 @@ pub async fn download_exact_ref(input: &str) -> Result<PathBuf> {
         ExactModelRef::Url { url, filename } => {
             let dest = primary_models_dir().join(filename);
             if existing_download(&dest).await {
+                persist_url_provenance(&dest, &url)?;
                 return Ok(dest);
             }
             eprintln!("📥 Downloading {}...", dest.display());
             download_url(&url, &dest).await?;
+            persist_url_provenance(&dest, &url)?;
             Ok(dest)
         }
     }
@@ -564,6 +919,282 @@ pub async fn search_huggingface(query: &str, limit: usize) -> Result<Vec<SearchH
     Ok(hits)
 }
 
+fn persist_curated_provenance(model: &CuratedModel, dir: &Path) -> Result<()> {
+    persist_curated_provenance_with_revision(model, dir, model.source_revision)
+}
+
+fn persist_curated_provenance_with_revision(
+    model: &CuratedModel,
+    dir: &Path,
+    resolved_revision: Option<&str>,
+) -> Result<()> {
+    let primary_path = dir.join(model.file);
+    if let Some(repo) = model.source_repo {
+        persist_huggingface_provenance(
+            &primary_path,
+            repo,
+            resolved_revision,
+            Some(model.source_file),
+            Some(huggingface_resolve_url(
+                repo,
+                resolved_revision,
+                model.source_file,
+            )),
+        )?;
+    } else {
+        persist_url_provenance(&primary_path, model.url)?;
+    }
+
+    for asset in model.extra_files {
+        persist_asset_provenance(&dir.join(asset.file), asset.url)?;
+    }
+    if let Some(asset) = &model.mmproj {
+        persist_asset_provenance(&dir.join(asset.file), asset.url)?;
+    }
+    Ok(())
+}
+
+fn persist_asset_provenance(path: &Path, url: &str) -> Result<()> {
+    if let Some((repo, revision, file)) = parse_huggingface_ref(url) {
+        persist_huggingface_provenance(
+            path,
+            &repo,
+            revision.as_deref(),
+            Some(&file),
+            Some(huggingface_resolve_url(&repo, revision.as_deref(), &file)),
+        )
+    } else {
+        persist_url_provenance(path, url)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HuggingFaceRepairCandidate {
+    repo: String,
+    revision: Option<String>,
+    file: String,
+}
+
+async fn lookup_huggingface_repair_candidates(
+    filename: &str,
+) -> Result<Vec<HuggingFaceRepairCandidate>> {
+    warn_if_missing_huggingface_token();
+    let client = http_client()?;
+    let mut queries = vec![filename.to_string()];
+    if let Some(stem) = Path::new(filename)
+        .file_stem()
+        .and_then(|value| value.to_str())
+    {
+        queries.push(stem.to_string());
+        if let Some(base) = split_gguf_base_name(stem) {
+            queries.push(base.to_string());
+        }
+    }
+
+    let mut repo_ids = Vec::new();
+    let mut seen_repos = HashSet::new();
+    for query in queries {
+        let mut request = client.get("https://huggingface.co/api/models").query(&[
+            ("search", query.as_str()),
+            ("filter", "gguf"),
+            ("limit", "20"),
+        ]);
+        if let Some(token) = &runtime_config().huggingface_token {
+            request = request.bearer_auth(token);
+        }
+        let repos: Vec<HuggingFaceRepoSummary> = request
+            .send()
+            .await
+            .with_context(|| format!("Search Hugging Face for {query}"))?
+            .error_for_status()
+            .with_context(|| format!("Hugging Face search failed for {query}"))?
+            .json()
+            .await
+            .with_context(|| format!("Parse Hugging Face search response for {query}"))?;
+        for repo in repos {
+            if seen_repos.insert(repo.id.clone()) {
+                repo_ids.push(repo.id);
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for repo_id in repo_ids {
+        let detail = fetch_huggingface_repo_detail(&repo_id).await?;
+        let revision = detail.sha.clone();
+        for sibling in detail.siblings {
+            let basename = Path::new(&sibling.rfilename)
+                .file_name()
+                .and_then(|value| value.to_str());
+            if basename == Some(filename) {
+                candidates.push(HuggingFaceRepairCandidate {
+                    repo: repo_id.clone(),
+                    revision: revision.clone(),
+                    file: sibling.rfilename,
+                });
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+pub async fn repair_provenance(
+    source: ProvenanceRepairSource,
+    model_dir: Option<&Path>,
+    force: bool,
+    write: bool,
+) -> Result<ProvenanceRepairReport> {
+    let mut entries = Vec::new();
+    let scan_dirs = match model_dir {
+        Some(dir) => vec![dir.to_path_buf()],
+        None => model_dirs(),
+    };
+
+    for dir in scan_dirs {
+        let Ok(read_dir) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let is_model_file = path.extension().and_then(|ext| ext.to_str()) == Some("gguf");
+            let is_model_dir = path.is_dir() && path.join("config.json").exists();
+            if !is_model_file && !is_model_dir {
+                continue;
+            }
+
+            if !force && load_model_provenance(&path).is_some() {
+                entries.push(ProvenanceRepairEntry {
+                    path,
+                    status: ProvenanceRepairStatus::SkippedExisting,
+                    detail: "existing provenance sidecar present".to_string(),
+                });
+                continue;
+            }
+
+            let repair = match source {
+                ProvenanceRepairSource::HuggingFace => {
+                    repair_huggingface_provenance_for_path(&path, write).await?
+                }
+            };
+            entries.push(repair);
+        }
+    }
+
+    Ok(ProvenanceRepairReport { entries })
+}
+
+async fn repair_huggingface_provenance_for_path(
+    path: &Path,
+    write: bool,
+) -> Result<ProvenanceRepairEntry> {
+    if path.is_dir() {
+        if let Some((repo, revision)) = huggingface_source_identity_from_cache_path(path) {
+            if write {
+                persist_huggingface_provenance(path, &repo, revision.as_deref(), None, None)?;
+            }
+            let detail = match revision {
+                Some(revision) => format!("matched Hugging Face cache snapshot {repo}@{revision}"),
+                None => format!("matched Hugging Face cache snapshot {repo}"),
+            };
+            return Ok(ProvenanceRepairEntry {
+                path: path.to_path_buf(),
+                status: ProvenanceRepairStatus::Repaired,
+                detail,
+            });
+        }
+
+        if let Some(repo) = model_source_repo_from_config_path(path) {
+            let revision = resolve_huggingface_revision(&repo, None).await;
+            if write {
+                persist_huggingface_provenance(path, &repo, revision.as_deref(), None, None)?;
+            }
+            let detail = match revision {
+                Some(revision) => format!("matched config source {repo}@{revision}"),
+                None => format!("matched config source {repo}"),
+            };
+            return Ok(ProvenanceRepairEntry {
+                path: path.to_path_buf(),
+                status: ProvenanceRepairStatus::Repaired,
+                detail,
+            });
+        }
+
+        return Ok(ProvenanceRepairEntry {
+            path: path.to_path_buf(),
+            status: ProvenanceRepairStatus::Unmatched,
+            detail: "no Hugging Face source detected for directory".to_string(),
+        });
+    }
+
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("Invalid model filename: {}", path.display()))?;
+
+    if let Some(model) = matching_curated_model_by_basename(filename) {
+        if write {
+            persist_curated_provenance(model, path.parent().unwrap_or_else(|| Path::new(".")))?;
+        }
+        return Ok(ProvenanceRepairEntry {
+            path: path.to_path_buf(),
+            status: ProvenanceRepairStatus::Repaired,
+            detail: format!("matched curated metadata {}", model.id),
+        });
+    }
+
+    let candidates = lookup_huggingface_repair_candidates(filename).await?;
+    if candidates.is_empty() {
+        return Ok(ProvenanceRepairEntry {
+            path: path.to_path_buf(),
+            status: ProvenanceRepairStatus::Unmatched,
+            detail: "no unique Hugging Face match".to_string(),
+        });
+    }
+
+    if candidates.len() > 1 {
+        let repos = candidates
+            .iter()
+            .map(|candidate| match &candidate.revision {
+                Some(revision) => format!("{}@{}", candidate.repo, revision),
+                None => candidate.repo.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(ProvenanceRepairEntry {
+            path: path.to_path_buf(),
+            status: ProvenanceRepairStatus::Ambiguous,
+            detail: format!("multiple Hugging Face matches: {repos}"),
+        });
+    }
+
+    let candidate = &candidates[0];
+    if write {
+        persist_huggingface_provenance(
+            path,
+            &candidate.repo,
+            candidate.revision.as_deref(),
+            Some(&candidate.file),
+            Some(huggingface_resolve_url(
+                &candidate.repo,
+                candidate.revision.as_deref(),
+                &candidate.file,
+            )),
+        )?;
+    }
+    Ok(ProvenanceRepairEntry {
+        path: path.to_path_buf(),
+        status: ProvenanceRepairStatus::Repaired,
+        detail: format!(
+            "matched Hugging Face {}",
+            format_huggingface_exact_ref(
+                &candidate.repo,
+                candidate.revision.as_deref(),
+                &candidate.file
+            )
+        ),
+    })
+}
+
 pub async fn download_curated_model(model: &CuratedModel) -> Result<PathBuf> {
     let dir = primary_models_dir();
     tokio::fs::create_dir_all(&dir).await?;
@@ -593,6 +1224,7 @@ pub async fn download_curated_model(model: &CuratedModel) -> Result<PathBuf> {
     }
 
     if all_present {
+        persist_curated_provenance(model, &dir)?;
         eprintln!(
             "✅ {} already exists ({:.1}GB, {} file{})",
             model.id,
@@ -602,6 +1234,11 @@ pub async fn download_curated_model(model: &CuratedModel) -> Result<PathBuf> {
         );
         return Ok(dest);
     }
+
+    let resolved_revision = match (model.source_repo, model.source_revision) {
+        (Some(repo), revision) => resolve_huggingface_revision(repo, revision).await,
+        _ => None,
+    };
 
     eprintln!("📥 Downloading {} ({})...", model.id, model.size);
     let mut needed = Vec::new();
@@ -640,6 +1277,7 @@ pub async fn download_curated_model(model: &CuratedModel) -> Result<PathBuf> {
         download_url(&url, &dir.join(file)).await?;
     }
 
+    persist_curated_provenance_with_revision(model, &dir, resolved_revision.as_deref())?;
     eprintln!("✅ Downloaded {} to {}", model.id, dir.display());
     Ok(dest)
 }
@@ -650,7 +1288,26 @@ pub async fn download_huggingface_model(
     file: &str,
 ) -> Result<PathBuf> {
     let assets = huggingface_download_assets(repo, revision, file)?;
-    download_remote_assets(&format_huggingface_exact_ref(repo, revision, file), assets).await
+    let resolved_revision = resolve_huggingface_revision(repo, revision).await;
+    let primary = download_remote_assets(
+        &format_huggingface_exact_ref(repo, revision, file),
+        assets.clone(),
+    )
+    .await?;
+    let dir = primary_models_dir();
+    for (filename, url) in assets {
+        let path = dir.join(&filename);
+        if let Some((url_repo, _, source_file)) = parse_huggingface_ref(&url) {
+            persist_huggingface_provenance(
+                &path,
+                &url_repo,
+                resolved_revision.as_deref(),
+                Some(&source_file),
+                Some(url),
+            )?;
+        }
+    }
+    Ok(primary)
 }
 
 pub async fn download_url(url: &str, dest: &Path) -> Result<()> {
@@ -1172,5 +1829,44 @@ mod tests {
         {
             assert!(free.is_none());
         }
+    }
+
+    #[test]
+    fn provenance_sidecar_round_trip() {
+        let unique = format!(
+            "mesh-llm-provenance-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model_path = dir.join("example.gguf");
+        std::fs::write(&model_path, b"hello world").unwrap();
+
+        let provenance = build_huggingface_provenance(
+            &model_path,
+            "Qwen/Qwen3-8B-GGUF",
+            Some("abc123"),
+            Some("Qwen3-8B-Q4_K_M.gguf"),
+            Some(
+                "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/abc123/Qwen3-8B-Q4_K_M.gguf"
+                    .to_string(),
+            ),
+            "example.gguf".to_string(),
+        );
+        write_model_provenance(&model_path, &provenance).unwrap();
+
+        let loaded = load_model_provenance(&model_path).unwrap();
+        assert_eq!(loaded.source.repo.as_deref(), Some("Qwen/Qwen3-8B-GGUF"));
+        assert_eq!(loaded.source.revision.as_deref(), Some("abc123"));
+        assert_eq!(loaded.identity.format, "gguf");
+        assert!(model_sidecar_path(&model_path).exists());
+
+        let _ = std::fs::remove_file(model_sidecar_path(&model_path));
+        let _ = std::fs::remove_file(model_path);
+        let _ = std::fs::remove_dir(dir);
     }
 }

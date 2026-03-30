@@ -23,7 +23,7 @@ pub use plugins::blackboard;
 pub use plugins::blackboard::mcp as blackboard_mcp;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use mesh::NodeRole;
 use std::path::{Path, PathBuf};
 
@@ -208,6 +208,11 @@ enum Command {
         #[arg(long)]
         draft: bool,
     },
+    /// Manage model provenance sidecars.
+    Provenance {
+        #[command(subcommand)]
+        command: ProvenanceCommand,
+    },
     /// Drop a model from the mesh.
     #[command(hide = true)]
     Drop {
@@ -316,6 +321,33 @@ enum PluginCommand {
     List,
 }
 
+#[derive(Subcommand, Debug)]
+enum ProvenanceCommand {
+    /// Rebuild provenance sidecars for local models.
+    Repair {
+        /// Provenance source to query.
+        #[arg(long, value_enum)]
+        source: ProvenanceSourceArg,
+        /// Limit the scan to one model directory.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+        /// Overwrite existing sidecars.
+        #[arg(long)]
+        force: bool,
+        /// Preview matches without writing sidecars.
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProvenanceSourceArg {
+    Huggingface,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -386,6 +418,7 @@ async fn main() -> Result<()> {
             } => return run_model_search(query, *curated, *limit).await,
             Command::Show { model } => return run_model_show(model).await,
             Command::Download { model, draft } => return run_model_download(model, *draft).await,
+            Command::Provenance { command } => return run_provenance_command(command).await,
             Command::Drop { name, port } => {
                 return run_drop(name, *port).await;
             }
@@ -3056,6 +3089,63 @@ async fn run_model_download(model_ref: &str, include_draft: bool) -> Result<()> 
         .ok_or_else(|| anyhow::anyhow!("Draft model '{}' not found in curated metadata", draft))?;
     models::download_curated_model(draft_model).await?;
     Ok(())
+}
+
+async fn run_provenance_command(command: &ProvenanceCommand) -> Result<()> {
+    match command {
+        ProvenanceCommand::Repair {
+            source,
+            model_dir,
+            force,
+            dry_run,
+            json,
+        } => {
+            let source = match source {
+                ProvenanceSourceArg::Huggingface => models::ProvenanceRepairSource::HuggingFace,
+            };
+            let report =
+                models::repair_provenance(source, model_dir.as_deref(), *force, !*dry_run).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+
+            let mut repaired = 0usize;
+            let mut skipped_existing = 0usize;
+            let mut ambiguous = 0usize;
+            let mut unmatched = 0usize;
+            for entry in &report.entries {
+                let label = match entry.status {
+                    models::ProvenanceRepairStatus::Repaired => {
+                        repaired += 1;
+                        if *dry_run {
+                            "would_repair"
+                        } else {
+                            "repaired"
+                        }
+                    }
+                    models::ProvenanceRepairStatus::SkippedExisting => {
+                        skipped_existing += 1;
+                        "skipped_existing"
+                    }
+                    models::ProvenanceRepairStatus::Ambiguous => {
+                        ambiguous += 1;
+                        "ambiguous"
+                    }
+                    models::ProvenanceRepairStatus::Unmatched => {
+                        unmatched += 1;
+                        "unmatched"
+                    }
+                };
+                println!("{label}\t{}\t{}", entry.path.display(), entry.detail);
+            }
+            eprintln!(
+                "summary: repaired={} skipped_existing={} ambiguous={} unmatched={}",
+                repaired, skipped_existing, ambiguous, unmatched
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn run_plugin_command(command: &PluginCommand, cli: &Cli) -> Result<()> {
