@@ -17,6 +17,8 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://relay.nostr.band",
+    "wss://nostr.land",
+    "wss://nostr.wine",
 ];
 
 /// What we publish about a mesh.
