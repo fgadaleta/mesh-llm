@@ -45,11 +45,14 @@ stop_nodes() {
     kill "$NODE1_PID" 2>/dev/null || true
     wait "$NODE1_PID" 2>/dev/null || true
   fi
-  pkill -f "mesh-llm.*--port ${NODE1_API_PORT}" 2>/dev/null || true
-  pkill -f "mesh-llm.*--port ${NODE2_API_PORT}" 2>/dev/null || true
-  pkill -f "mesh-llm.*--port ${CLIENT1_API_PORT}" 2>/dev/null || true
-  pkill -f "llama-server.*${MODEL_NAME}" 2>/dev/null || true
-  pkill -f "rpc-server.*${MODEL_NAME}" 2>/dev/null || true
+  if [[ -n "${LLAMA_SERVER_PID:-}" ]] && kill -0 "$LLAMA_SERVER_PID" 2>/dev/null; then
+    kill "$LLAMA_SERVER_PID" 2>/dev/null || true
+    wait "$LLAMA_SERVER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${RPC_SERVER_PID:-}" ]] && kill -0 "$RPC_SERVER_PID" 2>/dev/null; then
+    kill "$RPC_SERVER_PID" 2>/dev/null || true
+    wait "$RPC_SERVER_PID" 2>/dev/null || true
+  fi
   unset NODE1_PID NODE2_PID CLIENT1_PID
 }
 
