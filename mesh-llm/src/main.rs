@@ -3362,13 +3362,16 @@ fn build_serving_list(resolved_models: &[PathBuf], model_name: &str) -> Vec<Stri
     let mut all: Vec<String> = resolved_models
         .iter()
         .map(|m| {
-            let stem = m
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+            let name = model_path_name(m).unwrap_or_else(|| {
+                let stem = m
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                stem
+            });
             // Strip split GGUF suffix: "Model-00001-of-00004" → "Model"
-            router::strip_split_suffix_owned(&stem)
+            router::strip_split_suffix_owned(&name)
         })
         .collect();
     if !all.contains(&clean_name) {
