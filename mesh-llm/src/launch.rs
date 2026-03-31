@@ -1,9 +1,7 @@
-//! Process management for backend server binaries.
+//! Process management for llama.cpp binaries.
 //!
-//! Starts rpc-server and backend inference processes wired up to the mesh
-//! tunnel ports. Concrete backends plug into this module via BackendOps.
+//! Starts rpc-server and llama-server wired up to the mesh tunnel ports.
 
-use crate::backend;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use std::path::{Path, PathBuf};
@@ -217,7 +215,6 @@ pub struct InferenceServerProcess {
 }
 
 pub struct ModelLaunchSpec<'a> {
-    pub backend: backend::BackendKind,
     pub model: &'a Path,
     pub http_port: u16,
     pub tunnel_ports: &'a [u16],
@@ -507,23 +504,6 @@ async fn terminate_process(pid: u32) {
         .stderr(std::process::Stdio::null())
         .status();
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-}
-
-/// Start a backend server for a model. This dispatches to the concrete backend
-/// implementation so other runtimes can plug into the same control plane.
-pub async fn start_model_server(
-    bin_dir: &Path,
-    binary_flavor: Option<BinaryFlavor>,
-    spec: ModelLaunchSpec<'_>,
-) -> Result<InferenceServerProcess> {
-    let ops = backend::backend_ops(spec.backend);
-    tracing::debug!(
-        "dispatching backend '{}' via {} (health: {})",
-        ops.as_str(),
-        ops.process_label(),
-        ops.health_path()
-    );
-    ops.start_server(bin_dir, binary_flavor, spec).await
 }
 
 /// Start llama-server with the given model, HTTP port, and RPC tunnel ports.

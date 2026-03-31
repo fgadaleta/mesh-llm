@@ -5,7 +5,7 @@
 //! Every mesh change: kill llama-server, re-elect, winner starts fresh.
 //! mesh-llm owns :api_port and proxies to the right host by model name.
 
-use crate::{backend, download, launch, mesh, moe, tunnel};
+use crate::{download, launch, mesh, moe, tunnel};
 use mesh::NodeRole;
 use std::collections::HashMap;
 use std::path::Path;
@@ -98,7 +98,7 @@ pub struct ModelTargets {
 
 #[derive(Clone, Debug)]
 pub struct LocalProcessInfo {
-    pub backend: backend::BackendKind,
+    pub backend: String,
     pub pid: u32,
     pub port: u16,
 }
@@ -547,7 +547,7 @@ pub async fn election_loop(
             llama_process = Some(process);
             if let Some(ref process) = llama_process {
                 on_process(Some(LocalProcessInfo {
-                    backend: backend::detect_backend(&model),
+                    backend: "llama".into(),
                     pid: process.handle.pid(),
                     port: llama_port,
                 }));
@@ -706,11 +706,10 @@ async fn moe_election_loop(
                 };
 
                 let mb = total_model_bytes(&model);
-                match launch::start_model_server(
+                match launch::start_llama_server(
                     &bin_dir,
                     binary_flavor,
                     launch::ModelLaunchSpec {
-                        backend: backend::detect_backend(&model),
                         model: &model,
                         http_port: llama_port,
                         tunnel_ports: &[],
@@ -736,7 +735,7 @@ async fn moe_election_loop(
                         llama_process = Some(process);
                         if let Some(ref process) = llama_process {
                             on_process(Some(LocalProcessInfo {
-                                backend: backend::detect_backend(&model),
+                                backend: "llama".into(),
                                 pid: process.handle.pid(),
                                 port: llama_port,
                             }));
@@ -825,11 +824,10 @@ async fn moe_election_loop(
             };
 
             let shard_bytes = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
-            match launch::start_model_server(
+            match launch::start_llama_server(
                 &bin_dir,
                 binary_flavor,
                 launch::ModelLaunchSpec {
-                    backend: backend::detect_backend(&shard_path),
                     model: &shard_path,
                     http_port: llama_port,
                     tunnel_ports: &[],
@@ -855,7 +853,7 @@ async fn moe_election_loop(
                     llama_process = Some(process);
                     if let Some(ref process) = llama_process {
                         on_process(Some(LocalProcessInfo {
-                            backend: backend::detect_backend(&shard_path),
+                            backend: "llama".into(),
                             pid: process.handle.pid(),
                             port: llama_port,
                         }));
@@ -1167,11 +1165,10 @@ async fn start_llama(
         None
     };
 
-    match launch::start_model_server(
+    match launch::start_llama_server(
         bin_dir,
         binary_flavor,
         launch::ModelLaunchSpec {
-            backend: backend::detect_backend(model),
             model,
             http_port: llama_port,
             tunnel_ports: &rpc_ports,
