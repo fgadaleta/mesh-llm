@@ -463,8 +463,7 @@ fn is_eos(token: u32, _config: &model::ModelConfig) -> bool {
 }
 
 fn build_chat_prompt(messages: &[serde_json::Value]) -> String {
-    // Qwen/ChatML format — works for Qwen2, Qwen2.5, etc.
-    // Other models would need their own template, but this covers the primary MLX target.
+    // Qwen/ChatML format — works for Qwen2, Qwen2.5, Qwen3, etc.
     let mut prompt = String::new();
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("user");
