@@ -376,11 +376,18 @@ pub async fn election_loop(
             should_dup
         };
 
-        // Compute the worker set (only relevant in split mode)
+        // Compute the worker set (only relevant in split mode).
+        // Only include RTT-eligible peers so that when a peer's RTT drops
+        // below the split threshold (e.g. relay → direct), the worker set
+        // changes and triggers a restart with --rpc.
         let mut new_worker_set: Vec<iroh::EndpointId> = if need_split {
             model_peers
                 .iter()
                 .filter(|p| !matches!(p.role, NodeRole::Client))
+                .filter(|p| match p.rtt_ms {
+                    Some(rtt) if rtt > mesh::MAX_SPLIT_RTT_MS => false,
+                    _ => true,
+                })
                 .map(|p| p.id)
                 .collect()
         } else {

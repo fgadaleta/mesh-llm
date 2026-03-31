@@ -819,7 +819,7 @@ impl Node {
         let transport_config = QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(1024u32.into())
             .build();
-        let mut builder = Endpoint::builder()
+        let mut builder = Endpoint::empty_builder()
             .secret_key(secret_key)
             .alpns(vec![ALPN_V1.to_vec(), ALPN_V0.to_vec()])
             .transport_config(transport_config);
@@ -976,7 +976,7 @@ impl Node {
         let transport_config = QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(1024u32.into())
             .build();
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::empty_builder()
             .secret_key(SecretKey::generate(&mut rand::rng()))
             .alpns(vec![ALPN.to_vec()])
             .relay_mode(iroh::endpoint::RelayMode::Disabled)
@@ -1246,6 +1246,15 @@ impl Node {
             let mut state = self.state.lock().await;
             if let Some(peer) = state.peers.get_mut(&id) {
                 let prev = peer.rtt_ms;
+                // Only accept equal-or-lower RTT. Gossip round-trip timing
+                // can inflate the value when routed via relay, overwriting a
+                // good direct-path measurement. The RTT gate only cares about
+                // "fast enough for split", so keeping the best-seen value is
+                // correct — if the path truly degrades the peer will be
+                // unreachable and removed via the normal liveness path.
+                if prev.is_some_and(|p| rtt_ms > p) {
+                    return;
+                }
                 peer.rtt_ms = Some(rtt_ms);
                 (Some(peer.clone()), prev)
             } else {
@@ -3129,8 +3138,10 @@ impl Node {
                 let path_list = iroh::Watcher::get(&mut paths);
                 for path_info in path_list {
                     if path_info.is_selected() {
-                        let rtt = path_info.rtt();
-                        let rtt_ms = rtt.as_millis() as u32;
+                        let rtt_ms = match path_info.rtt() {
+                            Some(rtt) => rtt.as_millis() as u32,
+                            None => continue,
+                        };
                         let path_type = if path_info.is_ip() { "direct" } else { "relay" };
                         if rtt_ms > 0 {
                             eprintln!(
@@ -3202,8 +3213,10 @@ impl Node {
                 let path_list = iroh::Watcher::get(&mut paths);
                 for path_info in path_list {
                     if path_info.is_selected() {
-                        let rtt = path_info.rtt();
-                        let path_rtt_ms = rtt.as_millis() as u32;
+                        let path_rtt_ms = match path_info.rtt() {
+                            Some(rtt) => rtt.as_millis() as u32,
+                            None => continue,
+                        };
                         let path_type = if path_info.is_ip() { "direct" } else { "relay" };
                         if path_rtt_ms > 0 && path_rtt_ms < rtt_ms {
                             eprintln!(
@@ -3298,8 +3311,10 @@ impl Node {
                 let path_list = iroh::Watcher::get(&mut paths);
                 for path_info in path_list {
                     if path_info.is_selected() {
-                        let rtt = path_info.rtt();
-                        let rtt_ms = rtt.as_millis() as u32;
+                        let rtt_ms = match path_info.rtt() {
+                            Some(rtt) => rtt.as_millis() as u32,
+                            None => continue,
+                        };
                         let path_type = if path_info.is_ip() { "direct" } else { "relay" };
                         if rtt_ms > 0 {
                             eprintln!(
@@ -3709,7 +3724,7 @@ pub(crate) mod tests {
         let transport_config = QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(128u32.into())
             .build();
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::empty_builder()
             .secret_key(SecretKey::generate(&mut rand::rng()))
             .alpns(vec![ALPN_V1.to_vec(), ALPN_V0.to_vec()])
             .transport_config(transport_config)
@@ -4210,7 +4225,7 @@ pub(crate) mod tests {
             .await;
         post_node.start_accepting();
 
-        let legacy_endpoint = Endpoint::builder()
+        let legacy_endpoint = Endpoint::empty_builder()
             .secret_key(SecretKey::generate(&mut rand::rng()))
             .alpns(vec![ALPN_V0.to_vec()])
             .transport_config(
@@ -5753,7 +5768,7 @@ pub(crate) mod tests {
             .await;
         post_node.start_accepting();
 
-        let legacy_endpoint = Endpoint::builder()
+        let legacy_endpoint = Endpoint::empty_builder()
             .secret_key(SecretKey::generate(&mut rand::rng()))
             .alpns(vec![ALPN_V0.to_vec()])
             .transport_config(
@@ -5939,7 +5954,7 @@ pub(crate) mod tests {
             .await;
         post_node.start_accepting();
 
-        let legacy_endpoint = Endpoint::builder()
+        let legacy_endpoint = Endpoint::empty_builder()
             .secret_key(SecretKey::generate(&mut rand::rng()))
             .alpns(vec![ALPN_V0.to_vec()])
             .transport_config(
@@ -6122,7 +6137,7 @@ pub(crate) mod tests {
         node_b.set_mesh_id("three-node-mesh-001".to_string()).await;
         let node_b_id = node_b.id();
 
-        let legacy_endpoint = Endpoint::builder()
+        let legacy_endpoint = Endpoint::empty_builder()
             .secret_key(SecretKey::generate(&mut rand::rng()))
             .alpns(vec![ALPN_V0.to_vec()])
             .transport_config(
@@ -6278,7 +6293,7 @@ pub(crate) mod tests {
         );
 
         // Sub-test A: v1 node connecting to a v0-only endpoint negotiates ALPN_V0
-        let v0_endpoint = Endpoint::builder()
+        let v0_endpoint = Endpoint::empty_builder()
             .secret_key(SecretKey::generate(&mut rand::rng()))
             .alpns(vec![ALPN_V0.to_vec()])
             .transport_config(
@@ -6340,7 +6355,7 @@ pub(crate) mod tests {
         node_b.start_accepting();
         let node_b_addr = node_b.endpoint.addr();
 
-        let v0_ep2 = Endpoint::builder()
+        let v0_ep2 = Endpoint::empty_builder()
             .secret_key(SecretKey::generate(&mut rand::rng()))
             .alpns(vec![ALPN_V0.to_vec()])
             .transport_config(
@@ -6488,6 +6503,40 @@ pub(crate) mod tests {
                 .expect("peer_change_rx closed unexpectedly"),
             "RTT update for unknown peer should not trigger re-election"
         );
+
+        Ok(())
+    }
+
+    /// RTT should never increase — relay gossip RTT must not overwrite
+    /// a known-good direct path measurement.
+    #[tokio::test]
+    async fn test_rtt_cannot_regress() -> Result<()> {
+        let node = make_test_node(super::NodeRole::Worker).await?;
+        let peer_key = SecretKey::generate(&mut rand::rng());
+        let peer_id = EndpointId::from(peer_key.public());
+
+        {
+            let mut state = node.state.lock().await;
+            state
+                .peers
+                .insert(peer_id, make_test_peer(peer_id, Some(20), 16));
+        }
+
+        // Try to raise RTT — should be rejected
+        node.update_peer_rtt(peer_id, 2600).await;
+        {
+            let state = node.state.lock().await;
+            let rtt = state.peers.get(&peer_id).unwrap().rtt_ms;
+            assert_eq!(rtt, Some(20), "RTT must not increase from 20 to 2600");
+        }
+
+        // Lower RTT — should be accepted
+        node.update_peer_rtt(peer_id, 10).await;
+        {
+            let state = node.state.lock().await;
+            let rtt = state.peers.get(&peer_id).unwrap().rtt_ms;
+            assert_eq!(rtt, Some(10), "RTT must decrease from 20 to 10");
+        }
 
         Ok(())
     }
