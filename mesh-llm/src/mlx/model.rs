@@ -133,7 +133,14 @@ impl Attention {
 
         let (k, v) = cache.update(k, v)?;
 
-        let attn = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, None)?;
+        // Causal mask for prefill (multi-token). Decode (l=1) needs no mask.
+        let mask = if l > 1 {
+            Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
+        } else {
+            None
+        };
+
+        let attn = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
 
         let attn =
             attn.transpose_axes(&[0, 2, 1, 3])?
