@@ -813,11 +813,11 @@ fn parse_size_gb(s: &str) -> f64 {
 /// Build model tiers from the catalog, sorted largest first.
 /// Each entry is (model_name, min_vram_gb) where min_vram = file_size * 1.1.
 /// Excludes draft models (< 1GB).
-fn model_tiers() -> Vec<(&'static str, f64)> {
-    let mut tiers: Vec<_> = crate::download::MODEL_CATALOG
+fn model_tiers() -> Vec<(String, f64)> {
+    let mut tiers: Vec<_> = crate::models::catalog::MODEL_CATALOG
         .iter()
-        .filter(|m| parse_size_gb(m.size) >= 1.0) // skip drafts
-        .map(|m| (m.name, parse_size_gb(m.size) * 1.1))
+        .filter(|m| parse_size_gb(&m.size) >= 1.0) // skip drafts
+        .map(|m| (m.name.clone(), parse_size_gb(&m.size) * 1.1))
         .collect();
     tiers.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     tiers
@@ -840,7 +840,7 @@ fn model_tiers() -> Vec<(&'static str, f64)> {
 ///   85-165GB: Qwen2.5-72B (47G) + Coder-32B (20G)
 ///   165GB+:  MiniMax-M2.5 (138G)
 pub fn auto_model_pack(vram_gb: f64) -> Vec<String> {
-    let local_models = crate::mesh::scan_local_models();
+    let local_models = crate::models::scan_local_models();
     let tiers = model_tiers();
 
     // Helper: check if a model is on disk

@@ -2,11 +2,11 @@ mod affinity;
 mod api;
 mod autoupdate;
 mod benchmark;
-mod download;
 mod election;
 mod hardware;
 mod launch;
 mod mesh;
+mod models;
 mod moe;
 mod nostr;
 mod pipeline;
@@ -25,6 +25,7 @@ pub use plugins::blackboard::mcp as blackboard_mcp;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mesh::NodeRole;
+use models::catalog;
 use std::path::{Path, PathBuf};
 
 pub const VERSION: &str = "0.52.0";
@@ -56,6 +57,10 @@ struct Cli {
     /// Model to serve (path, catalog name, or HuggingFace URL).
     #[arg(long)]
     model: Vec<PathBuf>,
+
+    /// Raw local GGUF file to serve directly (repeatable).
+    #[arg(long)]
+    gguf: Vec<PathBuf>,
 
     /// API port (default: 9337).
     #[arg(long, default_value = "9337")]
@@ -177,6 +182,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Manage model storage, migration, and update checks.
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
     /// Download a model from the catalog
     Download {
         /// Model name (e.g. "Qwen2.5-32B-Instruct-Q4_K_M" or just "32b")
@@ -293,6 +303,63 @@ enum PluginCommand {
     List,
 }
 
+#[derive(Subcommand, Debug)]
+enum ModelsCommand {
+    /// List built-in recommended models.
+    Recommended,
+    /// List installed local models from the HF cache or legacy storage.
+    Installed,
+    /// List built-in catalog models.
+    #[command(hide = true)]
+    List,
+    /// Search for GGUF models in the catalog or on Hugging Face.
+    Search {
+        /// Search terms.
+        #[arg(required = true)]
+        query: Vec<String>,
+        /// Search only the built-in catalog.
+        #[arg(long)]
+        catalog: bool,
+        /// Maximum number of results to show.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Show details for one exact model reference.
+    Show {
+        /// Exact catalog id, Hugging Face ref, or direct URL.
+        model: String,
+    },
+    /// Download one exact model reference.
+    Download {
+        /// Exact catalog id, Hugging Face ref, or direct URL.
+        model: String,
+        /// Also download the recommended draft model for speculative decoding.
+        #[arg(long)]
+        draft: bool,
+    },
+    /// Inspect or migrate deprecated ~/.models content into the Hugging Face cache.
+    Migrate {
+        /// Materialize recognized Hugging Face-backed legacy models into the HF cache.
+        #[arg(long)]
+        apply: bool,
+        /// Remove recognized legacy GGUF files that already exist in the Hugging Face cache.
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Check or refresh cached Hugging Face repos.
+    #[command(visible_alias = "update")]
+    Updates {
+        /// Repo id like Qwen/Qwen3-8B-GGUF.
+        repo: Option<String>,
+        /// Operate on every cached Hugging Face repo.
+        #[arg(long)]
+        all: bool,
+        /// Check for newer upstream revisions without refreshing local cache.
+        #[arg(long)]
+        check: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -353,28 +420,50 @@ async fn main() -> Result<()> {
     // Subcommand dispatch
     if let Some(cmd) = &cli.command {
         match cmd {
+            Command::Models { command } => {
+                match command {
+                    ModelsCommand::Recommended | ModelsCommand::List => {
+                        models::run_model_recommended()
+                    }
+                    ModelsCommand::Installed => models::run_model_installed(),
+                    ModelsCommand::Search {
+                        query,
+                        catalog,
+                        limit,
+                    } => models::run_model_search(query, *catalog, *limit).await?,
+                    ModelsCommand::Show { model } => models::run_model_show(model).await?,
+                    ModelsCommand::Download { model, draft } => {
+                        models::run_model_download(model, *draft).await?
+                    }
+                    ModelsCommand::Migrate { apply, prune } => models::run_migrate(*apply, *prune)?,
+                    ModelsCommand::Updates { repo, all, check } => {
+                        models::run_update(repo.as_deref(), *all, *check)?
+                    }
+                }
+                return Ok(());
+            }
             Command::Download { name, draft } => {
                 match name {
                     Some(query) => {
-                        let model = download::find_model(query)
+                        let model = catalog::find_model(query)
                             .ok_or_else(|| anyhow::anyhow!("No model matching '{}' in catalog. Run `mesh-llm download` to list.", query))?;
-                        download::download_model(model).await?;
+                        catalog::download_model(model).await?;
                         if *draft {
-                            if let Some(draft_name) = model.draft {
+                            if let Some(draft_name) = model.draft.as_deref() {
                                 let draft_model =
-                                    download::find_model(draft_name).ok_or_else(|| {
+                                    catalog::find_model(draft_name).ok_or_else(|| {
                                         anyhow::anyhow!(
                                             "Draft model '{}' not found in catalog",
                                             draft_name
                                         )
                                     })?;
-                                download::download_model(draft_model).await?;
+                                catalog::download_model(draft_model).await?;
                             } else {
                                 eprintln!("⚠ No draft model available for {}", model.name);
                             }
                         }
                     }
-                    None => download::list_models(),
+                    None => catalog::list_models(),
                 }
                 return Ok(());
             }
@@ -590,11 +679,16 @@ async fn main() -> Result<()> {
     }
 
     // --- Validation ---
-    if cli.client && !cli.model.is_empty() {
+    if cli.client && (!cli.model.is_empty() || !cli.gguf.is_empty()) {
         anyhow::bail!("--client and --model are mutually exclusive");
     }
     // No args at all = idle mode with console for browsing/joining
-    if cli.model.is_empty() && cli.join.is_empty() && !cli.client && !cli.auto {
+    if cli.model.is_empty()
+        && cli.gguf.is_empty()
+        && cli.join.is_empty()
+        && !cli.client
+        && !cli.auto
+    {
         {
             let bin_dir = match &cli.bin_dir {
                 Some(d) => d.clone(),
@@ -607,10 +701,19 @@ async fn main() -> Result<()> {
     // --- Resolve models from CLI ---
     // All --model entries get resolved/downloaded. First is primary (gets rpc/tunnel).
     // Additional models run as solo llama-servers (must fit in VRAM independently).
+    // --gguf entries are explicit raw-file escapes and must already exist on disk.
     let mut resolved_models: Vec<PathBuf> = Vec::new();
+    for path in &cli.gguf {
+        if !path.exists() {
+            anyhow::bail!("GGUF file not found: {}", path.display());
+        }
+        resolved_models.push(path.clone());
+    }
     for m in &cli.model {
         resolved_models.push(resolve_model(m).await?);
     }
+    models::warn_about_legacy_model_usage(&resolved_models);
+    models::warn_about_updates_for_paths(&resolved_models);
 
     // Build requested model names from all resolved models
     // Strip split GGUF suffix so "MiniMax-M2.5-Q4_K_M-00001-of-00004" → "MiniMax-M2.5-Q4_K_M"
@@ -640,20 +743,25 @@ async fn resolve_model(input: &std::path::Path) -> Result<PathBuf> {
         return Ok(input.to_path_buf());
     }
 
-    // Check all model directories (including goose) for just a filename
+    // Check managed model directories for just a filename
     if !s.contains('/') {
-        for dir in mesh::model_dirs() {
+        for dir in models::model_dirs() {
             let candidate = dir.join(input);
             if candidate.exists() {
                 return Ok(candidate);
             }
         }
+        let installed_name = s.strip_suffix(".gguf").unwrap_or(&s);
+        let installed_path = models::find_model_path(installed_name);
+        if installed_path.exists() {
+            return Ok(installed_path);
+        }
         // Try catalog match
-        if let Some(entry) = download::find_model(&s) {
-            return download::download_model(entry).await;
+        if let Some(entry) = catalog::find_model(&s) {
+            return catalog::download_model(entry).await;
         }
         anyhow::bail!(
-            "Model not found: {}\nNot a local file, not in ~/.models/ or goose models, not in catalog.\n\
+            "Model not found: {}\nNot a local file, not in the Hugging Face cache or legacy ~/.models, not in catalog.\n\
              Use a path, a catalog name (run `mesh-llm download` to list), or a HuggingFace URL.",
             s
         );
@@ -665,26 +773,29 @@ async fn resolve_model(input: &std::path::Path) -> Result<PathBuf> {
             .rsplit('/')
             .next()
             .ok_or_else(|| anyhow::anyhow!("Can't extract filename from URL: {}", s))?;
-        return download::download_hf_split_gguf(&s, filename).await;
+        return catalog::download_hf_split_gguf(&s, filename).await;
     }
 
     // HF shorthand: org/repo/file.gguf
     if s.contains('/') && s.ends_with(".gguf") {
-        let url = if s.contains("/resolve/") {
-            format!("https://huggingface.co/{}", s)
-        } else {
-            let parts: Vec<&str> = s.splitn(3, '/').collect();
-            if parts.len() == 3 {
-                format!(
-                    "https://huggingface.co/{}/{}/resolve/main/{}",
-                    parts[0], parts[1], parts[2]
-                )
-            } else {
-                anyhow::bail!("Can't parse HF shorthand: {}. Use org/repo/file.gguf", s);
-            }
+        if s.contains("/resolve/") {
+            let filename = s.rsplit('/').next().unwrap();
+            return catalog::download_hf_split_gguf(&s, filename).await;
+        }
+        let parts: Vec<&str> = s.splitn(3, '/').collect();
+        if parts.len() != 3 {
+            anyhow::bail!("Can't parse HF shorthand: {}. Use org/repo/file.gguf", s);
+        }
+        let (repo_tail, revision) = match parts[1].split_once('@') {
+            Some((repo, revision)) => (repo, Some(revision)),
+            None => (parts[1], None),
         };
-        let filename = s.rsplit('/').next().unwrap();
-        return download::download_hf_split_gguf(&url, filename).await;
+        return catalog::download_hf_repo_file(
+            &format!("{}/{}", parts[0], repo_tail),
+            revision,
+            parts[2],
+        )
+        .await;
     }
 
     anyhow::bail!("Model not found: {}", s);
@@ -694,18 +805,16 @@ async fn resolve_model(input: &std::path::Path) -> Result<PathBuf> {
 /// If not on disk, downloads it (drafts are <1GB).
 pub async fn ensure_draft(model: &std::path::Path) -> Option<PathBuf> {
     let filename = model.file_name()?.to_str()?;
-    let catalog_entry = download::MODEL_CATALOG
-        .iter()
-        .find(|m| m.file == filename)?;
-    let draft_name = catalog_entry.draft?;
-    let draft_entry = download::MODEL_CATALOG
+    let catalog_entry = catalog::MODEL_CATALOG.iter().find(|m| m.file == filename)?;
+    let draft_name = catalog_entry.draft.as_deref()?;
+    let draft_entry = catalog::MODEL_CATALOG
         .iter()
         .find(|m| m.name == draft_name)?;
     let draft_stem = draft_entry
         .file
         .strip_suffix(".gguf")
-        .unwrap_or(draft_entry.file);
-    let draft_path = mesh::find_model_path(draft_stem);
+        .unwrap_or(&draft_entry.file);
+    let draft_path = models::find_model_path(draft_stem);
     if draft_path.exists() {
         return Some(draft_path);
     }
@@ -714,10 +823,10 @@ pub async fn ensure_draft(model: &std::path::Path) -> Option<PathBuf> {
         "📥 Downloading draft model {} ({})...",
         draft_entry.name, draft_entry.size
     );
-    match download::download_model(draft_entry).await {
-        Ok(_path) => {
+    match catalog::download_model(draft_entry).await {
+        Ok(path) => {
             eprintln!("✅ Draft model ready: {}", draft_entry.name);
-            Some(draft_path)
+            Some(path)
         }
         Err(e) => {
             eprintln!(
@@ -787,7 +896,7 @@ async fn pick_model_assignment(node: &mesh::Node, local_models: &[String]) -> Op
 
     /// Check if a model fits in our VRAM. Returns false and logs if it doesn't.
     fn model_fits(model: &str, my_vram: u64) -> bool {
-        let model_path = mesh::find_model_path(model);
+        let model_path = models::find_model_path(model);
         let model_bytes = std::fs::metadata(&model_path)
             .map(|md| md.len())
             .unwrap_or(0);
@@ -875,8 +984,8 @@ async fn pick_model_assignment(node: &mesh::Node, local_models: &[String]) -> Op
         if serving_count.get(m).copied().unwrap_or(0) > 0 {
             continue;
         }
-        if let Some(cat) = download::find_model(m) {
-            let size_bytes = parse_size_str(cat.size);
+        if let Some(cat) = catalog::find_model(m) {
+            let size_bytes = parse_size_str(&cat.size);
             let needed = (size_bytes as f64 * 1.1) as u64;
             if needed <= my_vram {
                 downloadable.push((m.clone(), d.request_count));
@@ -965,7 +1074,7 @@ async fn check_unserved_model(node: &mesh::Node, local_models: &[String]) -> Opt
     let mut unserved: Vec<(String, u64)> = Vec::new();
     for (m, d) in &demand {
         if serving_count.get(m).copied().unwrap_or(0) == 0 && local_models.contains(m) {
-            let model_path = mesh::find_model_path(m);
+            let model_path = models::find_model_path(m);
             let model_bytes = std::fs::metadata(&model_path)
                 .map(|md| md.len())
                 .unwrap_or(0);
@@ -991,7 +1100,7 @@ async fn check_unserved_model(node: &mesh::Node, local_models: &[String]) -> Opt
         }
         let servers = serving_count.get(m).copied().unwrap_or(0) as f64;
         if servers > 0.0 && d.request_count > 0 && local_models.contains(m) {
-            let model_path = mesh::find_model_path(m);
+            let model_path = models::find_model_path(m);
             let model_bytes = std::fs::metadata(&model_path)
                 .map(|md| md.len())
                 .unwrap_or(0);
@@ -1146,7 +1255,7 @@ async fn run_auto(
     let local_models = if is_client {
         vec![]
     } else {
-        mesh::scan_local_models()
+        models::scan_local_models()
     };
     tracing::info!("Local models on disk: {:?}", local_models);
 
@@ -1376,23 +1485,15 @@ async fn run_auto(
         };
         if let Some(model_name) = assignment {
             eprintln!("Mesh assigned model: {model_name}");
-            let model_path = mesh::find_model_path(&model_name);
+            let model_path = models::find_model_path(&model_name);
             if model_path.exists() {
                 model_path
-            } else if let Some(cat) = download::find_model(&model_name) {
+            } else if let Some(cat) = catalog::find_model(&model_name) {
                 // Model not on disk but in catalog — download it
                 eprintln!("📥 Downloading {} for mesh...", model_name);
-                let dest = download::models_dir().join(cat.file);
-                download::download_model(cat).await?;
-                dest
+                catalog::download_model(cat).await?
             } else {
-                // Not on disk and not in catalog — try common paths
-                let alt = download::models_dir().join(&model_name);
-                if alt.exists() {
-                    alt
-                } else {
-                    model_path
-                }
+                model_path
             }
         } else {
             // Nothing on disk matches — go passive, act as proxy
@@ -1414,16 +1515,11 @@ async fn run_auto(
             match run_passive(&cli, node.clone(), is_client, plugin_manager.clone()).await? {
                 Some(model_name) => {
                     // Promoted! Resolve the model path and continue to serving
-                    let model_path = mesh::find_model_path(&model_name);
+                    let model_path = models::find_model_path(&model_name);
                     if model_path.exists() {
                         model_path
                     } else {
-                        let alt = download::models_dir().join(&model_name);
-                        if alt.exists() {
-                            alt
-                        } else {
-                            model_path
-                        }
+                        model_path
                     }
                 }
                 None => return Ok(()), // clean shutdown
@@ -1747,7 +1843,7 @@ async fn run_auto(
 async fn run_idle(cli: Cli, _bin_dir: PathBuf) -> Result<()> {
     let resolved_plugins = load_resolved_plugins(&cli)?;
     let my_vram_gb = mesh::detect_vram_bytes_capped(cli.max_vram) as f64 / 1e9;
-    let local_models = mesh::scan_local_models();
+    let local_models = models::scan_local_models();
     eprintln!(
         "mesh-llm v{VERSION} — {:.0}GB VRAM, {} models on disk",
         my_vram_gb,
@@ -1765,6 +1861,10 @@ async fn run_idle(cli: Cli, _bin_dir: PathBuf) -> Result<()> {
     eprintln!("    mesh-llm --join <token>      join by invite token");
     eprintln!("    mesh-llm --client --auto     join as API-only client");
     eprintln!();
+    if models::legacy_models_present() {
+        models::print_legacy_storage_warning();
+        eprintln!();
+    }
 
     // Start a dormant node just for the console
     let (node, _channels) = mesh::Node::start(
@@ -1913,7 +2013,7 @@ async fn run_passive(
     if !is_client {
         let watch_node = node.clone();
         let mut peer_rx = node.peer_change_rx.clone();
-        let local_models = mesh::scan_local_models();
+        let local_models = models::scan_local_models();
         tokio::spawn(async move {
             // Wait for initial mesh settle
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -3107,9 +3207,12 @@ fn build_serving_list(resolved_models: &[PathBuf], model_name: &str) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hf_hub::{Cache, Repo, RepoType};
     use serde_json::json;
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::net::SocketAddr;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3237,6 +3340,107 @@ mod tests {
             raw.truncate(header_end);
             return raw;
         }
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_model_accepts_short_catalog_name_from_hf_cache() {
+        let prev_hub_cache = std::env::var_os("HF_HUB_CACHE");
+        let prev_hf_home = std::env::var_os("HF_HOME");
+        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+
+        let cache_root = std::env::temp_dir().join(format!(
+            "mesh-llm-short-name-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&cache_root).unwrap();
+        std::env::set_var("HF_HUB_CACHE", &cache_root);
+        std::env::remove_var("HF_HOME");
+        std::env::remove_var("XDG_CACHE_HOME");
+
+        let cache = Cache::new(cache_root.clone());
+        let repo = Repo::with_revision(
+            "bartowski/Llama-3.2-1B-Instruct-GGUF".to_string(),
+            RepoType::Model,
+            "main".to_string(),
+        );
+        let cache_repo = cache.repo(repo);
+        cache_repo.create_ref("test-commit").unwrap();
+        let model_path = cache_repo
+            .pointer_path("test-commit")
+            .join("Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"gguf").unwrap();
+
+        let resolved = resolve_model(Path::new("Llama-3.2-1B-Instruct-Q4_K_M"))
+            .await
+            .unwrap();
+        assert_eq!(resolved, model_path);
+
+        let _ = std::fs::remove_dir_all(&cache_root);
+        restore_env("HF_HUB_CACHE", prev_hub_cache);
+        restore_env("HF_HOME", prev_hf_home);
+        restore_env("XDG_CACHE_HOME", prev_xdg);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resolve_model_accepts_non_catalog_name_from_hf_cache() {
+        let prev_hub_cache = std::env::var_os("HF_HUB_CACHE");
+        let prev_hf_home = std::env::var_os("HF_HOME");
+        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+
+        let cache_root = std::env::temp_dir().join(format!(
+            "mesh-llm-non-catalog-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&cache_root).unwrap();
+        std::env::set_var("HF_HUB_CACHE", &cache_root);
+        std::env::remove_var("HF_HOME");
+        std::env::remove_var("XDG_CACHE_HOME");
+
+        let cache = Cache::new(cache_root.clone());
+        let repo = Repo::with_revision(
+            "someone/Custom-GGUF".to_string(),
+            RepoType::Model,
+            "main".to_string(),
+        );
+        let cache_repo = cache.repo(repo);
+        cache_repo.create_ref("test-commit").unwrap();
+        let model_path = cache_repo
+            .pointer_path("test-commit")
+            .join("Custom-Model-Q4_K_M.gguf");
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::fs::write(&model_path, b"gguf").unwrap();
+
+        let resolved_by_stem = resolve_model(Path::new("Custom-Model-Q4_K_M"))
+            .await
+            .unwrap();
+        assert_eq!(resolved_by_stem, model_path);
+
+        let resolved_by_filename = resolve_model(Path::new("Custom-Model-Q4_K_M.gguf"))
+            .await
+            .unwrap();
+        assert_eq!(resolved_by_filename, model_path);
+
+        let _ = std::fs::remove_dir_all(&cache_root);
+        restore_env("HF_HUB_CACHE", prev_hub_cache);
+        restore_env("HF_HOME", prev_hf_home);
+        restore_env("XDG_CACHE_HOME", prev_xdg);
     }
 
     fn find_header_end(buf: &[u8]) -> Option<usize> {

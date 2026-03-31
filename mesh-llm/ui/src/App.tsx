@@ -84,7 +84,28 @@ type MeshModel = {
   node_count: number;
   size_gb: number;
   vision?: boolean;
+  vision_status?: 'supported' | 'likely' | 'none' | string;
+  reasoning?: boolean;
+  reasoning_status?: 'supported' | 'likely' | 'none' | string;
 };
+
+function visionBadge(model?: MeshModel | null) {
+  if (!model) return null;
+  if (model.vision) return { icon: '👁', title: 'Vision — understands images' };
+  if (model.vision_status === 'likely') {
+    return { icon: '👁?', title: 'Vision likely — inferred from model metadata' };
+  }
+  return null;
+}
+
+function reasoningBadge(model?: MeshModel | null) {
+  if (!model) return null;
+  if (model.reasoning) return { icon: '🧠', title: 'Reasoning-oriented model' };
+  if (model.reasoning_status === 'likely') {
+    return { icon: '🧠?', title: 'Reasoning likely — inferred from model metadata' };
+  }
+  return null;
+}
 
 type Peer = {
   id: string;
@@ -1863,6 +1884,9 @@ function ChatPage(props: {
                 ) : null}
                 {warmModels.map((model) => {
                   const modelStats = modelStatsByName[model];
+                  const selectedMeshModel = (status?.mesh_models ?? []).find((m) => m.name === model);
+                  const visionInfo = visionBadge(selectedMeshModel);
+                  const reasoningInfo = reasoningBadge(selectedMeshModel);
                   return (
                     <SelectItem
                       key={model}
@@ -1872,7 +1896,8 @@ function ChatPage(props: {
                       <div className="flex min-w-0 flex-col gap-0.5">
                         <span className="truncate leading-5">
                           {shortName(model)}
-                          {visionModels.has(model) && <span className="ml-1.5" title="Vision — understands images">👁</span>}
+                          {visionInfo && <span className="ml-1.5" title={visionInfo.title}>{visionInfo.icon}</span>}
+                          {reasoningInfo && <span className="ml-1.5" title={reasoningInfo.title}>{reasoningInfo.icon}</span>}
                         </span>
                         {modelStats ? (
                           <span className="grid grid-cols-[108px_132px] gap-x-3 text-xs leading-4 text-muted-foreground group-data-[highlighted]:text-accent-foreground group-data-[state=checked]:text-accent-foreground">
@@ -2409,7 +2434,10 @@ function DashboardPage({
             {filteredModels.length > 0 ? (
               <div className="h-[360px] overflow-y-auto pr-2 md:h-[420px] lg:h-[460px] xl:h-[520px]">
                 <div className="space-y-2">
-                  {filteredModels.map((model) => (
+                  {filteredModels.map((model) => {
+                    const modelVision = visionBadge(model);
+                    const modelReasoning = reasoningBadge(model);
+                    return (
                     <div key={model.name} className="rounded-md border p-3">
                       <div className="flex flex-col items-start gap-2 sm:flex-row sm:items-start">
                         <div className="flex h-7 w-7 items-center justify-center rounded-md border bg-muted/40 text-muted-foreground">
@@ -2417,7 +2445,11 @@ function DashboardPage({
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="text-sm font-medium leading-5 [overflow-wrap:anywhere]">{shortName(model.name)}</div>
-                          <div className="text-xs leading-4 text-muted-foreground [overflow-wrap:anywhere]">{model.name}</div>
+                          <div className="text-xs leading-4 text-muted-foreground [overflow-wrap:anywhere]">
+                            {model.name}
+                            {modelVision && <span className="ml-1.5" title={modelVision.title}>{modelVision.icon}</span>}
+                            {modelReasoning && <span className="ml-1.5" title={modelReasoning.title}>{modelReasoning.icon}</span>}
+                          </div>
                         </div>
                         <Badge
                           className={cn(
@@ -2433,12 +2465,13 @@ function DashboardPage({
                       <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
                         <span>{model.node_count} node{model.node_count === 1 ? '' : 's'}</span>
                         <span className="flex items-center gap-2">
-                          {model.vision && <span title="Vision — understands images">👁</span>}
+                          {modelVision && <span title={modelVision.title}>{modelVision.icon}</span>}
                           {model.size_gb.toFixed(1)} GB
                         </span>
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             ) : (
