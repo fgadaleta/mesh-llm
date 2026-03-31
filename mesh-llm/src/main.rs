@@ -452,6 +452,18 @@ async fn main() -> Result<()> {
         cli.publish = true;
     }
 
+    // --- Public-to-private identity transition ---
+    // If the previous run was public (--auto / --publish / --mesh-name) but this
+    // run is private, clear the stored identity so the private mesh gets a fresh
+    // key that isn't associated with the old public listing.
+    let is_public = cli.auto || cli.publish;
+    if is_public {
+        mesh::mark_was_public();
+    } else if mesh::was_previously_public() {
+        eprintln!("🔑 Previous run was public — rotating identity for private mesh");
+        mesh::clear_public_identity();
+    }
+
     // --- Auto-discover ---
     if cli.auto && cli.join.is_empty() {
         cli.nostr_discovery = true;
