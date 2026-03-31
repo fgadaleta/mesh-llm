@@ -6609,6 +6609,60 @@ pub fn load_last_mesh_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+// ---------------------------------------------------------------------------
+// Public-to-private identity transition
+// ---------------------------------------------------------------------------
+
+fn was_public_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".mesh-llm")
+        .join("was-public")
+}
+
+/// Record that this node was started in public mode (--auto / --publish / --mesh-name).
+/// Called at startup so we can detect a public→private transition next time.
+pub fn mark_was_public() {
+    let path = was_public_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, "1");
+}
+
+/// Returns true if the previous run was public (marker file exists).
+pub fn was_previously_public() -> bool {
+    was_public_path().exists()
+}
+
+/// Clear identity files (key, nostr.nsec, mesh-id, last-mesh, was-public) so the
+/// next start gets a completely fresh identity. Called when transitioning from
+/// public → private to avoid reusing a publicly-known identity in a private mesh.
+pub fn clear_public_identity() {
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = home.join(".mesh-llm");
+    let mut ok = true;
+    for name in &["key", "nostr.nsec", "mesh-id", "last-mesh"] {
+        let p = dir.join(name);
+        if p.exists() {
+            if std::fs::remove_file(&p).is_ok() {
+                tracing::info!("Cleared {}", p.display());
+            } else {
+                tracing::warn!("Failed to clear {}", p.display());
+                ok = false;
+            }
+        }
+    }
+    // Only remove the marker after identity files are gone, so a failed
+    // cleanup is retried on the next private start.
+    let marker = dir.join("was-public");
+    if ok {
+        let _ = std::fs::remove_file(&marker);
+    } else {
+        tracing::warn!("Keeping was-public marker — will retry cleanup next start");
+    }
+}
+
 /// Load secret key from ~/.mesh-llm/key, or create a new one and save it.
 async fn load_or_create_key() -> Result<SecretKey> {
     let home =
@@ -6632,4 +6686,77 @@ async fn load_or_create_key() -> Result<SecretKey> {
     tokio::fs::write(&key_path, hex::encode(key.to_bytes())).await?;
     tracing::info!("Generated new key, saved to {}", key_path.display());
     Ok(key)
+}
+
+#[cfg(test)]
+mod public_identity_tests {
+    use super::*;
+    use std::fs;
+
+    /// Test that mark_was_public / was_previously_public / clear_public_identity
+    /// work correctly.  Uses the real ~/.mesh-llm/ directory (same approach as
+    /// the rotate_keys tests) and restores originals afterward.
+    #[test]
+    fn public_to_private_transition_clears_identity() {
+        let dir = dirs::home_dir().unwrap().join(".mesh-llm");
+        fs::create_dir_all(&dir).ok();
+
+        // Files we may touch:
+        let paths: Vec<std::path::PathBuf> =
+            ["key", "nostr.nsec", "mesh-id", "last-mesh", "was-public"]
+                .iter()
+                .map(|n| dir.join(n))
+                .collect();
+
+        // Save originals so we can restore after the test.
+        let originals: Vec<Option<Vec<u8>>> = paths
+            .iter()
+            .map(|p| {
+                if p.exists() {
+                    Some(fs::read(p).unwrap())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // --- Scenario 1: no marker → was_previously_public is false ---
+        let _ = fs::remove_file(dir.join("was-public"));
+        assert!(!was_previously_public(), "should be false when no marker");
+
+        // --- Scenario 2: mark as public → marker exists ---
+        mark_was_public();
+        assert!(was_previously_public(), "should be true after marking");
+
+        // Plant some identity files to verify clear removes them.
+        fs::write(dir.join("key"), b"test-key").unwrap();
+        fs::write(dir.join("nostr.nsec"), b"test-nsec").unwrap();
+        fs::write(dir.join("mesh-id"), b"test-mesh-id").unwrap();
+        fs::write(dir.join("last-mesh"), b"test-last-mesh").unwrap();
+
+        // --- Scenario 3: clear_public_identity removes everything ---
+        clear_public_identity();
+        for name in &["key", "nostr.nsec", "mesh-id", "last-mesh", "was-public"] {
+            assert!(
+                !dir.join(name).exists(),
+                "{name} should be deleted after clear"
+            );
+        }
+        assert!(
+            !was_previously_public(),
+            "marker should be gone after clear"
+        );
+
+        // --- Scenario 4: clear on already-clean directory is fine ---
+        clear_public_identity(); // should not panic
+
+        // Restore originals.
+        for (path, orig) in paths.iter().zip(originals.iter()) {
+            if let Some(data) = orig {
+                fs::write(path, data).ok();
+            } else {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
 }
