@@ -91,7 +91,7 @@ fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct LegacyPeerAnnouncementV0 {
+pub(crate) struct PeerAnnouncementV0 {
     addr: EndpointAddr,
     #[serde(default)]
     role: NodeRole,
@@ -129,7 +129,7 @@ pub(crate) struct LegacyPeerAnnouncementV0 {
     available_model_sizes: HashMap<String, u64>,
 }
 
-impl LegacyPeerAnnouncementV0 {
+impl PeerAnnouncementV0 {
     pub(crate) fn into_internal(self) -> PeerAnnouncement {
         let assigned_models = if !self.serving_models.is_empty() {
             self.serving_models.clone()
@@ -161,7 +161,7 @@ impl LegacyPeerAnnouncementV0 {
     }
 }
 
-impl From<&PeerAnnouncement> for LegacyPeerAnnouncementV0 {
+impl From<&PeerAnnouncement> for PeerAnnouncementV0 {
     fn from(ann: &PeerAnnouncement) -> Self {
         Self {
             addr: ann.addr.clone(),
@@ -4234,7 +4234,7 @@ mod tests {
             .await?;
         let legacy_id = legacy_endpoint.id();
         let legacy_addr = legacy_endpoint.addr();
-        let legacy_ann = super::LegacyPeerAnnouncementV0 {
+        let legacy_ann = super::PeerAnnouncementV0 {
             addr: legacy_addr.clone(),
             role: super::NodeRole::Host { http_port: 9444 },
             models: vec!["legacy-model".to_string()],
@@ -4292,7 +4292,7 @@ mod tests {
             let gossip_buf = read_len_prefixed(&mut recv_gossip)
                 .await
                 .expect("legacy server must read JSON gossip frame");
-            let received_anns: Vec<super::LegacyPeerAnnouncementV0> =
+            let received_anns: Vec<super::PeerAnnouncementV0> =
                 serde_json::from_slice(&gossip_buf).expect("legacy gossip must decode as JSON");
             assert!(
                 received_anns
@@ -4348,7 +4348,7 @@ mod tests {
             let response_buf = read_len_prefixed(&mut recv_gossip2)
                 .await
                 .expect("post node should answer legacy gossip");
-            let response_anns: Vec<super::LegacyPeerAnnouncementV0> =
+            let response_anns: Vec<super::PeerAnnouncementV0> =
                 serde_json::from_slice(&response_buf)
                     .expect("post node must answer with JSON gossip");
             assert!(
@@ -4438,7 +4438,7 @@ mod tests {
     #[test]
     fn legacy_json_gossip_payload_decodes() {
         let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x42; 32]).public());
-        let ann = super::LegacyPeerAnnouncementV0 {
+        let ann = super::PeerAnnouncementV0 {
             addr: EndpointAddr {
                 id: peer_id,
                 addrs: Default::default(),

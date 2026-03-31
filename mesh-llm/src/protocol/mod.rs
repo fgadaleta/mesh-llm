@@ -15,7 +15,7 @@
 
 #[cfg(test)]
 use crate::mesh::NodeRole;
-use crate::mesh::{LegacyPeerAnnouncementV0, PeerAnnouncement};
+use crate::mesh::{PeerAnnouncement, PeerAnnouncementV0};
 
 pub(crate) mod convert;
 pub(crate) mod v0;
@@ -256,8 +256,8 @@ pub(crate) async fn write_gossip_payload(
             write_len_prefixed(send, &frame.encode_to_vec()).await?;
         }
         ControlProtocol::JsonV0 => {
-            let legacy_anns: Vec<LegacyPeerAnnouncementV0> =
-                anns.iter().map(LegacyPeerAnnouncementV0::from).collect();
+            let legacy_anns: Vec<PeerAnnouncementV0> =
+                anns.iter().map(PeerAnnouncementV0::from).collect();
             let json = serde_json::to_vec(&legacy_anns)?;
             write_len_prefixed(send, &json).await?;
         }
@@ -290,7 +290,7 @@ pub(crate) fn decode_gossip_payload(
                 .collect::<Vec<_>>())
         }
         ControlProtocol::JsonV0 => {
-            let anns: Vec<LegacyPeerAnnouncementV0> = serde_json::from_slice(buf)?;
+            let anns: Vec<PeerAnnouncementV0> = serde_json::from_slice(buf)?;
             Ok(anns
                 .into_iter()
                 .map(|ann| {
@@ -442,7 +442,7 @@ mod tests {
             experts_summary: None,
             available_model_sizes: HashMap::from([("Qwen".into(), 1234_u64)]),
         };
-        let json = serde_json::to_vec(&vec![LegacyPeerAnnouncementV0::from(&ann)]).unwrap();
+        let json = serde_json::to_vec(&vec![PeerAnnouncementV0::from(&ann)]).unwrap();
 
         let decoded = decode_gossip_payload(ControlProtocol::JsonV0, peer_id, &json).unwrap();
 
@@ -843,7 +843,7 @@ mod tests {
             experts_summary: None,
             available_model_sizes: HashMap::new(),
         };
-        let json = serde_json::to_vec(&vec![LegacyPeerAnnouncementV0::from(&ann)])
+        let json = serde_json::to_vec(&vec![PeerAnnouncementV0::from(&ann)])
             .expect("JSON serialization must succeed");
 
         let decoded = decode_gossip_payload(ControlProtocol::JsonV0, remote_id, &json)
