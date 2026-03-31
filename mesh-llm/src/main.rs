@@ -208,7 +208,7 @@ enum Command {
         /// Print the invite token of the best match (for piping to --join)
         #[arg(long)]
         auto: bool,
-        /// Nostr relay URLs (default: damus, nos.lol, nostr.band)
+        /// Nostr relay URLs (default: see DEFAULT_RELAYS)
         #[arg(long)]
         relay: Vec<String>,
     },

@@ -3615,20 +3615,11 @@ pub fn load_last_mesh_id() -> Option<String> {
 }
 
 /// Load secret key from ~/.mesh-llm/key, or create a new one and save it.
-/// Migrates from ~/.mesh-inference/key if it exists.
 async fn load_or_create_key() -> Result<SecretKey> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let dir = home.join(".mesh-llm");
     let key_path = dir.join("key");
-
-    // Migrate from old name
-    let old_key = home.join(".mesh-inference").join("key");
-    if !key_path.exists() && old_key.exists() {
-        tokio::fs::create_dir_all(&dir).await?;
-        tokio::fs::copy(&old_key, &key_path).await?;
-        tracing::info!("Migrated key from {}", old_key.display());
-    }
 
     if key_path.exists() {
         let hex = tokio::fs::read_to_string(&key_path).await?;
