@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use base64::Engine;
-use iroh::endpoint::{ConnectOptions, Connection};
+use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use tokio::sync::{watch, Mutex};
+
+use crate::protocol::*;
 
 /// Demand signal for a model — tracks interest via API requests and --model declarations.
 /// Gossiped across the mesh and merged via max(). Decays naturally when last_active gets old.
@@ -89,7 +91,7 @@ fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyPeerAnnouncementV0 {
+pub(crate) struct LegacyPeerAnnouncementV0 {
     addr: EndpointAddr,
     #[serde(default)]
     role: NodeRole,
@@ -128,7 +130,7 @@ struct LegacyPeerAnnouncementV0 {
 }
 
 impl LegacyPeerAnnouncementV0 {
-    fn into_internal(self) -> PeerAnnouncement {
+    pub(crate) fn into_internal(self) -> PeerAnnouncement {
         let assigned_models = if !self.serving_models.is_empty() {
             self.serving_models.clone()
         } else {
@@ -252,346 +254,6 @@ pub fn merge_demand(
     }
 }
 
-pub const ALPN_V1: &[u8] = b"mesh-llm/1";
-pub const ALPN_V0: &[u8] = b"mesh-llm/0";
-pub const ALPN: &[u8] = ALPN_V1;
-pub(crate) const NODE_PROTOCOL_GENERATION: u32 = 1;
-pub(crate) const MAX_CONTROL_FRAME_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
-
-const STREAM_GOSSIP: u8 = 0x01;
-const STREAM_TUNNEL: u8 = 0x02;
-const STREAM_TUNNEL_MAP: u8 = 0x03;
-pub const STREAM_TUNNEL_HTTP: u8 = 0x04;
-const STREAM_ROUTE_REQUEST: u8 = 0x05;
-const STREAM_PEER_DOWN: u8 = 0x06;
-const STREAM_PEER_LEAVING: u8 = 0x07;
-const STREAM_BLACKBOARD: u8 = 0x08;
-const STREAM_PLUGIN_CHANNEL: u8 = 0x09;
-const STREAM_PLUGIN_BULK_TRANSFER: u8 = 0x0a;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ControlProtocol {
-    ProtoV1,
-    JsonV0,
-}
-
-fn protocol_from_alpn(alpn: &[u8]) -> ControlProtocol {
-    if alpn == ALPN_V0 {
-        ControlProtocol::JsonV0
-    } else {
-        ControlProtocol::ProtoV1
-    }
-}
-
-fn connection_protocol(conn: &Connection) -> ControlProtocol {
-    protocol_from_alpn(conn.alpn())
-}
-
-async fn connect_mesh(endpoint: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
-    let opts = ConnectOptions::new().with_additional_alpns(vec![ALPN_V0.to_vec()]);
-    let connecting = endpoint.connect_with_opts(addr, ALPN_V1, opts).await?;
-    Ok(connecting.await?)
-}
-
-async fn write_len_prefixed(send: &mut iroh::endpoint::SendStream, body: &[u8]) -> Result<()> {
-    send.write_all(&(body.len() as u32).to_le_bytes()).await?;
-    send.write_all(body).await?;
-    Ok(())
-}
-
-async fn read_len_prefixed(recv: &mut iroh::endpoint::RecvStream) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_CONTROL_FRAME_BYTES {
-        anyhow::bail!("control frame too large: {} bytes", len);
-    }
-    let mut buf = vec![0u8; len];
-    recv.read_exact(&mut buf).await?;
-    Ok(buf)
-}
-
-async fn write_gossip_payload(
-    send: &mut iroh::endpoint::SendStream,
-    protocol: ControlProtocol,
-    anns: &[PeerAnnouncement],
-    sender_id: EndpointId,
-) -> Result<()> {
-    match protocol {
-        ControlProtocol::ProtoV1 => {
-            let frame = build_gossip_frame(anns, sender_id);
-            write_len_prefixed(send, &frame.encode_to_vec()).await?;
-        }
-        ControlProtocol::JsonV0 => {
-            let legacy_anns: Vec<LegacyPeerAnnouncementV0> =
-                anns.iter().map(LegacyPeerAnnouncementV0::from).collect();
-            let json = serde_json::to_vec(&legacy_anns)?;
-            write_len_prefixed(send, &json).await?;
-        }
-    }
-    Ok(())
-}
-
-fn decode_gossip_payload(
-    protocol: ControlProtocol,
-    remote: EndpointId,
-    buf: &[u8],
-) -> Result<Vec<(EndpointAddr, PeerAnnouncement)>> {
-    match protocol {
-        ControlProtocol::ProtoV1 => {
-            let frame = crate::proto::node::GossipFrame::decode(buf)
-                .map_err(|e| anyhow::anyhow!("gossip decode from {}: {e}", remote.fmt_short()))?;
-            frame.validate_frame().map_err(|e| {
-                anyhow::anyhow!("invalid gossip frame from {}: {e}", remote.fmt_short())
-            })?;
-            if frame.sender_id.as_slice() != remote.as_bytes() {
-                anyhow::bail!(
-                    "gossip sender_id mismatch from {}: connection identity does not match frame sender_id",
-                    remote.fmt_short()
-                );
-            }
-            Ok(frame
-                .peers
-                .iter()
-                .filter_map(proto_ann_to_local)
-                .collect::<Vec<_>>())
-        }
-        ControlProtocol::JsonV0 => {
-            let anns: Vec<LegacyPeerAnnouncementV0> = serde_json::from_slice(buf)?;
-            Ok(anns
-                .into_iter()
-                .map(|ann| {
-                    let ann = ann.into_internal();
-                    (ann.addr.clone(), ann)
-                })
-                .collect::<Vec<_>>())
-        }
-    }
-}
-
-fn decode_legacy_tunnel_map_frame(buf: &[u8]) -> Result<crate::proto::node::TunnelMap> {
-    let serialized: HashMap<String, u16> = serde_json::from_slice(buf)?;
-    let entries = serialized
-        .into_iter()
-        .filter_map(|(hex_id, port)| {
-            let bytes = hex::decode(&hex_id).ok()?;
-            let arr: [u8; 32] = bytes.try_into().ok()?;
-            Some(crate::proto::node::TunnelEntry {
-                target_peer_id: arr.to_vec(),
-                relay_peer_id: None,
-                tunnel_port: port as u32,
-            })
-        })
-        .collect();
-    Ok(crate::proto::node::TunnelMap {
-        owner_peer_id: Vec::new(),
-        entries,
-    })
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) enum ControlFrameError {
-    OversizeFrame { size: usize },
-    BadGeneration { got: u32 },
-    InvalidEndpointId { got: usize },
-    InvalidSenderId { got: usize },
-    MissingHttpPort,
-    DecodeError(String),
-    WrongStreamType { expected: u8, got: u8 },
-    ForgedSender,
-}
-
-impl std::fmt::Display for ControlFrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ControlFrameError::OversizeFrame { size } => write!(
-                f,
-                "control frame too large: {} bytes (max {})",
-                size, MAX_CONTROL_FRAME_BYTES
-            ),
-            ControlFrameError::BadGeneration { got } => write!(
-                f,
-                "bad protocol generation: expected {}, got {}",
-                NODE_PROTOCOL_GENERATION, got
-            ),
-            ControlFrameError::InvalidEndpointId { got } => {
-                write!(f, "invalid endpoint_id length: expected 32, got {}", got)
-            }
-            ControlFrameError::InvalidSenderId { got } => {
-                write!(f, "invalid sender_id length: expected 32, got {}", got)
-            }
-            ControlFrameError::MissingHttpPort => {
-                write!(f, "HOST-role peer annotation missing http_port")
-            }
-            ControlFrameError::DecodeError(msg) => write!(f, "protobuf decode error: {}", msg),
-            ControlFrameError::WrongStreamType { expected, got } => write!(
-                f,
-                "wrong stream type: expected {:#04x}, got {:#04x}",
-                expected, got
-            ),
-            ControlFrameError::ForgedSender => {
-                write!(f, "frame peer_id does not match QUIC connection identity")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ControlFrameError {}
-
-pub(crate) trait ValidateControlFrame: prost::Message + Default + Sized {
-    fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        Ok(())
-    }
-}
-
-impl ValidateControlFrame for crate::proto::node::GossipFrame {
-    fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
-        }
-        if self.sender_id.len() != 32 {
-            return Err(ControlFrameError::InvalidSenderId {
-                got: self.sender_id.len(),
-            });
-        }
-        for pa in &self.peers {
-            validate_peer_announcement(pa)?;
-        }
-        Ok(())
-    }
-}
-
-impl ValidateControlFrame for crate::proto::node::TunnelMap {
-    fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.owner_peer_id.len() != 32 {
-            return Err(ControlFrameError::InvalidEndpointId {
-                got: self.owner_peer_id.len(),
-            });
-        }
-        for entry in &self.entries {
-            if entry.target_peer_id.len() != 32 {
-                return Err(ControlFrameError::InvalidEndpointId {
-                    got: entry.target_peer_id.len(),
-                });
-            }
-        }
-        Ok(())
-    }
-}
-impl ValidateControlFrame for crate::proto::node::RouteTableRequest {
-    fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
-        }
-        if !self.requester_id.is_empty() && self.requester_id.len() != 32 {
-            return Err(ControlFrameError::InvalidEndpointId {
-                got: self.requester_id.len(),
-            });
-        }
-        Ok(())
-    }
-}
-impl ValidateControlFrame for crate::proto::node::RouteTable {
-    fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
-        }
-        for entry in &self.entries {
-            if entry.endpoint_id.len() != 32 {
-                return Err(ControlFrameError::InvalidEndpointId {
-                    got: entry.endpoint_id.len(),
-                });
-            }
-        }
-        Ok(())
-    }
-}
-impl ValidateControlFrame for crate::proto::node::PeerDown {
-    fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
-        }
-        if self.peer_id.len() != 32 {
-            return Err(ControlFrameError::InvalidEndpointId {
-                got: self.peer_id.len(),
-            });
-        }
-        Ok(())
-    }
-}
-impl ValidateControlFrame for crate::proto::node::PeerLeaving {
-    fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
-        }
-        if self.peer_id.len() != 32 {
-            return Err(ControlFrameError::InvalidEndpointId {
-                got: self.peer_id.len(),
-            });
-        }
-        Ok(())
-    }
-}
-
-pub(crate) fn encode_control_frame(stream_type: u8, msg: &impl prost::Message) -> Vec<u8> {
-    let proto_bytes = msg.encode_to_vec();
-    let len = proto_bytes.len() as u32;
-    let mut buf = Vec::with_capacity(1 + 4 + proto_bytes.len());
-    buf.push(stream_type);
-    buf.extend_from_slice(&len.to_le_bytes());
-    buf.extend_from_slice(&proto_bytes);
-    buf
-}
-
-pub(crate) fn decode_control_frame<T: ValidateControlFrame>(
-    expected_stream_type: u8,
-    data: &[u8],
-) -> Result<T, ControlFrameError> {
-    const HEADER_LEN: usize = 5;
-    if data.len() < HEADER_LEN {
-        return Err(ControlFrameError::DecodeError(format!(
-            "frame too short: {} bytes (minimum {})",
-            data.len(),
-            HEADER_LEN
-        )));
-    }
-    let actual_type = data[0];
-    if actual_type != expected_stream_type {
-        return Err(ControlFrameError::WrongStreamType {
-            expected: expected_stream_type,
-            got: actual_type,
-        });
-    }
-    let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-    if len > MAX_CONTROL_FRAME_BYTES {
-        return Err(ControlFrameError::OversizeFrame { size: len });
-    }
-    let proto_bytes = data.get(5..5 + len).ok_or_else(|| {
-        ControlFrameError::DecodeError(format!(
-            "frame truncated: header says {} bytes but only {} available",
-            len,
-            data.len().saturating_sub(5)
-        ))
-    })?;
-    let msg = T::decode(proto_bytes).map_err(|e| ControlFrameError::DecodeError(e.to_string()))?;
-    msg.validate_frame()?;
-    Ok(msg)
-}
-
-pub(crate) fn validate_peer_announcement(
-    pa: &crate::proto::node::PeerAnnouncement,
-) -> Result<(), ControlFrameError> {
-    if pa.endpoint_id.len() != 32 {
-        return Err(ControlFrameError::InvalidEndpointId {
-            got: pa.endpoint_id.len(),
-        });
-    }
-    if pa.role == crate::proto::node::NodeRole::Host as i32 && pa.http_port.is_none() {
-        return Err(ControlFrameError::MissingHttpPort);
-    }
-    Ok(())
-}
-
 /// Role a node plays in the mesh.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum NodeRole {
@@ -612,28 +274,28 @@ impl Default for NodeRole {
 /// Gossip payload — extends EndpointAddr with role metadata.
 /// Internal mesh gossip model. Legacy JSON v0 is adapted at the boundary.
 #[derive(Debug, Clone)]
-struct PeerAnnouncement {
-    addr: EndpointAddr,
-    role: NodeRole,
+pub(crate) struct PeerAnnouncement {
+    pub(crate) addr: EndpointAddr,
+    pub(crate) role: NodeRole,
     /// Models explicitly configured for this node.
-    configured_models: Vec<String>,
-    vram_bytes: u64,
-    model_source: Option<String>,
-    assigned_models: Vec<String>,
-    hosted_models: Option<Vec<String>>,
-    catalog_models: Vec<String>,
-    desired_models: Vec<String>,
-    version: Option<String>,
-    model_demand: HashMap<String, ModelDemand>,
-    mesh_id: Option<String>,
-    gpu_name: Option<String>,
-    hostname: Option<String>,
-    is_soc: Option<bool>,
-    gpu_vram: Option<String>,
-    gpu_bandwidth_gbps: Option<String>,
-    available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
-    experts_summary: Option<crate::proto::node::ExpertsSummary>,
-    available_model_sizes: HashMap<String, u64>,
+    pub(crate) configured_models: Vec<String>,
+    pub(crate) vram_bytes: u64,
+    pub(crate) model_source: Option<String>,
+    pub(crate) assigned_models: Vec<String>,
+    pub(crate) hosted_models: Option<Vec<String>>,
+    pub(crate) catalog_models: Vec<String>,
+    pub(crate) desired_models: Vec<String>,
+    pub(crate) version: Option<String>,
+    pub(crate) model_demand: HashMap<String, ModelDemand>,
+    pub(crate) mesh_id: Option<String>,
+    pub(crate) gpu_name: Option<String>,
+    pub(crate) hostname: Option<String>,
+    pub(crate) is_soc: Option<bool>,
+    pub(crate) gpu_vram: Option<String>,
+    pub(crate) gpu_bandwidth_gbps: Option<String>,
+    pub(crate) available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
+    pub(crate) experts_summary: Option<crate::proto::node::ExpertsSummary>,
+    pub(crate) available_model_sizes: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1222,178 +884,6 @@ impl Drop for InflightRequestGuard {
             self.inflight_requests
                 .load(std::sync::atomic::Ordering::Relaxed) as u64,
         );
-    }
-}
-
-fn local_role_to_proto(role: &NodeRole) -> (i32, Option<u32>) {
-    match role {
-        NodeRole::Worker => (crate::proto::node::NodeRole::Worker as i32, None),
-        NodeRole::Host { http_port } => (
-            crate::proto::node::NodeRole::Host as i32,
-            Some(*http_port as u32),
-        ),
-        NodeRole::Client => (crate::proto::node::NodeRole::Client as i32, None),
-    }
-}
-
-fn proto_role_to_local(role_int: i32, http_port: Option<u32>) -> NodeRole {
-    match crate::proto::node::NodeRole::try_from(role_int).unwrap_or_default() {
-        crate::proto::node::NodeRole::Host => NodeRole::Host {
-            http_port: http_port.unwrap_or(0) as u16,
-        },
-        crate::proto::node::NodeRole::Client => NodeRole::Client,
-        _ => NodeRole::Worker,
-    }
-}
-
-fn local_ann_to_proto_ann(ann: &PeerAnnouncement) -> crate::proto::node::PeerAnnouncement {
-    let (role_int, http_port) = local_role_to_proto(&ann.role);
-    let serialized_addr = serde_json::to_vec(&ann.addr).unwrap_or_default();
-    let demand: Vec<crate::proto::node::ModelDemandEntry> = ann
-        .model_demand
-        .iter()
-        .map(|(name, d)| crate::proto::node::ModelDemandEntry {
-            model_name: name.clone(),
-            last_active: d.last_active,
-            request_count: d.request_count,
-        })
-        .collect();
-    crate::proto::node::PeerAnnouncement {
-        endpoint_id: ann.addr.id.as_bytes().to_vec(),
-        role: role_int,
-        http_port,
-        version: ann.version.clone(),
-        gpu_name: ann.gpu_name.clone(),
-        hostname: ann.hostname.clone(),
-        is_soc: ann.is_soc,
-        gpu_vram: ann.gpu_vram.clone(),
-        catalog_models: ann.catalog_models.clone(),
-        assigned_models: ann.assigned_models.clone(),
-        desired_models: ann.desired_models.clone(),
-        available_model_metadata: ann.available_model_metadata.clone(),
-        experts_summary: ann.experts_summary.clone(),
-        rtt_ms: None,
-        configured_models: ann.configured_models.clone(),
-        vram_bytes: ann.vram_bytes,
-        model_source: ann.model_source.clone(),
-        mesh_id: ann.mesh_id.clone(),
-        demand,
-        available_model_sizes: ann.available_model_sizes.clone(),
-        serialized_addr,
-        hosted_models: ann.hosted_models.clone().unwrap_or_default(),
-        hosted_models_known: Some(ann.hosted_models.is_some()),
-    }
-}
-
-fn build_gossip_frame(
-    anns: &[PeerAnnouncement],
-    sender_id: EndpointId,
-) -> crate::proto::node::GossipFrame {
-    let peers: Vec<crate::proto::node::PeerAnnouncement> =
-        anns.iter().map(|ann| local_ann_to_proto_ann(ann)).collect();
-    crate::proto::node::GossipFrame {
-        gen: NODE_PROTOCOL_GENERATION,
-        sender_id: sender_id.as_bytes().to_vec(),
-        peers,
-    }
-}
-
-fn proto_ann_to_local(
-    pa: &crate::proto::node::PeerAnnouncement,
-) -> Option<(EndpointAddr, PeerAnnouncement)> {
-    let id_arr: [u8; 32] = pa.endpoint_id.as_slice().try_into().ok()?;
-    let pk = iroh::PublicKey::from_bytes(&id_arr).ok()?;
-    let peer_id = EndpointId::from(pk);
-    let addr: EndpointAddr = if !pa.serialized_addr.is_empty() {
-        serde_json::from_slice(&pa.serialized_addr).unwrap_or(EndpointAddr {
-            id: peer_id,
-            addrs: Default::default(),
-        })
-    } else {
-        EndpointAddr {
-            id: peer_id,
-            addrs: Default::default(),
-        }
-    };
-    let role = proto_role_to_local(pa.role, pa.http_port);
-    let model_demand: HashMap<String, ModelDemand> = pa
-        .demand
-        .iter()
-        .map(|e| {
-            (
-                e.model_name.clone(),
-                ModelDemand {
-                    last_active: e.last_active,
-                    request_count: e.request_count,
-                },
-            )
-        })
-        .collect();
-    let hosted_models = pa
-        .hosted_models_known
-        .unwrap_or(!pa.hosted_models.is_empty())
-        .then(|| pa.hosted_models.clone());
-    let assigned_models = pa.assigned_models.clone();
-    let ann = PeerAnnouncement {
-        addr: addr.clone(),
-        role,
-        configured_models: pa.configured_models.clone(),
-        vram_bytes: pa.vram_bytes,
-        model_source: pa.model_source.clone(),
-        assigned_models,
-        hosted_models,
-        catalog_models: pa.catalog_models.clone(),
-        desired_models: pa.desired_models.clone(),
-        version: pa.version.clone(),
-        model_demand,
-        mesh_id: pa.mesh_id.clone(),
-        gpu_name: pa.gpu_name.clone(),
-        hostname: pa.hostname.clone(),
-        is_soc: pa.is_soc,
-        gpu_vram: pa.gpu_vram.clone(),
-        gpu_bandwidth_gbps: None,
-        available_model_metadata: pa.available_model_metadata.clone(),
-        experts_summary: pa.experts_summary.clone(),
-        available_model_sizes: pa.available_model_sizes.clone(),
-    };
-    Some((addr, ann))
-}
-
-fn routing_table_to_proto(table: &RoutingTable) -> crate::proto::node::RouteTable {
-    let entries = table
-        .hosts
-        .iter()
-        .map(|e| crate::proto::node::RouteEntry {
-            endpoint_id: e.endpoint_id.as_bytes().to_vec(),
-            model: e.model.clone(),
-        })
-        .collect();
-    crate::proto::node::RouteTable {
-        entries,
-        mesh_id: table.mesh_id.clone(),
-        gen: NODE_PROTOCOL_GENERATION,
-    }
-}
-
-fn proto_route_table_to_local(table: &crate::proto::node::RouteTable) -> RoutingTable {
-    let hosts = table
-        .entries
-        .iter()
-        .filter_map(|e| {
-            let arr: [u8; 32] = e.endpoint_id.as_slice().try_into().ok()?;
-            let pk = iroh::PublicKey::from_bytes(&arr).ok()?;
-            let endpoint_id = EndpointId::from(pk);
-            Some(RouteEntry {
-                model: e.model.clone(),
-                node_id: endpoint_id.fmt_short().to_string(),
-                endpoint_id,
-                vram_gb: 0.0,
-            })
-        })
-        .collect();
-    RoutingTable {
-        hosts,
-        mesh_id: table.mesh_id.clone(),
     }
 }
 

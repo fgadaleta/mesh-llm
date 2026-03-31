@@ -49,20 +49,21 @@ pub(crate) fn local_ann_to_proto_ann(
         hostname: ann.hostname.clone(),
         is_soc: ann.is_soc,
         gpu_vram: ann.gpu_vram.clone(),
-        available_models: ann.available_models.clone(),
-        serving_models: ann.serving_models.clone(),
-        requested_models: ann.requested_models.clone(),
+        catalog_models: ann.catalog_models.clone(),
+        assigned_models: ann.assigned_models.clone(),
+        desired_models: ann.desired_models.clone(),
         available_model_metadata: ann.available_model_metadata.clone(),
         experts_summary: ann.experts_summary.clone(),
         rtt_ms: None,
-        catalog_models: ann.models.clone(),
+        configured_models: ann.configured_models.clone(),
         vram_bytes: ann.vram_bytes,
         model_source: ann.model_source.clone(),
-        primary_serving: ann.serving.clone(),
         mesh_id: ann.mesh_id.clone(),
         demand,
         available_model_sizes: ann.available_model_sizes.clone(),
         serialized_addr,
+        hosted_models: ann.hosted_models.clone().unwrap_or_default(),
+        hosted_models_known: Some(ann.hosted_models.is_some()),
     }
 }
 
@@ -110,16 +111,20 @@ pub(crate) fn proto_ann_to_local(
             )
         })
         .collect();
+    let hosted_models = pa
+        .hosted_models_known
+        .unwrap_or(!pa.hosted_models.is_empty())
+        .then(|| pa.hosted_models.clone());
     let ann = PeerAnnouncement {
         addr: addr.clone(),
         role,
-        models: pa.catalog_models.clone(),
+        configured_models: pa.configured_models.clone(),
         vram_bytes: pa.vram_bytes,
         model_source: pa.model_source.clone(),
-        serving: pa.primary_serving.clone(),
-        serving_models: pa.serving_models.clone(),
-        available_models: pa.available_models.clone(),
-        requested_models: pa.requested_models.clone(),
+        assigned_models: pa.assigned_models.clone(),
+        hosted_models,
+        catalog_models: pa.catalog_models.clone(),
+        desired_models: pa.desired_models.clone(),
         version: pa.version.clone(),
         model_demand,
         mesh_id: pa.mesh_id.clone(),

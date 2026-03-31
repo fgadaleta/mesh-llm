@@ -15,7 +15,7 @@
 
 #[cfg(test)]
 use crate::mesh::NodeRole;
-use crate::mesh::PeerAnnouncement;
+use crate::mesh::{LegacyPeerAnnouncementV0, PeerAnnouncement};
 
 pub(crate) mod convert;
 pub(crate) mod v0;
@@ -256,7 +256,9 @@ pub(crate) async fn write_gossip_payload(
             write_len_prefixed(send, &frame.encode_to_vec()).await?;
         }
         ControlProtocol::JsonV0 => {
-            let json = serde_json::to_vec(anns)?;
+            let legacy_anns: Vec<LegacyPeerAnnouncementV0> =
+                anns.iter().map(LegacyPeerAnnouncementV0::from).collect();
+            let json = serde_json::to_vec(&legacy_anns)?;
             write_len_prefixed(send, &json).await?;
         }
     }
@@ -288,10 +290,13 @@ pub(crate) fn decode_gossip_payload(
                 .collect::<Vec<_>>())
         }
         ControlProtocol::JsonV0 => {
-            let anns: Vec<PeerAnnouncement> = serde_json::from_slice(buf)?;
+            let anns: Vec<LegacyPeerAnnouncementV0> = serde_json::from_slice(buf)?;
             Ok(anns
                 .into_iter()
-                .map(|ann| (ann.addr.clone(), ann))
+                .map(|ann| {
+                    let ann = ann.into_internal();
+                    (ann.addr.clone(), ann)
+                })
                 .collect::<Vec<_>>())
         }
     }
@@ -345,11 +350,53 @@ pub(crate) fn decode_control_frame<T: ValidateControlFrame>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh::tests::{make_test_peer_info, make_valid_gossip_frame};
     use crate::mesh::{resolve_peer_down, resolve_peer_leaving, ModelDemand, PeerInfo};
     use crate::proto::node::{GossipFrame, NodeRole, PeerAnnouncement, RouteTableRequest};
     use iroh::{EndpointAddr, EndpointId, SecretKey};
     use std::collections::{HashMap, HashSet};
+
+    fn make_valid_gossip_frame() -> GossipFrame {
+        GossipFrame {
+            gen: NODE_PROTOCOL_GENERATION,
+            sender_id: vec![0u8; 32],
+            peers: vec![PeerAnnouncement {
+                endpoint_id: vec![0u8; 32],
+                role: NodeRole::Worker as i32,
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn make_test_peer_info(peer_id: EndpointId) -> PeerInfo {
+        PeerInfo {
+            id: peer_id,
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            tunnel_port: None,
+            role: crate::mesh::NodeRole::Worker,
+            configured_models: vec![],
+            vram_bytes: 0,
+            rtt_ms: None,
+            model_source: None,
+            assigned_models: vec![],
+            hosted_models: vec![],
+            hosted_models_known: false,
+            catalog_models: vec![],
+            desired_models: vec![],
+            last_seen: std::time::Instant::now(),
+            version: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+        }
+    }
 
     #[test]
     fn protocol_from_alpn_supports_v1_and_legacy_v0() {
@@ -370,13 +417,13 @@ mod tests {
                 addrs: Default::default(),
             },
             role: super::NodeRole::Host { http_port: 3131 },
-            models: vec!["Qwen".into()],
+            configured_models: vec!["Qwen".into()],
             vram_bytes: 48_000_000_000,
             model_source: Some("Qwen.gguf".into()),
-            serving: Some("Qwen".into()),
-            serving_models: vec!["Qwen".into()],
-            available_models: vec!["Qwen".into()],
-            requested_models: vec!["Qwen".into()],
+            assigned_models: vec!["Qwen".into()],
+            hosted_models: Some(vec!["Qwen".into()]),
+            catalog_models: vec!["Qwen".into()],
+            desired_models: vec!["Qwen".into()],
             version: Some("0.52.0".into()),
             model_demand: HashMap::from([(
                 "Qwen".into(),
@@ -395,13 +442,16 @@ mod tests {
             experts_summary: None,
             available_model_sizes: HashMap::from([("Qwen".into(), 1234_u64)]),
         };
-        let json = serde_json::to_vec(&vec![ann.clone()]).unwrap();
+        let json = serde_json::to_vec(&vec![LegacyPeerAnnouncementV0::from(&ann)]).unwrap();
 
         let decoded = decode_gossip_payload(ControlProtocol::JsonV0, peer_id, &json).unwrap();
 
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].0.id, peer_id);
-        assert_eq!(decoded[0].1.serving.as_deref(), Some("Qwen"));
+        assert_eq!(
+            decoded[0].1.assigned_models.first().map(String::as_str),
+            Some("Qwen")
+        );
         assert_eq!(decoded[0].1.mesh_id.as_deref(), Some("mesh-compat"));
     }
 
@@ -626,7 +676,7 @@ mod tests {
         let err = resolve_peer_leaving(remote_id, &decoded)
             .expect_err("forged PeerLeaving (peer_id != remote) must be rejected");
         assert!(
-            matches!(err, ControlFrameError::ForgedSender),
+            matches!(err, crate::protocol::ControlFrameError::ForgedSender),
             "expected ForgedSender, got {:?}",
             err
         );
@@ -774,13 +824,13 @@ mod tests {
                 addrs: Default::default(),
             },
             role: super::NodeRole::Worker,
-            models: vec!["v0-model".to_string()],
+            configured_models: vec!["v0-model".to_string()],
             vram_bytes: 8 * 1024 * 1024 * 1024,
             model_source: None,
-            serving: Some("v0-model".to_string()),
-            serving_models: vec!["v0-model".to_string()],
-            available_models: vec![],
-            requested_models: vec![],
+            assigned_models: vec!["v0-model".to_string()],
+            hosted_models: Some(vec!["v0-model".to_string()]),
+            catalog_models: vec![],
+            desired_models: vec![],
             version: Some("0.49.0".to_string()),
             model_demand: HashMap::new(),
             mesh_id: Some("gossip-gen-test".to_string()),
@@ -793,7 +843,8 @@ mod tests {
             experts_summary: None,
             available_model_sizes: HashMap::new(),
         };
-        let json = serde_json::to_vec(&vec![ann]).expect("JSON serialization must succeed");
+        let json = serde_json::to_vec(&vec![LegacyPeerAnnouncementV0::from(&ann)])
+            .expect("JSON serialization must succeed");
 
         let decoded = decode_gossip_payload(ControlProtocol::JsonV0, remote_id, &json)
             .expect("v0 JSON gossip without gen field must be accepted");
@@ -807,7 +858,7 @@ mod tests {
             "decoded addr id must match remote_id"
         );
         assert_eq!(
-            decoded[0].1.serving.as_deref(),
+            decoded[0].1.assigned_models.first().map(String::as_str),
             Some("v0-model"),
             "serving model must round-trip correctly through JSON decode"
         );
