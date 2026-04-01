@@ -38,7 +38,8 @@ use mesh::NodeRole;
 use models::catalog;
 use std::path::{Path, PathBuf};
 
-pub const VERSION: &str = "0.53.1";
+<<<<<<< HEAD
+pub const VERSION: &str = "0.54.0";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,7 +48,8 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("mesh_inference=info".parse()?)
                 .add_directive("nostr_relay_pool=off".parse()?)
-                .add_directive("nostr_sdk=warn".parse()?),
+                .add_directive("nostr_sdk=warn".parse()?)
+                .add_directive("noq_proto::connection=warn".parse()?),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -193,6 +195,18 @@ async fn main() -> Result<()> {
     // Auto-enable publishing when mesh is named
     if cli.mesh_name.is_some() && !cli.publish {
         cli.publish = true;
+    }
+
+    // --- Public-to-private identity transition ---
+    // If the previous run was public (--auto / --publish / --mesh-name) but this
+    // run is private, clear the stored identity so the private mesh gets a fresh
+    // key that isn't associated with the old public listing.
+    let is_public = cli.auto || cli.publish;
+    if is_public {
+        mesh::mark_was_public();
+    } else if mesh::was_previously_public() {
+        eprintln!("🔑 Previous run was public — rotating identity for private mesh");
+        mesh::clear_public_identity();
     }
 
     // --- Auto-discover ---
