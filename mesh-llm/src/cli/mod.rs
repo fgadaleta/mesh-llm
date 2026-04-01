@@ -184,8 +184,8 @@ pub(crate) enum Command {
     Load {
         /// Model name/path/url to load
         name: String,
-        /// API port of the running mesh-llm instance (default: 9337)
-        #[arg(long, default_value = "9337")]
+        /// Console/API port of the running mesh-llm instance (default: 3131)
+        #[arg(long, default_value = "3131")]
         port: u16,
     },
     /// Unload a local model from a running mesh-llm instance.
@@ -193,8 +193,8 @@ pub(crate) enum Command {
     Unload {
         /// Model name to unload
         name: String,
-        /// API port of the running mesh-llm instance (default: 9337)
-        #[arg(long, default_value = "9337")]
+        /// Console/API port of the running mesh-llm instance (default: 3131)
+        #[arg(long, default_value = "3131")]
         port: u16,
     },
     /// Show local model status on a running mesh-llm instance.
