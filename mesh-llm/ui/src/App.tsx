@@ -5011,7 +5011,7 @@ function StatusPill({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span className="inline-flex">{badge}</span>
+        <span className="inline-flex" tabIndex={0}>{badge}</span>
       </TooltipTrigger>
       <TooltipContent side="bottom" align="center" sideOffset={8}>
         {tooltip}
