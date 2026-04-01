@@ -147,11 +147,11 @@ curl localhost:9337/v1/chat/completions -d '{"model":"GLM-4.7-Flash-Q4_K_M", ...
 ```
 Different nodes serve different models. The API proxy routes by the `model` field.
 
-### Idle mode
+### No-arg behavior
 ```bash
-mesh-llm                                   # no args — shows instructions + console
+mesh-llm                                   # no args — prints --help and exits
 ```
-Opens a read-only console on `:3131`. Use the CLI to start or join a mesh.
+Does not start the console or bind any ports. Use the CLI flags shown in `--help` to start or join a mesh.
 
 ## Background service
 
@@ -445,7 +445,7 @@ Stage one supports local-only hot load/unload on a running node.
 
 ```bash
 mesh-llm load Llama-3.2-1B-Instruct-Q4_K_M
-mesh-llm drop Llama-3.2-1B-Instruct-Q4_K_M
+mesh-llm unload Llama-3.2-1B-Instruct-Q4_K_M
 mesh-llm status
 ```
 

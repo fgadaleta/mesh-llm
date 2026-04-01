@@ -1003,7 +1003,7 @@ impl Node {
         };
 
         // Accept loop starts but waits for start_accepting() before processing connections.
-        // This lets idle mode create a node (for identity/token) without joining any mesh.
+        // This lets a node exist before it is ready to accept mesh traffic.
         let node2 = node.clone();
         tokio::spawn(async move {
             node2.accept_loop().await;

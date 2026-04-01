@@ -268,6 +268,11 @@ async fn main() -> Result<()> {
         std::process::exit(0);
     }
 
+    if std::env::args_os().len() == 1 {
+        Cli::command().print_help().ok();
+        std::process::exit(0);
+    }
+
     let mut cli = Cli::parse();
 
     if let Some(name) = cli.plugin.clone() {
@@ -334,7 +339,7 @@ async fn main() -> Result<()> {
             Command::Load { name, port } => {
                 return run_load(name, *port).await;
             }
-            Command::Drop { name, port } => {
+            Command::Unload { name, port } => {
                 return run_drop(name, *port).await;
             }
             Command::Status { port } => {
@@ -572,22 +577,6 @@ async fn main() -> Result<()> {
     if cli.client && (!cli.model.is_empty() || !cli.gguf.is_empty()) {
         anyhow::bail!("--client and --model are mutually exclusive");
     }
-    // No args at all = idle mode with console for browsing/joining
-    if cli.model.is_empty()
-        && cli.gguf.is_empty()
-        && cli.join.is_empty()
-        && !cli.client
-        && !cli.auto
-    {
-        {
-            let bin_dir = match &cli.bin_dir {
-                Some(d) => d.clone(),
-                None => detect_bin_dir()?,
-            };
-            return run_idle(cli, bin_dir).await;
-        }
-    }
-
     // --- Resolve models from CLI ---
     // All --model entries get resolved/downloaded. First is primary (gets rpc/tunnel).
     // Additional models run as solo llama-servers (must fit in VRAM independently).
@@ -1949,75 +1938,7 @@ async fn run_auto(
     Ok(())
 }
 
-/// Idle mode: no args → show instructions and read-only console.
-/// Use --auto or --join to actually connect to a mesh.
-async fn run_idle(cli: Cli, _bin_dir: PathBuf) -> Result<()> {
-    let resolved_plugins = load_resolved_plugins(&cli)?;
-    let my_vram_gb = mesh::detect_vram_bytes_capped(cli.max_vram) as f64 / 1e9;
-    let local_models = models::scan_local_models();
-    eprintln!(
-        "mesh-llm v{VERSION} — {:.0}GB VRAM, {} models on disk",
-        my_vram_gb,
-        local_models.len()
-    );
-    eprintln!();
-    eprintln!("  Console: http://localhost:{}", cli.console);
-    eprintln!();
-    eprintln!("  Start a mesh:");
-    eprintln!("    mesh-llm --model Qwen2.5-32B                 serve a model");
-    eprintln!("    mesh-llm --auto --model GLM-4.7-Flash-Q4_K_M --mesh-name \"my-mesh\"");
-    eprintln!();
-    eprintln!("  Join a mesh:");
-    eprintln!("    mesh-llm --auto              discover and join automatically");
-    eprintln!("    mesh-llm --join <token>      join by invite token");
-    eprintln!("    mesh-llm --client --auto     join as API-only client");
-    eprintln!();
-    if models::legacy_models_present() {
-        models::print_legacy_storage_warning();
-        eprintln!();
-    }
-
-    // Start a dormant node just for the console
-    let (node, _channels) = mesh::Node::start(
-        NodeRole::Worker,
-        &cli.relay,
-        cli.bind_port,
-        cli.max_vram,
-        cli.enumerate_host,
-    )
-    .await?;
-    node.set_available_models(local_models).await;
-    node.set_blackboard_name(blackboard_display_name(&cli, &node))
-        .await;
-    let (plugin_mesh_tx, plugin_mesh_rx) = tokio::sync::mpsc::channel(256);
-    let plugin_manager =
-        plugin::PluginManager::start(&resolved_plugins, plugin_host_mode(&cli), plugin_mesh_tx)
-            .await?;
-    node.set_plugin_manager(plugin_manager.clone()).await;
-    node.start_plugin_channel_forwarder(plugin_mesh_rx);
-
-    let cs = api::MeshApi::new(
-        node.clone(),
-        "(idle)".into(),
-        cli.port,
-        0,
-        plugin_manager,
-        affinity::AffinityRouter::new(),
-    );
-    cs.set_nostr_relays(nostr_relays(&cli.nostr_relay)).await;
-    cs.update(false, false).await;
-    let cs2 = cs.clone();
-    let (_tx, rx) = tokio::sync::watch::channel(election::InferenceTarget::None);
-    tokio::spawn(async move {
-        api::start(cli.console, cs2, rx, cli.listen_all).await;
-    });
-
-    tokio::signal::ctrl_c().await?;
-    eprintln!("\nShutting down...");
-    Ok(())
-}
-
-/// Used by both --client (pure consumer) and idle GPU nodes (standby, no matching model).
+/// Used by both --client (pure consumer) and standby GPU nodes (no matching model).
 /// If `create_node` is true, creates a new Node (--client path). Otherwise reuses existing.
 /// Run as passive node (client or standby GPU).
 /// Returns Ok(Some(model_name)) if a standby GPU should promote to serve a model.
@@ -2033,7 +1954,7 @@ async fn run_passive(
     node.set_blackboard_name(blackboard_display_name(cli, &node))
         .await;
 
-    // Nostr publishing (if --publish, for idle GPU nodes advertising capacity)
+    // Nostr publishing (if --publish, for standby GPU nodes advertising capacity)
     if cli.publish && !is_client {
         let pub_node = node.clone();
         let nostr_keys = nostr::load_or_create_keys()?;

@@ -94,10 +94,10 @@ mesh-llm --client --join <TOKEN> --port 9555
 - Routes to correct host per model
 - Streaming works through cross-model QUIC tunnel
 
-### 9. Drop a model
+### 9. Unload a model
 
 ```bash
-mesh-llm drop GLM-4.7-Flash-Q4_K_M
+mesh-llm unload GLM-4.7-Flash-Q4_K_M
 ```
 
 - Node serving that model exits cleanly
@@ -113,7 +113,7 @@ mesh-llm --model Qwen2.5-0.5B-Instruct-Q4_K_M --console
 # Operator surface
 mesh-llm load Llama-3.2-1B-Instruct-Q4_K_M
 mesh-llm status
-mesh-llm drop Llama-3.2-1B-Instruct-Q4_K_M
+mesh-llm unload Llama-3.2-1B-Instruct-Q4_K_M
 
 # REST surface
 curl localhost:3131/api/runtime
@@ -195,25 +195,23 @@ mesh-llm --model Qwen2.5-3B
 - No `⚡ API ready (bootstrap)` message (only joiners get bootstrap proxy)
 - API port opens only after election resolves
 
-## Idle Mode & Management API
+## No-Arg Behavior & Management API
 
-### 21. Idle mode (no args)
+### 21. No-arg help
 
 ```bash
 mesh-llm
 ```
 
-- Log: `mesh-llm v0.19.0 — 52GB VRAM, 7 models on disk` + suggested commands
-- Console on `:3131`, inference port `:9337` returns 503
-- `curl localhost:3131/api/status` → JSON with `model_name: "(idle)"`, 0 peers
-- `curl localhost:3131/api/discover` → Nostr mesh listings (JSON array)
-- **Dormant QUIC**: peers from previous sessions cannot reconnect (no ghost peers)
+- Prints the same usage/help text as `mesh-llm --help`
+- No ports are bound
+- `curl localhost:3131/api/status` fails to connect
 
 
 ### 22. Join via console
 
 ```bash
-mesh-llm    # idle mode
+mesh-llm --client --auto
 # In browser: http://localhost:3131 → Discover → Join
 # Or via API:
 curl -X POST localhost:3131/api/join -H 'Content-Type: application/json' -d '{"token":"..."}'

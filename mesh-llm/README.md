@@ -69,13 +69,13 @@ mesh-llm --auto --model GLM-4.7-Flash-Q4_K_M --mesh-name "poker-night"
 
 The first person to run it creates the mesh and starts serving. Everyone else discovers "poker-night" and joins automatically. `--mesh-name` implies `--publish` and strictly filters discovery to that name only — your group won't accidentally land in someone else's mesh.
 
-## Idle mode
+## No-arg behavior
 
 ```bash
 mesh-llm    # no args
 ```
 
-Shows getting-started instructions and opens a read-only console on `:3131`. The node stays dormant — no inbound QUIC connections or heartbeat — until you start or join a mesh via CLI flags.
+Prints the standard `--help` output and exits. It does not bind the console or API ports until you start or join a mesh with CLI flags.
 
 ## Live demo
 

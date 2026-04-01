@@ -283,6 +283,16 @@ function peerPrimaryModel(peer: Peer): string {
   return peerRoutableModels(peer)[0] ?? peerAssignedModels(peer)[0] ?? '';
 }
 
+function peerStatusLabel(peer: Peer): string {
+  if (peer.role === "Client") return "Client";
+  if (peerRoutableModels(peer).some((model) => model !== "(idle)"))
+    return "Serving";
+  if (peerAssignedModels(peer).some((model) => model !== "(idle)"))
+    return "Assigned";
+  if (peer.role === "Host") return "Host";
+  return "Idle";
+}
+
 function sectionFromPathname(pathname: string): TopSection | null {
   if (pathname === "/dashboard" || pathname === "/dashboard/")
     return "dashboard";
@@ -1312,14 +1322,6 @@ export function App() {
     setReasoningOpen({});
     setInput("");
   }
-
-  const peerStatusLabel = (peer: Peer): string => {
-    if (peer.role === 'Client') return 'Client';
-    if (peerRoutableModels(peer).some((model) => model !== '(idle)')) return 'Serving';
-    if (peerAssignedModels(peer).some((model) => model !== '(idle)')) return 'Assigned';
-    if (peer.role === 'Host') return 'Host';
-    return 'Idle';
-  };
 
   const topologyNodes = useMemo<TopologyNode[]>(() => {
     if (!status) return [];

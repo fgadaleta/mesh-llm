@@ -517,9 +517,9 @@ impl MeshApi {
             } else {
                 "Serving".to_string()
             }
-        } else if !is_host && model_name != "(idle)" && !model_name.is_empty() {
+        } else if !is_host && !model_name.is_empty() {
             "Worker (split)".to_string()
-        } else if model_name == "(idle)" || model_name.is_empty() {
+        } else if model_name.is_empty() {
             if all_peers.is_empty() {
                 "Idle".to_string()
             } else {
@@ -1275,12 +1275,7 @@ fn build_runtime_status_payload(
         .collect();
 
     let has_primary_process = models.iter().any(|model| model.kind == "primary");
-    if is_host
-        && !llama_ready
-        && !has_primary_process
-        && model_name != "(idle)"
-        && !model_name.is_empty()
-    {
+    if is_host && !llama_ready && !has_primary_process && !model_name.is_empty() {
         models.insert(
             0,
             RuntimeModelPayload {

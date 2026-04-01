@@ -188,9 +188,10 @@ pub(crate) enum Command {
         #[arg(long, default_value = "9337")]
         port: u16,
     },
-    /// Drop a local runtime-loaded model from a running mesh-llm instance.
-    Drop {
-        /// Model name to drop
+    /// Unload a local runtime-loaded model from a running mesh-llm instance.
+    #[command(alias = "drop")]
+    Unload {
+        /// Model name to unload
         name: String,
         /// API port of the running mesh-llm instance (default: 9337)
         #[arg(long, default_value = "9337")]
