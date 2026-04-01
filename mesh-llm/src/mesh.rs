@@ -3131,7 +3131,7 @@ impl Node {
 
         {
             let state = self.state.lock().await;
-            if state.peers.contains_key(&peer_id) {
+            if state.connections.contains_key(&peer_id) {
                 return Ok(());
             }
             if state.dead_peers.contains(&peer_id) {
