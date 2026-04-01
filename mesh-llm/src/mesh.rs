@@ -273,20 +273,10 @@ pub struct PeerInfo {
 /// and excluded from gossip propagation. After 2x this duration they're removed entirely.
 const PEER_STALE_SECS: u64 = 180; // 3 minutes
 
-/// Directories to scan for GGUF models.
-pub fn model_dirs() -> Vec<std::path::PathBuf> {
-    crate::models::model_dirs()
-}
-
-/// Scan model directories for GGUF files and return their stem names.
-pub fn scan_local_models() -> Vec<String> {
-    crate::models::scan_local_models()
-}
-
 /// Scan model directories for GGUF files and return a map of stem name to file size in bytes.
 pub fn scan_local_model_sizes() -> HashMap<String, u64> {
     let mut sizes: HashMap<String, u64> = HashMap::new();
-    for models_dir in model_dirs() {
+    for models_dir in crate::models::model_dirs() {
         if let Ok(entries) = std::fs::read_dir(&models_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -332,7 +322,7 @@ fn derive_quantization_type(stem: &str) -> String {
 
 pub fn scan_all_model_metadata() -> Vec<crate::proto::node::CompactModelMetadata> {
     let mut result = Vec::new();
-    for models_dir in model_dirs() {
+    for models_dir in crate::models::model_dirs() {
         let Ok(entries) = std::fs::read_dir(&models_dir) else {
             continue;
         };
@@ -408,12 +398,6 @@ fn split_gguf_base_name(stem: &str) -> Option<&str> {
     Some(&stem[..dash])
 }
 
-/// Find a GGUF model file by stem name, searching all model directories.
-/// Returns the first match found (prefers the managed Hugging Face cache, then legacy ~/.models).
-/// For split GGUFs, finds the first part (name-00001-of-NNNNN.gguf).
-pub fn find_model_path(stem: &str) -> std::path::PathBuf {
-    crate::models::find_model_path(stem)
-}
 /// Detect available VRAM. On Apple Silicon, uses ~75% of system RAM
 /// (the rest is reserved for OS/apps on unified memory).
 /// Detect available memory for model loading, capped by max_vram_gb if set.
