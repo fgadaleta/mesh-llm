@@ -20,6 +20,8 @@ use tokio::sync::{watch, Mutex};
 
 static CONSOLE_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
 const MESH_LLM_VERSION: &str = crate::VERSION;
+/// How often (in seconds) to refresh the local model inventory cache.
+const INVENTORY_CACHE_REFRESH_SECS: u64 = 60;
 
 // ── Shared state ──
 
@@ -46,6 +48,9 @@ struct ApiInner {
     nostr_relays: Vec<String>,
     nostr_discovery: bool,
     sse_clients: Vec<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Cached result of the last local inventory scan.  Refreshed on a timer
+    /// so `status()` never blocks on filesystem/GGUF reads.
+    cached_inventory: crate::models::LocalModelInventorySnapshot,
 }
 
 #[derive(Serialize)]
@@ -315,6 +320,7 @@ impl MeshApi {
                     .collect(),
                 nostr_discovery: false,
                 sse_clients: Vec::new(),
+                cached_inventory: crate::models::LocalModelInventorySnapshot::default(),
             })),
         }
     }
@@ -352,6 +358,19 @@ impl MeshApi {
         self.inner.lock().await.llama_port = port;
     }
 
+    /// Refresh the cached local inventory snapshot in a blocking thread pool task.
+    /// Called once at startup and periodically by the background timer in `start()`.
+    async fn refresh_inventory_cache(&self) {
+        match tokio::task::spawn_blocking(crate::models::scan_local_inventory_snapshot).await {
+            Ok(snapshot) => {
+                self.inner.lock().await.cached_inventory = snapshot;
+            }
+            Err(e) => {
+                tracing::warn!("Local inventory cache refresh failed: {e}");
+            }
+        }
+    }
+
     async fn status(&self) -> StatusPayload {
         // Snapshot inner fields and drop the lock before any async node queries.
         // This prevents deadlock: if node.peers() etc. block on node.state.lock(),
@@ -373,6 +392,7 @@ impl MeshApi {
             mesh_name,
             latest_version,
             nostr_discovery,
+            local_scan,
         ) = {
             let inner = self.inner.lock().await;
             (
@@ -392,13 +412,11 @@ impl MeshApi {
                 inner.mesh_name.clone(),
                 inner.latest_version.clone(),
                 inner.nostr_discovery,
+                inner.cached_inventory.clone(),
             )
         }; // inner lock dropped here
 
         let all_peers = node.peers().await;
-        let local_scan = tokio::task::spawn_blocking(crate::models::scan_local_inventory_snapshot)
-            .await
-            .unwrap_or_default();
         let peers: Vec<PeerPayload> = all_peers
             .iter()
             .map(|p| PeerPayload {
@@ -878,6 +896,17 @@ pub async fn start(
             inner.latest_version = Some(latest);
         }
         state5.push_status().await;
+    });
+
+    // Populate the inventory cache eagerly, then refresh it every INVENTORY_CACHE_REFRESH_SECS so
+    // `status()` never performs blocking filesystem/GGUF reads inline.
+    let state6 = state.clone();
+    tokio::spawn(async move {
+        state6.refresh_inventory_cache().await;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(INVENTORY_CACHE_REFRESH_SECS)).await;
+            state6.refresh_inventory_cache().await;
+        }
     });
 
     let addr = if listen_all { "0.0.0.0" } else { "127.0.0.1" };

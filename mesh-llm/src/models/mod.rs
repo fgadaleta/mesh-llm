@@ -22,6 +22,7 @@ pub use cli::{
 };
 pub use inventory::{
     scan_all_model_metadata, scan_local_inventory_snapshot, scan_local_model_sizes,
+    LocalModelInventorySnapshot,
 };
 pub use local::{
     exact_model_source_for_path, find_model_path, huggingface_hub_cache, huggingface_hub_cache_dir,

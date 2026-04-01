@@ -2472,7 +2472,7 @@ impl Node {
                     let mut serving_models = p.serving_models.clone();
                     if serving_models.is_empty() {
                         if let Some(legacy_serving) = p.serving.clone() {
-                            serving_models.insert(legacy_serving);
+                            serving_models.push(legacy_serving);
                         }
                     }
                     (p.requested_models.clone(), serving_models)
@@ -4055,7 +4055,6 @@ pub(crate) mod tests {
             is_soc: None,
             gpu_vram: None,
             gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
-            served_model_descriptors: Arc::new(Mutex::new(Vec::new())),
         };
 
         let accept_node = node.clone();
