@@ -51,6 +51,67 @@ Phase 4 in TODO. Unknown MoE models use the 50% shared core fallback with sequen
 ### No scale testing on large models
 Phase 5 in TODO. Mixtral 8×22B (~80GB) and Qwen3-235B-A22B (~130GB) are the real targets where expert sharding provides value (models that don't fit on one machine). Not tested yet.
 
+## Future Evolution: Topology via Model Descriptors
+
+As mesh-llm moves to canonical per-model descriptors in the gossip protocol, MoE should evolve to consume `ModelTopology` from those descriptors instead of treating MoE as a GGUF-only local concern.
+
+Planned direction:
+
+- **Descriptor-first topology**: every served or available model can advertise:
+  - canonical identity (`repository`, `revision`, `artifact`)
+  - capabilities (`vision`, `reasoning`, `tool_use`, `moe`)
+  - optional `topology.moe`
+- **Initial MoE topology sources**:
+  1. precomputed MoE data already baked into this repo
+  2. Hugging Face metadata such as `num_experts` and `num_experts_per_tok`
+  3. GGUF header fallback when no stronger source exists
+- **What goes into `ModelMoeInfo` first**:
+  - `expert_count`
+  - `used_expert_count`
+  - optional `min_experts_per_node`
+  - a source label such as `catalog`, `hf_metadata`, or `gguf_header`
+
+This means future MoE coordination can become revision-aware:
+
+- nodes can tell whether they are talking about the same exact model snapshot
+- MoE grouping can reject mixed revisions cleanly
+- cached analysis can be keyed by `repository + revision + artifact`
+
+### Planned `moe-analyze` integration
+
+`moe-analyze` remains the path to high-quality ranking data.
+
+Expected evolution:
+
+- when a model is detected as MoE but only has fallback topology, mesh-llm can still run conservatively
+- if `llama-moe-analyze` is available, mesh-llm can run it in the background for that exact model revision
+- the resulting ranking should be cached as descriptor-aligned topology data, not as an ad hoc local guess
+- improved rankings should only take effect on the next reload or re-election, never mid-run
+
+This gives a clean progression:
+
+1. **HF / precomputed topology** — immediate compatibility
+2. **fallback topology** — safe but conservative operation
+3. **`moe-analyze` ranking** — optimized expert placement for later runs
+
+### Possible future live local inference path
+
+There is also room for a lighter-weight live local path later, but it should remain explicitly second-tier to `moe-analyze`.
+
+Possibilities include:
+
+- collecting router statistics from short local warm-up prompts
+- estimating expert importance from recent local traffic
+- using weight-derived approximations when full analysis is unavailable
+
+This data would be useful for:
+
+- improving placement when no precomputed ranking exists
+- prioritizing which unknown MoE models deserve a full `moe-analyze`
+- informing probe-based session placement on larger meshes
+
+But it should not replace `moe-analyze` as the canonical high-confidence ranking source without further validation.
+
 ## Key Findings
 
 From [MoE_SPLIT_REPORT.md](MoE_SPLIT_REPORT.md):

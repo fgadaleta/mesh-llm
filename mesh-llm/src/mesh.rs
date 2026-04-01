@@ -61,6 +61,391 @@ fn node_role_label(role: &NodeRole) -> String {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ServedModelIdentity {
+    pub model_name: String,
+    pub is_primary: bool,
+    pub source_kind: ModelSourceKind,
+    pub canonical_ref: Option<String>,
+    pub repository: Option<String>,
+    pub revision: Option<String>,
+    pub artifact: Option<String>,
+    pub local_file_name: Option<String>,
+    pub identity_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ServedModelDescriptor {
+    pub identity: ServedModelIdentity,
+    pub capabilities: crate::models::ModelCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<crate::models::ModelTopology>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSourceKind {
+    Catalog,
+    HuggingFace,
+    LocalGguf,
+    DirectUrl,
+    #[default]
+    Unknown,
+}
+
+pub fn infer_served_model_descriptors(
+    primary_model_name: &str,
+    serving_models: &[String],
+    model_source: Option<&str>,
+    primary_model_path: Option<&std::path::Path>,
+) -> Vec<ServedModelDescriptor> {
+    let primary = model_source
+        .and_then(identity_from_model_source)
+        .or_else(|| {
+            primary_model_path.and_then(|path| identity_from_model_path(primary_model_name, path))
+        });
+    serving_models
+        .iter()
+        .enumerate()
+        .map(|(idx, model_name)| {
+            if idx == 0 || model_name == primary_model_name {
+                let mut identity = primary.clone().unwrap_or_default();
+                identity.model_name = model_name.clone();
+                identity.is_primary = true;
+                if identity.local_file_name.is_none() {
+                    identity.local_file_name = Some(format!("{model_name}.gguf"));
+                }
+                descriptor_from_identity(model_name, identity)
+            } else {
+                descriptor_from_model_path(
+                    model_name,
+                    &crate::models::find_model_path(model_name),
+                    false,
+                )
+                .unwrap_or_else(|| ServedModelDescriptor {
+                    identity: ServedModelIdentity {
+                        model_name: model_name.clone(),
+                        is_primary: false,
+                        source_kind: ModelSourceKind::Unknown,
+                        canonical_ref: None,
+                        repository: None,
+                        revision: None,
+                        artifact: None,
+                        local_file_name: Some(format!("{model_name}.gguf")),
+                        identity_hash: None,
+                    },
+                    capabilities: crate::models::ModelCapabilities::default(),
+                    topology: None,
+                })
+            }
+        })
+        .collect()
+}
+
+pub fn infer_available_model_descriptors(
+    available_models: &[String],
+) -> Vec<ServedModelDescriptor> {
+    available_models
+        .iter()
+        .filter_map(|model_name| {
+            let path = crate::models::find_model_path(model_name);
+            descriptor_from_model_path(model_name, &path, false)
+        })
+        .collect()
+}
+
+pub fn backfill_legacy_descriptors(ann: &mut PeerAnnouncement) {
+    if ann.served_model_descriptors.is_empty() {
+        let primary_model_name = ann
+            .serving
+            .as_deref()
+            .or_else(|| ann.serving_models.first().map(String::as_str))
+            .unwrap_or_default()
+            .to_string();
+        let serving_models = if ann.serving_models.is_empty() {
+            ann.serving.clone().into_iter().collect()
+        } else {
+            ann.serving_models.clone()
+        };
+        ann.served_model_descriptors = infer_remote_served_descriptors(
+            &primary_model_name,
+            &serving_models,
+            ann.model_source.as_deref(),
+        );
+    }
+    if ann.available_model_descriptors.is_empty() {
+        ann.available_model_descriptors = infer_remote_available_descriptors(
+            &ann.available_models,
+            &ann.served_model_descriptors,
+        );
+    }
+}
+
+fn infer_remote_served_descriptors(
+    primary_model_name: &str,
+    serving_models: &[String],
+    model_source: Option<&str>,
+) -> Vec<ServedModelDescriptor> {
+    let primary = model_source.and_then(identity_from_model_source);
+    serving_models
+        .iter()
+        .enumerate()
+        .map(|(idx, model_name)| {
+            let identity = if idx == 0 || model_name == primary_model_name {
+                let mut identity = primary
+                    .clone()
+                    .unwrap_or_else(|| unknown_identity(model_name));
+                identity.model_name = model_name.clone();
+                identity.is_primary = true;
+                if identity.local_file_name.is_none() {
+                    identity.local_file_name = Some(format!("{model_name}.gguf"));
+                }
+                identity
+            } else {
+                unknown_identity(model_name)
+            };
+            ServedModelDescriptor {
+                identity,
+                capabilities: crate::models::ModelCapabilities::default(),
+                topology: None,
+            }
+        })
+        .collect()
+}
+
+fn infer_remote_available_descriptors(
+    available_models: &[String],
+    served: &[ServedModelDescriptor],
+) -> Vec<ServedModelDescriptor> {
+    let served_by_name: HashMap<_, _> = served
+        .iter()
+        .map(|descriptor| (descriptor.identity.model_name.clone(), descriptor.clone()))
+        .collect();
+    available_models
+        .iter()
+        .map(|model_name| {
+            served_by_name
+                .get(model_name)
+                .cloned()
+                .unwrap_or_else(|| ServedModelDescriptor {
+                    identity: unknown_identity(model_name),
+                    capabilities: crate::models::ModelCapabilities::default(),
+                    topology: None,
+                })
+        })
+        .collect()
+}
+
+fn unknown_identity(model_name: &str) -> ServedModelIdentity {
+    ServedModelIdentity {
+        model_name: model_name.to_string(),
+        is_primary: false,
+        source_kind: ModelSourceKind::Unknown,
+        canonical_ref: None,
+        repository: None,
+        revision: None,
+        artifact: None,
+        local_file_name: Some(format!("{model_name}.gguf")),
+        identity_hash: None,
+    }
+}
+
+fn identity_from_model_source(source: &str) -> Option<ServedModelIdentity> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((repo_id, revision, file)) = parse_hf_resolve_url_parts(trimmed) {
+        let canonical_ref = format_hf_canonical_ref(&repo_id, revision.as_deref(), &file);
+        return Some(ServedModelIdentity {
+            model_name: String::new(),
+            is_primary: false,
+            source_kind: ModelSourceKind::HuggingFace,
+            canonical_ref: Some(canonical_ref.clone()),
+            repository: Some(repo_id),
+            revision,
+            artifact: Some(file.clone()),
+            local_file_name: file.rsplit('/').next().map(str::to_string),
+            identity_hash: Some(identity_hash_for(&canonical_ref)),
+        });
+    }
+
+    if let Some((repo_id, revision, file)) = parse_hf_ref_parts(trimmed) {
+        let canonical_ref = format_hf_canonical_ref(&repo_id, revision.as_deref(), &file);
+        return Some(ServedModelIdentity {
+            model_name: String::new(),
+            is_primary: false,
+            source_kind: ModelSourceKind::HuggingFace,
+            canonical_ref: Some(canonical_ref.clone()),
+            repository: Some(repo_id),
+            revision,
+            artifact: Some(file.clone()),
+            local_file_name: file.rsplit('/').next().map(str::to_string),
+            identity_hash: Some(identity_hash_for(&canonical_ref)),
+        });
+    }
+
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(ServedModelIdentity {
+            model_name: String::new(),
+            is_primary: false,
+            source_kind: ModelSourceKind::DirectUrl,
+            canonical_ref: Some(trimmed.to_string()),
+            repository: None,
+            revision: None,
+            artifact: None,
+            local_file_name: trimmed.rsplit('/').next().map(str::to_string),
+            identity_hash: Some(identity_hash_for(trimmed)),
+        });
+    }
+
+    if trimmed.ends_with(".gguf") || trimmed.contains('/') {
+        let local_file_name = std::path::Path::new(trimmed)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(str::to_string);
+        return Some(ServedModelIdentity {
+            model_name: String::new(),
+            is_primary: false,
+            source_kind: ModelSourceKind::LocalGguf,
+            canonical_ref: None,
+            repository: None,
+            revision: None,
+            artifact: None,
+            local_file_name,
+            identity_hash: None,
+        });
+    }
+
+    Some(ServedModelIdentity {
+        model_name: String::new(),
+        is_primary: false,
+        source_kind: ModelSourceKind::Catalog,
+        canonical_ref: Some(trimmed.to_string()),
+        repository: None,
+        revision: None,
+        artifact: None,
+        local_file_name: None,
+        identity_hash: Some(identity_hash_for(&format!("catalog:{trimmed}"))),
+    })
+}
+
+fn identity_from_model_path(
+    model_name: &str,
+    path: &std::path::Path,
+) -> Option<ServedModelIdentity> {
+    if let Some(identity) = crate::models::huggingface_identity_for_path(path) {
+        return Some(ServedModelIdentity {
+            model_name: model_name.to_string(),
+            is_primary: false,
+            source_kind: ModelSourceKind::HuggingFace,
+            canonical_ref: Some(identity.canonical_ref.clone()),
+            repository: Some(identity.repo_id),
+            revision: Some(identity.revision),
+            artifact: Some(identity.file),
+            local_file_name: Some(identity.local_file_name),
+            identity_hash: Some(identity_hash_for(&identity.canonical_ref)),
+        });
+    }
+
+    if path.exists() {
+        let local_file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(str::to_string)
+            .or_else(|| Some(format!("{model_name}.gguf")));
+        return Some(ServedModelIdentity {
+            model_name: model_name.to_string(),
+            is_primary: false,
+            source_kind: ModelSourceKind::LocalGguf,
+            canonical_ref: None,
+            repository: None,
+            revision: None,
+            artifact: None,
+            local_file_name,
+            identity_hash: None,
+        });
+    }
+
+    None
+}
+
+fn descriptor_from_model_path(
+    model_name: &str,
+    path: &std::path::Path,
+    is_primary: bool,
+) -> Option<ServedModelDescriptor> {
+    let mut identity = identity_from_model_path(model_name, path)?;
+    identity.is_primary = is_primary;
+    Some(descriptor_from_identity(model_name, identity))
+}
+
+fn descriptor_from_identity(
+    model_name: &str,
+    mut identity: ServedModelIdentity,
+) -> ServedModelDescriptor {
+    identity.model_name = model_name.to_string();
+    let path = crate::models::find_model_path(model_name);
+    let catalog = crate::models::find_catalog_model_exact(model_name);
+    let topology = crate::models::infer_local_model_topology(&path, catalog);
+    let mut capabilities =
+        crate::models::capabilities::infer_local_model_capabilities(model_name, &path, catalog);
+    capabilities.moe = capabilities.moe
+        || topology
+            .as_ref()
+            .and_then(|value| value.moe.as_ref())
+            .is_some();
+    ServedModelDescriptor {
+        identity,
+        capabilities,
+        topology,
+    }
+}
+
+fn parse_hf_ref_parts(input: &str) -> Option<(String, Option<String>, String)> {
+    let parts: Vec<&str> = input.splitn(3, '/').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let (repo_tail, revision) = match parts[1].split_once('@') {
+        Some((repo, revision)) => (repo, Some(revision.to_string())),
+        None => (parts[1], None),
+    };
+    Some((
+        format!("{}/{}", parts[0], repo_tail),
+        revision,
+        parts[2].to_string(),
+    ))
+}
+
+fn parse_hf_resolve_url_parts(url: &str) -> Option<(String, Option<String>, String)> {
+    let path = url
+        .strip_prefix("https://huggingface.co/")
+        .or_else(|| url.strip_prefix("http://huggingface.co/"))?;
+    let (repo, rest) = path.split_once("/resolve/")?;
+    let (revision, file) = rest.split_once('/')?;
+    Some((
+        repo.to_string(),
+        Some(revision.to_string()),
+        file.to_string(),
+    ))
+}
+
+fn format_hf_canonical_ref(repo: &str, revision: Option<&str>, file: &str) -> String {
+    match revision {
+        Some(revision) => format!("{repo}@{revision}/{file}"),
+        None => format!("{repo}/{file}"),
+    }
+}
+
+fn identity_hash_for(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 fn peer_info_to_mesh_peer(peer: &PeerInfo) -> crate::plugin::proto::MeshPeer {
     crate::plugin::proto::MeshPeer {
         peer_id: endpoint_id_hex(peer.id),
@@ -88,7 +473,59 @@ fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool {
         || old.serving_models != new.serving_models
         || old.available_models != new.available_models
         || old.requested_models != new.requested_models
+        || old.served_model_descriptors != new.served_model_descriptors
+        || old.available_model_descriptors != new.available_model_descriptors
         || old.version != new.version
+}
+
+fn model_identity_score(identity: &ServedModelIdentity) -> u8 {
+    let kind_score = match identity.source_kind {
+        ModelSourceKind::HuggingFace => 4,
+        ModelSourceKind::Catalog => 3,
+        ModelSourceKind::DirectUrl => 2,
+        ModelSourceKind::LocalGguf => 1,
+        ModelSourceKind::Unknown => 0,
+    };
+    let canonical_bonus = if identity.canonical_ref.is_some() {
+        2
+    } else {
+        0
+    };
+    let revision_bonus = if identity.revision.is_some() { 1 } else { 0 };
+    kind_score + canonical_bonus + revision_bonus
+}
+
+fn model_descriptor_score(descriptor: &ServedModelDescriptor) -> u8 {
+    let identity = &descriptor.identity;
+    let capability_bonus =
+        u8::from(descriptor.capabilities.vision != crate::models::CapabilityLevel::None)
+            + u8::from(descriptor.capabilities.reasoning != crate::models::CapabilityLevel::None)
+            + u8::from(descriptor.capabilities.tool_use != crate::models::CapabilityLevel::None)
+            + u8::from(descriptor.capabilities.moe)
+            + u8::from(
+                descriptor
+                    .topology
+                    .as_ref()
+                    .and_then(|value| value.moe.as_ref())
+                    .is_some(),
+            );
+    model_identity_score(identity) + capability_bonus
+}
+
+fn upsert_mesh_catalog_descriptor(
+    descriptors: &mut HashMap<String, ServedModelDescriptor>,
+    descriptor: ServedModelDescriptor,
+) {
+    if descriptor.identity.model_name.is_empty() {
+        return;
+    }
+    match descriptors.get(&descriptor.identity.model_name) {
+        Some(existing)
+            if model_descriptor_score(existing) >= model_descriptor_score(&descriptor) => {}
+        _ => {
+            descriptors.insert(descriptor.identity.model_name.clone(), descriptor);
+        }
+    }
 }
 
 fn apply_transitive_ann(
@@ -131,7 +568,8 @@ fn apply_transitive_ann(
     if ann.model_source.is_some() {
         existing.model_source = ann.model_source.clone();
     }
-    // Guard: only update when non-empty — old nodes omit these proto fields.
+    existing.served_model_descriptors = ann.served_model_descriptors.clone();
+    existing.available_model_descriptors = ann.available_model_descriptors.clone();
     if !ann.available_model_metadata.is_empty() {
         existing.available_model_metadata = ann.available_model_metadata.clone();
     }
@@ -232,6 +670,10 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) experts_summary: Option<crate::proto::node::ExpertsSummary>,
     #[serde(default)]
     pub(crate) available_model_sizes: HashMap<String, u64>,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub(crate) served_model_descriptors: Vec<ServedModelDescriptor>,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub(crate) available_model_descriptors: Vec<ServedModelDescriptor>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +709,14 @@ pub struct PeerInfo {
     pub available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
     pub experts_summary: Option<crate::proto::node::ExpertsSummary>,
     pub available_model_sizes: HashMap<String, u64>,
+    pub served_model_descriptors: Vec<ServedModelDescriptor>,
+    pub available_model_descriptors: Vec<ServedModelDescriptor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MeshCatalogEntry {
+    pub model_name: String,
+    pub descriptor: Option<ServedModelDescriptor>,
 }
 
 /// Peers not directly verified within this window are considered stale
@@ -278,26 +728,114 @@ pub fn model_dirs() -> Vec<std::path::PathBuf> {
     crate::models::model_dirs()
 }
 
+fn hf_hub_cache_dir() -> Option<std::path::PathBuf> {
+    Some(crate::models::huggingface_hub_cache_dir())
+}
+
+fn push_gguf_files_recursive(
+    dir: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+    seen: &mut HashSet<std::path::PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            push_gguf_files_recursive(&path, out, seen);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+            continue;
+        }
+        let normalized = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if seen.insert(normalized) {
+            out.push(path);
+        }
+    }
+}
+
+fn push_hf_snapshot_ggufs(
+    cache_root: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+    seen: &mut HashSet<std::path::PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let repo_dir = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = repo_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("models--") {
+            continue;
+        }
+        let snapshots_dir = repo_dir.join("snapshots");
+        let Ok(snapshot_entries) = std::fs::read_dir(&snapshots_dir) else {
+            continue;
+        };
+        for snapshot in snapshot_entries.flatten() {
+            let snapshot_path = snapshot.path();
+            let Ok(snapshot_type) = snapshot.file_type() else {
+                continue;
+            };
+            if snapshot_type.is_dir() {
+                push_gguf_files_recursive(&snapshot_path, out, seen);
+            }
+        }
+    }
+}
+
+fn local_gguf_paths() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for models_dir in model_dirs() {
+        push_gguf_files_recursive(&models_dir, &mut out, &mut seen);
+    }
+    if let Some(cache_root) = hf_hub_cache_dir() {
+        push_hf_snapshot_ggufs(&cache_root, &mut out, &mut seen);
+    }
+    out.sort();
+    out
+}
+
 /// Scan model directories for GGUF files and return their stem names.
 pub fn scan_local_models() -> Vec<String> {
-    crate::models::scan_local_models()
+    let mut names = Vec::new();
+    for path in local_gguf_paths() {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if size > 500_000_000 {
+                let name = split_gguf_base_name(stem).unwrap_or(stem).to_string();
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names.sort();
+    names
 }
 /// Scan model directories for GGUF files and return a map of stem name to file size in bytes.
 pub fn scan_local_model_sizes() -> HashMap<String, u64> {
     let mut sizes: HashMap<String, u64> = HashMap::new();
-    for models_dir in crate::models::model_dirs() {
-        if let Ok(entries) = std::fs::read_dir(&models_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                        if size > 500_000_000 {
-                            let name = split_gguf_base_name(stem).unwrap_or(stem).to_string();
-                            sizes.entry(name).and_modify(|e| *e += size).or_insert(size);
-                        }
-                    }
-                }
+    for path in local_gguf_paths() {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if size > 500_000_000 {
+                let name = split_gguf_base_name(stem).unwrap_or(stem).to_string();
+                sizes.entry(name).and_modify(|e| *e += size).or_insert(size);
             }
         }
     }
@@ -331,59 +869,50 @@ fn derive_quantization_type(stem: &str) -> String {
 
 pub fn scan_all_model_metadata() -> Vec<crate::proto::node::CompactModelMetadata> {
     let mut result = Vec::new();
-    for models_dir in crate::models::model_dirs() {
-        let Ok(entries) = std::fs::read_dir(&models_dir) else {
+    for path in local_gguf_paths() {
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if size < 500_000_000 {
             continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
-                continue;
+        let model_key = split_gguf_base_name(&stem).unwrap_or(&stem).to_string();
+        let quantization_type = derive_quantization_type(&model_key);
+        let meta = if let Some(m) = crate::moe::scan_gguf_compact_meta(&path) {
+            crate::proto::node::CompactModelMetadata {
+                model_key: model_key.clone(),
+                context_length: m.context_length,
+                vocab_size: m.vocab_size,
+                embedding_size: m.embedding_size,
+                head_count: m.head_count,
+                layer_count: m.layer_count,
+                feed_forward_length: m.feed_forward_length,
+                key_length: m.key_length,
+                value_length: m.value_length,
+                architecture: m.architecture,
+                tokenizer_model_name: m.tokenizer_model_name,
+                special_tokens: vec![],
+                rope_scale: m.rope_scale,
+                rope_freq_base: m.rope_freq_base,
+                is_moe: m.expert_count > 1,
+                expert_count: m.expert_count,
+                used_expert_count: m.expert_used_count,
+                quantization_type,
             }
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            if size < 500_000_000 {
-                continue;
+        } else {
+            crate::proto::node::CompactModelMetadata {
+                model_key,
+                quantization_type,
+                ..Default::default()
             }
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            let model_key = split_gguf_base_name(&stem).unwrap_or(&stem).to_string();
-            let quantization_type = derive_quantization_type(&model_key);
-            let meta = if let Some(m) = crate::moe::scan_gguf_compact_meta(&path) {
-                crate::proto::node::CompactModelMetadata {
-                    model_key: model_key.clone(),
-                    context_length: m.context_length,
-                    vocab_size: m.vocab_size,
-                    embedding_size: m.embedding_size,
-                    head_count: m.head_count,
-                    layer_count: m.layer_count,
-                    feed_forward_length: m.feed_forward_length,
-                    key_length: m.key_length,
-                    value_length: m.value_length,
-                    architecture: m.architecture,
-                    tokenizer_model_name: m.tokenizer_model_name,
-                    special_tokens: vec![],
-                    rope_scale: m.rope_scale,
-                    rope_freq_base: m.rope_freq_base,
-                    is_moe: m.expert_count > 1,
-                    expert_count: m.expert_count,
-                    used_expert_count: m.expert_used_count,
-                    quantization_type,
-                }
-            } else {
-                crate::proto::node::CompactModelMetadata {
-                    model_key,
-                    quantization_type,
-                    ..Default::default()
-                }
-            };
-            if !result
-                .iter()
-                .any(|e: &crate::proto::node::CompactModelMetadata| e.model_key == meta.model_key)
-            {
-                result.push(meta);
-            }
+        };
+        if !result
+            .iter()
+            .any(|e: &crate::proto::node::CompactModelMetadata| e.model_key == meta.model_key)
+        {
+            result.push(meta);
         }
     }
     result
@@ -411,7 +940,33 @@ fn split_gguf_base_name(stem: &str) -> Option<&str> {
 /// Returns the first match found (prefers the managed Hugging Face cache, then legacy ~/.models).
 /// For split GGUFs, finds the first part (name-00001-of-NNNNN.gguf).
 pub fn find_model_path(stem: &str) -> std::path::PathBuf {
-    crate::models::find_model_path(stem)
+    let mut split_candidate: Option<std::path::PathBuf> = None;
+    for path in local_gguf_paths() {
+        let Some(path_stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if path_stem == stem {
+            return path;
+        }
+        if split_gguf_base_name(path_stem) == Some(stem)
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|name| name.contains("-00001-of-"))
+                .unwrap_or(false)
+            && split_candidate.is_none()
+        {
+            split_candidate = Some(path);
+        }
+    }
+    if let Some(path) = split_candidate {
+        return path;
+    }
+    // Fallback: return ~/.models/ path even if it doesn't exist.
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".models")
+        .join(format!("{}.gguf", stem))
 }
 /// Detect available VRAM. On Apple Silicon, uses ~75% of system RAM
 /// (the rest is reserved for OS/apps on unified memory).
@@ -546,6 +1101,8 @@ pub struct Node {
     model_source: Arc<Mutex<Option<String>>>,
     serving: Arc<Mutex<Option<String>>>,
     serving_models: Arc<Mutex<Vec<String>>>,
+    served_model_descriptors: Arc<Mutex<Vec<ServedModelDescriptor>>>,
+    available_model_descriptors: Arc<Mutex<Vec<ServedModelDescriptor>>>,
     llama_ready: Arc<Mutex<bool>>,
     available_models: Arc<Mutex<Vec<String>>>,
     requested_models: Arc<Mutex<Vec<String>>>,
@@ -869,6 +1426,8 @@ impl Node {
             model_source: Arc::new(Mutex::new(None)),
             serving: Arc::new(Mutex::new(None)),
             serving_models: Arc::new(Mutex::new(Vec::new())),
+            served_model_descriptors: Arc::new(Mutex::new(Vec::new())),
+            available_model_descriptors: Arc::new(Mutex::new(Vec::new())),
             llama_ready: Arc::new(Mutex::new(false)),
             available_models: Arc::new(Mutex::new(Vec::new())),
             requested_models: Arc::new(Mutex::new(Vec::new())),
@@ -953,6 +1512,8 @@ impl Node {
             model_source: Arc::new(Mutex::new(None)),
             serving: Arc::new(Mutex::new(None)),
             serving_models: Arc::new(Mutex::new(Vec::new())),
+            served_model_descriptors: Arc::new(Mutex::new(Vec::new())),
+            available_model_descriptors: Arc::new(Mutex::new(Vec::new())),
             llama_ready: Arc::new(Mutex::new(false)),
             available_models: Arc::new(Mutex::new(Vec::new())),
             requested_models: Arc::new(Mutex::new(Vec::new())),
@@ -1078,6 +1639,14 @@ impl Node {
         // Also keep `serving` in sync (primary = first model)
         *self.serving.lock().await = models.first().cloned();
         *self.serving_models.lock().await = models;
+    }
+
+    pub async fn set_served_model_descriptors(&self, descriptors: Vec<ServedModelDescriptor>) {
+        *self.served_model_descriptors.lock().await = descriptors;
+    }
+
+    pub async fn set_available_model_descriptors(&self, descriptors: Vec<ServedModelDescriptor>) {
+        *self.available_model_descriptors.lock().await = descriptors;
     }
 
     pub async fn serving_models(&self) -> Vec<String> {
@@ -2203,6 +2772,46 @@ impl Node {
         let mut result: Vec<String> = all.into_iter().collect();
         result.sort();
         result
+    }
+
+    pub async fn mesh_catalog_entries(&self) -> Vec<MeshCatalogEntry> {
+        let names = self.mesh_catalog().await;
+        let my_available_descriptors = self.available_model_descriptors.lock().await.clone();
+        let my_served_descriptors = self.served_model_descriptors.lock().await.clone();
+        let peer_descriptors: Vec<_> = {
+            let state = self.state.lock().await;
+            state
+                .peers
+                .values()
+                .map(|p| {
+                    (
+                        p.available_model_descriptors.clone(),
+                        p.served_model_descriptors.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        let mut by_name: HashMap<String, ServedModelDescriptor> = HashMap::new();
+        for descriptor in my_available_descriptors
+            .into_iter()
+            .chain(my_served_descriptors.into_iter())
+        {
+            upsert_mesh_catalog_descriptor(&mut by_name, descriptor);
+        }
+        for (available, served) in peer_descriptors {
+            for descriptor in available.into_iter().chain(served.into_iter()) {
+                upsert_mesh_catalog_descriptor(&mut by_name, descriptor);
+            }
+        }
+
+        names
+            .into_iter()
+            .map(|model_name| MeshCatalogEntry {
+                descriptor: by_name.get(&model_name).cloned(),
+                model_name,
+            })
+            .collect()
     }
 
     /// Get all models currently being served in the mesh (loaded in VRAM somewhere).
@@ -3388,6 +3997,8 @@ impl Node {
             existing.available_models = ann.available_models.clone();
             existing.requested_models = ann.requested_models.clone();
             existing.last_seen = std::time::Instant::now();
+            existing.served_model_descriptors = ann.served_model_descriptors.clone();
+            existing.available_model_descriptors = ann.available_model_descriptors.clone();
             if ann.version.is_some() {
                 existing.version = ann.version.clone();
             }
@@ -3469,6 +4080,8 @@ impl Node {
             available_model_metadata: ann.available_model_metadata.clone(),
             experts_summary: ann.experts_summary.clone(),
             available_model_sizes: ann.available_model_sizes.clone(),
+            served_model_descriptors: ann.served_model_descriptors.clone(),
+            available_model_descriptors: ann.available_model_descriptors.clone(),
         };
         state.peers.insert(id, peer.clone());
         let count = state.peers.len();
@@ -3554,6 +4167,8 @@ impl Node {
                 available_model_metadata: ann.available_model_metadata.clone(),
                 experts_summary: ann.experts_summary.clone(),
                 available_model_sizes: ann.available_model_sizes.clone(),
+                served_model_descriptors: ann.served_model_descriptors.clone(),
+                available_model_descriptors: ann.available_model_descriptors.clone(),
             };
             state.peers.insert(id, peer.clone());
             drop(state);
@@ -3573,6 +4188,8 @@ impl Node {
         let my_source = self.model_source.lock().await.clone();
         let my_serving = self.serving.lock().await.clone();
         let my_serving_models = self.serving_models.lock().await.clone();
+        let my_served_model_descriptors = self.served_model_descriptors.lock().await.clone();
+        let my_available_model_descriptors = self.available_model_descriptors.lock().await.clone();
         let my_available = self.available_models.lock().await.clone();
         let my_requested = self.requested_models.lock().await.clone();
         let my_mesh_id = self.mesh_id.lock().await.clone();
@@ -3608,6 +4225,8 @@ impl Node {
                     available_model_metadata: p.available_model_metadata.clone(),
                     experts_summary: p.experts_summary.clone(),
                     available_model_sizes: p.available_model_sizes.clone(),
+                    served_model_descriptors: p.served_model_descriptors.clone(),
+                    available_model_descriptors: p.available_model_descriptors.clone(),
                 })
                 .collect()
         };
@@ -3649,6 +4268,8 @@ impl Node {
             available_model_metadata: my_model_metadata,
             experts_summary: None,
             available_model_sizes: my_model_sizes,
+            served_model_descriptors: my_served_model_descriptors,
+            available_model_descriptors: my_available_model_descriptors,
         });
         announcements
     }
@@ -4187,6 +4808,8 @@ pub(crate) mod tests {
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            available_model_descriptors: vec![],
         };
         let legacy_route_table = RoutingTable {
             hosts: vec![RouteEntry {
@@ -4394,6 +5017,8 @@ pub(crate) mod tests {
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            available_model_descriptors: vec![],
         }
     }
 
@@ -4695,6 +5320,8 @@ pub(crate) mod tests {
             available_model_metadata: vec![meta.clone()],
             experts_summary: Some(experts.clone()),
             available_model_sizes: model_sizes.clone(),
+            served_model_descriptors: vec![],
+            available_model_descriptors: vec![],
         };
 
         let proto_pa = local_ann_to_proto_ann(&local_ann);
@@ -4911,6 +5538,8 @@ pub(crate) mod tests {
             available_model_metadata: vec![meta],
             experts_summary: None,
             available_model_sizes: new_sizes,
+            served_model_descriptors: vec![],
+            available_model_descriptors: vec![],
         };
 
         apply_transitive_ann(&mut existing, &addr, &ann);
@@ -4989,6 +5618,8 @@ pub(crate) mod tests {
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            available_model_descriptors: vec![],
         };
 
         apply_transitive_ann(&mut existing, &weak_addr, &ann);
@@ -5034,6 +5665,8 @@ pub(crate) mod tests {
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            available_model_descriptors: vec![],
         };
         apply_transitive_ann(&mut existing, &richer_addr, &ann2);
 
@@ -5350,6 +5983,8 @@ pub(crate) mod tests {
             available_model_metadata: local_ann.available_model_metadata.clone(),
             experts_summary: local_ann.experts_summary.clone(),
             available_model_sizes: local_ann.available_model_sizes.clone(),
+            served_model_descriptors: local_ann.served_model_descriptors.clone(),
+            available_model_descriptors: local_ann.available_model_descriptors.clone(),
         };
         peers.insert(peer_id, peer_info);
 
@@ -5738,6 +6373,8 @@ pub(crate) mod tests {
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            available_model_descriptors: vec![],
         };
 
         let server = tokio::spawn(async move {
@@ -5924,6 +6561,8 @@ pub(crate) mod tests {
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            available_model_descriptors: vec![],
         };
 
         let server = tokio::spawn(async move {
@@ -6132,6 +6771,8 @@ pub(crate) mod tests {
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            available_model_descriptors: vec![],
         };
         let v0_gossip_json =
             serde_json::to_vec(&vec![v0_ann]).expect("v0 gossip JSON must serialize");

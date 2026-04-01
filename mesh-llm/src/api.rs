@@ -13,13 +13,16 @@
 use crate::{affinity, election, mesh, nostr, plugin, proxy};
 use include_dir::{include_dir, Dir};
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Mutex};
 
 static CONSOLE_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
 const MESH_LLM_VERSION: &str = crate::VERSION;
+const LOCAL_SCAN_CACHE_TTL: Duration = Duration::from_secs(15);
 
 // ── Shared state ──
 
@@ -45,7 +48,30 @@ struct ApiInner {
     latest_version: Option<String>,
     nostr_relays: Vec<String>,
     nostr_discovery: bool,
+    local_scan_cache: Option<LocalScanSnapshot>,
+    local_scan_cache_at: Option<Instant>,
     sse_clients: Vec<tokio::sync::mpsc::UnboundedSender<String>>,
+}
+
+#[derive(Clone)]
+struct LocalScanSnapshot {
+    model_names: HashSet<String>,
+    metadata_by_name: HashMap<String, crate::proto::node::CompactModelMetadata>,
+    size_by_name: HashMap<String, u64>,
+}
+
+fn build_local_scan_snapshot() -> LocalScanSnapshot {
+    let model_names = mesh::scan_local_models().into_iter().collect();
+    let metadata_by_name = mesh::scan_all_model_metadata()
+        .into_iter()
+        .map(|meta| (meta.model_key.clone(), meta))
+        .collect();
+    let size_by_name = mesh::scan_local_model_sizes();
+    LocalScanSnapshot {
+        model_names,
+        metadata_by_name,
+        size_by_name,
+    }
 }
 
 #[derive(Serialize)]
@@ -137,7 +163,16 @@ struct MeshModelPayload {
     display_name: String,
     status: String,
     node_count: usize,
+    mesh_vram_gb: f64,
     size_gb: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    architecture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quantization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     /// Whether this model supports vision/image input
     vision: bool,
     /// Display-oriented vision metadata status.
@@ -148,12 +183,112 @@ struct MeshModelPayload {
     /// Display-oriented reasoning metadata status.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_status: Option<&'static str>,
+    tool_use: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_use_status: Option<&'static str>,
+    moe: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expert_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    used_expert_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_model: Option<String>,
     /// Total requests seen across the mesh (from demand map)
     #[serde(skip_serializing_if = "Option::is_none")]
     request_count: Option<u64>,
     /// Seconds since last request or declaration (None if no demand data)
     #[serde(skip_serializing_if = "Option::is_none")]
     last_active_secs_ago: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_page_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_file: Option<String>,
+    fit_label: String,
+    fit_detail: String,
+    download_command: String,
+    run_command: String,
+    auto_command: String,
+}
+
+fn find_catalog_model<'a>(name: &str) -> Option<&'a crate::models::catalog::CatalogModel> {
+    crate::models::catalog::MODEL_CATALOG
+        .iter()
+        .find(|m| m.name == name || m.file.strip_suffix(".gguf").unwrap_or(m.file.as_str()) == name)
+}
+
+fn source_page_url_from_identity(identity: &mesh::ServedModelIdentity) -> Option<String> {
+    identity
+        .repository
+        .as_ref()
+        .map(|repository| format!("https://huggingface.co/{repository}"))
+}
+
+fn source_file_from_identity(identity: &mesh::ServedModelIdentity) -> Option<String> {
+    identity
+        .artifact
+        .clone()
+        .or_else(|| identity.local_file_name.clone())
+}
+
+fn likely_reasoning_model(name: &str, description: Option<&str>) -> bool {
+    let haystack = format!("{} {}", name, description.unwrap_or_default()).to_ascii_lowercase();
+    ["reasoning", "thinking", "deepseek-r1", "r1"]
+        .iter()
+        .any(|needle| haystack.contains(needle))
+}
+
+fn likely_vision_model(name: &str, description: Option<&str>) -> bool {
+    let haystack = format!("{} {}", name, description.unwrap_or_default()).to_ascii_lowercase();
+    ["vision", "-vl", "llava", "omni", "qwen2.5-vl", "mllama"]
+        .iter()
+        .any(|needle| haystack.contains(needle))
+}
+
+fn fit_hint_for_machine(size_gb: f64, my_vram_gb: f64) -> (String, String) {
+    if size_gb <= 0.0 || my_vram_gb <= 0.0 {
+        return (
+            "Unknown".into(),
+            "No local VRAM signal is available for this machine yet.".into(),
+        );
+    }
+    if size_gb * 1.2 <= my_vram_gb {
+        return (
+            "Likely comfortable".into(),
+            format!(
+                "This machine has {:.1} GB VRAM, which should handle a {:.1} GB model comfortably.",
+                my_vram_gb, size_gb
+            ),
+        );
+    }
+    if size_gb * 1.05 <= my_vram_gb {
+        return (
+            "Likely fits".into(),
+            format!(
+                "This machine has {:.1} GB VRAM. A {:.1} GB model should fit, but headroom will be tight.",
+                my_vram_gb, size_gb
+            ),
+        );
+    }
+    if size_gb * 0.8 <= my_vram_gb {
+        return (
+            "Possible with tradeoffs".into(),
+            format!(
+                "This machine has {:.1} GB VRAM. A {:.1} GB model may load, but expect tighter memory pressure.",
+                my_vram_gb, size_gb
+            ),
+        );
+    }
+    (
+        "Likely too large".into(),
+        format!(
+            "This machine has {:.1} GB VRAM, which is likely not enough for a {:.1} GB model locally.",
+            my_vram_gb, size_gb
+        ),
+    )
 }
 
 impl MeshApi {
@@ -185,6 +320,8 @@ impl MeshApi {
                     .map(|s| s.to_string())
                     .collect(),
                 nostr_discovery: false,
+                local_scan_cache: None,
+                local_scan_cache_at: None,
                 sse_clients: Vec::new(),
             })),
         }
@@ -221,6 +358,34 @@ impl MeshApi {
 
     pub async fn set_llama_port(&self, port: Option<u16>) {
         self.inner.lock().await.llama_port = port;
+    }
+
+    async fn local_scan_snapshot(&self) -> LocalScanSnapshot {
+        let cached = {
+            let inner = self.inner.lock().await;
+            match (&inner.local_scan_cache, inner.local_scan_cache_at) {
+                (Some(snapshot), Some(cached_at)) if cached_at.elapsed() < LOCAL_SCAN_CACHE_TTL => {
+                    Some(snapshot.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(snapshot) = cached {
+            return snapshot;
+        }
+
+        let snapshot = tokio::task::spawn_blocking(build_local_scan_snapshot)
+            .await
+            .unwrap_or_else(|_| LocalScanSnapshot {
+                model_names: HashSet::new(),
+                metadata_by_name: HashMap::new(),
+                size_by_name: HashMap::new(),
+            });
+
+        let mut inner = self.inner.lock().await;
+        inner.local_scan_cache = Some(snapshot.clone());
+        inner.local_scan_cache_at = Some(Instant::now());
+        snapshot
     }
 
     async fn status(&self) -> StatusPayload {
@@ -267,6 +432,7 @@ impl MeshApi {
         }; // inner lock dropped here
 
         let all_peers = node.peers().await;
+        let local_scan = self.local_scan_snapshot().await;
         let peers: Vec<PeerPayload> = all_peers
             .iter()
             .map(|p| PeerPayload {
@@ -291,18 +457,38 @@ impl MeshApi {
             })
             .collect();
 
-        let catalog = node.mesh_catalog().await;
+        let catalog = node.mesh_catalog_entries().await;
         let served = node.models_being_served().await;
         let active_demand = node.active_demand().await;
         let my_serving_models = node.serving_models().await;
+        let local_model_names = local_scan.model_names;
+        let mut metadata_by_name = local_scan.metadata_by_name;
+        let mut size_by_name = local_scan.size_by_name;
+        for peer in &all_peers {
+            for meta in &peer.available_model_metadata {
+                metadata_by_name
+                    .entry(meta.model_key.clone())
+                    .or_insert_with(|| meta.clone());
+            }
+            for (model_name, size) in &peer.available_model_sizes {
+                size_by_name.entry(model_name.clone()).or_insert(*size);
+            }
+        }
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let mesh_models: Vec<MeshModelPayload> = catalog
             .iter()
-            .map(|name| {
+            .map(|entry| {
+                let name = &entry.model_name;
+                let descriptor = entry.descriptor.as_ref();
+                let identity = descriptor.map(|descriptor| &descriptor.identity);
+                let catalog_entry = find_catalog_model(name);
                 let is_warm = served.contains(name);
+                let local_known = local_model_names.contains(name)
+                    || my_serving_models.iter().any(|s| s == name)
+                    || *name == model_name;
                 let display_name = crate::models::installed_model_display_name(name);
                 let node_count = if is_warm {
                     let peer_count = all_peers
@@ -322,19 +508,36 @@ impl MeshApi {
                 } else {
                     0
                 };
+                let mesh_vram_gb = if is_warm {
+                    let peer_vram = all_peers
+                        .iter()
+                        .filter(|p| {
+                            p.serving_models.iter().any(|s| s == name)
+                                || p.serving.as_deref() == Some(name.as_str())
+                        })
+                        .map(|p| p.vram_bytes as f64 / 1e9)
+                        .sum::<f64>();
+                    let my_vram =
+                        if my_serving_models.iter().any(|s| s == name) || *name == model_name {
+                            my_vram_gb
+                        } else {
+                            0.0
+                        };
+                    peer_vram + my_vram
+                } else {
+                    0.0
+                };
                 let size_gb = if *name == model_name && model_size_bytes > 0 {
                     model_size_bytes as f64 / 1e9
                 } else {
-                    crate::models::catalog::parse_size_gb(
-                        crate::models::catalog::MODEL_CATALOG
-                            .iter()
-                            .find(|m| {
-                                m.file.strip_suffix(".gguf").unwrap_or(&m.file) == name.as_str()
-                                    || m.name == name.as_str()
-                            })
-                            .map(|m| m.size.as_str())
-                            .unwrap_or("0"),
-                    )
+                    size_by_name
+                        .get(name)
+                        .map(|size| *size as f64 / 1e9)
+                        .unwrap_or_else(|| {
+                            crate::models::catalog::parse_size_gb(
+                                catalog_entry.map(|m| m.size.as_str()).unwrap_or("0"),
+                            )
+                        })
                 };
                 let (request_count, last_active_secs_ago) = match active_demand.get(name) {
                     Some(d) => (
@@ -343,7 +546,15 @@ impl MeshApi {
                     ),
                     None => (None, None),
                 };
-                let capabilities = crate::models::installed_model_capabilities(name);
+                let capabilities = descriptor
+                    .map(|descriptor| descriptor.capabilities)
+                    .unwrap_or_else(|| {
+                        if local_known {
+                            crate::models::installed_model_capabilities(name)
+                        } else {
+                            crate::models::ModelCapabilities::default()
+                        }
+                    });
                 let vision = capabilities.supports_vision_runtime();
                 let vision_status = if vision || capabilities.vision_label().is_some() {
                     Some(capabilities.vision_status())
@@ -359,6 +570,107 @@ impl MeshApi {
                 } else {
                     None
                 };
+                let tool_use = capabilities.tool_use_label().is_some();
+                let tool_use_status = capabilities
+                    .tool_use_label()
+                    .map(|_| capabilities.tool_use_status());
+                let description = catalog_entry.map(|m| m.description.to_string());
+                let metadata = metadata_by_name.get(name);
+                let architecture = metadata
+                    .map(|m| m.architecture.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let context_length = metadata
+                    .map(|m| m.context_length)
+                    .filter(|value| *value > 0);
+                let quantization = metadata
+                    .map(|m| m.quantization_type.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        catalog_entry.map(|m| m.file.to_string()).and_then(|file| {
+                            file.strip_suffix(".gguf")
+                                .and_then(|stem| stem.split('-').next_back())
+                                .map(str::to_string)
+                        })
+                    });
+                let reasoning = reasoning
+                    || (local_known
+                        && likely_reasoning_model(
+                            name,
+                            catalog_entry.map(|m| m.description.as_str()),
+                        ));
+                let topology_moe = descriptor
+                    .and_then(|descriptor| descriptor.topology.as_ref())
+                    .and_then(|topology| topology.moe.as_ref());
+                let moe = capabilities.moe
+                    || topology_moe.is_some()
+                    || metadata.map(|m| m.is_moe).unwrap_or(false);
+                let expert_count = topology_moe
+                    .map(|moe| moe.expert_count)
+                    .or_else(|| metadata.map(|m| m.expert_count).filter(|count| *count > 0))
+                    .or_else(|| {
+                        catalog_entry
+                            .and_then(|m| m.moe.as_ref())
+                            .map(|m| m.n_expert)
+                    });
+                let used_expert_count = topology_moe
+                    .map(|moe| moe.used_expert_count)
+                    .or_else(|| {
+                        metadata
+                            .map(|m| m.used_expert_count)
+                            .filter(|count| *count > 0)
+                    })
+                    .or_else(|| {
+                        catalog_entry
+                            .and_then(|m| m.moe.as_ref())
+                            .map(|m| m.n_expert_used)
+                    });
+                let draft_model = catalog_entry.and_then(|m| m.draft.clone());
+                let source_page_url =
+                    identity
+                        .and_then(source_page_url_from_identity)
+                        .or_else(|| {
+                            if local_known {
+                                catalog_entry.and_then(|m| m.source_page_url())
+                            } else {
+                                None
+                            }
+                        });
+                let source_ref = identity
+                    .and_then(|identity| identity.repository.clone())
+                    .or_else(|| {
+                        source_page_url
+                            .as_deref()
+                            .map(|url| url.replace("https://huggingface.co/", ""))
+                    });
+                let source_revision = identity.and_then(|identity| identity.revision.clone());
+                let source_file = identity.and_then(source_file_from_identity).or_else(|| {
+                    if local_known {
+                        catalog_entry.map(|m| m.file.to_string())
+                    } else {
+                        None
+                    }
+                });
+                let command_ref = identity
+                    .and_then(|identity| identity.canonical_ref.clone())
+                    .or_else(|| {
+                        if local_known {
+                            catalog_entry.and_then(|m| {
+                                match (m.source_repo(), m.source_revision(), m.source_file()) {
+                                    (Some(repo), revision, Some(file)) => Some(match revision {
+                                        Some(revision) => format!("{repo}@{revision}/{file}"),
+                                        None => format!("{repo}/{file}"),
+                                    }),
+                                    _ => None,
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| name.clone());
+                let (fit_label, fit_detail) = fit_hint_for_machine(size_gb, my_vram_gb);
                 MeshModelPayload {
                     name: name.clone(),
                     display_name,
@@ -368,13 +680,33 @@ impl MeshApi {
                         "cold".into()
                     },
                     node_count,
+                    mesh_vram_gb,
                     size_gb,
+                    architecture,
+                    context_length,
+                    quantization,
+                    description,
                     vision,
                     vision_status,
                     reasoning,
                     reasoning_status,
+                    tool_use,
+                    tool_use_status,
+                    moe,
+                    expert_count,
+                    used_expert_count,
+                    draft_model,
                     request_count,
                     last_active_secs_ago,
+                    source_page_url,
+                    source_ref,
+                    source_revision,
+                    source_file,
+                    fit_label,
+                    fit_detail,
+                    download_command: format!("mesh-llm models download {}", command_ref),
+                    run_command: format!("mesh-llm --model {}", command_ref),
+                    auto_command: format!("mesh-llm --auto --model {}", command_ref),
                 }
             })
             .collect();

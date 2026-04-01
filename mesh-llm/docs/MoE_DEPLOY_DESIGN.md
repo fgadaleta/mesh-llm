@@ -69,3 +69,21 @@ Each node runs `llama-server` with its split GGUF. No `--rpc`, no tensor splitti
 1. **Node count changes**: Re-splitting when a 3rd node joins a 2-node mesh. Currently handled — `moe_election_loop` detects the change, re-computes assignments, re-splits if the new split doesn't exist in cache.
 2. **Minimum viable calibration per model**: The 50% default is conservative. Different models may need more or less. Only Qwen3-30B-A3B has been properly calibrated (36% = 46/128 experts).
 3. **Can we skip `moe-analyze`?** The 50% fallback works but wastes storage. Gate norms from GGUF weights (no inference needed) might give a cheap approximation of expert importance.
+
+## Future Direction: Descriptor-Carried MoE Topology
+
+As mesh-llm moves toward protocol-level `ServedModelDescriptor` objects, MoE should stop depending only on local GGUF inspection and instead consume `ModelTopology.moe` when it is available.
+
+Planned source priority:
+
+1. precomputed MoE data in this repo
+2. Hugging Face metadata for exact `repository + revision + artifact`
+3. GGUF header fallback
+4. later, cached `moe-analyze` output for that exact descriptor identity
+
+This gives us two important properties:
+
+- **revision-aware grouping**: nodes can confirm they are serving the same exact MoE snapshot before coordinating
+- **clean future analysis flow**: `moe-analyze` can improve topology later without changing the contract for how topology is identified
+
+Longer term, we may also use lighter-weight local signals such as short warm-up inference or recent router statistics to improve unknown models. That data should remain explicitly lower-confidence than `moe-analyze`, and should be treated as a hinting/calibration layer rather than the canonical topology source.

@@ -2,6 +2,7 @@ pub mod capabilities;
 pub mod catalog;
 pub mod cli;
 pub mod local;
+pub mod topology;
 
 use anyhow::{anyhow, bail, Context, Result};
 use hf_hub::api::sync::{Api, ApiBuilder};
@@ -13,15 +14,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub use capabilities::ModelCapabilities;
+pub use capabilities::{CapabilityLevel, ModelCapabilities};
 pub use cli::{
     print_legacy_storage_warning, run_model_download, run_model_installed, run_model_recommended,
     run_model_search, run_model_show, warn_about_legacy_model_usage,
 };
 pub use local::{
-    find_model_path, huggingface_hub_cache, huggingface_hub_cache_dir, legacy_models_dir,
-    legacy_models_present, model_dirs, path_is_in_legacy_models_dir, scan_installed_models,
-    scan_local_models,
+    exact_model_source_for_path, find_model_path, huggingface_hub_cache, huggingface_hub_cache_dir,
+    huggingface_identity_for_path, legacy_models_dir, legacy_models_present, model_dirs,
+    path_is_in_legacy_models_dir, scan_installed_models, scan_local_models,
+};
+pub use topology::{
+    infer_catalog_topology, infer_local_model_topology, ModelMoeInfo, ModelTopology,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +134,8 @@ fn merge_capabilities(left: ModelCapabilities, right: ModelCapabilities) -> Mode
     ModelCapabilities {
         vision: left.vision.max(right.vision),
         reasoning: left.reasoning.max(right.reasoning),
+        tool_use: left.tool_use.max(right.tool_use),
+        moe: left.moe || right.moe,
     }
 }
 

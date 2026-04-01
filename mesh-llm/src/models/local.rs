@@ -2,6 +2,15 @@ use hf_hub::Cache;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HuggingFaceModelIdentity {
+    pub repo_id: String,
+    pub revision: String,
+    pub file: String,
+    pub canonical_ref: String,
+    pub local_file_name: String,
+}
+
 /// Directories to scan for GGUF models.
 pub fn model_dirs() -> Vec<PathBuf> {
     let canonical = huggingface_hub_cache_dir();
@@ -51,6 +60,46 @@ pub fn legacy_models_present() -> bool {
         return false;
     }
     tree_contains_gguf(&legacy_dir)
+}
+
+pub fn huggingface_identity_for_path(path: &Path) -> Option<HuggingFaceModelIdentity> {
+    let cache_root = huggingface_hub_cache_dir();
+    let relative = path.strip_prefix(&cache_root).ok()?;
+    let mut parts = relative.iter();
+    let repo_dir = parts.next()?.to_str()?;
+    if !repo_dir.starts_with("models--") {
+        return None;
+    }
+    if parts.next()?.to_str()? != "snapshots" {
+        return None;
+    }
+    let revision = parts.next()?.to_str()?.to_string();
+    let file = parts
+        .map(|part| part.to_str())
+        .collect::<Option<Vec<_>>>()?
+        .join("/");
+    if file.is_empty() {
+        return None;
+    }
+
+    let repo_id = repo_dir.trim_start_matches("models--").replace("--", "/");
+    let local_file_name = Path::new(&file)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)?;
+    let canonical_ref = format!("{repo_id}@{revision}/{file}");
+
+    Some(HuggingFaceModelIdentity {
+        repo_id,
+        revision,
+        file,
+        canonical_ref,
+        local_file_name,
+    })
+}
+
+pub fn exact_model_source_for_path(path: &Path) -> Option<String> {
+    huggingface_identity_for_path(path).map(|identity| identity.canonical_ref)
 }
 
 pub fn path_is_in_legacy_models_dir(path: &Path) -> bool {

@@ -38,7 +38,6 @@ use mesh::NodeRole;
 use models::catalog;
 use std::path::{Path, PathBuf};
 
-<<<<<<< HEAD
 pub const VERSION: &str = "0.54.0";
 
 #[tokio::main]
@@ -963,6 +962,8 @@ async fn run_auto(
 
     // Advertise what we have on disk and what we want the mesh to serve
     node.set_available_models(local_models.clone()).await;
+    node.set_available_model_descriptors(mesh::infer_available_model_descriptors(&local_models))
+        .await;
     node.set_requested_models(requested_model_names.clone())
         .await;
 
@@ -1213,15 +1214,24 @@ async fn run_auto(
     };
 
     // Set model source for gossip (so other joiners can discover it too)
-    let model_source = if !cli.model.is_empty() {
-        cli.model[0].to_string_lossy().to_string()
-    } else {
-        model_name.clone()
-    };
-    node.set_model_source(model_source).await;
+    let model_source = models::exact_model_source_for_path(&model).unwrap_or_else(|| {
+        if !cli.model.is_empty() {
+            cli.model[0].to_string_lossy().to_string()
+        } else {
+            model_name.clone()
+        }
+    });
+    node.set_model_source(model_source.clone()).await;
     // Set all serving models (primary + extras)
     let all_serving = build_serving_list(&resolved_models, &model_name);
     node.set_serving_models(all_serving.clone()).await;
+    node.set_served_model_descriptors(mesh::infer_served_model_descriptors(
+        &model_name,
+        &all_serving,
+        Some(model_source.as_str()),
+        Some(&model),
+    ))
+    .await;
     node.set_models(all_serving).await;
     // Re-gossip so peers learn what we're serving
     node.regossip().await;
@@ -1550,7 +1560,9 @@ async fn run_idle(cli: Cli, _bin_dir: PathBuf) -> Result<()> {
         cli.enumerate_host,
     )
     .await?;
-    node.set_available_models(local_models).await;
+    node.set_available_models(local_models.clone()).await;
+    node.set_available_model_descriptors(mesh::infer_available_model_descriptors(&local_models))
+        .await;
     node.set_blackboard_name(blackboard_display_name(&cli, &node))
         .await;
     let (plugin_mesh_tx, plugin_mesh_rx) = tokio::sync::mpsc::channel(256);

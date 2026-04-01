@@ -39,12 +39,17 @@ import {
   Minimize2,
   Moon,
   Network,
+  ExternalLink,
+  Download,
   Pencil,
   RotateCcw,
   Send,
   Server,
   Square,
   Sparkles,
+  Brain,
+  Boxes,
+  TextCursorInput,
   Sun,
   Trash2,
   UserPlus,
@@ -106,6 +111,7 @@ import {
 import {
   Sheet,
   SheetContent,
+  SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "./components/ui/sheet";
@@ -127,11 +133,32 @@ type MeshModel = {
   display_name?: string;
   status: "warm" | "cold" | string;
   node_count: number;
+  mesh_vram_gb?: number;
   size_gb: number;
+  architecture?: string;
+  context_length?: number;
+  quantization?: string;
+  description?: string;
   vision?: boolean;
   vision_status?: "supported" | "likely" | "none" | string;
   reasoning?: boolean;
   reasoning_status?: "supported" | "likely" | "none" | string;
+  tool_use?: boolean;
+  tool_use_status?: "supported" | "likely" | "none" | string;
+  moe?: boolean;
+  expert_count?: number;
+  used_expert_count?: number;
+  draft_model?: string;
+  source_page_url?: string;
+  fit_label?: string;
+  fit_detail?: string;
+  download_command?: string;
+  run_command?: string;
+  auto_command?: string;
+  request_count?: number;
+  last_active_secs_ago?: number;
+  source_ref?: string;
+  source_file?: string;
 };
 
 function modelDisplayName(model?: MeshModel | null) {
@@ -1372,8 +1399,9 @@ export function App() {
   }
 
   return (
-    <div className="h-screen overflow-hidden bg-background [height:100svh] [padding-top:env(safe-area-inset-top)] [padding-bottom:env(safe-area-inset-bottom)]">
-      <div className="flex h-full min-h-0 flex-col">
+    <TooltipProvider>
+      <div className="h-screen overflow-hidden bg-background [height:100svh] [padding-top:env(safe-area-inset-top)] [padding-bottom:env(safe-area-inset-bottom)]">
+        <div className="flex h-full min-h-0 flex-col">
         <AppHeader
           sections={sections}
           section={section}
@@ -1499,6 +1527,7 @@ export function App() {
         </footer>
       </div>
     </div>
+    </TooltipProvider>
   );
 }
 
@@ -2917,8 +2946,9 @@ function DashboardPage({
   const [modelFilter, setModelFilter] = useState<"all" | "warm" | "cold">(
     "all",
   );
-  const [isMeshOverviewFullscreen, setIsMeshOverviewFullscreen] =
-    useState(false);
+  const [isMeshOverviewFullscreen, setIsMeshOverviewFullscreen] = useState(false);
+  const [selectedCatalogModel, setSelectedCatalogModel] = useState<MeshModel | null>(null);
+  const [copiedCommand, setCopiedCommand] = useState<string | null>(null);
   const filteredModels = useMemo(() => {
     const models = status?.mesh_models ?? [];
     return [...models]
@@ -2992,6 +3022,19 @@ function DashboardPage({
     setIsMeshOverviewFullscreen((prev) => !prev);
   }
 
+  const copyModelCommand = useCallback(async (key: string, command?: string) => {
+    if (!command) return;
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopiedCommand(key);
+      window.setTimeout(() => {
+        setCopiedCommand((current) => (current === key ? null : current));
+      }, 1500);
+    } catch {
+      setCopiedCommand(null);
+    }
+  }, []);
+
   return (
     <div className="space-y-4">
       <Alert className="border-primary/20 bg-primary/5">
@@ -3028,14 +3071,11 @@ function DashboardPage({
             title="Node ID"
             value={status?.node_id ?? "n/a"}
             valueSuffix={
-              <Badge
-                className={cn(
-                  "h-6 px-2 text-[10px] font-semibold tracking-wide",
-                  topologyStatusClass(status?.node_status ?? "n/a"),
-                )}
-              >
-                {status?.node_status ?? "n/a"}
-              </Badge>
+              <StatusPill
+                label={status?.node_status ?? "n/a"}
+                tone={topologyStatusTone(status?.node_status ?? "n/a")}
+                tooltip={topologyStatusTooltip(status?.node_status ?? "n/a")}
+              />
             }
             icon={<Hash className="h-4 w-4" />}
             tooltip="Current node identifier in this mesh."
@@ -3132,76 +3172,45 @@ function DashboardPage({
             {filteredModels.length > 0 ? (
               <div className="h-[360px] overflow-y-auto pr-2 md:h-[420px] lg:h-[460px] xl:h-[520px]">
                 <div className="space-y-2">
-                  {filteredModels.map((model) => {
-                    const modelVision = visionBadge(model);
-                    const modelReasoning = reasoningBadge(model);
-                    const displayName = modelDisplayName(model);
-                    return (
-                      <div key={model.name} className="rounded-md border p-3">
-                        <div className="flex flex-col items-start gap-2 sm:flex-row sm:items-start">
-                          <div className="flex h-7 w-7 items-center justify-center rounded-md border bg-muted/40 text-muted-foreground">
-                            <Sparkles className="h-3.5 w-3.5" />
-                          </div>
-                          <div className="min-w-0 flex-1">
-                            <div className="text-sm font-medium leading-5 [overflow-wrap:anywhere]">
-                              {shortName(displayName)}
-                            </div>
-                            <div className="text-xs leading-4 text-muted-foreground [overflow-wrap:anywhere]">
-                              {model.name}
-                              {modelVision && (
-                                <span
-                                  className="ml-1.5"
-                                  title={modelVision.title}
-                                >
-                                  {modelVision.icon}
-                                </span>
-                              )}
-                              {modelReasoning && (
-                                <span
-                                  className="ml-1.5"
-                                  title={modelReasoning.title}
-                                >
-                                  {modelReasoning.icon}
-                                </span>
-                              )}
+                  {filteredModels.map((model) => (
+                    <button
+                      key={model.name}
+                      type="button"
+                      onClick={() => setSelectedCatalogModel(model)}
+                      className="block w-full rounded-md border p-3 text-left transition-colors hover:border-primary/35 hover:bg-muted/30"
+                    >
+                      <div className="flex flex-col items-start gap-2 sm:flex-row sm:items-start">
+                        <div className="flex h-7 w-7 items-center justify-center rounded-md border bg-muted/40 text-muted-foreground">
+                          <Sparkles className="h-3.5 w-3.5" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <div className="text-sm font-medium leading-5 [overflow-wrap:anywhere]">{shortName(model.name)}</div>
+                            <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                              {model.vision ? <span title="Vision">👁</span> : null}
+                              {model.reasoning ? <span title="Reasoning">🧠</span> : null}
+                              {model.moe ? <span title="Mixture of Experts">🧩</span> : null}
                             </div>
                           </div>
-                          <Badge
-                            className={cn(
-                              "shrink-0 gap-1 self-start",
-                              model.status === "warm"
-                                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                                : "",
-                              model.status === "cold"
-                                ? "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300"
-                                : "",
-                            )}
-                          >
-                            <span className="h-1.5 w-1.5 rounded-full bg-current" />
-                            {model.status === "warm"
-                              ? "Warm"
-                              : model.status === "cold"
-                                ? "Cold"
-                                : model.status}
-                          </Badge>
+                          <div className="text-xs leading-4 text-muted-foreground [overflow-wrap:anywhere]">{model.name}</div>
                         </div>
-                        <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
-                          <span>
-                            {model.node_count} node
-                            {model.node_count === 1 ? "" : "s"}
-                          </span>
-                          <span className="flex items-center gap-2">
-                            {modelVision && (
-                              <span title={modelVision.title}>
-                                {modelVision.icon}
-                              </span>
-                            )}
-                            {model.size_gb.toFixed(1)} GB
-                          </span>
-                        </div>
+                        <StatusPill
+                          className="self-start"
+                          label={model.status === 'warm' ? 'Warm' : model.status === 'cold' ? 'Cold' : model.status}
+                          tone={model.status === 'warm' ? 'warm' : model.status === 'cold' ? 'cold' : 'neutral'}
+                          dot
+                          tooltip={modelStatusTooltip(model.status)}
+                        />
                       </div>
-                    );
-                  })}
+                      <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+                        <span>{model.node_count} node{model.node_count === 1 ? '' : 's'}</span>
+                        <span className="flex items-center gap-2">
+                          {model.vision && <span title="Vision — understands images">👁</span>}
+                          {model.size_gb.toFixed(1)} GB
+                        </span>
+                      </div>
+                    </button>
+                  ))}
                 </div>
               </div>
             ) : (
@@ -3326,6 +3335,18 @@ function DashboardPage({
             document.body,
           )
         : null}
+
+      <Sheet open={!!selectedCatalogModel} onOpenChange={(open) => !open && setSelectedCatalogModel(null)}>
+        <SheetContent side="right" className="w-full overflow-y-auto border-l bg-background/95 p-0 backdrop-blur sm:max-w-2xl">
+          {selectedCatalogModel ? (
+            <ModelSidebar
+              model={selectedCatalogModel}
+              copiedCommand={copiedCommand}
+              onCopyCommand={copyModelCommand}
+            />
+          ) : null}
+        </SheetContent>
+      </Sheet>
 
       {/* Connect panel */}
       <Card className="mt-4">
@@ -3467,7 +3488,6 @@ function TopologyFlowNode({ data }: NodeProps<TopologyFlowNodeData>) {
   const dotClass = isCenter
     ? "bg-primary border-primary"
     : "bg-muted border-border";
-  const statusClass = topologyStatusClass(data.info.statusLabel);
   const dotCenterY = 22;
   const edgeHandleStyle = {
     opacity: 0,
@@ -3537,14 +3557,12 @@ function TopologyFlowNode({ data }: NodeProps<TopologyFlowNodeData>) {
               </div>
             )}
           </div>
-          <Badge
-            className={cn(
-              "h-5 shrink-0 rounded-full px-2 text-[9px] font-medium",
-              statusClass,
-            )}
-          >
-            {data.info.statusLabel}
-          </Badge>
+          <StatusPill
+            className="text-[9px]"
+            label={data.info.statusLabel}
+            tone={topologyStatusTone(data.info.statusLabel)}
+            tooltip={topologyStatusTooltip(data.info.statusLabel)}
+          />
         </div>
 
         <div className="mt-2 flex flex-wrap gap-1.5 text-[10px] leading-3">
@@ -4453,14 +4471,16 @@ function StatCard({
   );
   if (!tooltip) return card;
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <div>{card}</div>
-      </TooltipTrigger>
-      <TooltipContent side="bottom" align="center" sideOffset={8}>
-        {tooltip}
-      </TooltipContent>
-    </Tooltip>
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <div>{card}</div>
+        </TooltipTrigger>
+        <TooltipContent side="bottom" align="center" sideOffset={8}>
+          {tooltip}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
@@ -4496,6 +4516,350 @@ function DashboardPanelEmpty({
   );
 }
 
+function ModelSidebar({
+  model,
+  copiedCommand,
+  onCopyCommand,
+}: {
+  model: MeshModel;
+  copiedCommand: string | null;
+  onCopyCommand: (key: string, command?: string) => void;
+}) {
+  return (
+    <div className="flex min-h-full flex-col">
+      <div className="border-b bg-gradient-to-br from-sky-50 via-background to-background px-6 pb-3 pt-3 dark:from-sky-950/20">
+        <SheetHeader className="space-y-2 text-left">
+          <div className="flex items-start gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border bg-background text-primary shadow-sm">
+              <Sparkles className="h-3.5 w-3.5" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <SheetTitle className="text-lg font-semibold leading-tight tracking-tight [overflow-wrap:anywhere] sm:text-xl">
+                  {shortName(model.name)}
+                </SheetTitle>
+                <StatusPill
+                  label={model.status === 'warm' ? 'Warm' : 'Cold'}
+                  tone={model.status === 'warm' ? 'warm' : 'cold'}
+                  dot
+                  tooltip={modelStatusTooltip(model.status)}
+                />
+                <StatusPill
+                  label={headerFitLabel(model.fit_label ?? 'Unknown')}
+                  tone={fitLabelTone(model.fit_label ?? 'Unknown')}
+                  icon={<Check className="h-3 w-3" />}
+                  tooltip={fitLabelTooltip(model.fit_label ?? 'Unknown')}
+                />
+              </div>
+              {model.source_page_url ? (
+                <a
+                  href={model.source_page_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-1 inline-flex items-center gap-1.5 text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline [overflow-wrap:anywhere]"
+                >
+                  {huggingFacePathFromUrl(model.source_page_url) ?? model.name}
+                  <ExternalLink className="h-3 w-3 shrink-0" />
+                </a>
+              ) : (
+                <SheetDescription className="mt-1.5 text-sm text-muted-foreground [overflow-wrap:anywhere]">
+                  {model.name}
+                </SheetDescription>
+              )}
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <CapabilityBadge
+              label="Text"
+              icon={<MessageSquarePlus className="h-3.5 w-3.5" />}
+              tooltip="Supports text input and text generation."
+            />
+            {model.vision ? (
+              <CapabilityBadge
+                label="Vision"
+                icon={<ImagePlus className="h-3.5 w-3.5" />}
+                tooltip="Can understand image input."
+              />
+            ) : null}
+            {model.reasoning ? (
+              <CapabilityBadge
+                label="Reasoning"
+                icon={<Brain className="h-3.5 w-3.5" />}
+                tooltip="Reasoning-oriented model behavior."
+              />
+            ) : null}
+            {model.moe ? (
+              <CapabilityBadge
+                label="MoE"
+                icon={<Boxes className="h-3.5 w-3.5" />}
+                tooltip="Mixture-of-experts architecture."
+              />
+            ) : null}
+            {model.tool_use ? (
+              <CapabilityBadge
+                label="Tool Use"
+                icon={<Braces className="h-3.5 w-3.5" />}
+                tooltip={toolUseTooltip(model.tool_use_status)}
+              />
+            ) : null}
+          </div>
+        </SheetHeader>
+      </div>
+
+      <div className="flex-1 space-y-5 px-6 py-5">
+        <div className={cn('grid gap-3', model.context_length ? 'sm:grid-cols-4' : 'sm:grid-cols-3')}>
+          <ModelFactCard
+            title="Mesh Availability"
+            value={`${model.node_count} node${model.node_count === 1 ? '' : 's'}`}
+            icon={<Network className="h-4 w-4" />}
+            tooltip="Warm nodes currently serving this model."
+          />
+          <ModelFactCard
+            title="Mesh VRAM"
+            value={`${(model.mesh_vram_gb ?? 0).toFixed(1)} GB`}
+            icon={<MemoryStick className="h-4 w-4" />}
+            tooltip="VRAM allocated to warm instances of this model."
+          />
+          <ModelFactCard
+            title="File size"
+            value={model.size_gb > 0 ? `${model.size_gb.toFixed(1)} GB` : 'Unknown'}
+            icon={<MemoryStick className="h-4 w-4" />}
+            tooltip={fileSizeTooltip(model.source_file)}
+          />
+          {model.context_length ? (
+            <ModelFactCard
+              title="Context"
+              value={formatContextLength(model.context_length)}
+              icon={<TextCursorInput className="h-4 w-4" />}
+              tooltip="Approximate maximum context window."
+            />
+          ) : null}
+        </div>
+
+        {(model.description
+          || model.architecture
+          || model.quantization
+          || model.draft_model
+          || model.source_ref
+          || model.source_file
+          || model.expert_count
+          || model.used_expert_count) ? (
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm">Model Details</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              {model.description ? <p className="leading-7 text-muted-foreground">{model.description}</p> : null}
+              <div className="grid gap-3 sm:grid-cols-2">
+                {model.architecture ? <ModelMetaItem label="Architecture" value={model.architecture} /> : null}
+                {model.quantization ? <ModelMetaItem label="Quantization" value={model.quantization} /> : null}
+                {model.draft_model ? <ModelMetaItem label="Draft Pair" value={model.draft_model} /> : null}
+                {model.moe && model.expert_count && model.used_expert_count ? (
+                  <ModelMetaItem label="MoE Topology" value={`${model.expert_count} experts · top-${model.used_expert_count}`} />
+                ) : null}
+                {model.source_ref ? <ModelMetaItem label="Source" value={model.source_ref} /> : null}
+                {model.source_file ? <ModelMetaItem label="File" value={model.source_file} /> : null}
+              </div>
+            </CardContent>
+          </Card>
+        ) : null}
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">Mesh LLM Commands</CardTitle>
+            <SheetDescription className="text-xs text-muted-foreground">
+              Copy a command and run it in your terminal.
+            </SheetDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <CommandRow
+              label="Download"
+              description="Cache this model from Hugging Face for local use."
+              command={model.download_command}
+              copied={copiedCommand === 'download'}
+              onCopy={() => onCopyCommand('download', model.download_command)}
+              icon={<Download className="h-4 w-4" />}
+            />
+            <CommandRow
+              label="Run"
+              description="Serve this model directly with Mesh LLM."
+              command={model.run_command}
+              copied={copiedCommand === 'run'}
+              onCopy={() => onCopyCommand('run', model.run_command)}
+              icon={<Server className="h-4 w-4" />}
+            />
+            <CommandRow
+              label="Auto"
+              description="Start Mesh LLM in automatic routing mode with this model."
+              command={model.auto_command}
+              copied={copiedCommand === 'auto'}
+              onCopy={() => onCopyCommand('auto', model.auto_command)}
+              icon={<Sparkles className="h-4 w-4" />}
+            />
+          </CardContent>
+        </Card>
+
+        {model.request_count != null || model.last_active_secs_ago != null ? (
+          <div className="px-1 text-xs text-muted-foreground">
+            {model.request_count != null ? `${model.request_count} requests seen` : 'No request count'}
+            {model.last_active_secs_ago != null ? ` · active ${formatAge(model.last_active_secs_ago)} ago` : ''}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function CapabilityBadge({
+  label,
+  icon,
+  tooltip,
+}: {
+  label: string;
+  icon: ReactNode;
+  tooltip?: string;
+}) {
+  const badge = (
+    <Badge
+      variant="outline"
+      className="gap-1.5 rounded-full border-sky-300 bg-sky-50 px-3 py-1.5 text-xs font-medium text-foreground dark:border-sky-900 dark:bg-sky-950/30"
+    >
+      {icon}
+      {label}
+    </Badge>
+  );
+  if (!tooltip) return badge;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex">{badge}</span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" align="center" sideOffset={8}>
+        {tooltip}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function ModelFactCard({
+  title,
+  value,
+  icon,
+  tooltip,
+}: {
+  title: string;
+  value: string;
+  icon: ReactNode;
+  tooltip?: string;
+}) {
+  const card = (
+    <Card>
+      <CardContent className="p-3">
+        <div className="mb-2 flex items-center gap-2 text-muted-foreground">
+          {icon}
+          <span className="text-xs">{title}</span>
+        </div>
+        <div className="flex min-w-0 items-center gap-2 text-sm font-semibold text-foreground">
+          <span className="truncate">{value}</span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+  if (!tooltip) return card;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div>{card}</div>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" align="center" sideOffset={8}>
+        {tooltip}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function ModelMetaItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border bg-muted/25 px-3 py-2">
+      <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">{label}</div>
+      <div className="mt-1 text-sm font-medium [overflow-wrap:anywhere]">{value}</div>
+    </div>
+  );
+}
+
+function CommandRow({
+  label,
+  description,
+  command,
+  copied,
+  onCopy,
+  icon,
+}: {
+  label: string;
+  description: string;
+  command?: string;
+  copied: boolean;
+  onCopy: () => void;
+  icon: ReactNode;
+}) {
+  if (!command) return null;
+  return (
+    <div className="rounded-xl border bg-muted/15 p-3">
+      <div className="mb-2 flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-sm font-semibold">
+            {icon}
+            {label}
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">{description}</div>
+        </div>
+        <Button type="button" size="sm" variant="outline" className="h-8 gap-1.5 rounded-lg px-3" onClick={onCopy}>
+          {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          {copied ? 'Copied' : 'Copy'}
+        </Button>
+      </div>
+      <code className="block overflow-x-auto rounded-lg border bg-background px-3 py-2.5 font-mono text-[13px] leading-6 text-foreground">{command}</code>
+    </div>
+  );
+}
+
+function StatusPill({
+  label,
+  tone,
+  dot = false,
+  icon,
+  className,
+  tooltip,
+}: {
+  label: string;
+  tone: 'warm' | 'cold' | 'good' | 'info' | 'warn' | 'bad' | 'neutral';
+  dot?: boolean;
+  icon?: ReactNode;
+  className?: string;
+  tooltip?: string;
+}) {
+  const badge = (
+    <Badge className={cn('h-5 shrink-0 rounded-full px-2 text-[10px] font-medium', statusPillToneClass(tone), (dot || icon) ? 'gap-1' : '', className)}>
+      {dot ? <span className="h-1.5 w-1.5 rounded-full bg-current" /> : null}
+      {icon}
+      {label}
+    </Badge>
+  );
+  if (!tooltip) return badge;
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex">{badge}</span>
+        </TooltipTrigger>
+        <TooltipContent side="bottom" align="center" sideOffset={8}>
+          {tooltip}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
 function meshGpuVram(status: StatusPayload | null) {
   if (!status) return 0;
   return (
@@ -4516,6 +4880,29 @@ function shortName(name: string) {
   return (name || "").replace(/-Q\w+$/, "").replace(/-Instruct/, "");
 }
 
+function huggingFacePathFromUrl(url?: string) {
+  if (!url) return null;
+  return url
+    .replace(/^https?:\/\/huggingface\.co\//, '')
+    .replace(/\/$/, '');
+}
+
+function formatAge(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 60) return 'just now';
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
+  return `${Math.round(seconds / 86400)}d`;
+}
+
+function formatContextLength(value?: number) {
+  if (!value || !Number.isFinite(value)) return 'Unknown';
+  if (value >= 1000) {
+    const rounded = value / 1000;
+    return Number.isInteger(rounded) ? `${rounded}K` : `${rounded.toFixed(1)}K`;
+  }
+  return `${value}`;
+}
+
 function formatLatency(value?: number | null) {
   if (value == null || !Number.isFinite(Number(value))) return "—";
   const ms = Math.round(Number(value));
@@ -4523,18 +4910,129 @@ function formatLatency(value?: number | null) {
   return `${ms} ms`;
 }
 
-function topologyStatusClass(status: string) {
-  if (status === "Serving" || status === "Serving (split)") {
-    return "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
+function fitBadgeClass(label?: string) {
+  if (label === 'Likely comfortable') {
+    return 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300';
   }
-  if (status === "Client") {
-    return "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300";
+  if (label === 'Likely fits') {
+    return 'border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300';
   }
-  if (status === "Host") {
-    return "border-indigo-500/40 bg-indigo-500/10 text-indigo-700 dark:text-indigo-300";
+  if (label === 'Possible with tradeoffs') {
+    return 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300';
   }
-  if (status === "Idle" || status === "Standby") {
-    return "border-zinc-500/40 bg-zinc-500/10 text-zinc-700 dark:text-zinc-300";
+  if (label === 'Likely too large') {
+    return 'border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300';
+  }
+  return 'border-border bg-muted text-foreground';
+}
+
+function headerFitLabel(label?: string) {
+  if (label === 'Likely comfortable' || label === 'Likely fits') {
+    return 'Suitable for this node';
+  }
+  if (label === 'Possible with tradeoffs') {
+    return 'May fit this node';
+  }
+  if (label === 'Likely too large') {
+    return 'Too large for this node';
+  }
+  return 'Check fit';
+}
+
+function fitLabelTone(label?: string): 'good' | 'info' | 'warn' | 'bad' | 'neutral' {
+  if (label === 'Likely comfortable') return 'good';
+  if (label === 'Likely fits') return 'info';
+  if (label === 'Possible with tradeoffs') return 'warn';
+  if (label === 'Likely too large') return 'bad';
+  return 'neutral';
+}
+
+function modelStatusTooltip(status?: string) {
+  if (status === 'warm') {
+    return 'Loaded and serving in the mesh.';
+  }
+  if (status === 'cold') {
+    return 'Known to the mesh, but not loaded in VRAM.';
+  }
+  return 'Current model availability in the mesh.';
+}
+
+function fitLabelTooltip(label?: string) {
+  if (label === 'Likely comfortable') {
+    return 'Should run comfortably on this node.';
+  }
+  if (label === 'Likely fits') {
+    return 'Should fit on this node, but tightly.';
+  }
+  if (label === 'Possible with tradeoffs') {
+    return 'May fit, with tighter memory or performance tradeoffs.';
+  }
+  if (label === 'Likely too large') {
+    return 'Likely too large for this node alone.';
+  }
+  return 'Estimated fit for this node.';
+}
+
+function fileSizeTooltip(fileName?: string) {
+  const ext = fileName?.split('.').pop()?.toUpperCase();
+  if (ext === 'GGUF') return 'GGUF model file size on disk.';
+  if (ext) return `${ext} model file size on disk.`;
+  return 'Primary model file size on disk.';
+}
+
+function toolUseTooltip(status?: string) {
+  if (status === 'supported') {
+    return 'Supports tool or function calling.';
+  }
+  if (status === 'likely') {
+    return 'Likely supports tool or function calling.';
+  }
+  return 'Tool or function calling support.';
+}
+
+function topologyStatusTone(status: string): 'good' | 'info' | 'warn' | 'bad' | 'neutral' {
+  if (status === 'Serving' || status === 'Serving (split)') return 'good';
+  if (status === 'Client') return 'info';
+  if (status === 'Host') return 'info';
+  if (status === 'Idle' || status === 'Standby') return 'neutral';
+  if (status === 'Worker (split)') return 'warn';
+  return 'neutral';
+}
+
+function topologyStatusTooltip(status: string) {
+  if (status === 'Serving') {
+    return 'Actively serving a model.';
+  }
+  if (status === 'Serving (split)') {
+    return 'Serving a split model with the mesh.';
+  }
+  if (status === 'Worker (split)') {
+    return 'Contributing compute to a split model.';
+  }
+  if (status === 'Host') {
+    return 'Coordinating requests for the mesh.';
+  }
+  if (status === 'Client') {
+    return 'Sends requests, but does not contribute VRAM.';
+  }
+  if (status === 'Idle' || status === 'Standby') {
+    return 'Connected, but not serving a model.';
+  }
+  return 'Current serving role.';
+}
+
+function statusPillToneClass(tone: 'warm' | 'cold' | 'good' | 'info' | 'warn' | 'bad' | 'neutral') {
+  if (tone === 'warm' || tone === 'good') {
+    return 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300';
+  }
+  if (tone === 'cold' || tone === 'info') {
+    return 'border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300';
+  }
+  if (tone === 'warn') {
+    return 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300';
+  }
+  if (tone === 'bad') {
+    return 'border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300';
   }
   return "border-border bg-muted text-foreground";
 }

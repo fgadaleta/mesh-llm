@@ -88,6 +88,9 @@ pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize
         if let Some(label) = result.capabilities.reasoning_label() {
             caps.push(format!("🧠 reasoning ({label})"));
         }
+        if let Some(label) = result.capabilities.tool_use_label() {
+            caps.push(format!("🛠️ tool use ({label})"));
+        }
         println!("   capabilities: {}", caps.join("  "));
         println!("   ref: {}", result.exact_ref);
         println!("   show: mesh-llm models show {}", result.exact_ref);
@@ -121,6 +124,9 @@ pub fn run_model_recommended() {
         }
         if let Some(label) = model_capabilities.reasoning_label() {
             println!("  🧠 Reasoning: {}", label);
+        }
+        if let Some(label) = model_capabilities.tool_use_label() {
+            println!("  🛠️ Tool Use: {}", label);
         }
         if model.moe.is_some() {
             println!("  🧩 MoE: yes");
@@ -182,6 +188,9 @@ pub fn run_model_installed() {
         if let Some(label) = model_capabilities.reasoning_label() {
             println!("  🧠 Reasoning: {}", label);
         }
+        if let Some(label) = model_capabilities.tool_use_label() {
+            println!("  🛠️ Tool Use: {}", label);
+        }
         println!();
     }
 }
@@ -214,6 +223,9 @@ pub async fn run_model_show(model_ref: &str) -> Result<()> {
     }
     if let Some(label) = details.capabilities.reasoning_label() {
         println!("  🧠 reasoning ({label})");
+    }
+    if let Some(label) = details.capabilities.tool_use_label() {
+        println!("  🛠️ tool use ({label})");
     }
     if let Some(moe) = details.moe {
         println!(

@@ -1,19 +1,24 @@
 use super::catalog;
 use super::{hf_token_override, http_client, huggingface_resolve_url};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum CapabilityLevel {
+    #[default]
     None,
     Likely,
     Supported,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
     pub vision: CapabilityLevel,
     pub reasoning: CapabilityLevel,
+    pub tool_use: CapabilityLevel,
+    pub moe: bool,
 }
 
 impl Default for ModelCapabilities {
@@ -21,6 +26,8 @@ impl Default for ModelCapabilities {
         Self {
             vision: CapabilityLevel::None,
             reasoning: CapabilityLevel::None,
+            tool_use: CapabilityLevel::None,
+            moe: false,
         }
     }
 }
@@ -62,12 +69,32 @@ impl ModelCapabilities {
         }
     }
 
+    pub fn tool_use_status(self) -> &'static str {
+        match self.tool_use {
+            CapabilityLevel::Supported => "supported",
+            CapabilityLevel::Likely => "likely",
+            CapabilityLevel::None => "none",
+        }
+    }
+
+    pub fn tool_use_label(self) -> Option<&'static str> {
+        match self.tool_use {
+            CapabilityLevel::Supported => Some("yes"),
+            CapabilityLevel::Likely => Some("likely"),
+            CapabilityLevel::None => None,
+        }
+    }
+
     fn upgrade_vision(&mut self, level: CapabilityLevel) {
         self.vision = self.vision.max(level);
     }
 
     fn upgrade_reasoning(&mut self, level: CapabilityLevel) {
         self.reasoning = self.reasoning.max(level);
+    }
+
+    fn upgrade_tool_use(&mut self, level: CapabilityLevel) {
+        self.tool_use = self.tool_use.max(level);
     }
 }
 
@@ -76,6 +103,7 @@ pub fn infer_catalog_capabilities(model: &catalog::CatalogModel) -> ModelCapabil
     if model.mmproj.is_some() {
         caps.upgrade_vision(CapabilityLevel::Supported);
     }
+    caps.moe = model.moe.is_some();
     caps = merge_name_signals(
         caps,
         &[
@@ -144,6 +172,18 @@ pub fn merge_name_signals(mut caps: ModelCapabilities, values: &[&str]) -> Model
         caps.upgrade_reasoning(CapabilityLevel::Likely);
     }
 
+    if values
+        .iter()
+        .any(|value| strong_tool_use_name_signal(value))
+    {
+        caps.upgrade_tool_use(CapabilityLevel::Supported);
+    } else if values
+        .iter()
+        .any(|value| likely_tool_use_name_signal(value))
+    {
+        caps.upgrade_tool_use(CapabilityLevel::Likely);
+    }
+
     caps
 }
 
@@ -154,6 +194,7 @@ where
 {
     let mut saw_processor = false;
     let mut saw_reasoning_template = false;
+    let mut saw_tool_template = false;
     for sibling in siblings {
         let name = sibling.as_ref().to_lowercase();
         if name.contains("mmproj") {
@@ -172,12 +213,18 @@ where
         {
             saw_reasoning_template = true;
         }
+        if name.contains("tool") || name.contains("function") {
+            saw_tool_template = true;
+        }
     }
     if saw_processor {
         caps.upgrade_vision(CapabilityLevel::Likely);
     }
     if saw_reasoning_template {
         caps.upgrade_reasoning(CapabilityLevel::Likely);
+    }
+    if saw_tool_template {
+        caps.upgrade_tool_use(CapabilityLevel::Likely);
     }
     caps
 }
@@ -251,6 +298,52 @@ pub fn merge_config_signals(mut caps: ModelCapabilities, config: &Value) -> Mode
         }
     }
 
+    if json_contains_tool_use_tokens(config) {
+        caps.upgrade_tool_use(CapabilityLevel::Supported);
+    }
+
+    if config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .any(strong_tool_use_name_signal)
+    {
+        caps.upgrade_tool_use(CapabilityLevel::Supported);
+    } else if config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .any(likely_tool_use_name_signal)
+    {
+        caps.upgrade_tool_use(CapabilityLevel::Likely);
+    }
+
+    if let Some(model_type) = config.get("model_type").and_then(|value| value.as_str()) {
+        if strong_tool_use_name_signal(model_type) {
+            caps.upgrade_tool_use(CapabilityLevel::Supported);
+        } else if likely_tool_use_name_signal(model_type) {
+            caps.upgrade_tool_use(CapabilityLevel::Likely);
+        }
+    }
+
+    if config
+        .get("num_experts")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+        > 1
+        || config
+            .get("num_experts_per_tok")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            > 0
+    {
+        caps.moe = true;
+    }
+
     caps
 }
 
@@ -318,6 +411,31 @@ fn likely_reasoning_name_signal(value: &str) -> bool {
     .any(|needle| value.contains(needle))
 }
 
+fn strong_tool_use_name_signal(value: &str) -> bool {
+    let value = value.to_lowercase();
+    [
+        "tool calling",
+        "tool-calling",
+        "tool use",
+        "function calling",
+        "function-calling",
+        "function call",
+        "tool_use",
+        "tool_calls",
+        "function_call",
+        "function_calls",
+    ]
+    .iter()
+    .any(|needle| value.contains(needle))
+}
+
+fn likely_tool_use_name_signal(value: &str) -> bool {
+    let value = value.to_lowercase();
+    ["tool", "agentic", "function", "coding"]
+        .iter()
+        .any(|needle| value.contains(needle))
+}
+
 fn json_contains_reasoning_tokens(value: &Value) -> bool {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) => false,
@@ -334,6 +452,31 @@ fn json_contains_reasoning_tokens(value: &Value) -> bool {
             key_lower.contains("reason")
                 || key_lower.contains("think")
                 || json_contains_reasoning_tokens(value)
+        }),
+    }
+}
+
+fn json_contains_tool_use_tokens(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        Value::String(text) => {
+            let lower = text.to_lowercase();
+            lower.contains("tool_call")
+                || lower.contains("tool_calls")
+                || lower.contains("tool_use")
+                || lower.contains("tool_result")
+                || lower.contains("function_call")
+                || lower.contains("function_calls")
+                || lower.contains("parallel_tool_calls")
+                || lower.contains("\"tool\"")
+        }
+        Value::Array(items) => items.iter().any(json_contains_tool_use_tokens),
+        Value::Object(map) => map.iter().any(|(key, value)| {
+            let key_lower = key.to_lowercase();
+            key_lower.contains("tool")
+                || key_lower.contains("function")
+                || key_lower.contains("parallel_tool_calls")
+                || json_contains_tool_use_tokens(value)
         }),
     }
 }

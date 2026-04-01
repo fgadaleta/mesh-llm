@@ -288,7 +288,10 @@ pub(crate) fn decode_gossip_payload(
                 .collect::<Vec<_>>())
         }
         ControlProtocol::JsonV0 => {
-            let anns: Vec<PeerAnnouncement> = serde_json::from_slice(buf)?;
+            let mut anns: Vec<PeerAnnouncement> = serde_json::from_slice(buf)?;
+            for ann in &mut anns {
+                crate::mesh::backfill_legacy_descriptors(ann);
+            }
             Ok(anns
                 .into_iter()
                 .map(|ann| (ann.addr.clone(), ann))
@@ -394,6 +397,8 @@ mod tests {
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::from([("Qwen".into(), 1234_u64)]),
+            served_model_descriptors: vec![],
+            available_model_descriptors: vec![],
         };
         let json = serde_json::to_vec(&vec![ann.clone()]).unwrap();
 
@@ -792,6 +797,8 @@ mod tests {
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            available_model_descriptors: vec![],
         };
         let json = serde_json::to_vec(&vec![ann]).expect("JSON serialization must succeed");
 

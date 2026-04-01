@@ -31,6 +31,53 @@ message PeerAnnouncement {
   repeated ModelDemandEntry demand = 20;             // demand map entries (self entry only)
   map<string, uint64> available_model_sizes = 21;   // file sizes (bytes) per GGUF model name
   bytes serialized_addr = 22;                        // JSON-serialized EndpointAddr (includes network addresses for peer discovery)
+  repeated ServedModelIdentity served_model_identities = 23;
+  repeated ServedModelIdentity available_model_identities = 24;
+  repeated ServedModelDescriptor served_model_descriptors = 25;
+  repeated ServedModelDescriptor available_model_descriptors = 26;
+}
+
+message ServedModelDescriptor {
+  ServedModelIdentity identity = 1;
+  ModelCapabilities capabilities = 2;
+  optional ModelTopology topology = 3;
+}
+
+message ServedModelIdentity {
+  string model_name = 1;
+  bool is_primary = 2;
+  ModelSourceKind source_kind = 3;
+  optional string canonical_ref = 4;
+  optional string repository = 5;
+  optional string revision = 6;
+  optional string artifact = 7;
+  optional string local_file_name = 8;
+  optional string identity_hash = 9;
+}
+
+message ModelCapabilities {
+  CapabilityLevel vision = 1;
+  CapabilityLevel reasoning = 2;
+  CapabilityLevel tool_use = 3;
+  bool moe = 4;
+}
+
+enum CapabilityLevel {
+  CAPABILITY_LEVEL_UNSPECIFIED = 0;
+  CAPABILITY_LEVEL_NONE = 1;
+  CAPABILITY_LEVEL_LIKELY = 2;
+  CAPABILITY_LEVEL_SUPPORTED = 3;
+}
+
+message ModelTopology {
+  optional ModelMoeInfo moe = 1;
+}
+
+message ModelMoeInfo {
+  uint32 expert_count = 1;
+  uint32 used_expert_count = 2;
+  optional uint32 min_experts_per_node = 3;
+  optional string source = 4;
 }
 
 message CompactModelMetadata {
@@ -63,6 +110,15 @@ message ExpertsSummary {
   uint32 total_experts = 1;
   uint32 expert_count_used = 2;
   repeated uint32 top_expert_ids = 3;
+}
+
+enum ModelSourceKind {
+  MODEL_SOURCE_KIND_UNSPECIFIED = 0;
+  MODEL_SOURCE_KIND_CATALOG = 1;
+  MODEL_SOURCE_KIND_HUGGING_FACE = 2;
+  MODEL_SOURCE_KIND_LOCAL_GGUF = 3;
+  MODEL_SOURCE_KIND_DIRECT_URL = 4;
+  MODEL_SOURCE_KIND_UNKNOWN = 5;
 }
 
 message ModelDemandEntry {
