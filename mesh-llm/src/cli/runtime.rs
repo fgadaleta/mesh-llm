@@ -111,9 +111,8 @@ async fn run_control_request(path: &str, model_name: &str, port: u16, verb: &str
         .with_context(|| format!("Can't connect to mesh-llm on port {port}. Is it running?"))?;
     stream.write_all(request.as_bytes()).await?;
 
-    let mut response = vec![0u8; 4096];
-    let n = stream.read(&mut response).await?;
-    let resp = String::from_utf8_lossy(&response[..n]);
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await?;
 
     if resp.contains("200 OK") || resp.contains("201 Created") {
         let action = if verb == "Loaded" {
