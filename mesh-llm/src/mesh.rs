@@ -4046,6 +4046,7 @@ pub(crate) mod tests {
             is_soc: None,
             gpu_vram: None,
             gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            served_model_descriptors: Arc::new(Mutex::new(Vec::new())),
         };
 
         let accept_node = node.clone();
@@ -6604,6 +6605,7 @@ pub(crate) mod tests {
             experts_summary: None,
             tunnel_port: None,
             available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
         }
     }
 
