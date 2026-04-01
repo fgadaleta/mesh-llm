@@ -1,4 +1,5 @@
-use hf_hub::{Cache, RepoType};
+use hf_hub::cache_manager::HFCacheInfo;
+use hf_hub::Cache;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -80,30 +81,51 @@ pub fn legacy_models_present() -> bool {
 
 pub fn huggingface_identity_for_path(path: &Path) -> Option<HuggingFaceModelIdentity> {
     let cache = huggingface_hub_cache();
-    let info = cache.path_info(path)?;
-    if info.repo().repo_type() != RepoType::Model {
-        return None;
-    }
-    let revision = info.commit_hash().to_string();
-    let file = info.relative_path().to_string();
-    if file.is_empty() {
-        return None;
+    let cache_info = HFCacheInfo::scan_cache_dir(Some(cache.path())).ok()?;
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    for repo in &cache_info.repos {
+        let cache_id = repo.cache_id();
+        let Some(repo_id) = cache_id.strip_prefix("model/") else {
+            continue;
+        };
+        for revision in &repo.revisions {
+            for file in &revision.files {
+                let candidate = file
+                    .file_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| file.file_path.clone());
+                if file.file_path != path && candidate != resolved {
+                    continue;
+                }
+
+                let relative_path = file
+                    .file_path
+                    .strip_prefix(&revision.snapshot_path)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if relative_path.is_empty() {
+                    return None;
+                }
+
+                let canonical_ref = format!(
+                    "{repo_id}@{revision}/{relative_path}",
+                    revision = revision.commit_hash
+                );
+
+                return Some(HuggingFaceModelIdentity {
+                    repo_id: repo_id.to_string(),
+                    revision: revision.commit_hash.clone(),
+                    file: relative_path,
+                    canonical_ref,
+                    local_file_name: file.file_name.clone(),
+                });
+            }
+        }
     }
 
-    let repo_id = info.repo().repo_id().to_string();
-    let local_file_name = Path::new(&file)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(str::to_string)?;
-    let canonical_ref = format!("{repo_id}@{revision}/{file}");
-
-    Some(HuggingFaceModelIdentity {
-        repo_id,
-        revision,
-        file,
-        canonical_ref,
-        local_file_name,
-    })
+    None
 }
 
 pub fn exact_model_source_for_path(path: &Path) -> Option<String> {
@@ -188,26 +210,19 @@ fn tree_contains_gguf(root: &Path) -> bool {
 
 fn scan_hf_cache_models(names: &mut Vec<String>, seen: &mut HashSet<String>, min_size_bytes: u64) {
     let cache = huggingface_hub_cache();
-    let Ok(repos) = cache.repos() else {
+    let Ok(cache_info) = HFCacheInfo::scan_cache_dir(Some(cache.path())) else {
         return;
     };
-    for repo in repos {
-        if repo.repo().repo_type() != RepoType::Model {
+    for repo in &cache_info.repos {
+        if !repo.cache_id().starts_with("model/") {
             continue;
         }
-        let Ok(refs) = repo.refs() else {
-            continue;
-        };
-        for cache_ref in refs {
-            let Ok(files) = repo.files(cache_ref.commit_hash()) else {
-                continue;
-            };
-            for file in files {
-                if !file.ends_with(".gguf") {
+        for revision in &repo.revisions {
+            for file in &revision.files {
+                if !file.file_name.ends_with(".gguf") {
                     continue;
                 }
-                let path = repo.pointer_path(cache_ref.commit_hash()).join(file);
-                push_model_name(&path, names, seen, min_size_bytes);
+                push_model_name(&file.file_path, names, seen, min_size_bytes);
             }
         }
     }
@@ -272,22 +287,16 @@ fn find_hf_cache_model_path(root: &Path, stem: &str) -> Option<PathBuf> {
 
     let split_prefix = format!("{stem}-00001-of-");
     let cache = huggingface_hub_cache();
-    let Ok(repos) = cache.repos() else {
+    let Ok(cache_info) = HFCacheInfo::scan_cache_dir(Some(cache.path())) else {
         return None;
     };
-    for repo in repos {
-        if repo.repo().repo_type() != RepoType::Model {
+    for repo in &cache_info.repos {
+        if !repo.cache_id().starts_with("model/") {
             continue;
         }
-        let Ok(refs) = repo.refs() else {
-            continue;
-        };
-        for cache_ref in refs {
-            let Ok(files) = repo.files(cache_ref.commit_hash()) else {
-                continue;
-            };
-            for file in files {
-                let Some(name) = Path::new(&file)
+        for revision in &repo.revisions {
+            for file in &revision.files {
+                let Some(name) = Path::new(&file.file_name)
                     .file_name()
                     .and_then(|value| value.to_str())
                 else {
@@ -295,7 +304,7 @@ fn find_hf_cache_model_path(root: &Path, stem: &str) -> Option<PathBuf> {
                 };
                 if name == filename || (name.starts_with(&split_prefix) && name.ends_with(".gguf"))
                 {
-                    return Some(repo.pointer_path(cache_ref.commit_hash()).join(file));
+                    return Some(file.file_path.clone());
                 }
             }
         }

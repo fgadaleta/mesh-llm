@@ -8,6 +8,7 @@ pub mod topology;
 use anyhow::{anyhow, bail, Context, Result};
 use hf_hub::api::sync::{Api, ApiBuilder};
 use hf_hub::api::RepoInfo;
+use hf_hub::cache_manager::HFCacheInfo;
 use hf_hub::{Repo, RepoType};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -1296,27 +1297,35 @@ fn clear_progress_line() -> Result<()> {
 fn cached_repos() -> Result<Vec<CachedRepo>> {
     let cache = huggingface_hub_cache();
     let mut repos = Vec::new();
-    for repo in cache
-        .repos()
-        .context("Enumerate cached Hugging Face repos")?
-    {
-        if repo.repo().repo_type() != RepoType::Model {
+    let cache_info = HFCacheInfo::scan_cache_dir(Some(cache.path()))
+        .context("Enumerate cached Hugging Face repos")?;
+    for repo in &cache_info.repos {
+        let cache_id = repo.cache_id();
+        let Some(repo_id) = cache_id.strip_prefix("model/") else {
             continue;
-        }
-        let refs = repo
-            .refs()
-            .with_context(|| format!("Read cached refs for {}", repo.repo().repo_id()))?;
-        let Some(cache_ref) = refs
+        };
+        let Some(revision) = repo
+            .revisions
             .iter()
-            .find(|cache_ref| cache_ref.name() == "main")
-            .or_else(|| refs.first())
+            .find(|revision| revision.refs.contains("main"))
+            .or_else(|| repo.revisions.iter().next())
         else {
             continue;
         };
+        let ref_name = if revision.refs.contains("main") {
+            "main".to_string()
+        } else {
+            revision
+                .refs
+                .iter()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "main".to_string())
+        };
         repos.push(CachedRepo {
-            repo_id: repo.repo().repo_id().to_string(),
-            ref_name: cache_ref.name().to_string(),
-            local_revision: cache_ref.commit_hash().to_string(),
+            repo_id: repo_id.to_string(),
+            ref_name,
+            local_revision: revision.commit_hash.clone(),
         });
     }
 
@@ -1325,25 +1334,38 @@ fn cached_repos() -> Result<Vec<CachedRepo>> {
 }
 
 fn cached_repo_for_path(path: &Path) -> Result<Option<CachedRepo>> {
-    let cache = huggingface_hub_cache();
-    let Some(info) = cache.path_info(path) else {
+    let Some(identity) = huggingface_identity_for_path(path) else {
         return Ok(None);
     };
-    if info.repo().repo_type() != RepoType::Model {
-        return Ok(None);
-    }
-    let cache_repo = cache.repo(info.repo().clone());
-    let ref_name = cache_repo
-        .refs()
-        .with_context(|| format!("Read cached refs for {}", info.repo().repo_id()))?
-        .into_iter()
-        .find(|cache_ref| cache_ref.commit_hash() == info.commit_hash())
-        .map(|cache_ref| cache_ref.name().to_string())
+    let cache = huggingface_hub_cache();
+    let cache_info = HFCacheInfo::scan_cache_dir(Some(cache.path()))
+        .context("Enumerate cached Hugging Face repos")?;
+    let ref_name = cache_info
+        .repos
+        .iter()
+        .find(|repo| repo.cache_id().strip_prefix("model/") == Some(identity.repo_id.as_str()))
+        .and_then(|repo| {
+            repo.revisions
+                .iter()
+                .find(|revision| revision.commit_hash == identity.revision)
+        })
+        .map(|revision| {
+            if revision.refs.contains("main") {
+                "main".to_string()
+            } else {
+                revision
+                    .refs
+                    .iter()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "main".to_string())
+            }
+        })
         .unwrap_or_else(|| "main".to_string());
     Ok(Some(CachedRepo {
-        repo_id: info.repo().repo_id().to_string(),
+        repo_id: identity.repo_id,
         ref_name,
-        local_revision: info.commit_hash().to_string(),
+        local_revision: identity.revision,
     }))
 }
 
@@ -1422,12 +1444,32 @@ fn is_not_found_error(message: &str) -> bool {
 
 fn cached_repo_files(repo: &CachedRepo) -> Result<Vec<String>> {
     let cache = huggingface_hub_cache();
-    let repo_handle =
-        Repo::with_revision(repo.repo_id.clone(), RepoType::Model, repo.ref_name.clone());
-    cache
-        .repo(repo_handle)
-        .files(&repo.local_revision)
-        .with_context(|| format!("List cached files for {}", repo.repo_id))
+    let cache_info = HFCacheInfo::scan_cache_dir(Some(cache.path()))
+        .context("Enumerate cached Hugging Face repos")?;
+    let files = cache_info
+        .repos
+        .iter()
+        .find(|cached| cached.cache_id().strip_prefix("model/") == Some(repo.repo_id.as_str()))
+        .and_then(|cached| {
+            cached
+                .revisions
+                .iter()
+                .find(|revision| revision.commit_hash == repo.local_revision)
+        })
+        .map(|revision| {
+            revision
+                .files
+                .iter()
+                .filter_map(|file| {
+                    file.file_path
+                        .strip_prefix(&revision.snapshot_path)
+                        .ok()
+                        .map(|path| path.to_string_lossy().replace('\\', "/"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(files)
 }
 
 #[cfg(test)]
