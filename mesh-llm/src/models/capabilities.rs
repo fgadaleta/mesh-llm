@@ -1,5 +1,6 @@
 use super::catalog;
-use super::{hf_token_override, http_client, huggingface_resolve_url};
+use super::hf_token_override;
+use super::resolve::{http_client, huggingface_resolve_url};
 use serde_json::Value;
 use std::path::Path;
 
