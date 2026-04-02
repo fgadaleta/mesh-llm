@@ -270,6 +270,7 @@ pub(crate) async fn run() -> Result<()> {
         }
         resolved_models.push(path.clone());
     }
+    #[cfg(target_os = "macos")]
     for path in &cli.mlx_file {
         let Some(dir) = crate::mlx::mlx_model_dir(path) else {
             anyhow::bail!(
@@ -284,6 +285,10 @@ pub(crate) async fn run() -> Result<()> {
             );
         }
         resolved_models.push(dir.to_path_buf());
+    }
+    #[cfg(not(target_os = "macos"))]
+    if !cli.mlx_file.is_empty() {
+        anyhow::bail!("--mlx-file is only supported on macOS");
     }
     for m in &cli.model {
         resolved_models.push(resolve_model(m).await?);
