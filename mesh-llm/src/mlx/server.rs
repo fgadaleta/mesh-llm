@@ -423,7 +423,6 @@ fn setup_caches_with_reuse<'a>(
         if prefix_len > 0 {
             // Reuse cached KV — trim to prefix length and return suffix
             let mut caches = state.prompt_cache.take().unwrap().caches;
-            let rewind_to = caches[0].offset.saturating_sub(1);
             for c in &mut caches {
                 c.trim_to(prefix_len);
             }
