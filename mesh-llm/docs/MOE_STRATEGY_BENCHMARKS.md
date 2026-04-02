@@ -27,46 +27,44 @@ The strongest result is that `micro-analyze` is dramatically better than any wei
 
 ### GLM-4.7-Flash-Q4_K_M
 
-- Full analyze remains the reference ranking.
-- `micro-1p-8t-all-layers` matched full analyze exactly:
-  - Spearman: `1.00`
-  - Recall@24: `1.00`
-  - Weighted recall@24: `1.00`
-  - Runtime: `17.29s`
-- `heuristic-max` was the best weight-only heuristic, but still poor:
-  - Spearman: `0.06`
-  - Recall@24: `0.46`
-  - Weighted recall@24: `0.27`
-- All tested heuristics missed expert `0`, which is unacceptable for this model because full analyze shows expert `0` carries `22.94%` of gate mass.
+| Strategy | Spearman | Recall@24 | Weighted recall@24 | Runtime |
+| --- | ---: | ---: | ---: | ---: |
+| `analyze` | `1.00` | `1.00` | `1.00` | `44.27s` |
+| `micro-1p-8t-all-layers` | `1.00` | `1.00` | `1.00` | `17.29s` |
+| `heuristic-max` | `0.06` | `0.46` | `0.27` | startup only |
+| `sequential` | baseline fallback | baseline fallback | baseline fallback | startup only |
+
+All tested heuristics missed expert `0`, which is unacceptable for this model because full analyze shows expert `0` carries `22.94%` of gate mass.
 
 ### Qwen3-Coder-Next-Q4_K_M
 
-- `micro-1p-8t-all-layers` was already close to full analyze:
-  - Spearman: `0.951`
-  - Recall@256: `0.930`
-  - Weighted recall@256: `0.966`
-  - Runtime: `32.09s`
-- `micro-4p-32t-all-layers` matched full analyze exactly:
-  - Spearman: `1.00`
-  - Recall@256: `1.00`
-  - Weighted recall@256: `1.00`
-  - Runtime: `314.95s`
-- `heuristic-max` again beat the other weight-only heuristics, but stayed well below micro-analyze:
-  - Spearman: `0.020`
-  - Recall@256: `0.516`
-  - Weighted recall@256: `0.741`
+| Strategy | Spearman | Recall@256 | Weighted recall@256 | Runtime |
+| --- | ---: | ---: | ---: | ---: |
+| `analyze` | `1.00` | `1.00` | `1.00` | `106.74s` |
+| `micro-1p-8t-all-layers` | `0.951` | `0.930` | `0.966` | `32.09s` |
+| `micro-4p-32t-all-layers` | `1.00` | `1.00` | `1.00` | `314.95s` |
+| `heuristic-max` | `0.020` | `0.516` | `0.741` | startup only |
+| `sequential` | baseline fallback | baseline fallback | baseline fallback | startup only |
 
 ## Grouping Results
 
-With a good ranking, both grouping shapes work:
+### GLM-4.7-Flash-Q4_K_M
 
-- `current-analyze` is already strong.
-- `snake-analyze-replicated` is slightly better balanced.
+| Grouping strategy | Ranking source | Shared mass | Mean node mass | Imbalance |
+| --- | --- | ---: | ---: | ---: |
+| `current-analyze` | `analyze` | `52.90%` | `76.45%` | `0.0808%` |
+| `snake-analyze-replicated` | `analyze` | `52.90%` | `76.45%` | `0.0338%` |
+| `current-sequential` | `sequential` | `51.03%` | `75.52%` | lower risk fallback |
+| `snake-heuristic-replicated` | `heuristic-max` | `28.79%` | `64.39%` | `21.27%` |
 
-With a bad ranking, grouping does not rescue quality:
+### Qwen3-Coder-Next-Q4_K_M
 
-- On GLM, `snake-heuristic-replicated` is materially worse than `current-sequential`.
-- On Qwen, heuristic snake-draft is usable but still clearly below analyze-backed grouping.
+| Grouping strategy | Ranking source | Shared mass | Mean node mass | Imbalance |
+| --- | --- | ---: | ---: | ---: |
+| `current-analyze` | `analyze` | `71.01%` | `85.50%` | `0.0271%` |
+| `snake-analyze-replicated` | `analyze` | `71.01%` | `85.50%` | `0.00819%` |
+| `current-sequential` | `sequential` | `66.61%` | `83.30%` | lower risk fallback |
+| `snake-heuristic-replicated` | `heuristic-max` | `65.55%` | `82.77%` | `0.926%` |
 
 Practical interpretation:
 
@@ -77,13 +75,15 @@ Practical interpretation:
 
 Startup cost by strategy:
 
-- `bundled / cached analyze`: local config or CSV read only; no `llama-moe-analyze` process
-- `sequential`: GGUF header read only; no ranking analysis
-- `heuristic-*`: GGUF tensor scan to score router weights; no `llama-moe-analyze`
-- `micro-analyze`: short `llama-moe-analyze` run
-- `analyze`: full `llama-moe-analyze` run
+| Strategy | Work done at startup | Measured cost |
+| --- | --- | ---: |
+| `bundled / cached analyze` | Local config or CSV read only | file read only |
+| `sequential` | GGUF header read only | file read only |
+| `heuristic-*` | GGUF tensor scan for router-weight scoring | startup only |
+| `micro-analyze` | Short `llama-moe-analyze` run | model-dependent |
+| `analyze` | Full `llama-moe-analyze` run | model-dependent |
 
-### Full `llama-moe-analyze`
+### Measured analyze timings
 
 Timed on `studio54.local` with:
 
@@ -91,27 +91,10 @@ Timed on `studio54.local` with:
 /usr/bin/time -lp ./llama-moe-analyze -m MODEL --all-layers --export-ranking /tmp/ranking.csv -n 32 -c 4096 -ngl 99
 ```
 
-- `GLM-4.7-Flash-Q4_K_M`: `44.27s`
-- `Qwen3-Coder-Next-Q4_K_M`: `106.74s`
-
-### Micro analyze
-
-Measured from the benchmark suite:
-
-- GLM `micro-1p-8t-all-layers`: `17.29s`
-- Qwen `micro-1p-8t-all-layers`: `32.09s`
-
-### Bundled / cached ranking
-
-- Catalog ranking and cached CSV loading are effectively startup-time file reads.
-- They do not launch `llama-moe-analyze`.
-- This is the cheapest path, but only as good as the bundled or cached artifact.
-
-### Sequential / heuristic startup
-
-- `sequential` only reads GGUF metadata to detect expert counts, then uses `0..N`.
-- `heuristic-*` scans router tensors from the GGUF and computes a ranking locally.
-- Neither path launches `llama-moe-analyze`, but both are weaker than `micro-analyze` on the tested models.
+| Model | Full analyze | Micro analyze (`1p/8t/all-layers`) | Notes |
+| --- | ---: | ---: | --- |
+| `GLM-4.7-Flash-Q4_K_M` | `44.27s` | `17.29s` | micro matched full analyze exactly |
+| `Qwen3-Coder-Next-Q4_K_M` | `106.74s` | `32.09s` | micro was already close; larger micro run reached exact match |
 
 ## Recommendations
 
