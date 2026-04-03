@@ -77,6 +77,8 @@ Current behavior:
   One deployment gets one plan. Nodes either participate in that plan or sit out.
 - **`auto` is the default runtime behavior.**
   The system should pick solo, split, or split-with-redundancy based on current resources without requiring flags such as grouping or overlap mode.
+- **Keep the public surface small.**
+  `--split` stays a hidden test/debug override. `--max-vram` is the supported budget knob when an operator wants to constrain planning without changing hardware.
 
 ### Failure and Recovery Policy
 

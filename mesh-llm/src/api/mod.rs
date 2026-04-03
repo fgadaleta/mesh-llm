@@ -624,6 +624,32 @@ impl MeshApi {
             .collect()
     }
 
+    fn derive_node_status(
+        is_client: bool,
+        effective_is_host: bool,
+        effective_llama_ready: bool,
+        has_local_worker_activity: bool,
+        has_split_workers: bool,
+        display_model_name: &str,
+        peer_count: usize,
+    ) -> String {
+        if is_client {
+            "Client".to_string()
+        } else if effective_is_host && effective_llama_ready {
+            if has_split_workers {
+                "Serving (split)".to_string()
+            } else {
+                "Serving".to_string()
+            }
+        } else if has_local_worker_activity {
+            "Worker (split)".to_string()
+        } else if display_model_name.is_empty() && peer_count == 0 {
+            "Idle".to_string()
+        } else {
+            "Standby".to_string()
+        }
+    }
+
     async fn status(&self) -> StatusPayload {
         // Snapshot inner fields and drop the lock before any async node queries.
         // This prevents deadlock: if node.peers() etc. block on node.state.lock(),
@@ -724,33 +750,20 @@ impl MeshApi {
 
         let mesh_id = node.mesh_id().await;
 
-        // Derive node status for display
-        let has_local_model_activity =
-            has_local_processes || !my_hosted_models.is_empty() || !my_serving_models.is_empty();
-
-        let node_status = if is_client {
-            "Client".to_string()
-        } else if effective_is_host && effective_llama_ready {
-            let has_split_workers = all_peers.iter().any(|p| {
-                matches!(p.role, mesh::NodeRole::Worker)
-                    && p.is_assigned_model(display_model_name.as_str())
-            });
-            if has_split_workers {
-                "Serving (split)".to_string()
-            } else {
-                "Serving".to_string()
-            }
-        } else if !effective_is_host && has_local_model_activity {
-            "Worker (split)".to_string()
-        } else if display_model_name.is_empty() {
-            if all_peers.is_empty() {
-                "Idle".to_string()
-            } else {
-                "Standby".to_string()
-            }
-        } else {
-            "Standby".to_string()
-        };
+        let has_local_worker_activity = has_local_processes || !my_hosted_models.is_empty();
+        let has_split_workers = all_peers.iter().any(|p| {
+            matches!(p.role, mesh::NodeRole::Worker)
+                && p.is_assigned_model(display_model_name.as_str())
+        });
+        let node_status = Self::derive_node_status(
+            is_client,
+            effective_is_host,
+            effective_llama_ready,
+            has_local_worker_activity,
+            has_split_workers,
+            display_model_name.as_str(),
+            all_peers.len(),
+        );
 
         StatusPayload {
             version: MESH_LLM_VERSION.to_string(),
@@ -1188,6 +1201,36 @@ mod tests {
             422
         );
         assert_eq!(classify_runtime_error("bad request"), 400);
+    }
+
+    #[test]
+    fn test_derive_node_status_prefers_client_role() {
+        let status = MeshApi::derive_node_status(true, true, true, true, true, "Qwen", 2);
+        assert_eq!(status, "Client");
+    }
+
+    #[test]
+    fn test_derive_node_status_standby_when_only_declaring_models() {
+        let status = MeshApi::derive_node_status(false, false, false, false, false, "Qwen", 1);
+        assert_eq!(status, "Standby");
+    }
+
+    #[test]
+    fn test_derive_node_status_worker_requires_local_runtime_activity() {
+        let status = MeshApi::derive_node_status(false, false, false, true, false, "Qwen", 1);
+        assert_eq!(status, "Worker (split)");
+    }
+
+    #[test]
+    fn test_derive_node_status_marks_split_host() {
+        let status = MeshApi::derive_node_status(false, true, true, true, true, "Qwen", 1);
+        assert_eq!(status, "Serving (split)");
+    }
+
+    #[test]
+    fn test_derive_node_status_idle_without_model_or_peers() {
+        let status = MeshApi::derive_node_status(false, false, false, false, false, "", 0);
+        assert_eq!(status, "Idle");
     }
 
     #[test]

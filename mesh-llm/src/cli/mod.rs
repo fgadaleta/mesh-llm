@@ -105,8 +105,8 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     pub(crate) ctx_size: Option<u32>,
 
-    /// Cap VRAM used for planning and mesh advertisement (GB).
-    #[arg(long, hide = true)]
+    /// Cap VRAM used for planning, local-fit decisions, and mesh advertisement (GB).
+    #[arg(long)]
     pub(crate) max_vram: Option<f64>,
 
     /// Enumerate host hardware (GPU name, hostname) at startup.

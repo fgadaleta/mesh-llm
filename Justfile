@@ -329,6 +329,10 @@ compat-smoke model:
 moe-split-smoke families="all":
     scripts/moe-split-smoke.sh "llama.cpp/build/bin" {{ families }}
 
+# Validate an already-running MoE deployment end-to-end through one API/console pair.
+moe-live-smoke model api_url console_url expected_nodes="2" timeout="120":
+    scripts/moe-live-smoke.sh --expected-nodes {{ expected_nodes }} --timeout {{ timeout }} "{{ model }}" "{{ api_url }}" "{{ console_url }}"
+
 # Benchmark sticky-only vs prefix-only affinity on a 3-node local mesh.
 bench-prefix-affinity:
     @scripts/benchmark-prefix-affinity.sh

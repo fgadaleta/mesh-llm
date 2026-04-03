@@ -297,6 +297,48 @@ What it validates:
 - Each shard can be loaded by `llama-server`.
 - Splitter regressions fail early with a direct tool-level repro, before the mesh runtime is involved.
 
+### 10zz. Live MoE inference smoke
+
+Use this once a real split is already up for a family that passes direct `moe-split` validation.
+
+```bash
+just moe-live-smoke \
+  model=Qwen3-30B-A3B-Q4_K_M \
+  api_url=http://studio54.local:9337 \
+  console_url=http://studio54.local:3131
+```
+
+To validate more than one console view of the same deployment, call the script directly:
+
+```bash
+scripts/moe-live-smoke.sh \
+  --expected-nodes 2 \
+  Qwen3-30B-A3B-Q4_K_M \
+  http://studio54.local:9337 \
+  http://studio54.local:3131 \
+  http://build.local:3131
+```
+
+What it validates:
+
+- `/api/status` reports the model as `warm`
+- `node_count` and `active_nodes` agree with the expected MoE topology
+- `/v1/models` exposes the model through the chosen API
+- `/v1/chat/completions` succeeds through the mesh
+
+Current preferred live-inference families on `studio54.local + build.local`:
+
+| Family | Preferred model | Notes |
+|---|---|---|
+| `qwen3-a3b` | `Qwen3-30B-A3B-Q4_K_M` | Main live control case |
+| `glm-deepseek2` | `GLM-4.7-Flash-Q4_K_M` | Expect slower shard-1 startup on `build.local` |
+| `olmoe` | `OLMoE-1B-7B-0924-Instruct-Q4_K_M` | Use `--split --max-vram 4.0` on this pair to force the live MoE path |
+
+Coverage note:
+
+- `just moe-split-smoke` is the CI-safe family gate.
+- `scripts/moe-live-smoke.sh` is the manual or remote-runner integration check after actual mesh nodes are up.
+
 ### 11a. Two-node MoE split collapses to one survivor
 
 ```bash

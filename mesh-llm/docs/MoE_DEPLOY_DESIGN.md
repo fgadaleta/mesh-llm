@@ -8,11 +8,16 @@ This documents how MoE expert sharding is implemented in mesh-llm. Originally a 
 # MoE auto-detected — splits if needed, runs solo if it fits
 mesh-llm --model Qwen3-30B-A3B-Q4_K_M
 
-# Force splitting even if model fits locally
+# Hidden test/debug override: force splitting even if the model fits locally
 mesh-llm --model Qwen3-30B-A3B-Q4_K_M --split
 ```
 
 The system detects MoE from the GGUF header, computes expert assignments, splits the GGUF per node, and each node runs its own llama-server. Sessions are hash-routed. No manual steps.
+
+Normal operators should use plain `mesh-llm --model ...` or `--auto`.
+
+- `--split` remains a hidden test/debug override for forcing the MoE path.
+- `--max-vram` is a supported resource-budget knob when you want the planner to behave as if less VRAM is available.
 
 ## Planned Deployment Policy
 
