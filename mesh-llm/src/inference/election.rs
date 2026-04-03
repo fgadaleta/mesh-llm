@@ -104,6 +104,7 @@ pub struct LocalProcessInfo {
     pub backend: String,
     pub pid: u32,
     pub port: u16,
+    pub context_length: u32,
 }
 
 fn stop_requested(stop_rx: &watch::Receiver<bool>) -> bool {
@@ -127,14 +128,23 @@ impl ModelTargets {
         self.targets.get(model).cloned().unwrap_or_default()
     }
 
-    /// Get target for a model using a sticky key.
-    pub fn get_sticky(&self, model: &str, sticky_key: u64) -> InferenceTarget {
-        match self.targets.get(model) {
-            Some(targets) if !targets.is_empty() => {
-                let idx = sticky_key as usize % targets.len();
-                targets[idx].clone()
-            }
-            _ => InferenceTarget::None,
+    /// Round-robin pick from a caller-supplied candidate slice.
+    pub fn pick_from(&self, candidates: &[InferenceTarget]) -> InferenceTarget {
+        if candidates.is_empty() {
+            InferenceTarget::None
+        } else {
+            let idx = self.counter.fetch_add(1, Ordering::Relaxed) as usize % candidates.len();
+            candidates[idx].clone()
+        }
+    }
+
+    /// Sticky pick from a caller-supplied candidate slice.
+    pub fn pick_sticky_from(candidates: &[InferenceTarget], sticky_key: u64) -> InferenceTarget {
+        if candidates.is_empty() {
+            InferenceTarget::None
+        } else {
+            let idx = sticky_key as usize % candidates.len();
+            candidates[idx].clone()
         }
     }
 
@@ -578,6 +588,7 @@ pub async fn election_loop(
                     backend: "llama".into(),
                     pid: process.handle.pid(),
                     port: llama_port,
+                    context_length: process.context_length,
                 }));
             }
             on_change(true, true);
@@ -799,6 +810,7 @@ async fn moe_election_loop(
                                 backend: "llama".into(),
                                 pid: process.handle.pid(),
                                 port: llama_port,
+                                context_length: process.context_length,
                             }));
                         }
                         update_targets(
@@ -917,6 +929,7 @@ async fn moe_election_loop(
                             backend: "llama".into(),
                             pid: process.handle.pid(),
                             port: llama_port,
+                            context_length: process.context_length,
                         }));
                     }
                     node.regossip().await;
@@ -1612,32 +1625,38 @@ mod tests {
     }
 
     #[test]
-    fn test_get_sticky_consistent() {
+    fn test_pick_sticky_from_consistent() {
         let id_a = make_id(1);
         let id_b = make_id(2);
-        let mut targets = ModelTargets::default();
-        targets.targets.insert(
-            "qwen".to_string(),
-            vec![InferenceTarget::Remote(id_a), InferenceTarget::Remote(id_b)],
-        );
+        let candidates = vec![InferenceTarget::Remote(id_a), InferenceTarget::Remote(id_b)];
 
-        let first = targets.get_sticky("qwen", 42);
-        let second = targets.get_sticky("qwen", 42);
+        let first = ModelTargets::pick_sticky_from(&candidates, 42);
+        let second = ModelTargets::pick_sticky_from(&candidates, 42);
         assert_eq!(first, second);
     }
 
     #[test]
-    fn test_get_round_robins_across_targets() {
+    fn test_pick_sticky_from_empty_returns_none() {
+        let result = ModelTargets::pick_sticky_from(&[], 42);
+        assert_eq!(result, InferenceTarget::None);
+    }
+
+    #[test]
+    fn test_pick_from_round_robins() {
         let id_a = make_id(1);
         let id_b = make_id(2);
-        let mut targets = ModelTargets::default();
-        targets.targets.insert(
-            "qwen".to_string(),
-            vec![InferenceTarget::Remote(id_a), InferenceTarget::Remote(id_b)],
-        );
+        let targets = ModelTargets::default();
+        let candidates = vec![InferenceTarget::Remote(id_a), InferenceTarget::Remote(id_b)];
 
-        let first = targets.get("qwen");
-        let second = targets.get("qwen");
+        let first = targets.pick_from(&candidates);
+        let second = targets.pick_from(&candidates);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_pick_from_empty_returns_none() {
+        let targets = ModelTargets::default();
+        let result = targets.pick_from(&[]);
+        assert_eq!(result, InferenceTarget::None);
     }
 }

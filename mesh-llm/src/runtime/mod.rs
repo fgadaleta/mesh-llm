@@ -6,8 +6,8 @@ use self::discovery::{nostr_rediscovery, start_new_mesh};
 use self::local::{
     add_runtime_local_target, add_serving_assignment, advertise_model_ready, local_process_payload,
     remove_runtime_local_target, remove_serving_assignment, resolved_model_name,
-    start_runtime_local_model, withdraw_advertised_model, LocalRuntimeModelHandle,
-    ManagedModelController, RuntimeEvent,
+    set_advertised_model_context, start_runtime_local_model, withdraw_advertised_model,
+    LocalRuntimeModelHandle, ManagedModelController, RuntimeEvent,
 };
 use self::proxy::{api_proxy, bootstrap_proxy};
 use crate::api;
@@ -1262,6 +1262,7 @@ async fn run_auto(
     let model_name_for_cb = model_name.clone();
     let model_name_for_election = model_name.clone();
     let node_for_cb = node.clone();
+    let node_for_primary_process = node.clone();
     let primary_target_tx = target_tx.clone();
     let console_state_for_election = console_state.clone();
     let console_state_for_primary_process = console_state.clone();
@@ -1311,12 +1312,19 @@ async fn run_auto(
                 }
             },
             move |process| {
-                if let Some(ref cs) = console_state_for_primary_process {
-                    let cs = cs.clone();
-                    let model_name = primary_process_model_name.clone();
-                    tokio::spawn(async move {
-                        match process {
-                            Some(process) => {
+                let context_node = node_for_primary_process.clone();
+                let model_name = primary_process_model_name.clone();
+                let console_state = console_state_for_primary_process.clone();
+                tokio::spawn(async move {
+                    match process {
+                        Some(process) => {
+                            set_advertised_model_context(
+                                &context_node,
+                                &model_name,
+                                Some(process.context_length),
+                            )
+                            .await;
+                            if let Some(cs) = console_state {
                                 cs.upsert_local_process(local_process_payload(
                                     &model_name,
                                     &process.backend,
@@ -1325,12 +1333,15 @@ async fn run_auto(
                                 ))
                                 .await;
                             }
-                            None => {
+                        }
+                        None => {
+                            set_advertised_model_context(&context_node, &model_name, None).await;
+                            if let Some(cs) = console_state {
                                 cs.remove_local_process(&model_name).await;
                             }
                         }
-                    });
-                }
+                    }
+                });
             },
         ).await;
     });
@@ -1373,6 +1384,7 @@ async fn run_auto(
             let extra_model_name_for_process = extra_model_name.clone();
             let extra_model_name_for_advertise = extra_model_name.clone();
             let extra_node_for_advertise = node.clone();
+            let extra_node_for_process = node.clone();
             let primary_model_name_for_extra = model_name.clone();
             let managed_model_name = extra_name.clone();
             eprintln!("  + {extra_name}");
@@ -1400,12 +1412,19 @@ async fn run_auto(
                         }
                     },
                     move |process| {
-                        if let Some(ref cs) = extra_console_state {
-                            let cs = cs.clone();
-                            let model_name = extra_model_name_for_process.clone();
-                            tokio::spawn(async move {
-                                match process {
-                                    Some(process) => {
+                        let context_node = extra_node_for_process.clone();
+                        let model_name = extra_model_name_for_process.clone();
+                        let console_state = extra_console_state.clone();
+                        tokio::spawn(async move {
+                            match process {
+                                Some(process) => {
+                                    set_advertised_model_context(
+                                        &context_node,
+                                        &model_name,
+                                        Some(process.context_length),
+                                    )
+                                    .await;
+                                    if let Some(cs) = console_state {
                                         cs.upsert_local_process(local_process_payload(
                                             &model_name,
                                             &process.backend,
@@ -1414,12 +1433,16 @@ async fn run_auto(
                                         ))
                                         .await;
                                     }
-                                    None => {
+                                }
+                                None => {
+                                    set_advertised_model_context(&context_node, &model_name, None)
+                                        .await;
+                                    if let Some(cs) = console_state {
                                         cs.remove_local_process(&model_name).await;
                                     }
                                 }
-                            });
-                        }
+                            }
+                        });
                     },
                 ).await;
             });
@@ -1505,6 +1528,12 @@ async fn run_auto(
                             .await?;
 
                             add_runtime_local_target(&target_tx, &loaded_name, handle.port);
+                            set_advertised_model_context(
+                                &node,
+                                &loaded_name,
+                                Some(handle.context_length),
+                            )
+                            .await;
                             advertise_model_ready(&node, &primary_model_name, &loaded_name).await;
                             node.set_available_models(models::scan_local_models()).await;
                             if let Some(ref cs) = console_state {

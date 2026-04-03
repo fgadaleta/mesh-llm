@@ -334,7 +334,7 @@ function localRoutableModels(status: StatusPayload | null): string[] {
 }
 
 function peerPrimaryModel(peer: Peer): string {
-  return peerRoutableModels(peer)[0] ?? peerAssignedModels(peer)[0] ?? '';
+  return peerRoutableModels(peer)[0] ?? peerAssignedModels(peer)[0] ?? "";
 }
 
 function peerStatusLabel(peer: Peer): string {
@@ -652,7 +652,9 @@ export function App() {
   );
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
   const [status, setStatus] = useState<StatusPayload | null>(null);
-  const [modelsPayload, setModelsPayload] = useState<ModelsPayload | null>(null);
+  const [modelsPayload, setModelsPayload] = useState<ModelsPayload | null>(
+    null,
+  );
   const [modelsLoading, setModelsLoading] = useState(false);
   const [chatState, setChatState] = useState<ChatState>(() =>
     createInitialChatState(),
@@ -702,9 +704,9 @@ export function App() {
       if (model && model !== "(idle)") addServingNode(model, status.my_vram_gb);
     }
     for (const peer of status.peers ?? []) {
-      if (peer.role === 'Client') continue;
+      if (peer.role === "Client") continue;
       for (const model of new Set(peerRoutableModels(peer))) {
-        if (model && model !== '(idle)') addServingNode(model, peer.vram_gb);
+        if (model && model !== "(idle)") addServingNode(model, peer.vram_gb);
       }
     }
 
@@ -730,9 +732,7 @@ export function App() {
     return meshModels.some((m) => m.status === "warm" && m.vision);
   }, [meshModels, selectedModel, visionModels]);
   const meshModelByName = useMemo(() => {
-    const entries = meshModels.map(
-      (model) => [model.name, model] as const,
-    );
+    const entries = meshModels.map((model) => [model.name, model] as const);
     return Object.fromEntries(entries) as Record<string, MeshModel>;
   }, [meshModels]);
   const selectedModelStat = selectedChatModel
@@ -1446,13 +1446,18 @@ export function App() {
         self: true,
         host: status.is_host,
         client: status.is_client,
-        serving: status.model_name || '',
-        servingModels: (status.hosted_models && status.hosted_models.length > 0)
-          ? status.hosted_models
-          : (status.serving_models && status.serving_models.length > 0)
-            ? status.serving_models
-          : (status.model_name ? [status.model_name] : []),
-        statusLabel: status.node_status || (status.is_client ? 'Client' : status.is_host ? 'Host' : 'Idle'),
+        serving: status.model_name || "",
+        servingModels:
+          status.hosted_models && status.hosted_models.length > 0
+            ? status.hosted_models
+            : status.serving_models && status.serving_models.length > 0
+              ? status.serving_models
+              : status.model_name
+                ? [status.model_name]
+                : [],
+        statusLabel:
+          status.node_status ||
+          (status.is_client ? "Client" : status.is_host ? "Host" : "Idle"),
         latencyMs: null,
         hostname: status.my_hostname,
         isSoc: status.my_is_soc,
@@ -1460,13 +1465,16 @@ export function App() {
       });
     }
     for (const p of status.peers ?? []) {
-      const pModels = peerRoutableModels(p).length > 0 ? peerRoutableModels(p) : peerAssignedModels(p);
+      const pModels =
+        peerRoutableModels(p).length > 0
+          ? peerRoutableModels(p)
+          : peerAssignedModels(p);
       nodes.push({
         id: p.id,
         vram: overviewVramGb(p.role === "Client", p.vram_gb),
         self: false,
         host: /^Host/.test(p.role),
-        client: p.role === 'Client',
+        client: p.role === "Client",
         serving: peerPrimaryModel(p),
         servingModels: pModels,
         statusLabel: peerStatusLabel(p),
@@ -1502,136 +1510,136 @@ export function App() {
     <TooltipProvider>
       <div className="h-screen overflow-hidden bg-background [height:100svh] [padding-top:env(safe-area-inset-top)] [padding-bottom:env(safe-area-inset-bottom)]">
         <div className="flex h-full min-h-0 flex-col">
-        <AppHeader
-          sections={sections}
-          section={section}
-          setSection={navigateToSection}
-          themeMode={themeMode}
-          setThemeMode={setThemeMode}
-          statusError={statusError}
-          inviteWithModelCommand={inviteWithModelCommand}
-          inviteWithModelName={inviteWithModelName}
-          inviteClientCommand={inviteClientCommand}
-          inviteToken={inviteToken}
-          apiDirectUrl={apiDirectUrl}
-          isPublicMesh={status?.nostr_discovery ?? false}
-        />
+          <AppHeader
+            sections={sections}
+            section={section}
+            setSection={navigateToSection}
+            themeMode={themeMode}
+            setThemeMode={setThemeMode}
+            statusError={statusError}
+            inviteWithModelCommand={inviteWithModelCommand}
+            inviteWithModelName={inviteWithModelName}
+            inviteClientCommand={inviteClientCommand}
+            inviteToken={inviteToken}
+            apiDirectUrl={apiDirectUrl}
+            isPublicMesh={status?.nostr_discovery ?? false}
+          />
 
-        <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          {section === "chat" ? (
-            <div className="mx-auto flex min-h-0 min-w-0 w-full max-w-7xl flex-1 flex-col overflow-hidden p-2 md:p-4">
-              <ChatPage
-                status={status}
-                inviteToken={status?.token ?? ""}
-                isPublicMesh={status?.nostr_discovery ?? false}
-                isFlyHosted={isFlyHosted}
-                inflightRequests={status?.inflight_requests ?? 0}
-                warmModels={warmModels}
-                meshModelByName={meshModelByName}
-                modelStatsByName={modelStatsByName}
-                selectedModel={selectedModel}
-                setSelectedModel={setSelectedModel}
-                selectedModelNodeCount={selectedModelNodeCount}
-                selectedModelVramGb={selectedModelVramGb}
-                selectedModelVision={selectedModelVision}
-                visionModels={visionModels}
-                pendingImage={pendingImage}
-                setPendingImage={setPendingImage}
-                conversations={conversations}
-                activeConversationId={activeConversationId}
-                onConversationCreate={createNewConversation}
-                onConversationSelect={selectConversation}
-                onConversationRename={renameConversation}
-                onConversationDelete={deleteConversation}
-                onConversationsClear={clearAllConversations}
-                messages={messages}
-                reasoningOpen={reasoningOpen}
-                setReasoningOpen={setReasoningOpen}
-                chatScrollRef={chatScrollRef}
-                input={input}
-                setInput={setInput}
-                isSending={isSending}
-                canChat={canChat}
-                canRegenerate={canRegenerate}
-                onStop={stopStreaming}
-                onRegenerate={regenerateLastResponse}
-                onSubmit={handleSubmit}
-              />
-            </div>
-          ) : null}
-
-          {section === "dashboard" ? (
-            <div className="min-h-0 flex-1 overflow-y-auto">
-              <div className="mx-auto w-full max-w-7xl p-4">
-                <DashboardPage
+          <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+            {section === "chat" ? (
+              <div className="mx-auto flex min-h-0 min-w-0 w-full max-w-7xl flex-1 flex-col overflow-hidden p-2 md:p-4">
+                <ChatPage
                   status={status}
-                  meshModels={meshModels}
-                  modelsLoading={modelsLoading}
-                  topologyNodes={topologyNodes}
-                  selectedModel={selectedModel || status?.model_name || ""}
-                  meshModelByName={meshModelByName}
-                  themeMode={themeMode}
+                  inviteToken={status?.token ?? ""}
                   isPublicMesh={status?.nostr_discovery ?? false}
-                  inviteToken={inviteToken}
-                  isLocalhost={isLocalhost}
+                  isFlyHosted={isFlyHosted}
+                  inflightRequests={status?.inflight_requests ?? 0}
+                  warmModels={warmModels}
+                  meshModelByName={meshModelByName}
+                  modelStatsByName={modelStatsByName}
+                  selectedModel={selectedModel}
+                  setSelectedModel={setSelectedModel}
+                  selectedModelNodeCount={selectedModelNodeCount}
+                  selectedModelVramGb={selectedModelVramGb}
+                  selectedModelVision={selectedModelVision}
+                  visionModels={visionModels}
+                  pendingImage={pendingImage}
+                  setPendingImage={setPendingImage}
+                  conversations={conversations}
+                  activeConversationId={activeConversationId}
+                  onConversationCreate={createNewConversation}
+                  onConversationSelect={selectConversation}
+                  onConversationRename={renameConversation}
+                  onConversationDelete={deleteConversation}
+                  onConversationsClear={clearAllConversations}
+                  messages={messages}
+                  reasoningOpen={reasoningOpen}
+                  setReasoningOpen={setReasoningOpen}
+                  chatScrollRef={chatScrollRef}
+                  input={input}
+                  setInput={setInput}
+                  isSending={isSending}
+                  canChat={canChat}
+                  canRegenerate={canRegenerate}
+                  onStop={stopStreaming}
+                  onRegenerate={regenerateLastResponse}
+                  onSubmit={handleSubmit}
                 />
               </div>
-            </div>
-          ) : null}
-        </main>
-        <footer
-          className={cn(
-            "shrink-0 bg-card/70",
-            section === "chat" ? "hidden md:block" : "",
-          )}
-        >
-          <div className="mx-auto flex h-8 w-full max-w-7xl items-center justify-center gap-2 px-4 text-xs text-muted-foreground">
-            Mesh LLM{" "}
-            {status?.version ? `v${status.version}` : "version loading..."}
-            {status?.latest_version ? (
-              <>
-                <span>·</span>
-                <a
-                  href="https://github.com/michaelneale/mesh-llm/releases"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="underline-offset-2 hover:text-foreground hover:underline"
-                  title="A newer mesh-llm version is available"
-                >
-                  {status?.version
-                    ? `Update available: v${status.version} -> v${status.latest_version}`
-                    : `Update available: v${status.latest_version}`}
-                </a>
-              </>
             ) : null}
-            <span>·</span>
-            <a
-              href="https://github.com/michaelneale/mesh-llm"
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex h-5 w-5 items-center justify-center hover:text-foreground"
-              aria-label="GitHub repository"
-              title="GitHub repository"
-            >
-              <span className="relative h-4 w-4">
-                <img
-                  src={githubBlackLogo}
-                  alt=""
-                  aria-hidden="true"
-                  className="h-4 w-4 dark:hidden"
-                />
-                <img
-                  src={githubWhiteLogo}
-                  alt=""
-                  aria-hidden="true"
-                  className="hidden h-4 w-4 dark:block"
-                />
-              </span>
-            </a>
-          </div>
-        </footer>
+
+            {section === "dashboard" ? (
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                <div className="mx-auto w-full max-w-7xl p-4">
+                  <DashboardPage
+                    status={status}
+                    meshModels={meshModels}
+                    modelsLoading={modelsLoading}
+                    topologyNodes={topologyNodes}
+                    selectedModel={selectedModel || status?.model_name || ""}
+                    meshModelByName={meshModelByName}
+                    themeMode={themeMode}
+                    isPublicMesh={status?.nostr_discovery ?? false}
+                    inviteToken={inviteToken}
+                    isLocalhost={isLocalhost}
+                  />
+                </div>
+              </div>
+            ) : null}
+          </main>
+          <footer
+            className={cn(
+              "shrink-0 bg-card/70",
+              section === "chat" ? "hidden md:block" : "",
+            )}
+          >
+            <div className="mx-auto flex h-8 w-full max-w-7xl items-center justify-center gap-2 px-4 text-xs text-muted-foreground">
+              Mesh LLM{" "}
+              {status?.version ? `v${status.version}` : "version loading..."}
+              {status?.latest_version ? (
+                <>
+                  <span>·</span>
+                  <a
+                    href="https://github.com/michaelneale/mesh-llm/releases"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="underline-offset-2 hover:text-foreground hover:underline"
+                    title="A newer mesh-llm version is available"
+                  >
+                    {status?.version
+                      ? `Update available: v${status.version} -> v${status.latest_version}`
+                      : `Update available: v${status.latest_version}`}
+                  </a>
+                </>
+              ) : null}
+              <span>·</span>
+              <a
+                href="https://github.com/michaelneale/mesh-llm"
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex h-5 w-5 items-center justify-center hover:text-foreground"
+                aria-label="GitHub repository"
+                title="GitHub repository"
+              >
+                <span className="relative h-4 w-4">
+                  <img
+                    src={githubBlackLogo}
+                    alt=""
+                    aria-hidden="true"
+                    className="h-4 w-4 dark:hidden"
+                  />
+                  <img
+                    src={githubWhiteLogo}
+                    alt=""
+                    aria-hidden="true"
+                    className="hidden h-4 w-4 dark:block"
+                  />
+                </span>
+              </a>
+            </div>
+          </footer>
+        </div>
       </div>
-    </div>
     </TooltipProvider>
   );
 }
@@ -1761,253 +1769,280 @@ function AppHeader({
           </NavigationMenuList>
         </NavigationMenu>
         <div className="ml-auto flex items-center gap-2">
-            <Popover>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <PopoverTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="icon"
-                      aria-label="API access"
-                    >
-                      <Braces className="h-4 w-4" />
-                    </Button>
-                  </PopoverTrigger>
-                </TooltipTrigger>
-                <TooltipContent>API</TooltipContent>
-              </Tooltip>
-              <PopoverContent
-                className="w-[calc(100vw-2rem)] max-w-[420px] space-y-3"
-                align="end"
-              >
-                <div className="space-y-1">
-                  <div className="flex items-center gap-2 text-sm font-medium">
-                    <Braces className="h-4 w-4 text-muted-foreground" />
-                    <span>API Access</span>
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    OpenAI-compatible endpoint — works with any app that speaks
-                    the OpenAI API.
-                  </div>
+          <Popover>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <PopoverTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    aria-label="API access"
+                  >
+                    <Braces className="h-4 w-4" />
+                  </Button>
+                </PopoverTrigger>
+              </TooltipTrigger>
+              <TooltipContent>API</TooltipContent>
+            </Tooltip>
+            <PopoverContent
+              className="w-[calc(100vw-2rem)] max-w-[420px] space-y-3"
+              align="end"
+            >
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Braces className="h-4 w-4 text-muted-foreground" />
+                  <span>API Access</span>
                 </div>
-                {apiDirectUrl ? (
+                <div className="text-xs text-muted-foreground">
+                  OpenAI-compatible endpoint — works with any app that speaks
+                  the OpenAI API.
+                </div>
+              </div>
+              {apiDirectUrl ? (
+                <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
+                  <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                    {apiDirectUrl}
+                  </code>
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7 shrink-0"
+                    aria-label="Copy endpoint URL"
+                    onClick={() => void copyApiDirectUrl()}
+                  >
+                    {apiDirectCopied ? (
+                      <Check className="h-3.5 w-3.5" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="text-xs text-muted-foreground">
+                    Run mesh-llm locally to get an OpenAI-compatible API on your
+                    machine:
+                  </div>
                   <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
                     <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
-                      {apiDirectUrl}
+                      {isPublicMesh
+                        ? "mesh-llm --auto"
+                        : `mesh-llm --auto --join ${inviteToken || "(token)"}`}
                     </code>
                     <Button
                       type="button"
                       size="icon"
                       variant="ghost"
-                      className="h-7 w-7 shrink-0"
-                      aria-label="Copy endpoint URL"
-                      onClick={() => void copyApiDirectUrl()}
+                      className="h-6 w-6 shrink-0"
+                      aria-label="Copy command"
+                      onClick={() =>
+                        void navigator.clipboard.writeText(
+                          isPublicMesh
+                            ? "mesh-llm --auto"
+                            : `mesh-llm --auto --join ${inviteToken || ""}`,
+                        )
+                      }
                     >
-                      {apiDirectCopied ? (
-                        <Check className="h-3.5 w-3.5" />
-                      ) : (
-                        <Copy className="h-3.5 w-3.5" />
-                      )}
+                      <Copy className="h-3 w-3" />
                     </Button>
                   </div>
-                ) : (
-                  <div className="space-y-2">
-                    <div className="text-xs text-muted-foreground">
-                      Run mesh-llm locally to get an OpenAI-compatible API on
-                      your machine:
-                    </div>
-                    <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
-                      <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
-                        {isPublicMesh
-                          ? "mesh-llm --auto"
-                          : `mesh-llm --auto --join ${inviteToken || "(token)"}`}
-                      </code>
-                      <Button
-                        type="button"
-                        size="icon"
-                        variant="ghost"
-                        className="h-6 w-6 shrink-0"
-                        aria-label="Copy command"
-                        onClick={() =>
-                          void navigator.clipboard.writeText(
-                            isPublicMesh
-                              ? "mesh-llm --auto"
-                              : `mesh-llm --auto --join ${inviteToken || ""}`,
-                          )
-                        }
+                  <div className="text-xs text-muted-foreground">
+                    This gives you{" "}
+                    <code className="text-[0.7rem]">
+                      http://127.0.0.1:9337/v1
+                    </code>{" "}
+                    locally — point any OpenAI-compatible app at it.
+                  </div>
+                </div>
+              )}
+              <div className="space-y-2 pt-1">
+                <div className="text-xs font-medium">Use with agents</div>
+                <div className="space-y-1">
+                  {["claude", "goose"].map((agent) => {
+                    const cmd = isPublicMesh
+                      ? `mesh-llm ${agent}`
+                      : `mesh-llm ${agent} --join ${inviteToken || "(token)"}`;
+                    return (
+                      <div
+                        key={agent}
+                        className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5"
                       >
-                        <Copy className="h-3 w-3" />
-                      </Button>
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      This gives you{" "}
-                      <code className="text-[0.7rem]">
-                        http://127.0.0.1:9337/v1
-                      </code>{" "}
-                      locally — point any OpenAI-compatible app at it.
-                    </div>
-                  </div>
-                )}
-                <div className="space-y-2 pt-1">
-                  <div className="text-xs font-medium">Use with agents</div>
-                  <div className="space-y-1">
-                    {["claude", "goose"].map((agent) => {
-                      const cmd = isPublicMesh
-                        ? `mesh-llm ${agent}`
-                        : `mesh-llm ${agent} --join ${inviteToken || "(token)"}`;
-                      return (
-                        <div
-                          key={agent}
-                          className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5"
+                        <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                          {cmd}
+                        </code>
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="ghost"
+                          className="h-6 w-6 shrink-0"
+                          aria-label={`Copy ${agent} command`}
+                          onClick={() =>
+                            void navigator.clipboard.writeText(cmd)
+                          }
                         >
-                          <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
-                            {cmd}
-                          </code>
-                          <Button
-                            type="button"
-                            size="icon"
-                            variant="ghost"
-                            className="h-6 w-6 shrink-0"
-                            aria-label={`Copy ${agent} command`}
-                            onClick={() =>
-                              void navigator.clipboard.writeText(cmd)
-                            }
-                          >
-                            <Copy className="h-3 w-3" />
-                          </Button>
-                        </div>
-                      );
-                    })}
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    Also works with pi and any OpenAI-compatible client.{" "}
-                    <a
-                      href={`${DOCS_URL}/#agents`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="underline hover:text-foreground"
-                    >
-                      Setup guide →
-                    </a>
-                  </div>
+                          <Copy className="h-3 w-3" />
+                        </Button>
+                      </div>
+                    );
+                  })}
                 </div>
-                <div className="text-xs text-muted-foreground pt-1">
-                  Don't have it yet?{" "}
+                <div className="text-xs text-muted-foreground">
+                  Also works with pi and any OpenAI-compatible client.{" "}
                   <a
-                    href={`${DOCS_URL}/#install`}
+                    href={`${DOCS_URL}/#agents`}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="underline hover:text-foreground"
                   >
-                    Install mesh-llm →
+                    Setup guide →
                   </a>
                 </div>
-                <div className="text-xs text-muted-foreground pt-1">
-                  Agents can gossip too —{" "}
-                  <code className="text-[0.9em]">
-                    mesh-llm blackboard install-skill
-                  </code>{" "}
-                  <a
-                    href={`${DOCS_URL}/#blackboard`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="underline hover:text-foreground"
+              </div>
+              <div className="text-xs text-muted-foreground pt-1">
+                Don't have it yet?{" "}
+                <a
+                  href={`${DOCS_URL}/#install`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:text-foreground"
+                >
+                  Install mesh-llm →
+                </a>
+              </div>
+              <div className="text-xs text-muted-foreground pt-1">
+                Agents can gossip too —{" "}
+                <code className="text-[0.9em]">
+                  mesh-llm blackboard install-skill
+                </code>{" "}
+                <a
+                  href={`${DOCS_URL}/#blackboard`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:text-foreground"
+                >
+                  →
+                </a>
+              </div>
+            </PopoverContent>
+          </Popover>
+          <Popover>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <PopoverTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    aria-label="Invite"
+                    disabled={!inviteToken}
                   >
-                    →
-                  </a>
+                    <UserPlus className="h-4 w-4" />
+                  </Button>
+                </PopoverTrigger>
+              </TooltipTrigger>
+              <TooltipContent>Invite</TooltipContent>
+            </Tooltip>
+            <PopoverContent
+              className="w-[calc(100vw-2rem)] max-w-[420px] space-y-3"
+              align="end"
+            >
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <UserPlus className="h-4 w-4 text-muted-foreground" />
+                  <span>Invite to this mesh</span>
                 </div>
-              </PopoverContent>
-            </Popover>
-            <Popover>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <PopoverTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="icon"
-                      aria-label="Invite"
-                      disabled={!inviteToken}
-                    >
-                      <UserPlus className="h-4 w-4" />
-                    </Button>
-                  </PopoverTrigger>
-                </TooltipTrigger>
-                <TooltipContent>Invite</TooltipContent>
-              </Tooltip>
-              <PopoverContent
-                className="w-[calc(100vw-2rem)] max-w-[420px] space-y-3"
-                align="end"
-              >
-                <div className="space-y-1">
-                  <div className="flex items-center gap-2 text-sm font-medium">
-                    <UserPlus className="h-4 w-4 text-muted-foreground" />
-                    <span>Invite to this mesh</span>
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    Invite with a model loaded to add compute, or invite as a
-                    client for API-only access.
-                  </div>
+                <div className="text-xs text-muted-foreground">
+                  Invite with a model loaded to add compute, or invite as a
+                  client for API-only access.
                 </div>
-                <div className="space-y-1">
-                  <div className="flex items-center gap-2 text-xs font-medium">
-                    <span>Contribute compute</span>
-                    <Badge className="h-5 gap-1 border-emerald-500/40 bg-emerald-500/10 px-2 text-[10px] text-emerald-700 dark:text-emerald-300">
-                      <Sparkles className="h-3 w-3" />
-                      Recommended
-                    </Badge>
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    Joins and serves the model{" "}
-                    {inviteWithModelName || "selected model"}
-                  </div>
+              </div>
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 text-xs font-medium">
+                  <span>Contribute compute</span>
+                  <Badge className="h-5 gap-1 border-emerald-500/40 bg-emerald-500/10 px-2 text-[10px] text-emerald-700 dark:text-emerald-300">
+                    <Sparkles className="h-3 w-3" />
+                    Recommended
+                  </Badge>
                 </div>
-                {inviteWithModelCommand ? (
+                <div className="text-xs text-muted-foreground">
+                  Joins and serves the model{" "}
+                  {inviteWithModelName || "selected model"}
+                </div>
+              </div>
+              {inviteWithModelCommand ? (
+                <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
+                  <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                    {inviteWithModelCommand}
+                  </code>
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7 shrink-0"
+                    aria-label="Copy model command"
+                    onClick={() => void copyInviteWithModelCommand()}
+                  >
+                    {inviteWithModelCopied ? (
+                      <Check className="h-3.5 w-3.5" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
+                </div>
+              ) : (
+                <div className="text-xs text-muted-foreground">
+                  No warm model selected yet.
+                </div>
+              )}
+              <div className="space-y-1 pt-1">
+                <div className="text-xs font-medium">Join as client</div>
+                <div className="text-xs text-muted-foreground">
+                  Connects for API access without loading a model.
+                </div>
+              </div>
+              {inviteClientCommand ? (
+                <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
+                  <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
+                    {inviteClientCommand}
+                  </code>
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7 shrink-0"
+                    aria-label="Copy client command"
+                    onClick={() => void copyInviteClientCommand()}
+                  >
+                    {inviteClientCopied ? (
+                      <Check className="h-3.5 w-3.5" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
+                </div>
+              ) : (
+                <div className="text-xs text-muted-foreground">
+                  No invite token available yet.
+                </div>
+              )}
+              <div className="space-y-1 pt-1">
+                <div className="text-xs font-medium">Invite token</div>
+                {inviteToken ? (
                   <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
                     <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
-                      {inviteWithModelCommand}
+                      {inviteToken}
                     </code>
                     <Button
                       type="button"
                       size="icon"
                       variant="ghost"
                       className="h-7 w-7 shrink-0"
-                      aria-label="Copy model command"
-                      onClick={() => void copyInviteWithModelCommand()}
+                      aria-label="Copy invite token"
+                      onClick={() => void copyInviteToken()}
                     >
-                      {inviteWithModelCopied ? (
-                        <Check className="h-3.5 w-3.5" />
-                      ) : (
-                        <Copy className="h-3.5 w-3.5" />
-                      )}
-                    </Button>
-                  </div>
-                ) : (
-                  <div className="text-xs text-muted-foreground">
-                    No warm model selected yet.
-                  </div>
-                )}
-                <div className="space-y-1 pt-1">
-                  <div className="text-xs font-medium">Join as client</div>
-                  <div className="text-xs text-muted-foreground">
-                    Connects for API access without loading a model.
-                  </div>
-                </div>
-                {inviteClientCommand ? (
-                  <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
-                    <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
-                      {inviteClientCommand}
-                    </code>
-                    <Button
-                      type="button"
-                      size="icon"
-                      variant="ghost"
-                      className="h-7 w-7 shrink-0"
-                      aria-label="Copy client command"
-                      onClick={() => void copyInviteClientCommand()}
-                    >
-                      {inviteClientCopied ? (
+                      {tokenCopied ? (
                         <Check className="h-3.5 w-3.5" />
                       ) : (
                         <Copy className="h-3.5 w-3.5" />
@@ -2019,117 +2054,86 @@ function AppHeader({
                     No invite token available yet.
                   </div>
                 )}
-                <div className="space-y-1 pt-1">
-                  <div className="text-xs font-medium">Invite token</div>
-                  {inviteToken ? (
-                    <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
-                      <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap text-xs">
-                        {inviteToken}
-                      </code>
-                      <Button
-                        type="button"
-                        size="icon"
-                        variant="ghost"
-                        className="h-7 w-7 shrink-0"
-                        aria-label="Copy invite token"
-                        onClick={() => void copyInviteToken()}
-                      >
-                        {tokenCopied ? (
-                          <Check className="h-3.5 w-3.5" />
-                        ) : (
-                          <Copy className="h-3.5 w-3.5" />
-                        )}
-                      </Button>
-                    </div>
-                  ) : (
-                    <div className="text-xs text-muted-foreground">
-                      No invite token available yet.
-                    </div>
-                  )}
-                </div>
-              </PopoverContent>
-            </Popover>
-            <Popover
-              open={isThemePopoverOpen}
-              onOpenChange={setIsThemePopoverOpen}
-            >
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <PopoverTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-9 gap-1 px-2"
-                      aria-label={`Theme: ${themeMode}`}
-                    >
-                      {themeMode === "auto" ? (
-                        <Laptop className="h-4 w-4" />
-                      ) : null}
-                      {themeMode === "light" ? (
-                        <Sun className="h-4 w-4" />
-                      ) : null}
-                      {themeMode === "dark" ? (
-                        <Moon className="h-4 w-4" />
-                      ) : null}
-                      <ChevronDown className="h-3 w-3 text-muted-foreground" />
-                    </Button>
-                  </PopoverTrigger>
-                </TooltipTrigger>
-                <TooltipContent>Theme</TooltipContent>
-              </Tooltip>
-              <PopoverContent className="w-40 space-y-1 p-1" align="end">
-                <button
-                  type="button"
-                  className={cn(
-                    "flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-muted",
-                    themeMode === "auto" ? "bg-muted" : "",
-                  )}
-                  onClick={() => selectThemeMode("auto")}
-                >
-                  <span className="flex items-center gap-2">
-                    <Laptop className="h-3.5 w-3.5" />
-                    Auto
-                  </span>
-                  {themeMode === "auto" ? (
-                    <Check className="h-3.5 w-3.5" />
-                  ) : null}
-                </button>
-                <button
-                  type="button"
-                  className={cn(
-                    "flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-muted",
-                    themeMode === "light" ? "bg-muted" : "",
-                  )}
-                  onClick={() => selectThemeMode("light")}
-                >
-                  <span className="flex items-center gap-2">
-                    <Sun className="h-3.5 w-3.5" />
-                    Light
-                  </span>
-                  {themeMode === "light" ? (
-                    <Check className="h-3.5 w-3.5" />
-                  ) : null}
-                </button>
-                <button
-                  type="button"
-                  className={cn(
-                    "flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-muted",
-                    themeMode === "dark" ? "bg-muted" : "",
-                  )}
-                  onClick={() => selectThemeMode("dark")}
-                >
-                  <span className="flex items-center gap-2">
-                    <Moon className="h-3.5 w-3.5" />
-                    Dark
-                  </span>
-                  {themeMode === "dark" ? (
-                    <Check className="h-3.5 w-3.5" />
-                  ) : null}
-                </button>
-              </PopoverContent>
-            </Popover>
-          </div>
+              </div>
+            </PopoverContent>
+          </Popover>
+          <Popover
+            open={isThemePopoverOpen}
+            onOpenChange={setIsThemePopoverOpen}
+          >
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <PopoverTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-9 gap-1 px-2"
+                    aria-label={`Theme: ${themeMode}`}
+                  >
+                    {themeMode === "auto" ? (
+                      <Laptop className="h-4 w-4" />
+                    ) : null}
+                    {themeMode === "light" ? <Sun className="h-4 w-4" /> : null}
+                    {themeMode === "dark" ? <Moon className="h-4 w-4" /> : null}
+                    <ChevronDown className="h-3 w-3 text-muted-foreground" />
+                  </Button>
+                </PopoverTrigger>
+              </TooltipTrigger>
+              <TooltipContent>Theme</TooltipContent>
+            </Tooltip>
+            <PopoverContent className="w-40 space-y-1 p-1" align="end">
+              <button
+                type="button"
+                className={cn(
+                  "flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-muted",
+                  themeMode === "auto" ? "bg-muted" : "",
+                )}
+                onClick={() => selectThemeMode("auto")}
+              >
+                <span className="flex items-center gap-2">
+                  <Laptop className="h-3.5 w-3.5" />
+                  Auto
+                </span>
+                {themeMode === "auto" ? (
+                  <Check className="h-3.5 w-3.5" />
+                ) : null}
+              </button>
+              <button
+                type="button"
+                className={cn(
+                  "flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-muted",
+                  themeMode === "light" ? "bg-muted" : "",
+                )}
+                onClick={() => selectThemeMode("light")}
+              >
+                <span className="flex items-center gap-2">
+                  <Sun className="h-3.5 w-3.5" />
+                  Light
+                </span>
+                {themeMode === "light" ? (
+                  <Check className="h-3.5 w-3.5" />
+                ) : null}
+              </button>
+              <button
+                type="button"
+                className={cn(
+                  "flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-muted",
+                  themeMode === "dark" ? "bg-muted" : "",
+                )}
+                onClick={() => selectThemeMode("dark")}
+              >
+                <span className="flex items-center gap-2">
+                  <Moon className="h-3.5 w-3.5" />
+                  Dark
+                </span>
+                {themeMode === "dark" ? (
+                  <Check className="h-3.5 w-3.5" />
+                ) : null}
+              </button>
+            </PopoverContent>
+          </Popover>
+        </div>
       </div>
       {statusError ? (
         <div className="mx-auto w-full max-w-7xl px-4 pb-3">
@@ -2515,8 +2519,9 @@ function ChatPage(props: {
                     ? "✨ Auto (router picks best)"
                     : selectedModelValue
                       ? shortName(
-                          modelDisplayName(meshModelByName[selectedModelValue]) ||
-                            selectedModelValue,
+                          modelDisplayName(
+                            meshModelByName[selectedModelValue],
+                          ) || selectedModelValue,
                         )
                       : undefined}
                 </SelectValue>
@@ -3056,8 +3061,14 @@ function DashboardPage({
   const [modelFilter, setModelFilter] = useState<"all" | "warm" | "cold">(
     "all",
   );
-  const [isMeshOverviewFullscreen, setIsMeshOverviewFullscreen] = useState(false);
-  const [selectedCatalogModel, setSelectedCatalogModel] = useState<MeshModel | null>(null);
+  const [isMeshOverviewFullscreen, setIsMeshOverviewFullscreen] =
+    useState(false);
+  const [selectedCatalogModel, setSelectedCatalogModel] =
+    useState<MeshModel | null>(null);
+  const topologyDiagramNodes = useMemo(
+    () => topologyNodes.filter((node) => !node.client),
+    [topologyNodes],
+  );
   const filteredModels = useMemo(() => {
     const models = meshModels;
     return [...models]
@@ -3076,11 +3087,13 @@ function DashboardPage({
   }, [status?.peers]);
   const peerRows = useMemo(() => {
     return sortedPeers.map((peer) => {
-      const statusLabel = peer.role === 'Client'
-        ? 'Client'
-        : peerStatusLabel(peer);
+      const statusLabel =
+        peer.role === "Client" ? "Client" : peerStatusLabel(peer);
       const primaryModel = peerPrimaryModel(peer);
-      const modelLabel = primaryModel && primaryModel !== '(idle)' ? shortName(primaryModel) : 'idle';
+      const modelLabel =
+        primaryModel && primaryModel !== "(idle)"
+          ? shortName(primaryModel)
+          : "idle";
       const latencyLabel = formatLatency(peer.rtt_ms);
       const displayVramGb = overviewVramGb(
         peer.role === "Client",
@@ -3101,7 +3114,11 @@ function DashboardPage({
     });
   }, [sortedPeers, totalMeshVramGb]);
   const activePeerRows = useMemo(() => {
-    if (!selectedCatalogModel || selectedCatalogModel.status !== "warm" || !status) {
+    if (
+      !selectedCatalogModel ||
+      selectedCatalogModel.status !== "warm" ||
+      !status
+    ) {
       return [] as ActivePeerRow[];
     }
     const targetModel = selectedCatalogModel.name;
@@ -3115,7 +3132,9 @@ function DashboardPage({
         latencyLabel: "local",
         vramLabel: `${localVram.toFixed(1)} GB`,
         shareLabel:
-          totalModelVram > 0 ? `${Math.round((localVram / totalModelVram) * 100)}%` : "n/a",
+          totalModelVram > 0
+            ? `${Math.round((localVram / totalModelVram) * 100)}%`
+            : "n/a",
       });
     }
     for (const peer of peerRows) {
@@ -3128,7 +3147,9 @@ function DashboardPage({
         latencyLabel: peer.latencyLabel,
         vramLabel: `${peer.displayVramGb.toFixed(1)} GB`,
         shareLabel:
-          totalModelVram > 0 ? `${Math.round((peer.displayVramGb / totalModelVram) * 100)}%` : "n/a",
+          totalModelVram > 0
+            ? `${Math.round((peer.displayVramGb / totalModelVram) * 100)}%`
+            : "n/a",
       });
     }
     return rows;
@@ -3201,44 +3222,44 @@ function DashboardPage({
         </Alert>
       ) : null}
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
-          <StatCard
-            title="Node ID"
-            value={status?.node_id ?? "n/a"}
-            valueSuffix={
-              <StatusPill
-                label={status?.node_status ?? "n/a"}
-                tone={topologyStatusTone(status?.node_status ?? "n/a")}
-                tooltip={topologyStatusTooltip(status?.node_status ?? "n/a")}
-              />
-            }
-            icon={<Hash className="h-4 w-4" />}
-            tooltip="Current node identifier in this mesh."
-          />
-          <StatCard
-            title="Active Models"
-            value={`${meshModels.filter((m) => m.status === "warm").length}`}
-            icon={<Sparkles className="h-4 w-4" />}
-            tooltip="Models currently loaded and serving across the mesh."
-          />
-          <StatCard
-            title="Mesh VRAM"
-            value={`${meshGpuVram(status).toFixed(1)} GB`}
-            icon={<Cpu className="h-4 w-4" />}
-            tooltip="Total GPU VRAM across non-client nodes in the mesh."
-          />
-          <StatCard
-            title="Nodes"
-            value={`${topologyNodes.length}`}
-            icon={<Network className="h-4 w-4" />}
-            tooltip="Total nodes currently visible in topology."
-          />
-          <StatCard
-            title="Inflight"
-            value={`${status?.inflight_requests ?? 0}`}
-            icon={<Gauge className="h-4 w-4" />}
-            tooltip="Current in-flight request count."
-          />
-        </div>
+        <StatCard
+          title="Node ID"
+          value={status?.node_id ?? "n/a"}
+          valueSuffix={
+            <StatusPill
+              label={status?.node_status ?? "n/a"}
+              tone={topologyStatusTone(status?.node_status ?? "n/a")}
+              tooltip={topologyStatusTooltip(status?.node_status ?? "n/a")}
+            />
+          }
+          icon={<Hash className="h-4 w-4" />}
+          tooltip="Current node identifier in this mesh."
+        />
+        <StatCard
+          title="Active Models"
+          value={`${meshModels.filter((m) => m.status === "warm").length}`}
+          icon={<Sparkles className="h-4 w-4" />}
+          tooltip="Models currently loaded and serving across the mesh."
+        />
+        <StatCard
+          title="Mesh VRAM"
+          value={`${meshGpuVram(status).toFixed(1)} GB`}
+          icon={<Cpu className="h-4 w-4" />}
+          tooltip="Total GPU VRAM across non-client nodes in the mesh."
+        />
+        <StatCard
+          title="Nodes"
+          value={`${topologyDiagramNodes.length}`}
+          icon={<Network className="h-4 w-4" />}
+          tooltip="Total nodes currently visible in topology."
+        />
+        <StatCard
+          title="Inflight"
+          value={`${status?.inflight_requests ?? 0}`}
+          icon={<Gauge className="h-4 w-4" />}
+          tooltip="Current in-flight request count."
+        />
+      </div>
 
       <div className="grid items-start gap-4 lg:grid-cols-7">
         <div className="lg:col-span-5">
@@ -3266,7 +3287,7 @@ function DashboardPage({
               ) : (
                 <MeshTopologyDiagram
                   status={status}
-                  nodes={topologyNodes}
+                  nodes={topologyDiagramNodes}
                   selectedModel={selectedModel}
                   themeMode={themeMode}
                   fullscreen={false}
@@ -3318,26 +3339,64 @@ function DashboardPage({
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="flex flex-wrap items-center gap-2">
-                            <div className="text-sm font-medium leading-5 [overflow-wrap:anywhere]">{shortName(modelDisplayName(model))}</div>
+                            <div className="text-sm font-medium leading-5 [overflow-wrap:anywhere]">
+                              {shortName(modelDisplayName(model))}
+                            </div>
                             <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
-                              {model.vision ? <span role="img" aria-label="Vision">👁</span> : null}
-                              {model.reasoning ? <span role="img" aria-label="Reasoning">🧠</span> : null}
-                              {model.moe ? <span role="img" aria-label="Mixture of Experts">🧩</span> : null}
+                              {model.vision ? (
+                                <span role="img" aria-label="Vision">
+                                  👁
+                                </span>
+                              ) : null}
+                              {model.reasoning ? (
+                                <span role="img" aria-label="Reasoning">
+                                  🧠
+                                </span>
+                              ) : null}
+                              {model.moe ? (
+                                <span
+                                  role="img"
+                                  aria-label="Mixture of Experts"
+                                >
+                                  🧩
+                                </span>
+                              ) : null}
                             </div>
                           </div>
-                          <div className="text-xs leading-4 text-muted-foreground [overflow-wrap:anywhere]">{model.name}</div>
+                          <div className="text-xs leading-4 text-muted-foreground [overflow-wrap:anywhere]">
+                            {model.name}
+                          </div>
                         </div>
                         <StatusPill
                           className="self-start"
-                          label={model.status === 'warm' ? 'Warm' : model.status === 'cold' ? 'Cold' : model.status}
-                          tone={model.status === 'warm' ? 'warm' : model.status === 'cold' ? 'cold' : 'neutral'}
+                          label={
+                            model.status === "warm"
+                              ? "Warm"
+                              : model.status === "cold"
+                                ? "Cold"
+                                : model.status
+                          }
+                          tone={
+                            model.status === "warm"
+                              ? "warm"
+                              : model.status === "cold"
+                                ? "cold"
+                                : "neutral"
+                          }
                           dot
                         />
                       </div>
                       <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
-                        <span>{model.node_count} node{model.node_count === 1 ? '' : 's'}</span>
+                        <span>
+                          {model.node_count} node
+                          {model.node_count === 1 ? "" : "s"}
+                        </span>
                         <span className="flex items-center gap-2">
-                          {model.vision && <span role="img" aria-label="Vision">👁</span>}
+                          {model.vision && (
+                            <span role="img" aria-label="Vision">
+                              👁
+                            </span>
+                          )}
                           {model.size_gb.toFixed(1)} GB
                         </span>
                       </div>
@@ -3451,7 +3510,7 @@ function DashboardPage({
                   <CardContent className="flex min-h-0 flex-1 p-0">
                     <MeshTopologyDiagram
                       status={status}
-                      nodes={topologyNodes}
+                      nodes={topologyDiagramNodes}
                       selectedModel={selectedModel}
                       themeMode={themeMode}
                       fullscreen
@@ -3470,8 +3529,14 @@ function DashboardPage({
           )
         : null}
 
-      <Sheet open={!!selectedCatalogModel} onOpenChange={(open) => !open && setSelectedCatalogModel(null)}>
-      <SheetContent side="right" className="w-full overflow-y-auto border-l bg-background/95 p-0 backdrop-blur sm:max-w-2xl">
+      <Sheet
+        open={!!selectedCatalogModel}
+        onOpenChange={(open) => !open && setSelectedCatalogModel(null)}
+      >
+        <SheetContent
+          side="right"
+          className="w-full overflow-y-auto border-l bg-background/95 p-0 backdrop-blur sm:max-w-2xl"
+        >
           {selectedCatalogModel ? (
             <ModelSidebar
               model={selectedCatalogModel}
@@ -3644,9 +3709,7 @@ function TopologyFlowNode({ data }: NodeProps<TopologyFlowDiagramNode>) {
       <div className="mt-1 flex items-center justify-center gap-1 text-[10px] leading-3 text-foreground">
         <span className="break-all">{data.node.id}</span>
         {data.node.self ? (
-          <Badge
-            className="h-4 rounded-full border-sky-500/45 bg-sky-500/10 px-1.5 text-[9px] font-medium text-sky-700 dark:border-sky-400/55 dark:bg-sky-400/15 dark:text-sky-200"
-          >
+          <Badge className="h-4 rounded-full border-sky-500/45 bg-sky-500/10 px-1.5 text-[9px] font-medium text-sky-700 dark:border-sky-400/55 dark:bg-sky-400/15 dark:text-sky-200">
             You
           </Badge>
         ) : null}
@@ -3806,8 +3869,11 @@ function MeshTopologyDiagram({
   heightClass?: string;
   containerStyle?: CSSProperties;
 }) {
-  if (!status || !nodes.length) {
+  if (!status) {
     return <EmptyPanel text="No topology data yet." />;
+  }
+  if (!nodes.length) {
+    return <EmptyPanel text="No host or worker nodes visible yet." />;
   }
 
   return (
@@ -3851,31 +3917,9 @@ function MeshTopologyFlow({
       !n.client && !!n.serving && (!focusModel || n.serving === focusModel),
   );
   const servingIds = new Set(serving.map((n) => n.id));
-  const clients = others.filter((n) => n.client);
   const workers = others.filter((n) => !n.client && !servingIds.has(n.id));
 
-  const total = nodes.length;
-  const nodeRadius =
-    total >= 500
-      ? 3.6
-      : total >= 280
-        ? 4.8
-        : total >= 160
-          ? 6.2
-          : total >= 90
-            ? 7.4
-            : total >= 50
-              ? 8.8
-              : 10.4;
-  const positioned = layoutTopologyNodes(
-    center,
-    serving,
-    workers,
-    clients,
-    nodeRadius,
-  );
-  const clientEdgeStride =
-    total > 320 ? 6 : total > 220 ? 4 : total > 120 ? 2 : 1;
+  const positioned = layoutTopologyNodes(center, serving, workers);
   const meshVramGb = nodes
     .filter((n) => !n.client)
     .reduce((sum, n) => sum + Math.max(0, n.vram), 0);
@@ -3963,9 +4007,10 @@ function MeshTopologyFlow({
     [fullscreen, positioned],
   );
   const flowContainerRef = useRef<HTMLDivElement | null>(null);
-  const flowInstanceRef = useRef<
-    ReactFlowInstance<TopologyFlowDiagramNode, Edge> | null
-  >(null);
+  const flowInstanceRef = useRef<ReactFlowInstance<
+    TopologyFlowDiagramNode,
+    Edge
+  > | null>(null);
   const [containerReady, setContainerReady] = useState(false);
   const fitViewOptions = useMemo(() => ({ padding: 0.12, maxZoom: 1.45 }), []);
   const fitDuration = fullscreen ? 220 : 0;
@@ -4042,18 +4087,13 @@ function MeshTopologyFlow({
   ]);
 
   const flowEdges = useMemo<Edge[]>(() => {
-    const outer = positioned.filter((p) => p.id !== center.id);
-    return outer
-      .filter(
-        (p, idx) => !(p.bucket === "client" && idx % clientEdgeStride !== 0),
-      )
+    return positioned
+      .filter((p) => p.id !== center.id)
       .map((p) => {
         const stroke =
           p.bucket === "serving"
             ? "rgba(34,197,94,0.35)"
-            : p.bucket === "worker"
-              ? "rgba(56,189,248,0.3)"
-              : "rgba(148,163,184,0.22)";
+            : "rgba(56,189,248,0.3)";
         return {
           id: `edge-${center.id}-${p.id}`,
           source: center.id,
@@ -4063,12 +4103,12 @@ function MeshTopologyFlow({
           animated: false,
           style: {
             stroke,
-            strokeWidth: p.bucket === "client" ? 1.8 : 2.4,
-            strokeDasharray: p.bucket === "client" ? "2 8" : "2 6",
+            strokeWidth: 2.4,
+            strokeDasharray: "2 6",
           },
         };
       });
-  }, [positioned, center.id, clientEdgeStride]);
+  }, [positioned, center.id]);
 
   return (
     <div
@@ -4125,146 +4165,108 @@ function MeshTopologyFlow({
   );
 }
 
+type TopologyRowBucket = "serving" | "worker";
+
+type TopologyRow = {
+  nodes: TopologyNode[];
+  bucket: TopologyRowBucket;
+};
+
 function layoutTopologyNodes(
   center: TopologyNode,
   serving: TopologyNode[],
   workers: TopologyNode[],
-  clients: TopologyNode[],
-  nodeRadius: number,
 ): PositionedTopologyNode[] {
+  const chunkRows = (
+    rowNodes: TopologyNode[],
+    bucket: TopologyRowBucket,
+    maxPerRow: number,
+  ): TopologyRow[] => {
+    if (!rowNodes.length) return [];
+    const rowCount = Math.ceil(rowNodes.length / maxPerRow);
+    const baseRowSize = Math.floor(rowNodes.length / rowCount);
+    const remainder = rowNodes.length % rowCount;
+    const rows: TopologyRow[] = [];
+    let offset = 0;
+    for (let i = 0; i < rowCount; i += 1) {
+      const rowSize = baseRowSize + (i < remainder ? 1 : 0);
+      rows.push({
+        nodes: rowNodes.slice(offset, offset + rowSize),
+        bucket,
+      });
+      offset += rowSize;
+    }
+    return rows;
+  };
+
   const placeRow = (
-    row: TopologyNode[],
-    bucket: PositionedTopologyNode["bucket"],
+    row: TopologyRow,
     y: number,
     horizontalSpacing: number,
     positioned: PositionedTopologyNode[],
   ) => {
-    const startX = -((row.length - 1) * horizontalSpacing) / 2;
-    row.forEach((node, index) => {
+    const startX = -((row.nodes.length - 1) * horizontalSpacing) / 2;
+    row.nodes.forEach((node, index) => {
       positioned.push({
         ...node,
-        bucket,
+        bucket: row.bucket,
         x: startX + index * horizontalSpacing,
         y,
       });
     });
   };
 
-  const all: Array<PositionedTopologyNode> = [
-    ...serving.map((n) => ({ ...n, bucket: "serving" as const, x: 0, y: 0 })),
-    ...workers.map((n) => ({ ...n, bucket: "worker" as const, x: 0, y: 0 })),
-    ...clients.map((n) => ({ ...n, bucket: "client" as const, x: 0, y: 0 })),
-  ];
-
   const positioned: PositionedTopologyNode[] = [
     { ...center, x: 0, y: 0, bucket: "center" },
   ];
-  const peerCount = all.length;
+  const peerCount = serving.length + workers.length;
   if (peerCount === 0) return positioned;
 
-  if (peerCount <= 6) {
-    const horizontalSpacing = 270;
-    const bandOffset = 215;
-    const rowStep = 118;
-    const topRows: Array<{
-      nodes: TopologyNode[];
-      bucket: PositionedTopologyNode["bucket"];
-    }> = [];
-    const bottomRows: Array<{
-      nodes: TopologyNode[];
-      bucket: PositionedTopologyNode["bucket"];
-    }> = [];
+  // Grow maxPerRow with ~sqrt(peerCount) so the layout stays roughly square
+  // (wider rows, fewer rows) rather than stacking many rows that force extreme
+  // zoom-out to see the full topology.
+  const maxPerRow = Math.max(2, Math.min(8, Math.ceil(Math.sqrt(peerCount))));
+  const topRows = chunkRows(serving, "serving", maxPerRow);
+  const bottomRows = chunkRows(workers, "worker", maxPerRow);
 
-    if (serving.length) {
-      topRows.push({ nodes: serving, bucket: "serving" });
-    }
-
-    if (workers.length) {
-      if (serving.length === 0) {
-        topRows.push({ nodes: workers, bucket: "worker" });
-      } else {
-        bottomRows.push({ nodes: workers, bucket: "worker" });
-      }
-    }
-
-    if (clients.length) {
-      bottomRows.push({ nodes: clients, bucket: "client" });
-    }
-
-    topRows.forEach((row, index) => {
-      const distanceFromCenter =
-        bandOffset + (topRows.length - index - 1) * rowStep;
-      placeRow(
-        row.nodes,
-        row.bucket,
-        -distanceFromCenter,
-        horizontalSpacing,
-        positioned,
-      );
-    });
-
+  if (topRows.length === 0) {
+    const redistributedTop: TopologyRow[] = [];
+    const redistributedBottom: TopologyRow[] = [];
     bottomRows.forEach((row, index) => {
-      const distanceFromCenter = bandOffset + index * rowStep;
-      placeRow(
-        row.nodes,
-        row.bucket,
-        distanceFromCenter,
-        horizontalSpacing,
-        positioned,
-      );
+      (index % 2 === 0 ? redistributedTop : redistributedBottom).push(row);
     });
-
-    return positioned;
-  }
-
-  // Small meshes get a larger first ring so the graph uses the available canvas.
-  const baseRadius =
-    peerCount <= 3
-      ? 190
-      : peerCount <= 6
-        ? 220
-        : peerCount <= 10
-          ? 250
-          : Math.max(200, nodeRadius * 9 + 96);
-  const ringSpacing =
-    peerCount <= 10 ? 120 : Math.max(102, nodeRadius * 7 + 58);
-  const minArcLength = Math.max(110, nodeRadius * 7 + 54);
-
-  if (peerCount <= 10) {
-    for (let i = 0; i < peerCount; i += 1) {
-      const angle = -Math.PI / 2 + (2 * Math.PI * i) / peerCount;
-      const node = all[i];
-      positioned.push({
-        ...node,
-        x: Math.cos(angle) * baseRadius,
-        y: Math.sin(angle) * baseRadius,
-      });
+    topRows.push(...redistributedTop);
+    bottomRows.splice(0, bottomRows.length, ...redistributedBottom);
+  } else {
+    while (bottomRows.length > topRows.length + 1) {
+      const row = bottomRows.pop();
+      if (!row) break;
+      topRows.push(row);
     }
-    return positioned;
+    while (topRows.length > bottomRows.length + 1) {
+      const row = topRows.pop();
+      if (!row) break;
+      bottomRows.push(row);
+    }
   }
 
-  let offset = 0;
-  let ring = 0;
-  while (offset < peerCount) {
-    const radius = baseRadius + ring * ringSpacing;
-    const capacity = Math.max(
-      8,
-      Math.floor((2 * Math.PI * radius) / minArcLength),
+  const horizontalSpacing =
+    peerCount <= 3 ? 324 : peerCount <= 8 ? 292 : peerCount <= 14 ? 274 : 262;
+  const bandOffset = peerCount <= 3 ? 232 : 216;
+  const rowStep = 204;
+
+  topRows.forEach((row, index) => {
+    placeRow(
+      row,
+      -(bandOffset + index * rowStep),
+      horizontalSpacing,
+      positioned,
     );
-    const take = Math.min(capacity, peerCount - offset);
-    const phase = ring % 2 === 0 ? 0 : Math.PI / Math.max(6, take);
-    for (let i = 0; i < take; i += 1) {
-      const angle = -Math.PI / 2 + phase + (2 * Math.PI * i) / take;
-      const node = all[offset + i];
-      positioned.push({
-        ...node,
-        x: Math.cos(angle) * radius,
-        y: Math.sin(angle) * radius,
-      });
-    }
-    offset += take;
-    ring += 1;
-  }
+  });
+
+  bottomRows.forEach((row, index) => {
+    placeRow(row, bandOffset + index * rowStep, horizontalSpacing, positioned);
+  });
 
   return positioned;
 }
@@ -4692,10 +4694,10 @@ function ModelSidebar({
                   tooltip={modelStatusTooltip(model.status)}
                 />
                 <StatusPill
-                  label={headerFitLabel(model.fit_label ?? 'Unknown')}
-                  tone={fitLabelTone(model.fit_label ?? 'Unknown')}
+                  label={headerFitLabel(model.fit_label ?? "Unknown")}
+                  tone={fitLabelTone(model.fit_label ?? "Unknown")}
                   icon={<Check className="h-3 w-3" />}
-                  tooltip={fitLabelTooltip(model.fit_label ?? 'Unknown')}
+                  tooltip={fitLabelTooltip(model.fit_label ?? "Unknown")}
                 />
               </div>
               <SheetDescription className="mt-1.5 text-sm text-muted-foreground [overflow-wrap:anywhere]">
@@ -4707,10 +4709,15 @@ function ModelSidebar({
       </div>
 
       <div className="flex-1 space-y-5 px-6 py-5">
-        <div className={cn('grid gap-3', model.context_length ? 'sm:grid-cols-4' : 'sm:grid-cols-3')}>
+        <div
+          className={cn(
+            "grid gap-3",
+            model.context_length ? "sm:grid-cols-4" : "sm:grid-cols-3",
+          )}
+        >
           <ModelFactCard
             title="Mesh Availability"
-            value={`${model.node_count} node${model.node_count === 1 ? '' : 's'}`}
+            value={`${model.node_count} node${model.node_count === 1 ? "" : "s"}`}
             icon={<Network className="h-4 w-4" />}
             tooltip="Warm nodes currently serving this model."
           />
@@ -4722,7 +4729,9 @@ function ModelSidebar({
           />
           <ModelFactCard
             title="File size"
-            value={model.size_gb > 0 ? `${model.size_gb.toFixed(1)} GB` : 'Unknown'}
+            value={
+              model.size_gb > 0 ? `${model.size_gb.toFixed(1)} GB` : "Unknown"
+            }
             icon={<MemoryStick className="h-4 w-4" />}
             tooltip={fileSizeTooltip(model.source_file)}
           />
@@ -4782,14 +4791,14 @@ function ModelSidebar({
           </CardContent>
         </Card>
 
-        {(model.description
-          || model.architecture
-          || model.quantization
-          || model.draft_model
-          || model.source_ref
-          || model.source_revision
-          || model.expert_count
-          || model.used_expert_count) ? (
+        {model.description ||
+        model.architecture ||
+        model.quantization ||
+        model.draft_model ||
+        model.source_ref ||
+        model.source_revision ||
+        model.expert_count ||
+        model.used_expert_count ? (
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="flex items-center gap-2 text-sm">
@@ -4798,7 +4807,11 @@ function ModelSidebar({
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-3 text-sm">
-              {model.description ? <p className="leading-7 text-muted-foreground">{model.description}</p> : null}
+              {model.description ? (
+                <p className="leading-7 text-muted-foreground">
+                  {model.description}
+                </p>
+              ) : null}
               <div className="grid gap-3 sm:grid-cols-2">
                 {model.architecture ? (
                   <ModelMetaItem
@@ -4832,10 +4845,19 @@ function ModelSidebar({
                   <ModelMetaLinkItem
                     label="Model Source"
                     href={model.source_page_url}
-                    text={huggingFacePathFromUrl(model.source_page_url) ?? model.source_ref ?? model.name}
+                    text={
+                      huggingFacePathFromUrl(model.source_page_url) ??
+                      model.source_ref ??
+                      model.name
+                    }
                     icon={
                       isHuggingFaceUrl(model.source_page_url) ? (
-                        <span aria-hidden="true" className="text-sm leading-none">🤗</span>
+                        <span
+                          aria-hidden="true"
+                          className="text-sm leading-none"
+                        >
+                          🤗
+                        </span>
                       ) : (
                         <ExternalLink className="h-3.5 w-3.5" />
                       )
@@ -4853,7 +4875,7 @@ function ModelSidebar({
           </Card>
         ) : null}
 
-        {(model.name || fullFileName || revisionFileName) ? (
+        {model.name || fullFileName || revisionFileName ? (
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="flex items-center gap-2 text-sm">
@@ -4863,15 +4885,28 @@ function ModelSidebar({
             </CardHeader>
             <CardContent className="space-y-3 text-sm">
               <p className="text-sm leading-6 text-muted-foreground">
-                The same model file shown as the mesh shorthand, repository path, and pinned revision.
+                The same model file shown as the mesh shorthand, repository
+                path, and pinned revision.
               </p>
               <div className="grid gap-3">
-                <ModelMetaItem label="Shorthand" value={model.name} copyValue={model.name} />
+                <ModelMetaItem
+                  label="Shorthand"
+                  value={model.name}
+                  copyValue={model.name}
+                />
                 {fullFileName ? (
-                  <ModelMetaItem label="Full name" value={fullFileName} copyValue={fullFileName} />
+                  <ModelMetaItem
+                    label="Full name"
+                    value={fullFileName}
+                    copyValue={fullFileName}
+                  />
                 ) : null}
                 {revisionFileName ? (
-                  <ModelMetaItem label="Revision" value={revisionFileName} copyValue={revisionFileName} />
+                  <ModelMetaItem
+                    label="Revision"
+                    value={revisionFileName}
+                    copyValue={revisionFileName}
+                  />
                 ) : null}
               </div>
             </CardContent>
@@ -4899,10 +4934,18 @@ function ModelSidebar({
                 <TableBody>
                   {activePeers.map((peer) => (
                     <TableRow key={peer.id}>
-                      <TableCell className="font-mono text-xs">{peer.id}</TableCell>
-                      <TableCell className="text-right">{peer.latencyLabel}</TableCell>
-                      <TableCell className="text-right">{peer.vramLabel}</TableCell>
-                      <TableCell className="text-right">{peer.shareLabel}</TableCell>
+                      <TableCell className="font-mono text-xs">
+                        {peer.id}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {peer.latencyLabel}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {peer.vramLabel}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        {peer.shareLabel}
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -4913,8 +4956,12 @@ function ModelSidebar({
 
         {model.request_count != null || model.last_active_secs_ago != null ? (
           <div className="px-1 text-xs text-muted-foreground">
-            {model.request_count != null ? `${model.request_count} requests seen` : 'No request count'}
-            {model.last_active_secs_ago != null ? ` · active ${formatAge(model.last_active_secs_ago)} ago` : ''}
+            {model.request_count != null
+              ? `${model.request_count} requests seen`
+              : "No request count"}
+            {model.last_active_secs_ago != null
+              ? ` · active ${formatAge(model.last_active_secs_ago)} ago`
+              : ""}
           </div>
         ) : null}
       </div>
@@ -4932,9 +4979,7 @@ function CapabilityBadge({
   tooltip?: string;
 }) {
   const badge = (
-    <Badge
-      className="gap-1.5 rounded-full border-sky-300 bg-sky-50 px-3 py-1.5 text-xs font-medium text-foreground dark:border-sky-900 dark:bg-sky-950/30"
-    >
+    <Badge className="gap-1.5 rounded-full border-sky-300 bg-sky-50 px-3 py-1.5 text-xs font-medium text-foreground dark:border-sky-900 dark:bg-sky-950/30">
       {icon}
       {label}
     </Badge>
@@ -4943,7 +4988,9 @@ function CapabilityBadge({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span className="inline-flex" tabIndex={0}>{badge}</span>
+        <span className="inline-flex" tabIndex={0}>
+          {badge}
+        </span>
       </TooltipTrigger>
       <TooltipContent side="bottom" align="center" sideOffset={8}>
         {tooltip}
@@ -5028,13 +5075,19 @@ function ModelMetaItem({
             className="h-6 w-6 rounded-full p-0 text-muted-foreground hover:text-foreground"
             onClick={() => void copy()}
             aria-label={copied ? `${label} copied` : `Copy ${label}`}
-            title={copied ? 'Copied' : `Copy ${label}`}
+            title={copied ? "Copied" : `Copy ${label}`}
           >
-            {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+            {copied ? (
+              <Check className="h-3 w-3" />
+            ) : (
+              <Copy className="h-3 w-3" />
+            )}
           </Button>
         ) : null}
       </div>
-      <div className="mt-1 text-sm font-medium [overflow-wrap:anywhere]">{value}</div>
+      <div className="mt-1 text-sm font-medium [overflow-wrap:anywhere]">
+        {value}
+      </div>
     </div>
   );
 }
@@ -5078,14 +5131,21 @@ function StatusPill({
   tooltip,
 }: {
   label: string;
-  tone: 'warm' | 'cold' | 'good' | 'info' | 'warn' | 'bad' | 'neutral';
+  tone: "warm" | "cold" | "good" | "info" | "warn" | "bad" | "neutral";
   dot?: boolean;
   icon?: ReactNode;
   className?: string;
   tooltip?: string;
 }) {
   const badge = (
-    <Badge className={cn('h-5 shrink-0 rounded-full px-2 text-[10px] font-medium', statusPillToneClass(tone), (dot || icon) ? 'gap-1' : '', className)}>
+    <Badge
+      className={cn(
+        "h-5 shrink-0 rounded-full px-2 text-[10px] font-medium",
+        statusPillToneClass(tone),
+        dot || icon ? "gap-1" : "",
+        className,
+      )}
+    >
       {dot ? <span className="h-1.5 w-1.5 rounded-full bg-current" /> : null}
       {icon}
       {label}
@@ -5095,7 +5155,9 @@ function StatusPill({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span className="inline-flex" tabIndex={0}>{badge}</span>
+        <span className="inline-flex" tabIndex={0}>
+          {badge}
+        </span>
       </TooltipTrigger>
       <TooltipContent side="bottom" align="center" sideOffset={8}>
         {tooltip}
@@ -5126,9 +5188,7 @@ function shortName(name: string) {
 
 function huggingFacePathFromUrl(url?: string) {
   if (!url) return null;
-  return url
-    .replace(/^https?:\/\/huggingface\.co\//, '')
-    .replace(/\/$/, '');
+  return url.replace(/^https?:\/\/huggingface\.co\//, "").replace(/\/$/, "");
 }
 
 function isHuggingFaceUrl(url?: string) {
@@ -5156,14 +5216,14 @@ function modelRevisionFileName(model?: MeshModel | null) {
 }
 
 function formatAge(seconds: number) {
-  if (!Number.isFinite(seconds) || seconds < 60) return 'just now';
+  if (!Number.isFinite(seconds) || seconds < 60) return "just now";
   if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
   if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
   return `${Math.round(seconds / 86400)}d`;
 }
 
 function formatContextLength(value?: number) {
-  if (!value || !Number.isFinite(value)) return 'Unknown';
+  if (!value || !Number.isFinite(value)) return "Unknown";
   if (value >= 1000) {
     const rounded = value / 1000;
     return Number.isInteger(rounded) ? `${rounded}K` : `${rounded.toFixed(1)}K`;
@@ -5179,112 +5239,118 @@ function formatLatency(value?: number | null) {
 }
 
 function headerFitLabel(label?: string) {
-  if (label === 'Likely comfortable' || label === 'Likely fits') {
-    return 'Suitable for this node';
+  if (label === "Likely comfortable" || label === "Likely fits") {
+    return "Suitable for this node";
   }
-  if (label === 'Possible with tradeoffs') {
-    return 'May fit this node';
+  if (label === "Possible with tradeoffs") {
+    return "May fit this node";
   }
-  if (label === 'Likely too large') {
-    return 'Too large for this node';
+  if (label === "Likely too large") {
+    return "Too large for this node";
   }
-  return 'Check fit';
+  return "Check fit";
 }
 
-function fitLabelTone(label?: string): 'good' | 'info' | 'warn' | 'bad' | 'neutral' {
-  if (label === 'Likely comfortable') return 'good';
-  if (label === 'Likely fits') return 'good';
-  if (label === 'Possible with tradeoffs') return 'warn';
-  if (label === 'Likely too large') return 'bad';
-  return 'neutral';
+function fitLabelTone(
+  label?: string,
+): "good" | "info" | "warn" | "bad" | "neutral" {
+  if (label === "Likely comfortable") return "good";
+  if (label === "Likely fits") return "good";
+  if (label === "Possible with tradeoffs") return "warn";
+  if (label === "Likely too large") return "bad";
+  return "neutral";
 }
 
 function modelStatusTooltip(status?: string) {
-  if (status === 'warm') {
-    return 'Loaded and serving in the mesh.';
+  if (status === "warm") {
+    return "Loaded and serving in the mesh.";
   }
-  if (status === 'cold') {
-    return 'Downloaded locally, but not currently serving.';
+  if (status === "cold") {
+    return "Downloaded locally, but not currently serving.";
   }
-  return 'Current model availability in the mesh.';
+  return "Current model availability in the mesh.";
 }
 
 function fitLabelTooltip(label?: string) {
-  if (label === 'Likely comfortable') {
-    return 'Should run comfortably on this node.';
+  if (label === "Likely comfortable") {
+    return "Should run comfortably on this node.";
   }
-  if (label === 'Likely fits') {
-    return 'Should fit on this node, but tightly.';
+  if (label === "Likely fits") {
+    return "Should fit on this node, but tightly.";
   }
-  if (label === 'Possible with tradeoffs') {
-    return 'May fit, with tighter memory or performance tradeoffs.';
+  if (label === "Possible with tradeoffs") {
+    return "May fit, with tighter memory or performance tradeoffs.";
   }
-  if (label === 'Likely too large') {
-    return 'Likely too large for this node alone.';
+  if (label === "Likely too large") {
+    return "Likely too large for this node alone.";
   }
-  return 'Estimated fit for this node.';
+  return "Estimated fit for this node.";
 }
 
 function fileSizeTooltip(fileName?: string) {
-  const ext = fileName?.split('.').pop()?.toUpperCase();
-  if (ext === 'GGUF') return 'GGUF model file size on disk.';
+  const ext = fileName?.split(".").pop()?.toUpperCase();
+  if (ext === "GGUF") return "GGUF model file size on disk.";
   if (ext) return `${ext} model file size on disk.`;
-  return 'Primary model file size on disk.';
+  return "Primary model file size on disk.";
 }
 
 function toolUseTooltip(status?: string) {
-  if (status === 'supported') {
-    return 'Supports tool or function calling.';
+  if (status === "supported") {
+    return "Supports tool or function calling.";
   }
-  if (status === 'likely') {
-    return 'Likely supports tool or function calling.';
+  if (status === "likely") {
+    return "Likely supports tool or function calling.";
   }
-  return 'Tool or function calling support.';
+  return "Tool or function calling support.";
 }
 
-function topologyStatusTone(status: string): 'good' | 'info' | 'warn' | 'bad' | 'neutral' {
-  if (status === 'Serving' || status === 'Serving (split)') return 'good';
-  if (status === 'Client') return 'info';
-  if (status === 'Host') return 'info';
-  if (status === 'Idle' || status === 'Standby') return 'neutral';
-  if (status === 'Worker (split)') return 'warn';
-  return 'neutral';
+function topologyStatusTone(
+  status: string,
+): "good" | "info" | "warn" | "bad" | "neutral" {
+  if (status === "Serving" || status === "Serving (split)") return "good";
+  if (status === "Client") return "info";
+  if (status === "Host") return "info";
+  if (status === "Idle" || status === "Standby") return "neutral";
+  if (status === "Worker (split)") return "warn";
+  return "neutral";
 }
 
 function topologyStatusTooltip(status: string) {
-  if (status === 'Serving') {
-    return 'Actively serving a model.';
+  if (status === "Serving") {
+    return "Actively serving a model.";
   }
-  if (status === 'Serving (split)') {
-    return 'Serving a split model with the mesh.';
+  if (status === "Serving (split)") {
+    return "Serving a split model with the mesh.";
   }
-  if (status === 'Worker (split)') {
-    return 'Contributing compute to a split model.';
+  if (status === "Worker (split)") {
+    return "Contributing compute to a split model.";
   }
-  if (status === 'Host') {
-    return 'Coordinating requests for the mesh.';
+  if (status === "Host") {
+    return "Coordinating requests for the mesh.";
   }
-  if (status === 'Client') {
-    return 'Sends requests, but does not contribute VRAM.';
+  if (status === "Client") {
+    return "Sends requests, but does not contribute VRAM.";
   }
-  if (status === 'Idle' || status === 'Standby') {
-    return 'Connected, but not serving a model.';
+  if (status === "Idle" || status === "Standby") {
+    return "Connected, but not serving a model.";
   }
-  return 'Current serving role.';
+  return "Current serving role.";
 }
 
-function statusPillToneClass(tone: 'warm' | 'cold' | 'good' | 'info' | 'warn' | 'bad' | 'neutral') {
-  if (tone === 'warm' || tone === 'good') {
-    return 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300';
+function statusPillToneClass(
+  tone: "warm" | "cold" | "good" | "info" | "warn" | "bad" | "neutral",
+) {
+  if (tone === "warm" || tone === "good") {
+    return "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
   }
-  if (tone === 'cold' || tone === 'info') {
-    return 'border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300';
+  if (tone === "cold" || tone === "info") {
+    return "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300";
   }
-  if (tone === 'warn') {
-    return 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300';
+  if (tone === "warn") {
+    return "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300";
   }
-  if (tone === 'bad') {
-    return 'border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300';
+  if (tone === "bad") {
+    return "border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300";
   }
   return "border-border bg-muted text-foreground";
 }

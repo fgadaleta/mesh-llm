@@ -32,8 +32,16 @@ async fn spawn_api_proxy_test_harness(
 async fn spawn_capturing_upstream(
     response_body: &str,
 ) -> (u16, oneshot::Receiver<Vec<u8>>, tokio::task::JoinHandle<()>) {
+    spawn_status_upstream("200 OK", response_body).await
+}
+
+async fn spawn_status_upstream(
+    status: &str,
+    response_body: &str,
+) -> (u16, oneshot::Receiver<Vec<u8>>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let status = status.to_string();
     let response = response_body.to_string();
     let (request_tx, request_rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
@@ -42,7 +50,7 @@ async fn spawn_capturing_upstream(
         let _ = request_tx.send(raw);
 
         let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             response.len(),
             response
         );
@@ -172,6 +180,19 @@ fn local_targets(entries: &[(&str, u16)]) -> election::ModelTargets {
             )
         })
         .collect::<HashMap<_, _>>();
+    targets
+}
+
+fn single_model_targets(model: &str, ports: &[u16]) -> election::ModelTargets {
+    let mut targets = election::ModelTargets::default();
+    targets.targets.insert(
+        model.to_string(),
+        ports
+            .iter()
+            .copied()
+            .map(election::InferenceTarget::Local)
+            .collect(),
+    );
     targets
 }
 
@@ -612,4 +633,232 @@ async fn test_api_proxy_integration_streaming_client_disconnect_does_not_hang() 
         .unwrap();
 
     proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn test_api_proxy_retries_context_overflow_bad_request_to_next_target() {
+    let overflow_body =
+        r#"{"error":{"message":"prompt tokens exceed context window (n_ctx=4096)"}}"#;
+    let (small_port, small_rx, small_handle) =
+        spawn_status_upstream("400 Bad Request", overflow_body).await;
+    let (large_port, large_rx, large_handle) = spawn_capturing_upstream(r#"{"ok":true}"#).await;
+    let (proxy_addr, proxy_handle) =
+        spawn_api_proxy_test_harness(single_model_targets("test", &[small_port, large_port])).await;
+
+    let body = json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "overflow then retry"}],
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = send_request_and_read_response(proxy_addr, vec![request.into_bytes()]).await;
+    let first_raw = String::from_utf8(small_rx.await.unwrap()).unwrap();
+    let second_raw = String::from_utf8(large_rx.await.unwrap()).unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains(r#"{"ok":true}"#));
+    assert!(first_raw.contains("overflow then retry"));
+    assert!(second_raw.contains("overflow then retry"));
+
+    proxy_handle.abort();
+    let _ = small_handle.await;
+    let _ = large_handle.await;
+}
+
+#[tokio::test]
+async fn test_api_proxy_preserves_context_overflow_bad_request_for_single_target() {
+    let overflow_body =
+        r#"{"error":{"message":"prompt tokens exceed context window (n_ctx=4096)"}}"#;
+    let (port, upstream_rx, upstream_handle) =
+        spawn_status_upstream("400 Bad Request", overflow_body).await;
+    let (proxy_addr, proxy_handle) =
+        spawn_api_proxy_test_harness(local_targets(&[("test", port)])).await;
+
+    let body = json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "single target overflow should stay 400"}],
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = send_request_and_read_response(proxy_addr, vec![request.into_bytes()]).await;
+    let raw = String::from_utf8(upstream_rx.await.unwrap()).unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+    assert!(response.contains("context window"));
+    assert!(raw.contains("single target overflow should stay 400"));
+
+    proxy_handle.abort();
+    let _ = upstream_handle.await;
+}
+
+#[tokio::test]
+async fn test_api_proxy_returns_last_context_overflow_bad_request_when_all_targets_overflow() {
+    let first_body = r#"{"error":{"message":"prompt tokens exceed context window (n_ctx=2048)"}}"#;
+    let second_body = r#"{"error":{"message":"prompt tokens exceed context window (n_ctx=4096)"}}"#;
+    let (first_port, first_rx, first_handle) =
+        spawn_status_upstream("400 Bad Request", first_body).await;
+    let (second_port, second_rx, second_handle) =
+        spawn_status_upstream("400 Bad Request", second_body).await;
+    let (proxy_addr, proxy_handle) =
+        spawn_api_proxy_test_harness(single_model_targets("test", &[first_port, second_port]))
+            .await;
+
+    let body = json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "all targets overflow"}],
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = send_request_and_read_response(proxy_addr, vec![request.into_bytes()]).await;
+    let first_raw = String::from_utf8(first_rx.await.unwrap()).unwrap();
+    let second_raw = String::from_utf8(second_rx.await.unwrap()).unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+    assert!(response.contains("n_ctx=4096"));
+    assert!(first_raw.contains("all targets overflow"));
+    assert!(second_raw.contains("all targets overflow"));
+
+    proxy_handle.abort();
+    let _ = first_handle.await;
+    let _ = second_handle.await;
+}
+
+#[tokio::test]
+async fn test_api_proxy_does_not_retry_generic_bad_request() {
+    let bad_request_body = r#"{"error":{"message":"missing required field: messages"}}"#;
+    let (bad_port, bad_rx, bad_handle) =
+        spawn_status_upstream("400 Bad Request", bad_request_body).await;
+    let (unused_port, unused_rx, unused_handle) = spawn_capturing_upstream(r#"{"ok":true}"#).await;
+    let (proxy_addr, proxy_handle) =
+        spawn_api_proxy_test_harness(single_model_targets("test", &[bad_port, unused_port])).await;
+
+    let body = json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "bad request should stop"}],
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = send_request_and_read_response(proxy_addr, vec![request.into_bytes()]).await;
+    let first_raw = String::from_utf8(bad_rx.await.unwrap()).unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+    assert!(response.contains("missing required field"));
+    assert!(first_raw.contains("bad request should stop"));
+    assert!(tokio::time::timeout(Duration::from_millis(250), unused_rx)
+        .await
+        .is_err());
+
+    proxy_handle.abort();
+    let _ = bad_handle.await;
+    unused_handle.abort();
+}
+
+#[tokio::test]
+async fn test_api_proxy_normalizes_max_completion_tokens_for_upstream() {
+    let (upstream_port, upstream_rx, upstream_handle) =
+        spawn_capturing_upstream(r#"{"ok":true}"#).await;
+    let (proxy_addr, proxy_handle) =
+        spawn_api_proxy_test_harness(local_targets(&[("test", upstream_port)])).await;
+
+    let body = json!({
+        "model": "test",
+        "max_completion_tokens": 32,
+        "messages": [{"role": "user", "content": "normalize token alias"}],
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = send_request_and_read_response(proxy_addr, vec![request.into_bytes()]).await;
+    let raw = String::from_utf8(upstream_rx.await.unwrap()).unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(raw.contains("\"max_tokens\":32"));
+    assert!(!raw.contains("max_completion_tokens"));
+    assert!(raw.contains("normalize token alias"));
+
+    proxy_handle.abort();
+    let _ = upstream_handle.await;
+}
+
+#[tokio::test]
+async fn test_api_proxy_does_not_retry_after_successful_stream_starts() {
+    let (stream_port, stream_rx, stream_handle) = spawn_streaming_upstream(
+        "text/event-stream",
+        vec![
+            (Duration::ZERO, br#"data: {"delta":"first"}\n\n"#.to_vec()),
+            (
+                Duration::from_millis(50),
+                br#"data: {"delta":"second"}\n\n"#.to_vec(),
+            ),
+        ],
+    )
+    .await;
+    let (unused_port, unused_rx, unused_handle) = spawn_capturing_upstream(r#"{"ok":true}"#).await;
+    let (proxy_addr, proxy_handle) =
+        spawn_api_proxy_test_harness(single_model_targets("test", &[stream_port, unused_port]))
+            .await;
+
+    let body = json!({
+        "model": "test",
+        "stream": true,
+        "messages": [{"role": "user", "content": "stream wins immediately"}],
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.shutdown().await.unwrap();
+
+    let first = read_until_contains(
+        &mut stream,
+        br#"data: {"delta":"first"}\n\n"#,
+        Duration::from_secs(2),
+    )
+    .await;
+    let first_text = String::from_utf8_lossy(&first);
+    let raw = String::from_utf8(stream_rx.await.unwrap()).unwrap();
+
+    assert!(first_text.contains("HTTP/1.1 200 OK"));
+    assert!(first_text.contains(r#"data: {"delta":"first"}\n\n"#));
+    assert!(raw.contains("stream wins immediately"));
+    assert!(tokio::time::timeout(Duration::from_millis(250), unused_rx)
+        .await
+        .is_err());
+
+    drop(stream);
+    proxy_handle.abort();
+    tokio::time::timeout(Duration::from_secs(1), stream_handle)
+        .await
+        .expect("streaming upstream hung")
+        .unwrap();
+    unused_handle.abort();
 }

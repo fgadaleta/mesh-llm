@@ -20,14 +20,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 files=(
-    "$REPO_ROOT/mesh-llm/src/main.rs"
+    "$REPO_ROOT/mesh-llm/src/lib.rs"
     "$REPO_ROOT/mesh-llm/Cargo.toml"
     "$REPO_ROOT/mesh-llm/plugin/Cargo.toml"
     "$REPO_ROOT/mesh-llm/src/plugins/example/Cargo.toml"
 )
 
 perl -0pi -e 's/pub const VERSION: &str = "\K[^"]+(?=";)/'"$version"'/g' \
-    "$REPO_ROOT/mesh-llm/src/main.rs"
+    "$REPO_ROOT/mesh-llm/src/lib.rs"
 
 for manifest in \
     "$REPO_ROOT/mesh-llm/Cargo.toml" \

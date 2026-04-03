@@ -2509,7 +2509,7 @@ checksum = "38d1115007560874e373613744c6fba374c17688327a71c1476d1a5954cc857b"
 
 [[package]]
 name = "mesh-llm"
-version = "0.54.0"
+version = "0.55.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2551,7 +2551,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-llm-plugin"
-version = "0.54.0"
+version = "0.55.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3478,7 +3478,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-surface-example"
-version = "0.54.0"
+version = "0.55.1"
 dependencies = [
  "anyhow",
  "mesh-llm-plugin",

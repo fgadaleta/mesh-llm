@@ -16,6 +16,7 @@ pub(super) struct LocalRuntimeModelHandle {
     pub(super) port: u16,
     pub(super) backend: String,
     pub(super) process: launch::InferenceServerHandle,
+    pub(super) context_length: u32,
 }
 
 pub(super) struct ManagedModelController {
@@ -114,6 +115,16 @@ pub(super) async fn advertise_model_ready(
     node.regossip().await;
 }
 
+pub(super) async fn set_advertised_model_context(
+    node: &mesh::Node,
+    model_name: &str,
+    context_length: Option<u32>,
+) {
+    node.set_model_runtime_context_length(model_name, context_length)
+        .await;
+    node.regossip().await;
+}
+
 pub(super) async fn withdraw_advertised_model(node: &mesh::Node, model_name: &str) {
     let mut hosted_models = node.hosted_models().await;
     let old_len = hosted_models.len();
@@ -141,6 +152,11 @@ pub(super) async fn add_serving_assignment(
         serving_models.insert(0, primary);
     }
     node.set_serving_models(serving_models).await;
+    if let Some(descriptor) =
+        mesh::infer_local_served_model_descriptor(model_name, model_name == primary_model_name)
+    {
+        node.upsert_served_model_descriptor(descriptor).await;
+    }
     node.regossip().await;
 }
 
@@ -152,6 +168,7 @@ pub(super) async fn remove_serving_assignment(node: &mesh::Node, model_name: &st
         return;
     }
     node.set_serving_models(serving_models).await;
+    node.remove_served_model_descriptor(model_name).await;
     node.regossip().await;
 }
 
@@ -219,6 +236,7 @@ pub(super) async fn start_runtime_local_model(
             port,
             backend: backend.into(),
             process: process.handle,
+            context_length: process.context_length,
         },
         process.death_rx,
     ))

@@ -467,26 +467,30 @@ fn move_target_first(
     }
 }
 
-pub fn select_model_target_for_request(
+/// Select an inference target for a model request from a caller-supplied candidate
+/// list instead of pulling it from `targets`. This avoids cloning the entire
+/// `ModelTargets` when the caller has already reordered the candidates (e.g. by
+/// context capacity).
+pub fn select_model_target_from_candidates(
     targets: &election::ModelTargets,
+    candidates: &[election::InferenceTarget],
     model: &str,
     parsed_body: Option<&Value>,
     affinity: &AffinityRouter,
 ) -> TargetSelection {
     let routing = routing_keys(parsed_body);
-    let candidates = targets.candidates(model);
 
     if let Some(session_hash) = routing.session_hash.filter(|_| affinity.sticky_enabled()) {
         affinity.record_session_route();
         return TargetSelection {
-            target: targets.get_sticky(model, session_hash),
+            target: election::ModelTargets::pick_sticky_from(candidates, session_hash),
             learn_prefix_hash: None,
             cached_target: None,
         };
     }
 
     if let Some(prefix_hash) = routing.prefix_hash {
-        if let Some(target) = affinity.lookup_target(model, prefix_hash, &candidates) {
+        if let Some(target) = affinity.lookup_target(model, prefix_hash, candidates) {
             return TargetSelection {
                 target: target.clone(),
                 learn_prefix_hash: Some(prefix_hash),
@@ -496,7 +500,7 @@ pub fn select_model_target_for_request(
 
         if prefix_only_enabled() {
             return TargetSelection {
-                target: targets.get_sticky(model, prefix_hash),
+                target: election::ModelTargets::pick_sticky_from(candidates, prefix_hash),
                 learn_prefix_hash: Some(prefix_hash),
                 cached_target: None,
             };
@@ -505,14 +509,14 @@ pub fn select_model_target_for_request(
         if let Some(sticky_hash) = routing.sticky_hash.filter(|_| affinity.sticky_enabled()) {
             affinity.record_sticky_route();
             return TargetSelection {
-                target: targets.get_sticky(model, sticky_hash),
+                target: election::ModelTargets::pick_sticky_from(candidates, sticky_hash),
                 learn_prefix_hash: Some(prefix_hash),
                 cached_target: None,
             };
         }
 
         return TargetSelection {
-            target: targets.get(model),
+            target: targets.pick_from(candidates),
             learn_prefix_hash: Some(prefix_hash),
             cached_target: None,
         };
@@ -521,14 +525,14 @@ pub fn select_model_target_for_request(
     if let Some(sticky_hash) = routing.sticky_hash.filter(|_| affinity.sticky_enabled()) {
         affinity.record_sticky_route();
         return TargetSelection {
-            target: targets.get_sticky(model, sticky_hash),
+            target: election::ModelTargets::pick_sticky_from(candidates, sticky_hash),
             learn_prefix_hash: None,
             cached_target: None,
         };
     }
 
     TargetSelection {
-        target: targets.get(model),
+        target: targets.pick_from(candidates),
         learn_prefix_hash: None,
         cached_target: None,
     }
@@ -660,11 +664,24 @@ mod tests {
             r#"{"tools":[{"type":"function","function":{"name":"run"}}],"messages":[{"role":"system","content":"You are an agent."},{"role":"user","content":"task B"}]}"#,
         );
 
-        let first = select_model_target_for_request(&targets, "qwen", Some(&req_a), &affinity);
+        let candidates = targets.candidates("qwen");
+        let first = select_model_target_from_candidates(
+            &targets,
+            &candidates,
+            "qwen",
+            Some(&req_a),
+            &affinity,
+        );
         let prefix_hash = first.learn_prefix_hash.unwrap();
         affinity.learn_target("qwen", prefix_hash, &first.target);
 
-        let second = select_model_target_for_request(&targets, "qwen", Some(&req_b), &affinity);
+        let second = select_model_target_from_candidates(
+            &targets,
+            &candidates,
+            "qwen",
+            Some(&req_b),
+            &affinity,
+        );
         assert_eq!(Some(second.target.clone()), second.cached_target);
         assert_eq!(first.target, second.target);
     }

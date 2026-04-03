@@ -217,33 +217,21 @@ pub(super) async fn api_proxy(
                             .get_moe_target(&session_hint)
                             .unwrap_or(first_available_target(&targets))
                     } else if let Some(ref name) = effective_model {
-                        let selection = affinity::select_model_target_for_request(
-                            &targets, name, body_json, &affinity,
-                        );
-                        let t = selection.target.clone();
-                        if matches!(t, election::InferenceTarget::None) {
+                        if targets.candidates(name).is_empty() {
                             tracing::debug!("Model '{}' not found, trying first available", name);
                             first_available_target(&targets)
                         } else {
-                            let routed = proxy::route_to_target(
+                            let routed = proxy::route_model_request(
                                 node.clone(),
                                 tcp_stream,
-                                t.clone(),
+                                &targets,
+                                name,
+                                body_json,
                                 &request.raw,
+                                &affinity,
                             )
                             .await;
-                            if routed {
-                                if let Some(prefix_hash) = selection.learn_prefix_hash {
-                                    affinity.learn_target(name, prefix_hash, &t);
-                                }
-                            } else if let (Some(prefix_hash), Some(cached_target)) = (
-                                selection.learn_prefix_hash,
-                                selection.cached_target.as_ref(),
-                            ) {
-                                if cached_target == &t {
-                                    affinity.forget_target(name, prefix_hash, &t);
-                                }
-                            }
+                            debug_assert!(routed);
                             return;
                         }
                     } else {
