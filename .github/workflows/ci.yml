@@ -426,48 +426,72 @@ jobs:
             prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: ""
+            expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: qwen3-0.6b
             url: https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
             file: Qwen3-0.6B-Q8_0.gguf
             prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: ""
+            expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: qwen3-josie-0.6b
             url: https://huggingface.co/mradermacher/JOSIE-IT1-Qwen3-0.6B-GGUF/resolve/main/JOSIE-IT1-Qwen3-0.6B.Q4_K_M.gguf
             file: JOSIE-IT1-Qwen3-0.6B.Q4_K_M.gguf
-            prompt: "What is 2+2? Reply with one word only."
-            expect_contains: "4"
+            prompt: "Reply with exactly: blue"
+            expect_contains: blue
             forbid_contains: ""
+            expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: llama-3.2-1b
             url: https://huggingface.co/llmware/llama-3.2-1b-gguf/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
             file: Llama-3.2-1B-Instruct-Q4_K_M.gguf
             prompt: "Say hi."
             expect_contains: ""
             forbid_contains: ""
+            expect_exact: ""
+            prompt_suite_json: >-
+              [{"label":"exact-blue","prompt":"Reply with exactly: blue","expect_contains":"blue","forbid_contains":"{"},{"label":"exact-green","prompt":"Reply with exactly: green","expect_contains":"green","forbid_contains":"{"}]
           - name: gemma-3-1b
             url: https://huggingface.co/ggml-org/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf
             file: gemma-3-1b-it-Q4_K_M.gguf
             prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: ""
+            expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: gemma-2-2b
             url: https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf
             file: gemma-2-2b-it-Q4_K_M.gguf
             prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: "{"
+            expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: glm-4-9b
             url: https://huggingface.co/lmstudio-community/GLM-4-9B-0414-GGUF/resolve/main/GLM-4-9B-0414-Q4_K_M.gguf
             file: GLM-4-9B-0414-Q4_K_M.gguf
             prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: "{"
+            expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: gemma-4-e4b
             url: https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf
             file: gemma-4-E4B-it-Q4_K_M.gguf
             prompt: "Say the word blue."
             expect_contains: Blue
             forbid_contains: "{"
+            expect_exact: Blue
+            prompt_suite_json: >-
+              [{"label":"repeat-blue","prompt":"Say the word blue.","expect_exact":"Blue"}]
     steps:
       - uses: actions/checkout@v5
 
@@ -524,7 +548,9 @@ jobs:
             ~/.models/${{ matrix.file }} \
             "${{ matrix.prompt }}" \
             "${{ matrix.expect_contains }}" \
-            "${{ matrix.forbid_contains }}"
+            "${{ matrix.forbid_contains }}" \
+            "${{ matrix.expect_exact }}" \
+            '${{ matrix.prompt_suite_json }}'
 
       - name: Show sccache stats
         if: always()
