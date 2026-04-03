@@ -337,7 +337,9 @@ impl BlobStore {
             let has_metadata = self.token_path(token).exists();
             if !has_metadata {
                 // Remove orphaned object file that reap_expired cannot discover
-                let _ = std::fs::remove_file(self.object_path(token));
+                if let Err(err) = std::fs::remove_file(self.object_path(token)) {
+                    tracing::debug!("compact: could not remove orphaned blob for {token}: {err}");
+                }
             }
             has_metadata
         });
