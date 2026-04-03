@@ -15,6 +15,7 @@ The MLX backend is now a real serving path on macOS for a bounded set of text mo
 Working today:
 - MLX-native loading and serving on Apple Silicon
 - Hugging Face repo shorthand, exact artifact refs, and catalog entries
+- explicit MLX runtime selection via `--mlx` or `--mlx-file`
 - MLX sidecar download support:
   - `config.json`
   - `tokenizer.json`
@@ -25,6 +26,11 @@ Working today:
 - Hugging Face chat templates rendered through MiniJinja with compatibility normalization
 - Family-aware thinking/reasoning controls for supported template families
 - macOS MLX smoke coverage in CI
+
+Current product behavior:
+- MLX is an explicit opt-in backend when launching with `--model`
+- using MLX prints an experimental startup warning
+- the warning explicitly points users at the GitHub issues page if they hit problems
 
 What the existing llama.cpp-backed `mesh-llm` path already supports:
 - vision models via `mmproj`
@@ -53,6 +59,7 @@ Notes:
 - MLX remains a local-only serving path today
 - MLX support is currently text-only, even though the llama-backed path already supports vision models
 - DeepSeekV3 / Kimi-K2, `gpt-oss`, and `Kimi Linear` are correctness-first runtime additions today; they are compile/test verified but not part of the live macOS smoke matrix yet
+- MLX is intentionally not auto-selected from `--model`; callers must opt in with `--mlx`
 
 ## Families Still Missing Runtime Support
 

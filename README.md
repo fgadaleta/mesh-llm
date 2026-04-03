@@ -123,7 +123,7 @@ mesh-llm --model Qwen3-8B
 mesh-llm --model Qwen3-8B-Q4_K_M
 
 # MLX catalog name
-mesh-llm --model Qwen3-4B-MLX
+mesh-llm --model Qwen3-4B-MLX --mlx
 
 # HuggingFace URL (any GGUF)
 mesh-llm --model https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf
@@ -132,7 +132,7 @@ mesh-llm --model https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/res
 mesh-llm --model bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf
 
 # HuggingFace repo shorthand (works when the repo has one clear primary artifact)
-mesh-llm --model mlx-community/Qwen2.5-0.5B-Instruct-4bit
+mesh-llm --model mlx-community/Qwen2.5-0.5B-Instruct-4bit --mlx
 
 # Prefer GGUF or MLX when a repo has multiple candidates
 mesh-llm --model some-org/some-repo --gguf
@@ -140,6 +140,9 @@ mesh-llm --model some-org/some-repo --mlx
 
 # Local file path (legacy/raw file mode)
 mesh-llm --gguf-file ~/my-models/custom-model.gguf
+
+# Local MLX model path
+mesh-llm --mlx-file ~/my-models/qwen3-mlx/model.safetensors
 ```
 
 Catalog models are downloaded with resume support. Use the `models` subcommands to browse, inspect, and fetch exact refs.
@@ -149,7 +152,39 @@ MLX catalog entries use explicit `-MLX` names so they stay distinct from the GGU
 - Hugging Face repo snapshots are the canonical managed model store.
 - `~/.models/` is deprecated and will be removed in a future release.
 - Arbitrary local GGUF files remain supported through `--gguf-file`.
+- MLX runtime selection is explicit: use `--mlx` with `--model`, or `--mlx-file` for a local MLX path.
 - MoE split artifacts are cached separately under `~/.cache/mesh-llm/splits/`.
+
+### MLX status
+
+MLX is available on macOS as an experimental local backend for supported text models.
+
+- `--model ... --mlx` is required for MLX runtime selection.
+- `--mlx-file` is the explicit local-path MLX mode.
+- MLX currently bypasses the existing distributed/split GGUF path and runs locally on the Mac serving node.
+- On startup, MLX prints an experimental warning and points users to the GitHub issues page if they hit problems.
+
+Current MLX runtime families:
+
+- Llama
+- Qwen2
+- Qwen3
+- Gemma 2 text
+- Gemma 3 text
+- Gemma 4 text
+- GLM4 text
+- LFM2 text
+- DeepSeekV3 / Kimi-K2 text
+- gpt-oss text
+- Kimi Linear text
+
+Current MLX limitations:
+
+- experimental
+- macOS only
+- text only
+- larger families like DeepSeekV3 / Kimi-K2, `gpt-oss`, and `Kimi Linear` are implemented but not yet part of the live macOS smoke matrix
+- distributed/split MLX serving is still future work
 
 Useful commands:
 
