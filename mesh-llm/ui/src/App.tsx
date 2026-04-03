@@ -175,7 +175,7 @@ type ActivePeerRow = {
 
 type DetailPanelEntry =
   | { kind: "node"; nodeId: string }
-  | { kind: "model"; modelName: string; fromNodeId?: string };
+  | { kind: "model"; modelName: string };
 
 type NodeSidebarRecord = {
   id: string;
@@ -186,7 +186,7 @@ type NodeSidebarRecord = {
   statusLabel: string;
   latencyLabel: string;
   vramGb: number;
-  vramSharePct: number;
+  vramSharePct: number | null;
   isSoc?: boolean;
   gpus: { name: string; vram_bytes: number; bandwidth_gbps?: number }[];
   hostedModels: string[];
@@ -3236,9 +3236,11 @@ function DashboardPage({
       latencyLabel: topologyNode.self ? "local" : formatLatency(topologyNode.latencyMs),
       vramGb: Math.max(0, topologyNode.vram),
       vramSharePct:
-        topologyNode.client || totalMeshVramGb <= 0
-          ? 0
-          : Math.round((Math.max(0, topologyNode.vram) / totalMeshVramGb) * 100),
+        topologyNode.client
+          ? null
+          : totalMeshVramGb <= 0
+            ? 0
+            : Math.round((Math.max(0, topologyNode.vram) / totalMeshVramGb) * 100),
       isSoc: topologyNode.isSoc,
       gpus: topologyNode.gpus ?? [],
       hostedModels,
@@ -3282,9 +3284,9 @@ function DashboardPage({
     pushDetail({ kind: "node", nodeId });
   }
 
-  function openModelDetail(modelName: string, fromNodeId?: string) {
+  function openModelDetail(modelName: string) {
     if (!meshModelByName[modelName]) return;
-    pushDetail({ kind: "model", modelName, fromNodeId });
+    pushDetail({ kind: "model", modelName });
   }
 
   function closeDetailPanel() {
@@ -3557,7 +3559,15 @@ function DashboardPage({
                       <TableRow
                         key={peer.id}
                         className="cursor-pointer transition-colors hover:bg-muted/30"
+                        role="button"
+                        tabIndex={0}
                         onClick={() => openNodeDetail(peer.id)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            openNodeDetail(peer.id);
+                          }
+                        }}
                       >
                         <TableCell className="font-mono text-xs">
                           {peer.id}
@@ -3646,6 +3656,16 @@ function DashboardPage({
               onOpenModel={openModelDetail}
               onBack={detailPanelStack.length > 1 ? goBackDetailPanel : undefined}
             />
+          ) : activeDetail?.kind === "node" && !activeNode ? (
+            <div className="flex h-full flex-col items-center justify-center gap-4 p-8 text-center">
+              <p className="text-sm text-muted-foreground">This node is no longer available.</p>
+              <button
+                className="text-xs underline hover:text-foreground"
+                onClick={detailPanelStack.length > 1 ? goBackDetailPanel : closeDetailPanel}
+              >
+                {detailPanelStack.length > 1 ? "Go back" : "Close"}
+              </button>
+            </div>
           ) : null}
           {activeDetail?.kind === "model" && activeModel ? (
             <ModelSidebar
@@ -3654,6 +3674,16 @@ function DashboardPage({
               onOpenNode={openNodeDetail}
               onBack={detailPanelStack.length > 1 ? goBackDetailPanel : undefined}
             />
+          ) : activeDetail?.kind === "model" && !activeModel ? (
+            <div className="flex h-full flex-col items-center justify-center gap-4 p-8 text-center">
+              <p className="text-sm text-muted-foreground">This model is no longer available.</p>
+              <button
+                className="text-xs underline hover:text-foreground"
+                onClick={detailPanelStack.length > 1 ? goBackDetailPanel : closeDetailPanel}
+              >
+                {detailPanelStack.length > 1 ? "Go back" : "Close"}
+              </button>
+            </div>
           ) : null}
         </SheetContent>
       </Sheet>
@@ -4843,7 +4873,7 @@ function NodeSidebar({
 }: {
   node: NodeSidebarRecord;
   meshModelByName: Record<string, MeshModel>;
-  onOpenModel: (modelName: string, fromNodeId?: string) => void;
+  onOpenModel: (modelName: string) => void;
   onBack?: () => void;
 }) {
   const modelRows = useMemo(() => {
@@ -4934,7 +4964,7 @@ function NodeSidebar({
           />
           <ModelFactCard
             title="Mesh Share"
-            value={node.vramSharePct > 0 ? `${node.vramSharePct}%` : "n/a"}
+            value={node.vramSharePct != null ? `${node.vramSharePct}%` : "n/a"}
             icon={<Gauge className="h-4 w-4" />}
             tooltip={nodeMeshShareTooltip(node.role)}
           />
@@ -5372,8 +5402,16 @@ function ModelSidebar({
                   {activePeers.map((peer) => (
                     <TableRow
                       key={peer.id}
+                      role="button"
+                      tabIndex={0}
                       className="cursor-pointer transition-colors hover:bg-muted/30"
                       onClick={() => onOpenNode(peer.id)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          onOpenNode(peer.id);
+                        }
+                      }}
                     >
                       <TableCell className="font-mono text-xs">{peer.id}</TableCell>
                       <TableCell className="text-right">{peer.latencyLabel}</TableCell>
@@ -5702,14 +5740,14 @@ function nodeLatencyTooltip(self: boolean) {
   if (self) {
     return 'This is the local node.';
   }
-  return 'Observed round-trip latency from this node to the selected peer.';
+  return 'Observed round-trip latency from your node to this peer.';
 }
 
 function nodeVramTooltip(role: string) {
   if (role === 'Client') {
     return 'Clients do not contribute serving VRAM to the mesh.';
   }
-  return 'Total GPU memory reported by this node.';
+  return 'Serving VRAM contributed by this node to the mesh.';
 }
 
 function nodeMeshShareTooltip(role: string) {
