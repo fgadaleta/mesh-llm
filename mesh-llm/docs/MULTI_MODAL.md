@@ -2,22 +2,17 @@
 
 ## Status
 
-Design proposal.
+Implemented for the current multimodal scope.
 
-Current PR scope is the `chat/completions` vertical slice plus blob/object transport and console attachment support.
+Phases 1 through 5 in this plan are complete:
 
-Next planned build after this PR:
+- multimodal capability advertisement across status, models, routing, and UI
+- request-scoped ingress-local blob/object transport
+- console support for image, audio, and file attachments
+- multimodal `/v1/chat/completions`
+- multimodal `/v1/responses` for both non-streaming and streaming requests
 
-- polish and harden the existing multimodal `responses` path where needed
-
-mesh-llm already has part of the foundation:
-
-- vision capability inference
-- `mmproj` launch support for vision-capable llama.cpp models
-- image attachment support in the web console
-- request forwarding to llama.cpp `/v1/chat/completions`
-
-What is still missing is a complete mesh-llm multimodal contract: capability advertisement, routing, request normalization, blob transport, and console support for more than images.
+What remains is polish and hardening of the existing path, not new endpoint scope.
 
 ## Goals
 
@@ -106,18 +101,15 @@ mesh-llm should detect multimodal intent from structured content blocks, not jus
 
 Add a translation layer from `responses` input items into chat-completions-style message content after Phase 1 is working.
 
-## Routing Work Required
+## Routing Notes
 
-- Add `audio` and `multimodal` to model capability inference.
-- Extend local and remote model metadata detection for audio-capable model families.
-- Advertise audio/multimodal capabilities in `/api/status` and `/v1/models`.
-- Route multimodal payloads by structured content inspection, not only prompt text.
-- Add audio-aware routing heuristics similar to current image-aware routing.
-- When `model=auto`, prefer:
+- `audio` and `multimodal` are part of capability inference and surfaced in `/api/status` and `/v1/models`.
+- Multimodal payloads are detected by structured content inspection, not just prompt text.
+- `model=auto` prefers:
   - vision-capable hosts for image inputs
   - audio-capable hosts for audio inputs
   - models supporting both when both are present
-- Skip or constrain the pre-plan pipeline for requests containing media until the planner path is multimodal-safe.
+- Media requests bypass the fragile pre-plan path where needed.
 
 ## Video Support
 
@@ -219,38 +211,30 @@ Recommended first-pass behavior:
 - allow a small retry budget for reroute / transport retries
 - keep only a short grace period after terminal state
 
-## Console Work Required
+## Console State
 
 ### Existing
 
-- image attach UI exists already
-
-### Needed
-
-- add audio attachment UI alongside the existing image flow
-- optionally add generic file attachment UI for future file-style message parts
-- upload request-scoped objects before sending the completion request
-- replace large inline audio/file payloads with secret token references
-- keep small inline images working where practical, but support the same upload path when needed
-- show attachment previews / badges before send:
+- image, audio, and file attachment UI
+- upload-before-send for request-scoped objects
+- token-reference request construction for `chat/completions` and `responses`
+- attachment previews / badges before send:
   - image thumbnail
   - audio filename, duration if available, and remove action
   - generic file name, size, mime type, and remove action
-- show upload state clearly:
+- upload state handling:
   - pending
   - uploaded
   - failed
   - retrying
-- block send or degrade gracefully if required uploads fail
-- allow `model=auto` to switch to multimodal-capable models when attachments are present
-- show capability hints in the model picker:
+- `model=auto` switching when attachments are present
+- capability hints in the model picker:
   - vision
   - audio
   - multimodal
-- preserve attachment state through request retries and host reroutes for the same request
-- support cancel/removal of pending uploads before dispatch
-- add a clear fallback UX when no compatible warm model is available
-- keep the chat transcript representation explicit about attachment kind instead of flattening everything into plain text
+- attachment preservation through retries and reroutes for the same request
+- clear fallback UX when no compatible warm model is available
+- explicit transcript attachment rendering instead of flattening everything into plain text
 
 ### Suggested Console Sequence
 
@@ -284,83 +268,37 @@ We should:
 
 ## Implementation Phases
 
-## Recommended Build Order
-
-Build the smallest end-to-end vertical slice first.
-
-### First Build
-
-Make `/v1/chat/completions` handle request-scoped media attachments end to end for an explicitly selected compatible model.
-
-Scope:
-
-- capability plumbing for `multimodal` and `audio`
-- media-safe request parsing and pipeline bypass
-- request-scoped blob plugin skeleton and core integration points
-- console attachment upload path for audio first
-
-Why first:
-
-- it exercises the real request path
-- it validates the capability model
-- it proves the ingress-storage design before we add more API compatibility layers
-
-### Second Build
-
-Add good `model=auto` behavior.
-
-Scope:
-
-- auto-route image/audio to compatible models
-- capability hints in model picker and model listings
-- no-compatible-model fallback UX
-- retry / reroute behavior for requests with media attachments
-
-### Third Build
-
-Add multimodal `/v1/responses` compatibility.
-
-This is the next planned implementation after the current PR.
-
-### Later
-
-- video upload via frame sampling into image inputs
-
 ### Phase 1: Capability Plumbing
 
-- add `multimodal` and `audio` capabilities
-- update protobuf, status payloads, and model listings
-- update model capability inference
+Complete.
 
 ### Phase 2: Routing and Request Parsing
 
-- detect multimodal request parts structurally
-- add audio-aware routing
-- bypass fragile pipeline paths for media requests
-- make `auto` select multimodal-capable models
+Complete.
 
 ### Phase 3: Blob Plugin
 
-- implement request-scoped ingress storage plugin
-- add upload endpoint
-- add host fetch path
-- add request-finalization cleanup
+Complete.
 
 ### Phase 4: Console
 
-- add audio/file uploads
-- upload before request dispatch
-- send token references
-- improve multimodal model selection UX
+Complete.
 
 ### Phase 5: Compatibility Shims
 
-- `/v1/responses`
+Complete for `/v1/responses`.
 
 ### Phase 6: Optional Extended Backends
 
 - video ingestion and frame sampling pipeline
 - richer persistent asset handling if we ever want reusable attachments
+
+## Follow-Up Work
+
+- polish and harden the existing multimodal `responses` path where needed
+- improve capability inference for edge-case model families
+- refine attachment UX and transcript rendering
+- keep video, if ever pursued, as frame sampling over the existing image path
 
 ## Open Questions
 
