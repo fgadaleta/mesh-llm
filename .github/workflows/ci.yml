@@ -284,6 +284,8 @@ jobs:
             forbid_contains: ""
             thinking_mode: ""
             expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"}]
           - name: qwen3-0.6b
             repo: mlx-community/Qwen3-0.6B-4bit
             template_source: tokenizer_config.json
@@ -293,6 +295,8 @@ jobs:
             forbid_contains: ""
             thinking_mode: tagged
             expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: qwen3-josie-0.6b
             repo: mlx-community/JOSIE-IT1-Qwen3-0.6B-4bit
             template_source: chat_template.jinja
@@ -302,6 +306,8 @@ jobs:
             forbid_contains: ""
             thinking_mode: multiline
             expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: llama-3.2-1b
             repo: mlx-community/Llama-3.2-1B-Instruct-4bit
             template_source: tokenizer_config.json
@@ -311,6 +317,8 @@ jobs:
             forbid_contains: ""
             thinking_mode: ""
             expect_exact: ""
+            prompt_suite_json: >-
+              [{"label":"exact-color","prompt":"Reply with exactly: blue","expect_contains":"blue","forbid_contains":"{"}]
           - name: gemma-3-1b
             repo: mlx-community/gemma-3-1b-it-qat-4bit
             template_source: ""
@@ -320,6 +328,8 @@ jobs:
             forbid_contains: ""
             thinking_mode: ""
             expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"}]
           - name: gemma-2-2b
             repo: mlx-community/gemma-2-2b-it-4bit
             template_source: tokenizer_config.json
@@ -329,6 +339,8 @@ jobs:
             forbid_contains: "{"
             thinking_mode: ""
             expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"}]
           - name: glm-4-9b
             repo: mlx-community/GLM-4-9B-0414-4bit
             template_source: tokenizer_config.json
@@ -338,6 +350,8 @@ jobs:
             forbid_contains: "{"
             thinking_mode: ""
             expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"}]
           - name: gemma-4-e4b
             repo: unsloth/gemma-4-E4B-it-UD-MLX-4bit
             template_source: chat_template.jinja
@@ -347,6 +361,8 @@ jobs:
             forbid_contains: "{"
             thinking_mode: ""
             expect_exact: Blue
+            prompt_suite_json: >-
+              [{"label":"repeat-blue","prompt":"Say the word blue.","expect_exact":"Blue"}]
           - name: lfm2-350m
             repo: mlx-community/LFM2-350M-4bit
             template_source: chat_template.jinja
@@ -356,6 +372,8 @@ jobs:
             forbid_contains: "{"
             thinking_mode: ""
             expect_exact: blue
+            prompt_suite_json: >-
+              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"}]
     steps:
       - uses: actions/checkout@v5
 
@@ -386,7 +404,8 @@ jobs:
             "${{ matrix.expect_contains }}" \
             "${{ matrix.forbid_contains }}" \
             "${{ matrix.thinking_mode }}" \
-            "${{ matrix.expect_exact }}"
+            "${{ matrix.expect_exact }}" \
+            '${{ matrix.prompt_suite_json }}'
 
       - name: Show sccache stats
         if: always()

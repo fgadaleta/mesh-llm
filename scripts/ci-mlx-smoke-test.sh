@@ -3,7 +3,7 @@
 # run one inference request, verify template selection, then shut down.
 #
 # Usage:
-#   scripts/ci-mlx-smoke-test.sh <mesh-llm-binary> <mlx-model-dir-or-repo> [expected-template-source] [prompt] [expect-contains] [forbid-contains] [thinking-mode] [expect-exact]
+#   scripts/ci-mlx-smoke-test.sh <mesh-llm-binary> <mlx-model-dir-or-repo> [expected-template-source] [prompt] [expect-contains] [forbid-contains] [thinking-mode] [expect-exact] [prompt-suite-json]
 
 set -euo pipefail
 
@@ -15,6 +15,7 @@ EXPECT_CONTAINS="${5:-}"
 FORBID_CONTAINS="${6:-}"
 THINKING_MODE="${7:-}"
 EXPECT_EXACT="${8:-}"
+PROMPT_SUITE_JSON="${9:-}"
 pick_free_port() {
     python3 - <<'PY'
 import socket
@@ -123,8 +124,17 @@ if [ -n "$EXPECTED_TEMPLATE_SOURCE" ]; then
     echo "✅ Template source matched: $EXPECTED_TEMPLATE_SOURCE"
 fi
 
-echo "Testing /v1/chat/completions..."
-CURL_BODY=$(python3 - "$PROMPT_TEXT" <<'PY'
+run_chat_case() {
+    local prompt_text="$1"
+    local expect_contains="$2"
+    local forbid_contains="$3"
+    local thinking_mode="$4"
+    local expect_exact="$5"
+    local case_label="$6"
+
+    echo "Testing /v1/chat/completions ($case_label)..."
+    local curl_body
+    curl_body=$(python3 - "$prompt_text" <<'PY'
 import json, sys
 prompt = sys.argv[1]
 print(json.dumps({
@@ -136,66 +146,71 @@ print(json.dumps({
 }))
 PY
 )
-if ! RESPONSE=$(curl -sf "http://localhost:${API_PORT}/v1/chat/completions" \
-    -H "Content-Type: application/json" \
-    -d "$CURL_BODY" 2>&1); then
-    echo "❌ Inference request failed"
-    echo "$RESPONSE"
-    echo "--- Log tail ---"
-    tail -80 "$LOG" || true
-    exit 1
-fi
-
-CONTENT=$(echo "$RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0]['message']['content'])" 2>/dev/null || echo "")
-if [ -z "$CONTENT" ]; then
-    echo "❌ Empty response from inference"
-    echo "Raw response: $RESPONSE"
-    exit 1
-fi
-
-if echo "$CONTENT" | grep -F "<think>" >/dev/null 2>&1; then
-    echo "❌ Unexpected reasoning output with enable_thinking=false"
-    echo "Content: $CONTENT"
-    exit 1
-fi
-
-if [ -n "$EXPECT_CONTAINS" ] && ! echo "$CONTENT" | grep -F "$EXPECT_CONTAINS" >/dev/null 2>&1; then
-    echo "❌ Response did not contain expected text: $EXPECT_CONTAINS"
-    echo "Content: $CONTENT"
-    exit 1
-fi
-
-if [ -n "$EXPECT_EXACT" ]; then
-    NORMALIZED_CONTENT=$(printf '%s' "$CONTENT" | python3 -c "import sys; print(sys.stdin.read().strip())")
-    NORMALIZED_EXPECTED=$(printf '%s' "$EXPECT_EXACT" | python3 -c "import sys; print(sys.stdin.read().strip())")
-    if [ "$NORMALIZED_CONTENT" != "$NORMALIZED_EXPECTED" ]; then
-        echo "❌ Response did not exactly match expected text"
-        echo "Expected: $NORMALIZED_EXPECTED"
-        echo "Content:  $NORMALIZED_CONTENT"
+    local response
+    if ! response=$(curl -sf "http://localhost:${API_PORT}/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "$curl_body" 2>&1); then
+        echo "❌ Inference request failed"
+        echo "$response"
+        echo "--- Log tail ---"
+        tail -80 "$LOG" || true
         exit 1
     fi
-fi
 
-if [ -n "$FORBID_CONTAINS" ] && echo "$CONTENT" | grep -F "$FORBID_CONTAINS" >/dev/null 2>&1; then
-    echo "❌ Response contained forbidden text: $FORBID_CONTAINS"
-    echo "Content: $CONTENT"
-    exit 1
-fi
+    local content
+    content=$(echo "$response" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0]['message']['content'])" 2>/dev/null || echo "")
+    if [ -z "$content" ]; then
+        echo "❌ Empty response from inference"
+        echo "Raw response: $response"
+        exit 1
+    fi
 
-FINISH_REASON=$(echo "$RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0].get('finish_reason',''))" 2>/dev/null || echo "")
-if [ -z "$FINISH_REASON" ]; then
-    echo "❌ Missing finish_reason in response"
-    echo "Raw response: $RESPONSE"
-    exit 1
-fi
+    if echo "$content" | grep -F "<think>" >/dev/null 2>&1; then
+        echo "❌ Unexpected reasoning output with enable_thinking=false"
+        echo "Content: $content"
+        exit 1
+    fi
 
-echo "✅ Inference response: $CONTENT"
+    if [ -n "$expect_contains" ] && ! echo "$content" | grep -F "$expect_contains" >/dev/null 2>&1; then
+        echo "❌ Response did not contain expected text: $expect_contains"
+        echo "Content: $content"
+        exit 1
+    fi
 
-if [ -n "$THINKING_MODE" ]; then
-    echo "Testing explicit reasoning output..."
-    THINKING_RESPONSE=$(curl -sf "http://localhost:${API_PORT}/v1/chat/completions" \
-        -H "Content-Type: application/json" \
-        -d "$(python3 - "$PROMPT_TEXT" <<'PY'
+    if [ -n "$expect_exact" ]; then
+        local normalized_content normalized_expected
+        normalized_content=$(printf '%s' "$content" | python3 -c "import sys; print(sys.stdin.read().strip())")
+        normalized_expected=$(printf '%s' "$expect_exact" | python3 -c "import sys; print(sys.stdin.read().strip())")
+        if [ "$normalized_content" != "$normalized_expected" ]; then
+            echo "❌ Response did not exactly match expected text"
+            echo "Expected: $normalized_expected"
+            echo "Content:  $normalized_content"
+            exit 1
+        fi
+    fi
+
+    if [ -n "$forbid_contains" ] && echo "$content" | grep -F "$forbid_contains" >/dev/null 2>&1; then
+        echo "❌ Response contained forbidden text: $forbid_contains"
+        echo "Content: $content"
+        exit 1
+    fi
+
+    local finish_reason
+    finish_reason=$(echo "$response" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0].get('finish_reason',''))" 2>/dev/null || echo "")
+    if [ -z "$finish_reason" ]; then
+        echo "❌ Missing finish_reason in response"
+        echo "Raw response: $response"
+        exit 1
+    fi
+
+    echo "✅ Inference response: $content"
+
+    if [ -n "$thinking_mode" ]; then
+        echo "Testing explicit reasoning output ($case_label)..."
+        local thinking_response thinking_content
+        thinking_response=$(curl -sf "http://localhost:${API_PORT}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d "$(python3 - "$prompt_text" <<'PY'
 import json, sys
 prompt = sys.argv[1]
 print(json.dumps({
@@ -208,38 +223,60 @@ print(json.dumps({
 PY
 )" 2>&1)
 
-    THINKING_CONTENT=$(echo "$THINKING_RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0]['message']['content'])" 2>/dev/null || echo "")
-    if [ -z "$THINKING_CONTENT" ]; then
-        echo "❌ Empty response from explicit reasoning request"
-        echo "Raw response: $THINKING_RESPONSE"
-        exit 1
-    fi
-    case "$THINKING_MODE" in
-        tagged)
-            if ! echo "$THINKING_CONTENT" | grep -F "<think>" >/dev/null 2>&1; then
-                echo "❌ Explicit reasoning response did not contain <think> tags"
-                echo "Content: $THINKING_CONTENT"
-                exit 1
-            fi
-            ;;
-        multiline)
-            if [ "$THINKING_CONTENT" = "$CONTENT" ]; then
-                echo "❌ Explicit reasoning response matched non-thinking response"
-                echo "Content: $THINKING_CONTENT"
-                exit 1
-            fi
-            if ! printf '%s' "$THINKING_CONTENT" | python3 -c "import sys; s=sys.stdin.read(); raise SystemExit(0 if '\n' in s else 1)"; then
-                echo "❌ Explicit reasoning response was not multiline"
-                echo "Content: $THINKING_CONTENT"
-                exit 1
-            fi
-            ;;
-        *)
-            echo "❌ Unknown thinking mode: $THINKING_MODE"
+        thinking_content=$(echo "$thinking_response" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0]['message']['content'])" 2>/dev/null || echo "")
+        if [ -z "$thinking_content" ]; then
+            echo "❌ Empty response from explicit reasoning request"
+            echo "Raw response: $thinking_response"
             exit 1
-            ;;
-    esac
-    echo "✅ Explicit reasoning response: $THINKING_CONTENT"
+        fi
+        case "$thinking_mode" in
+            tagged)
+                if ! echo "$thinking_content" | grep -F "<think>" >/dev/null 2>&1; then
+                    echo "❌ Explicit reasoning response did not contain <think> tags"
+                    echo "Content: $thinking_content"
+                    exit 1
+                fi
+                ;;
+            multiline)
+                if [ "$thinking_content" = "$content" ]; then
+                    echo "❌ Explicit reasoning response matched non-thinking response"
+                    echo "Content: $thinking_content"
+                    exit 1
+                fi
+                if ! printf '%s' "$thinking_content" | python3 -c "import sys; s=sys.stdin.read(); raise SystemExit(0 if '\n' in s else 1)"; then
+                    echo "❌ Explicit reasoning response was not multiline"
+                    echo "Content: $thinking_content"
+                    exit 1
+                fi
+                ;;
+            *)
+                echo "❌ Unknown thinking mode: $thinking_mode"
+                exit 1
+                ;;
+        esac
+        echo "✅ Explicit reasoning response: $thinking_content"
+    fi
+}
+
+run_chat_case "$PROMPT_TEXT" "$EXPECT_CONTAINS" "$FORBID_CONTAINS" "$THINKING_MODE" "$EXPECT_EXACT" "primary"
+
+if [ -n "$PROMPT_SUITE_JSON" ]; then
+    echo "Running extra prompt suite..."
+    python3 - "$PROMPT_SUITE_JSON" <<'PY' | while IFS=$'\t' read -r label prompt expect_contains forbid_contains thinking_mode expect_exact; do
+import json, sys
+suite = json.loads(sys.argv[1])
+for index, case in enumerate(suite, start=1):
+    print("\t".join([
+        str(case.get("label", f"case-{index}")),
+        str(case.get("prompt", "")),
+        str(case.get("expect_contains", "")),
+        str(case.get("forbid_contains", "")),
+        str(case.get("thinking_mode", "")),
+        str(case.get("expect_exact", "")),
+    ]))
+PY
+        run_chat_case "$prompt" "$expect_contains" "$forbid_contains" "$thinking_mode" "$expect_exact" "$label"
+    done
 fi
 
 echo "Testing /v1/models..."
