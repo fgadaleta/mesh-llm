@@ -241,7 +241,13 @@ pub async fn run_model_download(
     preference: ResolveFormatPreference,
     include_draft: bool,
 ) -> Result<()> {
-    let path = download_exact_ref(model_ref, preference, "mesh-llm models download").await?;
+    let path = download_exact_ref(
+        model_ref,
+        preference,
+        "mesh-llm models download",
+        crate::models::MlxSelectionPolicy::AllowImplicit,
+    )
+    .await?;
     println!("✅ Downloaded model");
     println!("   {}", path.display());
 

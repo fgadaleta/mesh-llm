@@ -332,6 +332,17 @@ async fn resolve_model(
 
     // Already a local file
     if input.exists() {
+        #[cfg(target_os = "macos")]
+        if preference != ResolveFormatPreference::Mlx {
+            if let Some(dir) = crate::mlx::mlx_model_dir(input) {
+                if crate::mlx::is_mlx_model_dir(dir) {
+                    anyhow::bail!(
+                        "MLX model paths require explicit `--mlx` or `--mlx-file`.\nRetry with:\n  mesh-llm --model {} --mlx",
+                        input.display()
+                    );
+                }
+            }
+        }
         return Ok(input.to_path_buf());
     }
 
@@ -369,7 +380,13 @@ async fn resolve_model(
     }
 
     if s.contains('/') {
-        return models::download_exact_ref(&s, preference, "mesh-llm --model").await;
+        return models::download_exact_ref(
+            &s,
+            preference,
+            "mesh-llm --model",
+            models::MlxSelectionPolicy::RequireExplicitFlag,
+        )
+        .await;
     }
 
     anyhow::bail!("Model not found: {}", s);

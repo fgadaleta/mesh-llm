@@ -8,7 +8,7 @@ use super::sampling::{Sampler, SamplingParams, StopBuffer};
 use crate::inference::launch::{InferenceServerHandle, InferenceServerProcess};
 use anyhow::{Context, Result};
 use mlx_rs::Array;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Mutex};
@@ -171,6 +171,11 @@ pub async fn start_mlx_server(
     model_name: String,
     port: u16,
 ) -> Result<InferenceServerProcess> {
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        eprintln!("⚠️ MLX backend is experimental. Expect rough edges; prefer GGUF for the most mature path.");
+    });
+
     // Load model on a blocking thread (touches disk + GPU init)
     let dir = model_dir.to_path_buf();
     let model = tokio::task::spawn_blocking(move || MlxModel::load(&dir))
