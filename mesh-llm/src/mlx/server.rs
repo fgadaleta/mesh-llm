@@ -34,6 +34,7 @@ struct GenerationConfig {
     max_tokens: usize,
     sampling: SamplingParams,
     stop_sequences: Vec<String>,
+    response_policy: ResponsePolicy,
 }
 
 struct GenerationOutcome {
@@ -46,6 +47,118 @@ struct GenerationOutcome {
 enum StreamEvent {
     Text(String),
     Done(&'static str),
+}
+
+#[derive(Clone, Default)]
+struct ResponsePolicy {
+    strip_think_blocks: bool,
+}
+
+struct ResponseFilter {
+    policy: ResponsePolicy,
+    think: ThinkBlockFilter,
+}
+
+#[derive(Default)]
+struct ThinkBlockFilter {
+    inside_think: bool,
+    carry: String,
+}
+
+impl ResponseFilter {
+    fn new(policy: ResponsePolicy) -> Self {
+        Self {
+            policy,
+            think: ThinkBlockFilter::default(),
+        }
+    }
+
+    fn push(&mut self, text: &str) -> String {
+        if !self.policy.strip_think_blocks {
+            return text.to_string();
+        }
+        self.think.push(text)
+    }
+
+    fn finish(&mut self) -> String {
+        if !self.policy.strip_think_blocks {
+            return String::new();
+        }
+        self.think.finish()
+    }
+}
+
+impl ThinkBlockFilter {
+    fn push(&mut self, text: &str) -> String {
+        const START: &str = "<think>";
+        const END: &str = "</think>";
+
+        let mut input = std::mem::take(&mut self.carry);
+        input.push_str(text);
+        let mut out = String::new();
+
+        loop {
+            if self.inside_think {
+                if let Some(idx) = input.find(END) {
+                    input.drain(..idx + END.len());
+                    self.inside_think = false;
+                    continue;
+                }
+                let keep = partial_tag_suffix_len(&input, &[END]);
+                if keep > 0 {
+                    self.carry = input[input.len() - keep..].to_string();
+                }
+                return out;
+            }
+
+            let next_start = input.find(START);
+            let next_end = input.find(END);
+            match (next_start, next_end) {
+                (Some(start), Some(end)) if end < start => {
+                    out.push_str(&input[..end]);
+                    input.drain(..end + END.len());
+                }
+                (Some(start), _) => {
+                    out.push_str(&input[..start]);
+                    input.drain(..start + START.len());
+                    self.inside_think = true;
+                }
+                (None, Some(end)) => {
+                    out.push_str(&input[..end]);
+                    input.drain(..end + END.len());
+                }
+                (None, None) => {
+                    let keep = partial_tag_suffix_len(&input, &[START, END]);
+                    out.push_str(&input[..input.len() - keep]);
+                    if keep > 0 {
+                        self.carry = input[input.len() - keep..].to_string();
+                    }
+                    return out;
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        if self.inside_think {
+            self.inside_think = false;
+            self.carry.clear();
+            return String::new();
+        }
+        std::mem::take(&mut self.carry)
+    }
+}
+
+fn partial_tag_suffix_len(text: &str, tags: &[&str]) -> usize {
+    let mut best = 0;
+    for tag in tags {
+        for len in 1..tag.len() {
+            if text.ends_with(&tag[..len]) {
+                best = best.max(len);
+            }
+        }
+    }
+    best
 }
 
 /// Start the MLX inference server on the given port.
@@ -250,13 +363,18 @@ async fn handle_chat_completions(
         serde_json::from_slice(body).context("invalid JSON in chat completions request")?;
 
     let stream_mode = req["stream"].as_bool().unwrap_or(false);
-    let generation = parse_generation_config(&req);
-    let model_field = req["model"].as_str().unwrap_or("");
-
-    let prompt = {
+    let (generation, prompt) = {
         let state = state.lock().await;
-        render_chat_prompt_from_request(&state.model.prompt_template, &req)?
+        let generation = parse_generation_config(&req, &state.model);
+        let prompt_req = prepare_reasoning_request(
+            &req,
+            state.model.reasoning_family,
+            &generation.response_policy,
+        );
+        let prompt = render_chat_prompt_from_request(&state.model.prompt_template, &prompt_req)?;
+        (generation, prompt)
     };
+    let model_field = req["model"].as_str().unwrap_or("");
 
     if stream_mode {
         generate_streaming(stream, &prompt, generation, model_field, state).await
@@ -270,6 +388,67 @@ fn render_chat_prompt_from_request(
     req: &serde_json::Value,
 ) -> Result<String> {
     template.render_request(req)
+}
+
+fn prepare_reasoning_request(
+    req: &serde_json::Value,
+    reasoning_family: model::ReasoningFamily,
+    policy: &ResponsePolicy,
+) -> serde_json::Value {
+    if !policy.strip_think_blocks || reasoning_family == model::ReasoningFamily::None {
+        return req.clone();
+    }
+
+    const DIRECT_ANSWER_NUDGE: &str =
+        "Respond directly with the final answer. Do not include reasoning, analysis, or preamble unless the user explicitly asks for it.";
+
+    let mut patched = req.clone();
+    let Some(messages) = patched
+        .get_mut("messages")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return patched;
+    };
+
+    match messages.first_mut() {
+        Some(first)
+            if first
+                .get("role")
+                .and_then(|value| value.as_str())
+                .is_some_and(|role| role == "system") =>
+        {
+            if let Some(content) = first.get_mut("content") {
+                match content {
+                    serde_json::Value::String(text) => {
+                        if !text.contains(DIRECT_ANSWER_NUDGE) {
+                            if !text.is_empty() {
+                                text.push_str("\n\n");
+                            }
+                            text.push_str(DIRECT_ANSWER_NUDGE);
+                        }
+                    }
+                    serde_json::Value::Array(items) => {
+                        items.push(serde_json::json!({
+                            "type": "text",
+                            "text": DIRECT_ANSWER_NUDGE
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {
+            messages.insert(
+                0,
+                serde_json::json!({
+                    "role": "system",
+                    "content": DIRECT_ANSWER_NUDGE
+                }),
+            );
+        }
+    }
+
+    patched
 }
 
 /// Handle POST /v1/completions — raw text completion.
@@ -510,6 +689,7 @@ fn run_inference(
     let (mut caches, suffix) = setup_caches_with_reuse(state, &prompt_tokens);
     let mut sampler = Sampler::new(generation.sampling.clone());
     let mut stop_buffer = StopBuffer::new(generation.stop_sequences.clone());
+    let mut response_filter = ResponseFilter::new(generation.response_policy.clone());
 
     if generation.max_tokens == 0 {
         if !suffix.is_empty() {
@@ -564,7 +744,7 @@ fn run_inference(
             .map_err(|e| anyhow::anyhow!("tokenizer decode: {e}"))?
             .unwrap_or_default();
         let chunk = stop_buffer.push(&piece);
-        text.push_str(&chunk.emit);
+        text.push_str(&response_filter.push(&chunk.emit));
         if chunk.matched {
             finish_reason = "stop";
             break;
@@ -574,7 +754,8 @@ fn run_inference(
         next_token = sampler.sample_next_token(&logits)?;
     }
 
-    text.push_str(&stop_buffer.finish());
+    text.push_str(&response_filter.push(&stop_buffer.finish()));
+    text.push_str(&response_filter.finish());
 
     // Save prompt cache for next request (prompt only, not generated tokens)
     save_prompt_cache(state, prompt_tokens, caches);
@@ -607,6 +788,7 @@ fn run_inference_streaming(
     let (mut caches, suffix) = setup_caches_with_reuse(state, &prompt_tokens);
     let mut sampler = Sampler::new(generation.sampling.clone());
     let mut stop_buffer = StopBuffer::new(generation.stop_sequences.clone());
+    let mut response_filter = ResponseFilter::new(generation.response_policy.clone());
 
     if generation.max_tokens == 0 {
         if !suffix.is_empty() {
@@ -646,8 +828,9 @@ fn run_inference_streaming(
             .map_err(|e| anyhow::anyhow!("tokenizer decode: {e}"))?
             .unwrap_or_default();
         let chunk = stop_buffer.push(&piece);
-        if !chunk.emit.is_empty() {
-            if tx.blocking_send(StreamEvent::Text(chunk.emit)).is_err() {
+        let filtered = response_filter.push(&chunk.emit);
+        if !filtered.is_empty() {
+            if tx.blocking_send(StreamEvent::Text(filtered)).is_err() {
                 break; // client disconnected
             }
         }
@@ -661,7 +844,8 @@ fn run_inference_streaming(
         next_token = sampler.sample_next_token(&logits)?;
     }
 
-    let tail = stop_buffer.finish();
+    let mut tail = response_filter.push(&stop_buffer.finish());
+    tail.push_str(&response_filter.finish());
     if !tail.is_empty() {
         let _ = tx.blocking_send(StreamEvent::Text(tail));
     }
@@ -686,6 +870,7 @@ fn run_inference_cacheless(
     let prompt_len = tokens.len();
     let mut sampler = Sampler::new(generation.sampling.clone());
     let mut stop_buffer = StopBuffer::new(generation.stop_sequences.clone());
+    let mut response_filter = ResponseFilter::new(generation.response_policy.clone());
 
     if generation.max_tokens == 0 {
         if !tokens.is_empty() {
@@ -720,14 +905,15 @@ fn run_inference_cacheless(
             .map_err(|e| anyhow::anyhow!("tokenizer decode: {e}"))?
             .unwrap_or_default();
         let chunk = stop_buffer.push(&piece);
-        text.push_str(&chunk.emit);
+        text.push_str(&response_filter.push(&chunk.emit));
         if chunk.matched {
             finish_reason = "stop";
             break;
         }
     }
 
-    text.push_str(&stop_buffer.finish());
+    text.push_str(&response_filter.push(&stop_buffer.finish()));
+    text.push_str(&response_filter.finish());
 
     Ok(GenerationOutcome {
         text,
@@ -751,6 +937,7 @@ fn run_inference_streaming_cacheless(
     let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
     let mut sampler = Sampler::new(generation.sampling.clone());
     let mut stop_buffer = StopBuffer::new(generation.stop_sequences.clone());
+    let mut response_filter = ResponseFilter::new(generation.response_policy.clone());
 
     if generation.max_tokens == 0 {
         if !tokens.is_empty() {
@@ -778,7 +965,8 @@ fn run_inference_streaming_cacheless(
             .map_err(|e| anyhow::anyhow!("tokenizer decode: {e}"))?
             .unwrap_or_default();
         let chunk = stop_buffer.push(&piece);
-        if !chunk.emit.is_empty() && tx.blocking_send(StreamEvent::Text(chunk.emit)).is_err() {
+        let filtered = response_filter.push(&chunk.emit);
+        if !filtered.is_empty() && tx.blocking_send(StreamEvent::Text(filtered)).is_err() {
             break;
         }
         if chunk.matched {
@@ -787,7 +975,8 @@ fn run_inference_streaming_cacheless(
         }
     }
 
-    let tail = stop_buffer.finish();
+    let mut tail = response_filter.push(&stop_buffer.finish());
+    tail.push_str(&response_filter.finish());
     if !tail.is_empty() {
         let _ = tx.blocking_send(StreamEvent::Text(tail));
     }
@@ -799,7 +988,11 @@ fn is_eos(token: u32, config: &model::ModelConfig) -> bool {
     config.eos_token_id.contains(&token)
 }
 
-fn parse_generation_config(req: &serde_json::Value) -> GenerationConfig {
+fn parse_generation_config(req: &serde_json::Value, model: &MlxModel) -> GenerationConfig {
+    let mut stop_sequences = default_stop_sequences(model);
+    stop_sequences.extend(parse_stop_sequences(req.get("stop")));
+    stop_sequences.sort();
+    stop_sequences.dedup();
     GenerationConfig {
         max_tokens: req["max_tokens"].as_u64().unwrap_or(2048) as usize,
         sampling: SamplingParams {
@@ -811,7 +1004,8 @@ fn parse_generation_config(req: &serde_json::Value) -> GenerationConfig {
                 .filter(|value| *value > 0),
             seed: req["seed"].as_u64(),
         },
-        stop_sequences: parse_stop_sequences(req.get("stop")),
+        stop_sequences,
+        response_policy: response_policy(req, model),
     }
 }
 
@@ -828,6 +1022,111 @@ fn parse_stop_sequences(stop: Option<&serde_json::Value>) -> Vec<String> {
     }
 }
 
+fn default_stop_sequences(model: &MlxModel) -> Vec<String> {
+    default_stop_sequences_for(
+        model.prompt_template.behavior().prompt_template.as_deref(),
+        model.reasoning_family,
+    )
+}
+
+fn default_stop_sequences_for(
+    prompt_template: Option<&str>,
+    reasoning_family: model::ReasoningFamily,
+) -> Vec<String> {
+    let mut stops = Vec::new();
+    match prompt_template {
+        Some("chatml") => {
+            stops.push("<|im_end|>".to_string());
+            stops.push("<|im_start|>".to_string());
+        }
+        Some("llama3") => {
+            stops.push("<|eot_id|>".to_string());
+        }
+        Some("gemma3") => {
+            stops.push("<end_of_turn>".to_string());
+        }
+        _ => {}
+    }
+    match reasoning_family {
+        model::ReasoningFamily::Glm => {
+            stops.push("<|user|>".to_string());
+            stops.push("<|assistant|>".to_string());
+            stops.push("<|system|>".to_string());
+        }
+        model::ReasoningFamily::Kimi => {
+            stops.push("<|im_end|>".to_string());
+        }
+        _ => {}
+    }
+    stops
+}
+
+fn response_policy(req: &serde_json::Value, model: &MlxModel) -> ResponsePolicy {
+    response_policy_for(req, model.reasoning_family)
+}
+
+fn response_policy_for(
+    req: &serde_json::Value,
+    reasoning_family: model::ReasoningFamily,
+) -> ResponsePolicy {
+    ResponsePolicy {
+        strip_think_blocks: reasoning_disabled(req, reasoning_family),
+    }
+}
+
+fn reasoning_disabled(req: &serde_json::Value, family: model::ReasoningFamily) -> bool {
+    match family {
+        model::ReasoningFamily::Qwen3 | model::ReasoningFamily::Glm => {
+            request_bool_kwarg(req, "enable_thinking").unwrap_or(false) == false
+        }
+        model::ReasoningFamily::Kimi => {
+            if let Some(value) = request_bool_kwarg(req, "thinking") {
+                !value
+            } else {
+                request_bool_kwarg(req, "enable_thinking").unwrap_or(false) == false
+            }
+        }
+        model::ReasoningFamily::Lfm2 => {
+            if let Some(value) = request_bool_kwarg(req, "keep_past_thinking") {
+                !value
+            } else {
+                request_bool_kwarg(req, "enable_thinking").unwrap_or(false) == false
+            }
+        }
+        model::ReasoningFamily::GptOss => {
+            if let Some(value) = request_bool_kwarg(req, "enable_thinking") {
+                !value
+            } else {
+                matches!(
+                    request_string_kwarg(req, "reasoning_effort").as_deref(),
+                    None | Some("low")
+                )
+            }
+        }
+        model::ReasoningFamily::None => false,
+    }
+}
+
+fn request_bool_kwarg(req: &serde_json::Value, key: &str) -> Option<bool> {
+    req.get(key).and_then(|value| value.as_bool()).or_else(|| {
+        req.get("chat_template_kwargs")
+            .and_then(|value| value.get(key))
+            .and_then(|value| value.as_bool())
+    })
+}
+
+fn request_string_kwarg(req: &serde_json::Value, key: &str) -> Option<String> {
+    req.get(key)
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            req.get("chat_template_kwargs")
+                .and_then(|value| value.get(key))
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +1137,158 @@ mod tests {
     use tokenizers::normalizers::Strip;
     use tokenizers::pre_tokenizers::byte_level::ByteLevel;
     use tokenizers::TokenizerBuilder;
+
+    #[test]
+    fn think_block_filter_strips_tagged_reasoning_across_chunks() {
+        let mut filter = ResponseFilter::new(ResponsePolicy {
+            strip_think_blocks: true,
+        });
+        assert_eq!(filter.push("<thi"), "");
+        assert_eq!(filter.push("nk>internal"), "");
+        assert_eq!(filter.push("</think>blue"), "blue");
+        assert_eq!(filter.finish(), "");
+    }
+
+    #[test]
+    fn qwen3_generation_config_adds_chatml_stops_and_disables_thinking_by_default() {
+        let stops = default_stop_sequences_for(Some("chatml"), model::ReasoningFamily::Qwen3);
+        assert!(stops.contains(&"<|im_end|>".to_string()));
+        assert!(stops.contains(&"<|im_start|>".to_string()));
+        let policy = response_policy_for(&serde_json::json!({}), model::ReasoningFamily::Qwen3);
+        assert!(policy.strip_think_blocks);
+    }
+
+    #[test]
+    fn qwen3_generation_config_honors_explicit_enable_thinking() {
+        let policy = response_policy_for(
+            &serde_json::json!({"enable_thinking": true}),
+            model::ReasoningFamily::Qwen3,
+        );
+        assert!(!policy.strip_think_blocks);
+    }
+
+    #[test]
+    fn kimi_generation_config_maps_default_to_think_filtering() {
+        let stops = default_stop_sequences_for(Some("hf_template"), model::ReasoningFamily::Kimi);
+        assert!(stops.contains(&"<|im_end|>".to_string()));
+        let policy = response_policy_for(&serde_json::json!({}), model::ReasoningFamily::Kimi);
+        assert!(policy.strip_think_blocks);
+    }
+
+    #[test]
+    fn glm_generation_config_defaults_to_no_thinking_and_glm_stops() {
+        let stops = default_stop_sequences_for(Some("hf_template"), model::ReasoningFamily::Glm);
+        assert!(stops.contains(&"<|user|>".to_string()));
+        assert!(stops.contains(&"<|assistant|>".to_string()));
+        let policy = response_policy_for(&serde_json::json!({}), model::ReasoningFamily::Glm);
+        assert!(policy.strip_think_blocks);
+    }
+
+    #[test]
+    fn gpt_oss_generation_config_defaults_to_reasoning_suppression() {
+        let policy = response_policy_for(&serde_json::json!({}), model::ReasoningFamily::GptOss);
+        assert!(policy.strip_think_blocks);
+        let explicit = response_policy_for(
+            &serde_json::json!({"reasoning_effort":"medium"}),
+            model::ReasoningFamily::GptOss,
+        );
+        assert!(!explicit.strip_think_blocks);
+    }
+
+    #[test]
+    fn lfm2_generation_config_defaults_to_strip_past_thinking() {
+        let policy = response_policy_for(&serde_json::json!({}), model::ReasoningFamily::Lfm2);
+        assert!(policy.strip_think_blocks);
+        let explicit = response_policy_for(
+            &serde_json::json!({"keep_past_thinking":true}),
+            model::ReasoningFamily::Lfm2,
+        );
+        assert!(!explicit.strip_think_blocks);
+    }
+
+    #[test]
+    fn prepare_reasoning_request_injects_system_nudge_when_disabled() {
+        let req = serde_json::json!({
+            "messages": [{"role": "user", "content": "Reply with exactly: blue"}]
+        });
+        let patched = prepare_reasoning_request(
+            &req,
+            model::ReasoningFamily::Qwen3,
+            &ResponsePolicy {
+                strip_think_blocks: true,
+            },
+        );
+        let messages = patched["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Respond directly with the final answer."));
+    }
+
+    #[test]
+    fn prepare_reasoning_request_leaves_request_unchanged_when_reasoning_allowed() {
+        let req = serde_json::json!({
+            "messages": [{"role": "user", "content": "Reply with exactly: blue"}]
+        });
+        let patched = prepare_reasoning_request(
+            &req,
+            model::ReasoningFamily::Qwen3,
+            &ResponsePolicy {
+                strip_think_blocks: false,
+            },
+        );
+        assert_eq!(patched, req);
+    }
+
+    #[test]
+    fn prepare_reasoning_request_injects_nudge_for_all_reasoning_families() {
+        let req = serde_json::json!({
+            "messages": [{"role": "user", "content": "Reply with exactly: blue"}]
+        });
+        for family in [
+            model::ReasoningFamily::Qwen3,
+            model::ReasoningFamily::Glm,
+            model::ReasoningFamily::Kimi,
+            model::ReasoningFamily::GptOss,
+            model::ReasoningFamily::Lfm2,
+        ] {
+            let patched = prepare_reasoning_request(
+                &req,
+                family,
+                &ResponsePolicy {
+                    strip_think_blocks: true,
+                },
+            );
+            let messages = patched["messages"].as_array().unwrap();
+            assert_eq!(messages[0]["role"], "system");
+            assert!(messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Respond directly with the final answer."));
+        }
+    }
+
+    #[test]
+    fn prepare_reasoning_request_appends_nudge_to_existing_system_message() {
+        let req = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You are terse."},
+                {"role": "user", "content": "Reply with exactly: blue"}
+            ]
+        });
+        let patched = prepare_reasoning_request(
+            &req,
+            model::ReasoningFamily::Qwen3,
+            &ResponsePolicy {
+                strip_think_blocks: true,
+            },
+        );
+        let messages = patched["messages"].as_array().unwrap();
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("You are terse."));
+        assert!(system.contains("Respond directly with the final answer."));
+    }
 
     #[test]
     fn mlx_chat_smoke_renders_llama3_prompt_from_hf_request_shape() {

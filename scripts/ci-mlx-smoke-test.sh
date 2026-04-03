@@ -3,7 +3,7 @@
 # run one inference request, verify template selection, then shut down.
 #
 # Usage:
-#   scripts/ci-mlx-smoke-test.sh <mesh-llm-binary> <mlx-model-dir-or-repo> [expected-template-source] [prompt] [expect-contains] [forbid-contains] [thinking-mode]
+#   scripts/ci-mlx-smoke-test.sh <mesh-llm-binary> <mlx-model-dir-or-repo> [expected-template-source] [prompt] [expect-contains] [forbid-contains] [thinking-mode] [expect-exact]
 
 set -euo pipefail
 
@@ -14,6 +14,7 @@ PROMPT_TEXT="${4:-What is 2+2? Reply with one word only.}"
 EXPECT_CONTAINS="${5:-}"
 FORBID_CONTAINS="${6:-}"
 THINKING_MODE="${7:-}"
+EXPECT_EXACT="${8:-}"
 pick_free_port() {
     python3 - <<'PY'
 import socket
@@ -162,6 +163,17 @@ if [ -n "$EXPECT_CONTAINS" ] && ! echo "$CONTENT" | grep -F "$EXPECT_CONTAINS" >
     echo "❌ Response did not contain expected text: $EXPECT_CONTAINS"
     echo "Content: $CONTENT"
     exit 1
+fi
+
+if [ -n "$EXPECT_EXACT" ]; then
+    NORMALIZED_CONTENT=$(printf '%s' "$CONTENT" | python3 -c "import sys; print(sys.stdin.read().strip())")
+    NORMALIZED_EXPECTED=$(printf '%s' "$EXPECT_EXACT" | python3 -c "import sys; print(sys.stdin.read().strip())")
+    if [ "$NORMALIZED_CONTENT" != "$NORMALIZED_EXPECTED" ]; then
+        echo "❌ Response did not exactly match expected text"
+        echo "Expected: $NORMALIZED_EXPECTED"
+        echo "Content:  $NORMALIZED_CONTENT"
+        exit 1
+    fi
 fi
 
 if [ -n "$FORBID_CONTAINS" ] && echo "$CONTENT" | grep -F "$FORBID_CONTAINS" >/dev/null 2>&1; then

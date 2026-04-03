@@ -150,6 +150,16 @@ pub struct LinearAttnConfig {
     pub short_conv_kernel_size: Option<i32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningFamily {
+    None,
+    Qwen3,
+    Glm,
+    Kimi,
+    GptOss,
+    Lfm2,
+}
+
 #[derive(Debug, serde::Deserialize, Clone)]
 pub struct RopeParameters {
     #[serde(default)]
@@ -1823,6 +1833,7 @@ pub struct MlxModel {
     pub config: ModelConfig,
     pub tokenizer: tokenizers::Tokenizer,
     pub prompt_template: crate::mlx::template::PromptTemplate,
+    pub reasoning_family: ReasoningFamily,
     tokenwise_prefill: bool,
     cacheless_generation: bool,
 }
@@ -2820,6 +2831,7 @@ impl MlxModel {
             config,
             tokenizer,
             prompt_template,
+            reasoning_family: reasoning_family(&config_json),
             tokenwise_prefill: arch.is_gemma2() || arch.is_gemma4(),
             cacheless_generation: arch.is_gemma2()
                 || arch.is_gpt_oss()
@@ -3094,6 +3106,45 @@ fn model_architecture(config: &Value) -> ModelArchitecture {
     } else {
         ModelArchitecture::LlamaLike
     }
+}
+
+fn reasoning_family(config: &Value) -> ReasoningFamily {
+    let model_type = config
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|value| value.get("model_type"))
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let architectures = config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    if model_type == "qwen3" || architectures.iter().any(|value| value.contains("qwen3")) {
+        return ReasoningFamily::Qwen3;
+    }
+    if model_type.starts_with("glm") || architectures.iter().any(|value| value.contains("glm")) {
+        return ReasoningFamily::Glm;
+    }
+    if model_type == "gpt_oss" || architectures.iter().any(|value| value.contains("gptoss")) {
+        return ReasoningFamily::GptOss;
+    }
+    if model_type.starts_with("lfm2") || architectures.iter().any(|value| value.contains("lfm2")) {
+        return ReasoningFamily::Lfm2;
+    }
+    if model_type.contains("kimi") || architectures.iter().any(|value| value.contains("kimi")) {
+        return ReasoningFamily::Kimi;
+    }
+    ReasoningFamily::None
 }
 
 fn effective_text_config_json(config: &Value) -> Value {
