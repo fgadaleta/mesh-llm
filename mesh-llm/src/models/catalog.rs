@@ -245,6 +245,7 @@ fn mlx_sidecar_assets(asset: &HfAsset) -> Vec<(bool, HfAsset)> {
     [
         (true, "tokenizer.json"),
         (false, "tokenizer_config.json"),
+        (false, "chat_template.jinja"),
         (false, "chat_template.json"),
     ]
     .into_iter()

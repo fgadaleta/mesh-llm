@@ -37,7 +37,7 @@ hf-hub = { git = "https://github.com/i386/hf-hub.git", rev = "3afec18e119569d210
 [target.'cfg(target_os = "macos")'.dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 mlx-rs = { version = "0.25", features = ["safetensors"] }
-minijinja = { version = "2", features = ["json"] }
+minijinja = { version = "2", features = ["json", "loop_controls"] }
 tokenizers = "0.21"
 
 [dev-dependencies]

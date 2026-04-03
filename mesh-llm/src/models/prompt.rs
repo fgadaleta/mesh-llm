@@ -31,10 +31,17 @@ fn read_config_json(dir: &Path) -> Option<Value> {
 }
 
 fn read_template_text(dir: &Path) -> Option<String> {
-    for filename in ["chat_template.json", "tokenizer_config.json"] {
+    for filename in [
+        "chat_template.jinja",
+        "chat_template.json",
+        "tokenizer_config.json",
+    ] {
         let Ok(text) = std::fs::read_to_string(dir.join(filename)) else {
             continue;
         };
+        if filename.ends_with(".jinja") {
+            return Some(text);
+        }
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };

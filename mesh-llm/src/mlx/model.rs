@@ -587,6 +587,7 @@ fn normalize_model_dir(path: &Path) -> Option<&Path> {
     let name = path.file_name()?.to_str()?;
     match name {
         "config.json"
+        | "chat_template.jinja"
         | "tokenizer.json"
         | "tokenizer_config.json"
         | "model.safetensors"
