@@ -1021,12 +1021,9 @@ pub async fn route_model_request(
         return false;
     }
 
-    let mut filtered_targets = targets.clone();
-    filtered_targets
-        .targets
-        .insert(model.to_string(), ordered_candidates.clone());
-    let selection = crate::network::affinity::select_model_target_for_request(
-        &filtered_targets,
+    let selection = crate::network::affinity::select_model_target_from_candidates(
+        targets,
+        &ordered_candidates,
         model,
         parsed_body,
         affinity,
