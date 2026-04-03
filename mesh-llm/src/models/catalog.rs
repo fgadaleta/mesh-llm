@@ -262,6 +262,10 @@ fn mlx_sidecar_assets(asset: &HfAsset) -> Vec<(bool, HfAsset)> {
     .collect()
 }
 
+fn is_optional_metadata(required: bool, _asset: &HfAsset) -> bool {
+    !required
+}
+
 fn parse_safetensors_index_shards(index: &serde_json::Value) -> Result<Vec<String>> {
     let weight_map = index["weight_map"]
         .as_object()
@@ -472,7 +476,7 @@ fn download_hf_assets_blocking(label: &str, assets: Vec<HfAsset>) -> Result<Vec<
                         }
                         path
                     }
-                    Err(_) if !required && asset.file == "config.json" => {
+                    Err(_) if is_optional_metadata(required, &asset) => {
                         continue;
                     }
                     Err(err) => {
@@ -1078,6 +1082,34 @@ mod tests {
         assert!(sidecars
             .iter()
             .any(|(required, asset)| !required && asset.file == "chat_template.json"));
+    }
+
+    #[test]
+    fn optional_metadata_detection_covers_mlx_sidecars() {
+        let optional_files = [
+            "config.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "chat_template.json",
+        ];
+        for file in optional_files {
+            let asset = HfAsset {
+                repo: "mlx-community/JOSIE-IT1-Qwen3-0.6B-4bit".to_string(),
+                revision: "main".to_string(),
+                file: file.to_string(),
+            };
+            assert!(
+                is_optional_metadata(false, &asset),
+                "{file} should be optional"
+            );
+        }
+
+        let required = HfAsset {
+            repo: "mlx-community/JOSIE-IT1-Qwen3-0.6B-4bit".to_string(),
+            revision: "main".to_string(),
+            file: "tokenizer.json".to_string(),
+        };
+        assert!(!is_optional_metadata(true, &required));
     }
 
     #[test]
