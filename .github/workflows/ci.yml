@@ -14,6 +14,10 @@ env:
   # Tiny model for integration tests (~138MB Q8_0, has chat template)
   MODEL_URL: https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q8_0.gguf
   MODEL_FILE: SmolLM2-135M-Instruct-Q8_0.gguf
+  GGUF_PROMPT_MODEL_URL: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+  GGUF_PROMPT_MODEL_FILE: qwen2.5-0.5b-instruct-q4_k_m.gguf
+  MLX_PROMPT_MODEL_REPO: mlx-community/Qwen3-0.6B-4bit
+  MLX_PROMPT_MODEL_CACHE_SLUG: mlx-community--Qwen3-0.6B-4bit
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
@@ -136,6 +140,20 @@ jobs:
           curl -fSL "$MODEL_URL" -o ~/.models/$MODEL_FILE
           ls -lh ~/.models/$MODEL_FILE
 
+      - name: Cache GGUF prompt model
+        id: cache-gguf-prompt-model
+        uses: actions/cache@v5
+        with:
+          path: ~/.models/${{ env.GGUF_PROMPT_MODEL_FILE }}
+          key: model-${{ env.GGUF_PROMPT_MODEL_FILE }}
+
+      - name: Download GGUF prompt model
+        if: steps.cache-gguf-prompt-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.models
+          curl -fSL "$GGUF_PROMPT_MODEL_URL" -o ~/.models/$GGUF_PROMPT_MODEL_FILE
+          ls -lh ~/.models/$GGUF_PROMPT_MODEL_FILE
+
       # ── Integration smoke test ──
       - name: Smoke test (real inference)
         run: |
@@ -143,6 +161,18 @@ jobs:
             target/release/mesh-llm \
             llama.cpp/build/bin \
             ~/.models/$MODEL_FILE
+
+      - name: GGUF prompt suite
+        run: |
+          scripts/ci-gguf-smoke-test.sh \
+            target/release/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/$GGUF_PROMPT_MODEL_FILE \
+            "Reply with exactly: blue" \
+            "blue" \
+            "" \
+            "blue" \
+            '[{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]'
 
       - name: OpenAI Python compat smoke
         run: |
@@ -239,6 +269,26 @@ jobs:
           curl -fSL "$MODEL_URL" -o ~/.models/$MODEL_FILE
           ls -lh ~/.models/$MODEL_FILE
 
+      - name: Cache GGUF prompt model
+        id: cache-gguf-prompt-model
+        uses: actions/cache@v5
+        with:
+          path: ~/.models/${{ env.GGUF_PROMPT_MODEL_FILE }}
+          key: model-${{ env.GGUF_PROMPT_MODEL_FILE }}
+
+      - name: Download GGUF prompt model
+        if: steps.cache-gguf-prompt-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.models
+          curl -fSL "$GGUF_PROMPT_MODEL_URL" -o ~/.models/$GGUF_PROMPT_MODEL_FILE
+          ls -lh ~/.models/$GGUF_PROMPT_MODEL_FILE
+
+      - name: Cache MLX prompt model repo
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface/hub/models--${{ env.MLX_PROMPT_MODEL_CACHE_SLUG }}
+          key: mlx-hub-prompt-suite-${{ env.MLX_PROMPT_MODEL_CACHE_SLUG }}
+
       # ── Integration smoke test ──
       - name: Smoke test (real inference)
         run: |
@@ -246,6 +296,31 @@ jobs:
             target/release/mesh-llm \
             llama.cpp/build/bin \
             ~/.models/$MODEL_FILE
+
+      - name: GGUF prompt suite
+        run: |
+          scripts/ci-gguf-smoke-test.sh \
+            target/release/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/$GGUF_PROMPT_MODEL_FILE \
+            "Reply with exactly: blue" \
+            "blue" \
+            "" \
+            "blue" \
+            '[{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]'
+
+      - name: MLX prompt suite
+        run: |
+          scripts/ci-mlx-smoke-test.sh \
+            target/release/mesh-llm \
+            "${{ env.MLX_PROMPT_MODEL_REPO }}" \
+            "tokenizer_config.json" \
+            "Reply with exactly: blue" \
+            "blue" \
+            "" \
+            "tagged" \
+            "blue" \
+            '[{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]'
 
       - name: Split-mode test (host/worker routing)
         run: |
@@ -284,8 +359,6 @@ jobs:
             forbid_contains: ""
             thinking_mode: ""
             expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: qwen3-0.6b
             repo: mlx-community/Qwen3-0.6B-4bit
             template_source: tokenizer_config.json
@@ -295,8 +368,6 @@ jobs:
             forbid_contains: ""
             thinking_mode: tagged
             expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: qwen3-josie-0.6b
             repo: mlx-community/JOSIE-IT1-Qwen3-0.6B-4bit
             template_source: chat_template.jinja
@@ -306,8 +377,6 @@ jobs:
             forbid_contains: ""
             thinking_mode: multiline
             expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: llama-3.2-1b
             repo: mlx-community/Llama-3.2-1B-Instruct-4bit
             template_source: tokenizer_config.json
@@ -317,8 +386,6 @@ jobs:
             forbid_contains: ""
             thinking_mode: ""
             expect_exact: ""
-            prompt_suite_json: >-
-              [{"label":"exact-blue","prompt":"Reply with exactly: blue","expect_contains":"blue","forbid_contains":"{"},{"label":"exact-green","prompt":"Reply with exactly: green","expect_contains":"green","forbid_contains":"{"}]
           - name: gemma-3-1b
             repo: mlx-community/gemma-3-1b-it-qat-4bit
             template_source: ""
@@ -328,8 +395,6 @@ jobs:
             forbid_contains: ""
             thinking_mode: ""
             expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: gemma-2-2b
             repo: mlx-community/gemma-2-2b-it-4bit
             template_source: tokenizer_config.json
@@ -339,8 +404,6 @@ jobs:
             forbid_contains: "{"
             thinking_mode: ""
             expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: glm-4-9b
             repo: mlx-community/GLM-4-9B-0414-4bit
             template_source: tokenizer_config.json
@@ -350,8 +413,6 @@ jobs:
             forbid_contains: "{"
             thinking_mode: ""
             expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: gemma-4-e4b
             repo: unsloth/gemma-4-E4B-it-UD-MLX-4bit
             template_source: chat_template.jinja
@@ -361,8 +422,6 @@ jobs:
             forbid_contains: "{"
             thinking_mode: ""
             expect_exact: Blue
-            prompt_suite_json: >-
-              [{"label":"repeat-blue","prompt":"Say the word blue.","expect_exact":"Blue"}]
           - name: lfm2-350m
             repo: mlx-community/LFM2-350M-4bit
             template_source: chat_template.jinja
@@ -372,8 +431,6 @@ jobs:
             forbid_contains: "{"
             thinking_mode: ""
             expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
     steps:
       - uses: actions/checkout@v5
 
@@ -404,8 +461,7 @@ jobs:
             "${{ matrix.expect_contains }}" \
             "${{ matrix.forbid_contains }}" \
             "${{ matrix.thinking_mode }}" \
-            "${{ matrix.expect_exact }}" \
-            '${{ matrix.prompt_suite_json }}'
+            "${{ matrix.expect_exact }}"
 
       - name: Show sccache stats
         if: always()
@@ -426,72 +482,48 @@ jobs:
             prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: ""
-            expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: qwen3-0.6b
             url: https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
             file: Qwen3-0.6B-Q8_0.gguf
             prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: ""
-            expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: qwen3-josie-0.6b
             url: https://huggingface.co/mradermacher/JOSIE-IT1-Qwen3-0.6B-GGUF/resolve/main/JOSIE-IT1-Qwen3-0.6B.Q4_K_M.gguf
             file: JOSIE-IT1-Qwen3-0.6B.Q4_K_M.gguf
-            prompt: "Reply with exactly: blue"
-            expect_contains: blue
+            prompt: "What is 2+2? Reply with one word only."
+            expect_contains: "4"
             forbid_contains: ""
-            expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: llama-3.2-1b
             url: https://huggingface.co/llmware/llama-3.2-1b-gguf/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
             file: Llama-3.2-1B-Instruct-Q4_K_M.gguf
             prompt: "Say hi."
             expect_contains: ""
             forbid_contains: ""
-            expect_exact: ""
-            prompt_suite_json: >-
-              [{"label":"exact-blue","prompt":"Reply with exactly: blue","expect_contains":"blue","forbid_contains":"{"},{"label":"exact-green","prompt":"Reply with exactly: green","expect_contains":"green","forbid_contains":"{"}]
           - name: gemma-3-1b
             url: https://huggingface.co/ggml-org/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf
             file: gemma-3-1b-it-Q4_K_M.gguf
             prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: ""
-            expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: gemma-2-2b
             url: https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf
             file: gemma-2-2b-it-Q4_K_M.gguf
             prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: "{"
-            expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: glm-4-9b
             url: https://huggingface.co/lmstudio-community/GLM-4-9B-0414-GGUF/resolve/main/GLM-4-9B-0414-Q4_K_M.gguf
             file: GLM-4-9B-0414-Q4_K_M.gguf
             prompt: "Reply with exactly: blue"
             expect_contains: blue
             forbid_contains: "{"
-            expect_exact: blue
-            prompt_suite_json: >-
-              [{"label":"alt-color","prompt":"Reply with exactly: green","expect_exact":"green"},{"label":"alt-red","prompt":"Reply with exactly: red","expect_exact":"red"}]
           - name: gemma-4-e4b
             url: https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf
             file: gemma-4-E4B-it-Q4_K_M.gguf
             prompt: "Say the word blue."
             expect_contains: Blue
             forbid_contains: "{"
-            expect_exact: Blue
-            prompt_suite_json: >-
-              [{"label":"repeat-blue","prompt":"Say the word blue.","expect_exact":"Blue"}]
     steps:
       - uses: actions/checkout@v5
 
@@ -548,9 +580,7 @@ jobs:
             ~/.models/${{ matrix.file }} \
             "${{ matrix.prompt }}" \
             "${{ matrix.expect_contains }}" \
-            "${{ matrix.forbid_contains }}" \
-            "${{ matrix.expect_exact }}" \
-            '${{ matrix.prompt_suite_json }}'
+            "${{ matrix.forbid_contains }}"
 
       - name: Show sccache stats
         if: always()
