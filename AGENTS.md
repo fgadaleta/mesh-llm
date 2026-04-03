@@ -140,6 +140,17 @@ For changes in `mesh-llm/ui/`, use components and compose interfaces consistentl
 
 Read `mesh-llm/docs/TESTING.md` before running tests. It has all test scenarios, remote deploy instructions, and cleanup commands.
 
+## Command Concurrency
+
+Do not run Rust build, test, or format commands in parallel in the same worktree.
+
+- Never run multiple `cargo build`, `cargo test`, `cargo check`, or `cargo fmt` commands at the same time.
+- Never run `just build` in parallel with any Cargo command.
+- Prefer sequential Rust verification steps to avoid Cargo package-cache and target-dir lock contention.
+- If a Rust build/test command is already running, wait for it to finish before starting another.
+- Parallel tool use is fine for reads like `rg`, `sed`, `git status`, and `git diff`, but not for Rust build/test commands.
+- When using `multi_tool_use.parallel`, do not include more than one Rust build/test/format command in the same batch.
+
 ## Formatting
 
 Before committing Rust changes, format only the changed Rust files from the repo root, for example with `cargo fmt --all -- path/to/file.rs`, and include those formatting changes in the commit.

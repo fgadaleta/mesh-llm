@@ -404,23 +404,35 @@ mesh-llm --model Qwen3-8B
 # Full catalog name
 mesh-llm --model Qwen3-8B-Q4_K_M
 
+# MLX catalog name
+mesh-llm --model Qwen3-4B-MLX
+
 # HuggingFace URL (any GGUF)
 mesh-llm --model https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf
 
 # HuggingFace shorthand (org/repo/file.gguf)
 mesh-llm --model bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf
 
+# HuggingFace repo shorthand (works when the repo has one clear primary artifact)
+mesh-llm --model mlx-community/Qwen2.5-0.5B-Instruct-4bit
+
+# Prefer GGUF or MLX when a repo has multiple candidates
+mesh-llm --model some-org/some-repo --gguf
+mesh-llm --model some-org/some-repo --mlx
+
 # Local file path (legacy/raw file mode)
-mesh-llm --gguf ~/my-models/custom-model.gguf
+mesh-llm --gguf-file ~/my-models/custom-model.gguf
 ```
 
 Catalog models are downloaded with resume support. Use the `models` subcommands to browse, inspect, and fetch exact refs.
+
+MLX catalog entries use explicit `-MLX` names so they stay distinct from the GGUF catalog entries.
 
 ### Model storage and migration
 
 - Hugging Face repo snapshots are the canonical managed model store.
 - `~/.models/` is deprecated and will be removed in a future release.
-- Arbitrary local GGUF files remain supported through `--gguf`.
+- Arbitrary local GGUF files remain supported through `--gguf-file`.
 - MoE split artifacts are cached separately under `~/.cache/mesh-llm/splits/`.
 
 Useful commands:
@@ -431,7 +443,11 @@ mesh-llm models installed        # list installed local models
 mesh-llm models search qwen 8b   # search Hugging Face GGUF repos
 mesh-llm models search --catalog qwen
 mesh-llm models show Qwen/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf
+mesh-llm models show Qwen3-4B-MLX
 mesh-llm models download Qwen/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf
+mesh-llm models download Qwen3-4B-MLX
+mesh-llm models download mlx-community/Qwen2.5-0.5B-Instruct-4bit
+mesh-llm models download some-org/some-repo --mlx
 mesh-llm models migrate          # inspect deprecated ~/.models content
 mesh-llm models migrate --apply  # materialize recognized HF-backed models into the HF cache
 mesh-llm models updates --check  # check cached HF repos for newer upstream revisions

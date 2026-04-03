@@ -3,7 +3,7 @@ use crate::models::{
     capabilities, catalog, download_exact_ref, find_catalog_model_exact, huggingface_hub_cache_dir,
     installed_model_capabilities, legacy_models_dir, legacy_models_present,
     path_is_in_legacy_models_dir, scan_installed_models, search_catalog_models, search_huggingface,
-    show_exact_model, SearchProgress,
+    show_exact_model, ResolveFormatPreference, SearchProgress,
 };
 use crate::system::hardware;
 use anyhow::{anyhow, Result};
@@ -236,8 +236,12 @@ pub async fn run_model_show(model_ref: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_model_download(model_ref: &str, include_draft: bool) -> Result<()> {
-    let path = download_exact_ref(model_ref).await?;
+pub async fn run_model_download(
+    model_ref: &str,
+    preference: ResolveFormatPreference,
+    include_draft: bool,
+) -> Result<()> {
+    let path = download_exact_ref(model_ref, preference, "mesh-llm models download").await?;
     println!("✅ Downloaded model");
     println!("   {}", path.display());
 
@@ -329,7 +333,21 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
             limit,
         } => run_model_search(query, *catalog, *limit).await?,
         ModelsCommand::Show { model } => run_model_show(model).await?,
-        ModelsCommand::Download { model, draft } => run_model_download(model, *draft).await?,
+        ModelsCommand::Download {
+            model,
+            gguf,
+            mlx,
+            draft,
+        } => {
+            let preference = if *gguf {
+                ResolveFormatPreference::Gguf
+            } else if *mlx {
+                ResolveFormatPreference::Mlx
+            } else {
+                ResolveFormatPreference::Auto
+            };
+            run_model_download(model, preference, *draft).await?
+        }
         ModelsCommand::Migrate { apply, prune } => crate::models::run_migrate(*apply, *prune)?,
         ModelsCommand::Updates { repo, all, check } => {
             crate::models::run_update(repo.as_deref(), *all, *check)?

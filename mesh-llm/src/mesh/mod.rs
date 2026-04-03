@@ -116,7 +116,10 @@ pub fn infer_served_model_descriptors(
                 if identity.local_file_name.is_none() {
                     identity.local_file_name = Some(format!("{model_name}.gguf"));
                 }
-                descriptor_from_identity(model_name, identity)
+                match primary_model_path {
+                    Some(path) => descriptor_from_known_path(model_name, path, identity),
+                    None => descriptor_from_identity(model_name, identity),
+                }
             } else {
                 descriptor_from_model_path(
                     model_name,
@@ -350,7 +353,7 @@ fn descriptor_from_model_path(
 ) -> Option<ServedModelDescriptor> {
     let mut identity = identity_from_model_path(model_name, path)?;
     identity.is_primary = is_primary;
-    Some(descriptor_from_identity(model_name, identity))
+    Some(descriptor_from_known_path(model_name, path, identity))
 }
 
 fn descriptor_from_identity(
@@ -358,7 +361,19 @@ fn descriptor_from_identity(
     mut identity: ServedModelIdentity,
 ) -> ServedModelDescriptor {
     identity.model_name = model_name.to_string();
-    let path = crate::models::find_model_path(model_name);
+    descriptor_from_known_path(
+        model_name,
+        &crate::models::find_model_path(model_name),
+        identity,
+    )
+}
+
+fn descriptor_from_known_path(
+    model_name: &str,
+    path: &std::path::Path,
+    mut identity: ServedModelIdentity,
+) -> ServedModelDescriptor {
+    identity.model_name = model_name.to_string();
     let catalog = crate::models::find_catalog_model_exact(model_name);
     let topology = crate::models::infer_local_model_topology(&path, catalog);
     let mut capabilities =

@@ -34,19 +34,27 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) auto: bool,
 
-    /// Model to serve (path, catalog name, or HuggingFace URL).
+    /// Model to serve (path, catalog name, Hugging Face ref, repo shorthand, or URL).
     #[arg(long)]
     pub(crate) model: Vec<PathBuf>,
 
+    /// Prefer the GGUF backend when resolving an ambiguous Hugging Face repo.
+    #[arg(long, conflicts_with = "mlx")]
+    pub(crate) gguf: bool,
+
+    /// Prefer the MLX backend when resolving an ambiguous Hugging Face repo.
+    #[arg(long, conflicts_with = "gguf")]
+    pub(crate) mlx: bool,
+
     /// Raw local GGUF file to serve directly (repeatable).
-    #[arg(long = "gguf-file", visible_alias = "gguf")]
+    #[arg(long = "gguf-file")]
     pub(crate) gguf_file: Vec<PathBuf>,
 
     /// Raw local MLX model path to serve directly (repeatable).
     ///
     /// Accepts a model directory or a file inside one, such as
     /// `config.json`, `tokenizer.json`, or `model.safetensors`.
-    #[arg(long = "mlx-file", visible_alias = "mlx")]
+    #[arg(long = "mlx-file")]
     pub(crate) mlx_file: Vec<PathBuf>,
 
     /// API port (default: 9337).

@@ -4,6 +4,7 @@ pub mod gguf;
 pub mod inventory;
 pub mod local;
 mod maintenance;
+pub mod prompt;
 mod resolve;
 pub mod search;
 pub mod topology;
@@ -21,9 +22,10 @@ pub use local::{
     path_is_in_legacy_models_dir, scan_installed_models, scan_local_models,
 };
 pub use maintenance::{run_migrate, run_update, warn_about_updates_for_paths};
+pub use prompt::{infer_prompt_behavior_for_dir, ModelPromptBehavior};
 pub use resolve::{
     download_exact_ref, find_catalog_model_exact, installed_model_capabilities,
-    installed_model_display_name, show_exact_model,
+    installed_model_display_name, show_exact_model, ResolveFormatPreference,
 };
 pub use search::{search_catalog_models, search_huggingface, SearchProgress};
 pub use topology::{infer_local_model_topology, ModelMoeInfo, ModelTopology};
@@ -115,6 +117,15 @@ mod tests {
         assert_eq!(repo, "Qwen/Qwen3-8B-GGUF");
         assert_eq!(revision.as_deref(), Some("main"));
         assert_eq!(file, "Qwen3-8B-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn parse_huggingface_ref_accepts_mlx_shorthand() {
+        let (repo, revision, file) =
+            parse_huggingface_ref("mlx-community/Qwen2.5-0.5B-Instruct/model.safetensors").unwrap();
+        assert_eq!(repo, "mlx-community/Qwen2.5-0.5B-Instruct");
+        assert_eq!(revision, None);
+        assert_eq!(file, "model.safetensors");
     }
 
     #[test]

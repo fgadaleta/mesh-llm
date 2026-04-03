@@ -239,16 +239,13 @@ async fn handle_chat_completions(
     let req: serde_json::Value =
         serde_json::from_slice(body).context("invalid JSON in chat completions request")?;
 
-    let messages = req["messages"]
-        .as_array()
-        .context("missing messages array")?;
     let stream_mode = req["stream"].as_bool().unwrap_or(false);
     let generation = parse_generation_config(&req);
     let model_field = req["model"].as_str().unwrap_or("");
 
     let prompt = {
         let state = state.lock().await;
-        state.model.prompt_template.render_messages(messages)
+        render_chat_prompt_from_request(&state.model.prompt_template, &req)?
     };
 
     if stream_mode {
@@ -256,6 +253,13 @@ async fn handle_chat_completions(
     } else {
         generate_blocking(stream, &prompt, generation, model_field, state).await
     }
+}
+
+fn render_chat_prompt_from_request(
+    template: &crate::mlx::template::PromptTemplate,
+    req: &serde_json::Value,
+) -> Result<String> {
+    template.render_request(req)
 }
 
 /// Handle POST /v1/completions — raw text completion.
@@ -667,6 +671,96 @@ fn parse_stop_sequences(stop: Option<&serde_json::Value>) -> Vec<String> {
             .map(ToOwned::to_owned)
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mlx_chat_smoke_renders_llama3_prompt_from_hf_request_shape() {
+        let template = crate::mlx::template::PromptTemplate::Llama3;
+        let req = serde_json::json!({
+            "model": "meta-llama/Llama-3.2-3B-Instruct",
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Say hi"}
+            ]
+        });
+
+        let prompt = render_chat_prompt_from_request(&template, &req).unwrap();
+
+        assert!(prompt.starts_with("<|begin_of_text|>"));
+        assert!(
+            prompt.contains("<|start_header_id|>system<|end_header_id|>\n\nBe concise.<|eot_id|>")
+        );
+        assert!(prompt.contains("<|start_header_id|>user<|end_header_id|>\n\nSay hi<|eot_id|>"));
+        assert!(prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+    }
+
+    #[test]
+    fn mlx_chat_smoke_renders_tools_prompt_from_hf_template() {
+        let root =
+            std::env::temp_dir().join(format!("mesh-llm-server-qwen-tools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("tokenizer_config.json"),
+            serde_json::json!({
+                "chat_template": "{%- if tools %}{{- '<|im_start|>system\\n# Tools\\n<tools>' }}{%- for tool in tools %}{{- tool | tojson }}{%- endfor %}{{- '</tools><|im_end|>\\n' }}{%- endif %}{%- for message in messages %}{{- '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}{%- endfor %}{%- if add_generation_prompt %}{{- '<|im_start|>assistant\\n' }}{%- endif %}"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let template = crate::mlx::template::PromptTemplate::detect(
+            &root,
+            &serde_json::json!({"model_type":"qwen2"}),
+        );
+        let req = serde_json::json!({
+            "model": "Qwen/Qwen2.5-0.5B-Instruct",
+            "messages": [{"role": "user", "content": "use a tool"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "run",
+                    "description": "Run a command"
+                }
+            }]
+        });
+
+        let prompt = render_chat_prompt_from_request(&template, &req).unwrap();
+
+        assert!(prompt.contains("# Tools"));
+        assert!(prompt.contains("\"name\":\"run\""));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn mlx_chat_smoke_renders_gemma3_prompt_from_hf_request_shape() {
+        let template = crate::mlx::template::PromptTemplate::Gemma3;
+        let req = serde_json::json!({
+            "model": "mlx-community/gemma-3-4b-it-4bit",
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Say hi"},
+                {"role": "assistant", "content": "Hi."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look "},
+                    {"type": "image"},
+                    {"type": "text", "text": "here"}
+                ]}
+            ]
+        });
+
+        let prompt = render_chat_prompt_from_request(&template, &req).unwrap();
+
+        assert!(
+            prompt.starts_with("<bos><start_of_turn>user\nBe concise.\n\nSay hi<end_of_turn>\n")
+        );
+        assert!(prompt.contains("<start_of_turn>model\nHi.<end_of_turn>\n"));
+        assert!(prompt.contains("<start_of_turn>user\nlook<start_of_image>here<end_of_turn>\n"));
+        assert!(prompt.ends_with("<start_of_turn>model\n"));
     }
 }
 

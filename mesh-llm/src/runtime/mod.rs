@@ -17,6 +17,7 @@ use crate::mesh;
 use crate::mesh::NodeRole;
 use crate::models;
 use crate::models::catalog;
+use crate::models::ResolveFormatPreference;
 use crate::network::{affinity, nostr, router, tunnel};
 use crate::plugin;
 use crate::system::{autoupdate, benchmark, hardware};
@@ -290,8 +291,15 @@ pub(crate) async fn run() -> Result<()> {
     if !cli.mlx_file.is_empty() {
         anyhow::bail!("--mlx-file is only supported on macOS");
     }
+    let model_format_preference = if cli.gguf {
+        ResolveFormatPreference::Gguf
+    } else if cli.mlx {
+        ResolveFormatPreference::Mlx
+    } else {
+        ResolveFormatPreference::Auto
+    };
     for m in &cli.model {
-        resolved_models.push(resolve_model(m).await?);
+        resolved_models.push(resolve_model(m, model_format_preference).await?);
     }
     models::warn_about_legacy_model_usage(&resolved_models);
     models::warn_about_updates_for_paths(&resolved_models);
@@ -312,7 +320,10 @@ pub(crate) async fn run() -> Result<()> {
 }
 
 /// Resolve a model path: local file, catalog name, or HuggingFace URL.
-async fn resolve_model(input: &std::path::Path) -> Result<PathBuf> {
+async fn resolve_model(
+    input: &std::path::Path,
+    preference: ResolveFormatPreference,
+) -> Result<PathBuf> {
     let s = input.to_string_lossy();
 
     // Already a local file
@@ -353,26 +364,8 @@ async fn resolve_model(input: &std::path::Path) -> Result<PathBuf> {
         return catalog::download_hf_split_gguf(&s, filename).await;
     }
 
-    // HF shorthand: org/repo/file.gguf
-    if s.contains('/') && s.ends_with(".gguf") {
-        if s.contains("/resolve/") {
-            let filename = s.rsplit('/').next().unwrap();
-            return catalog::download_hf_split_gguf(&s, filename).await;
-        }
-        let parts: Vec<&str> = s.splitn(3, '/').collect();
-        if parts.len() != 3 {
-            anyhow::bail!("Can't parse HF shorthand: {}. Use org/repo/file.gguf", s);
-        }
-        let (repo_tail, revision) = match parts[1].split_once('@') {
-            Some((repo, revision)) => (repo, Some(revision)),
-            None => (parts[1], None),
-        };
-        return catalog::download_hf_repo_file(
-            &format!("{}/{}", parts[0], repo_tail),
-            revision,
-            parts[2],
-        )
-        .await;
+    if s.contains('/') {
+        return models::download_exact_ref(&s, preference, "mesh-llm --model").await;
     }
 
     anyhow::bail!("Model not found: {}", s);
@@ -1486,7 +1479,11 @@ async fn run_auto(
                     api::RuntimeControlRequest::Load { spec, resp } => {
                         let mut assigned_runtime_model: Option<String> = None;
                         let result = async {
-                            let model_path = resolve_model(&PathBuf::from(&spec)).await?;
+                            let model_path = resolve_model(
+                                &PathBuf::from(&spec),
+                                ResolveFormatPreference::Auto,
+                            )
+                            .await?;
                             let runtime_model_name = resolved_model_name(&model_path);
                             let already_loaded = managed_models.contains_key(&runtime_model_name)
                                 || runtime_models.contains_key(&runtime_model_name);
@@ -1976,9 +1973,12 @@ mod tests {
         std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
         std::fs::write(&model_path, b"gguf").unwrap();
 
-        let resolved = resolve_model(Path::new("Llama-3.2-1B-Instruct-Q4_K_M"))
-            .await
-            .unwrap();
+        let resolved = resolve_model(
+            Path::new("Llama-3.2-1B-Instruct-Q4_K_M"),
+            ResolveFormatPreference::Auto,
+        )
+        .await
+        .unwrap();
         assert_eq!(resolved, model_path);
 
         let _ = std::fs::remove_dir_all(&cache_root);
@@ -2020,14 +2020,20 @@ mod tests {
         std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
         std::fs::write(&model_path, b"gguf").unwrap();
 
-        let resolved_by_stem = resolve_model(Path::new("Custom-Model-Q4_K_M"))
-            .await
-            .unwrap();
+        let resolved_by_stem = resolve_model(
+            Path::new("Custom-Model-Q4_K_M"),
+            ResolveFormatPreference::Auto,
+        )
+        .await
+        .unwrap();
         assert_eq!(resolved_by_stem, model_path);
 
-        let resolved_by_filename = resolve_model(Path::new("Custom-Model-Q4_K_M.gguf"))
-            .await
-            .unwrap();
+        let resolved_by_filename = resolve_model(
+            Path::new("Custom-Model-Q4_K_M.gguf"),
+            ResolveFormatPreference::Auto,
+        )
+        .await
+        .unwrap();
         assert_eq!(resolved_by_filename, model_path);
 
         let _ = std::fs::remove_dir_all(&cache_root);

@@ -378,6 +378,7 @@ impl MlxModel {
             std::fs::read_to_string(dir.join("config.json")).context("reading config.json")?;
         let config_json: Value =
             serde_json::from_str(&config_text).context("parsing config.json")?;
+        ensure_supported_mlx_model(dir, &config_json)?;
         let config: ModelConfig =
             serde_json::from_str(&config_text).context("parsing config.json")?;
 
@@ -631,6 +632,42 @@ fn read_model_config(dir: &Path) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
+fn ensure_supported_mlx_model(dir: &Path, config: &Value) -> Result<()> {
+    if config_supports_mlx(config) {
+        return Ok(());
+    }
+    if let Some(architecture) = detect_architecture_from_safetensors_header(dir) {
+        tracing::info!(
+            "MLX loader: config.json did not identify a supported architecture, but safetensors headers matched {}",
+            architecture
+        );
+        return Ok(());
+    }
+
+    let model_type = config
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let architectures = config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "none".to_string());
+    bail!(
+        "unsupported MLX model architecture in {} (model_type={}, architectures={}); supported MLX models currently cover Llama/Qwen-style safetensors checkpoints",
+        dir.display(),
+        model_type,
+        architectures,
+    )
+}
+
 fn detect_architecture_from_safetensors_header(dir: &Path) -> Option<String> {
     let path = if dir.join("model.safetensors").exists() {
         dir.join("model.safetensors")
@@ -746,5 +783,24 @@ mod tests {
         assert!(config_supports_mlx(&qwen));
         assert!(config_supports_mlx(&llama));
         assert!(!config_supports_mlx(&unsupported));
+    }
+
+    #[test]
+    fn unsupported_architecture_error_mentions_model_type() {
+        let root =
+            std::env::temp_dir().join(format!("mesh-llm-mlx-unsupported-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config = serde_json::json!({
+            "model_type": "gemma3",
+            "architectures": ["Gemma3ForConditionalGeneration"]
+        });
+
+        let err = ensure_supported_mlx_model(&root, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported MLX model architecture"));
+        assert!(err.contains("model_type=gemma3"));
+        assert!(err.contains("Gemma3ForConditionalGeneration"));
     }
 }
