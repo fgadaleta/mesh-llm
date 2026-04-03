@@ -197,14 +197,21 @@ fn render_hf_template(
         .unwrap_or(true);
     let mut ctx = serde_json::Map::new();
     ctx.insert("messages".to_string(), messages);
-    ctx.insert("tools".to_string(), tools.unwrap_or(Value::Null));
+    ctx.insert(
+        "tools".to_string(),
+        tools.unwrap_or_else(|| Value::Array(Vec::new())),
+    );
     ctx.insert(
         "documents".to_string(),
-        req.get("documents").cloned().unwrap_or(Value::Null),
+        req.get("documents")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
     );
     ctx.insert(
         "builtin_tools".to_string(),
-        req.get("builtin_tools").cloned().unwrap_or(Value::Null),
+        req.get("builtin_tools")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
     );
     ctx.insert(
         "add_generation_prompt".to_string(),

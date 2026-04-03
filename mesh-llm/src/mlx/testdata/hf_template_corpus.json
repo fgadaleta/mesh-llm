@@ -112,7 +112,7 @@
   {
     "repo": "lmstudio-community/Qwen3-Coder-Next-MLX-4bit",
     "source_file": "chat_template.jinja",
-    "expect_hf_render": false,
+    "expect_hf_render": true,
     "family": "qwen3_coder_next",
     "bos_token": null,
     "eos_token": "<|im_end|>",
@@ -123,7 +123,7 @@
   {
     "repo": "lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-MLX-4bit",
     "source_file": "chat_template.jinja",
-    "expect_hf_render": false,
+    "expect_hf_render": true,
     "family": "qwen3_coder_30b",
     "bos_token": null,
     "eos_token": "<|im_end|>",
