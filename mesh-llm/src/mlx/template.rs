@@ -11,7 +11,7 @@ pub enum PromptTemplate {
         special_tokens: SpecialTokens,
         source_file: String,
         behavior: crate::models::ModelPromptBehavior,
-        default_enable_thinking: Option<bool>,
+        reasoning_defaults: ReasoningDefaults,
         fallback: Box<PromptTemplate>,
     },
     ChatMl {
@@ -27,6 +27,14 @@ pub(crate) struct SpecialTokens {
     eos_token: Option<String>,
     pad_token: Option<String>,
     unk_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReasoningDefaults {
+    enable_thinking: Option<bool>,
+    thinking: Option<bool>,
+    keep_past_thinking: Option<bool>,
+    reasoning_effort: Option<String>,
 }
 
 impl PromptTemplate {
@@ -61,7 +69,7 @@ impl PromptTemplate {
                 special_tokens: read_special_tokens(dir),
                 source_file,
                 behavior,
-                default_enable_thinking: default_enable_thinking(config),
+                reasoning_defaults: reasoning_defaults(config),
                 fallback: Box::new(fallback),
             };
         }
@@ -104,23 +112,21 @@ impl PromptTemplate {
             PromptTemplate::HuggingFace {
                 template,
                 special_tokens,
-                default_enable_thinking,
+                reasoning_defaults,
                 source_file,
                 fallback,
                 ..
-            } => {
-                match render_hf_template(template, special_tokens, *default_enable_thinking, req) {
-                    Ok(prompt) => Ok(prompt),
-                    Err(err) => {
-                        tracing::warn!(
+            } => match render_hf_template(template, special_tokens, reasoning_defaults, req) {
+                Ok(prompt) => Ok(prompt),
+                Err(err) => {
+                    tracing::warn!(
                         "MLX prompt template: failed to render HF template from {}: {err}; falling back to {:?}",
                         source_file,
                         fallback.behavior().prompt_template
                     );
-                        fallback.render_request(req)
-                    }
+                    fallback.render_request(req)
                 }
-            }
+            },
             PromptTemplate::ChatMl {
                 default_system_prompt,
             } => {
@@ -183,7 +189,7 @@ fn heuristic_prompt_template(config: &Value) -> PromptTemplate {
 fn render_hf_template(
     template: &str,
     special_tokens: &SpecialTokens,
-    default_enable_thinking: Option<bool>,
+    reasoning_defaults: &ReasoningDefaults,
     req: &Value,
 ) -> Result<String> {
     let mut env = build_hf_environment();
@@ -191,10 +197,12 @@ fn render_hf_template(
         .context("compile HF chat template")?;
 
     let tmpl = env.get_template("chat").context("load HF chat template")?;
-    let messages = req
-        .get("messages")
-        .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let messages = normalize_hf_messages(
+        template,
+        req.get("messages")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    );
     let tools = req.get("tools").cloned();
     let custom_tools = req.get("custom_tools").cloned();
     let add_generation_prompt = req
@@ -205,19 +213,15 @@ fn render_hf_template(
     ctx.insert("messages".to_string(), messages);
     ctx.insert(
         "tools".to_string(),
-        tools.unwrap_or_else(|| Value::Array(Vec::new())),
+        tools.unwrap_or_else(|| absent_tools_value(template)),
     );
     ctx.insert(
         "documents".to_string(),
-        req.get("documents")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new())),
+        req.get("documents").cloned().unwrap_or(Value::Null),
     );
     ctx.insert(
         "builtin_tools".to_string(),
-        req.get("builtin_tools")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new())),
+        req.get("builtin_tools").cloned().unwrap_or(Value::Null),
     );
     ctx.insert(
         "add_generation_prompt".to_string(),
@@ -229,27 +233,68 @@ fn render_hf_template(
     for (key, value) in [
         (
             "tools_in_user_message",
-            req.get("tools_in_user_message").cloned(),
+            template_kwarg(req, "tools_in_user_message"),
         ),
-        ("keep_past_thinking", req.get("keep_past_thinking").cloned()),
-        ("date_string", req.get("date_string").cloned()),
-        ("reasoning_effort", req.get("reasoning_effort").cloned()),
+        (
+            "keep_past_thinking",
+            template_kwarg(req, "keep_past_thinking"),
+        ),
+        ("date_string", template_kwarg(req, "date_string")),
+        ("reasoning_effort", template_kwarg(req, "reasoning_effort")),
+        ("thinking", template_kwarg(req, "thinking")),
     ] {
         if let Some(value) = value {
             ctx.insert(key.to_string(), value);
         }
     }
-    match req.get("enable_thinking").cloned() {
+    match template_kwarg(req, "enable_thinking") {
         Some(value) => {
             ctx.insert("enable_thinking".to_string(), value);
         }
         None => {
-            if let Some(default_enable_thinking) = default_enable_thinking {
+            if let Some(default_enable_thinking) = reasoning_defaults.enable_thinking {
                 ctx.insert(
                     "enable_thinking".to_string(),
                     Value::Bool(default_enable_thinking),
                 );
             }
+        }
+    }
+    if !ctx.contains_key("thinking") {
+        if let Some(value) = template_kwarg(req, "enable_thinking") {
+            ctx.insert("thinking".to_string(), value);
+        } else if let Some(default_thinking) = reasoning_defaults.thinking {
+            ctx.insert("thinking".to_string(), Value::Bool(default_thinking));
+        }
+    }
+    if !ctx.contains_key("keep_past_thinking") {
+        if let Some(value) = template_kwarg(req, "enable_thinking") {
+            ctx.insert("keep_past_thinking".to_string(), value);
+        } else if let Some(default_keep_past_thinking) = reasoning_defaults.keep_past_thinking {
+            ctx.insert(
+                "keep_past_thinking".to_string(),
+                Value::Bool(default_keep_past_thinking),
+            );
+        }
+    }
+    if !ctx.contains_key("reasoning_effort") {
+        if let Some(value) = template_kwarg(req, "enable_thinking") {
+            if value == Value::Bool(false) {
+                ctx.insert(
+                    "reasoning_effort".to_string(),
+                    Value::String("low".to_string()),
+                );
+            } else if value == Value::Bool(true) {
+                ctx.insert(
+                    "reasoning_effort".to_string(),
+                    Value::String("medium".to_string()),
+                );
+            }
+        } else if let Some(default_reasoning_effort) = &reasoning_defaults.reasoning_effort {
+            ctx.insert(
+                "reasoning_effort".to_string(),
+                Value::String(default_reasoning_effort.clone()),
+            );
         }
     }
     if let Some(token) = &special_tokens.bos_token {
@@ -270,7 +315,7 @@ fn render_hf_template(
     Ok(rendered)
 }
 
-fn default_enable_thinking(config: &Value) -> Option<bool> {
+fn reasoning_defaults(config: &Value) -> ReasoningDefaults {
     let model_type = config
         .get("model_type")
         .and_then(|value| value.as_str())
@@ -286,10 +331,93 @@ fn default_enable_thinking(config: &Value) -> Option<bool> {
         .collect::<Vec<_>>();
 
     if model_type == "qwen3" || architectures.iter().any(|value| value.contains("qwen3")) {
-        return Some(false);
+        return ReasoningDefaults {
+            enable_thinking: Some(false),
+            ..ReasoningDefaults::default()
+        };
+    }
+    if model_type == "glm" || architectures.iter().any(|value| value.contains("glm")) {
+        return ReasoningDefaults {
+            enable_thinking: Some(false),
+            ..ReasoningDefaults::default()
+        };
+    }
+    if model_type == "kimi" || architectures.iter().any(|value| value.contains("kimi")) {
+        return ReasoningDefaults {
+            thinking: Some(false),
+            ..ReasoningDefaults::default()
+        };
+    }
+    if model_type == "gpt_oss" || architectures.iter().any(|value| value.contains("gptoss")) {
+        return ReasoningDefaults {
+            reasoning_effort: Some("low".to_string()),
+            ..ReasoningDefaults::default()
+        };
+    }
+    if model_type == "lfm2" || architectures.iter().any(|value| value.contains("lfm2")) {
+        return ReasoningDefaults {
+            keep_past_thinking: Some(false),
+            ..ReasoningDefaults::default()
+        };
     }
 
-    None
+    ReasoningDefaults::default()
+}
+
+fn template_kwarg(req: &Value, key: &str) -> Option<Value> {
+    req.get(key).cloned().or_else(|| {
+        req.get("chat_template_kwargs")
+            .and_then(|value| value.get(key))
+            .cloned()
+    })
+}
+
+fn normalize_hf_messages(template: &str, messages: Value) -> Value {
+    let Some(messages) = messages.as_array() else {
+        return messages;
+    };
+    let fill_tool_calls =
+        template.contains("message['tool_calls']") || template.contains("message[\"tool_calls\"]");
+    let fill_tool_call_id = template.contains("message['tool_call_id']")
+        || template.contains("message[\"tool_call_id\"]");
+    let fill_name = template.contains("message['name']") || template.contains("message[\"name\"]");
+    let fill_tool_responses = template.contains("message['tool_responses']")
+        || template.contains("message[\"tool_responses\"]");
+
+    Value::Array(
+        messages
+            .iter()
+            .map(|message| {
+                let Some(object) = message.as_object() else {
+                    return message.clone();
+                };
+                let mut normalized = object.clone();
+                for (key, should_fill, value) in [
+                    ("tool_calls", fill_tool_calls, Value::Null),
+                    ("tool_call_id", fill_tool_call_id, Value::Null),
+                    ("name", fill_name, Value::Null),
+                    ("tool_responses", fill_tool_responses, Value::Null),
+                ] {
+                    if should_fill {
+                        normalized.entry(key.to_string()).or_insert(value);
+                    }
+                }
+                Value::Object(normalized)
+            })
+            .collect(),
+    )
+}
+
+fn absent_tools_value(template: &str) -> Value {
+    let uses_length = template.contains("tools|length")
+        || template.contains("tools | length")
+        || template.contains("tools|count")
+        || template.contains("tools | count");
+    if template.contains("tools is not none") && !uses_length {
+        Value::Null
+    } else {
+        Value::Array(Vec::new())
+    }
 }
 
 fn build_hf_environment<'a>() -> Environment<'a> {

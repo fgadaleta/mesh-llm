@@ -3,15 +3,32 @@
 # run one inference request, verify template selection, then shut down.
 #
 # Usage:
-#   scripts/ci-mlx-smoke-test.sh <mesh-llm-binary> <mlx-model-dir-or-repo> [expected-template-source]
+#   scripts/ci-mlx-smoke-test.sh <mesh-llm-binary> <mlx-model-dir-or-repo> [expected-template-source] [prompt] [expect-contains] [forbid-contains] [thinking-mode]
 
 set -euo pipefail
 
 MESH_LLM="$1"
 MODEL_SPEC="$2"
 EXPECTED_TEMPLATE_SOURCE="${3:-}"
-API_PORT=9337
-CONSOLE_PORT=3131
+PROMPT_TEXT="${4:-What is 2+2? Reply with one word only.}"
+EXPECT_CONTAINS="${5:-}"
+FORBID_CONTAINS="${6:-}"
+THINKING_MODE="${7:-}"
+pick_free_port() {
+    python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
+API_PORT="$(pick_free_port)"
+CONSOLE_PORT="$(pick_free_port)"
+while [ "$API_PORT" = "$CONSOLE_PORT" ]; do
+    CONSOLE_PORT="$(pick_free_port)"
+done
 MAX_WAIT=300
 LOG=/tmp/mesh-llm-ci-mlx.log
 
@@ -20,6 +37,7 @@ echo "  mesh-llm:  $MESH_LLM"
 echo "  model:     $MODEL_SPEC"
 echo "  api port:  $API_PORT"
 echo "  os:        $(uname -s)"
+echo "  prompt:    $PROMPT_TEXT"
 
 if [ "$(uname -s)" != "Darwin" ]; then
     echo "❌ MLX smoke test only supports macOS"
@@ -32,15 +50,19 @@ if [ ! -f "$MESH_LLM" ]; then
 fi
 
 echo "Starting mesh-llm..."
+LAUNCH_PREFIX=()
+if command -v stdbuf >/dev/null 2>&1; then
+    LAUNCH_PREFIX=(stdbuf -oL -eL)
+fi
 if [ -d "$MODEL_SPEC" ]; then
-    RUST_LOG=info "$MESH_LLM" \
+    RUST_LOG=info "${LAUNCH_PREFIX[@]}" "$MESH_LLM" \
         --mlx-file "$MODEL_SPEC" \
         --no-draft \
         --port "$API_PORT" \
         --console "$CONSOLE_PORT" \
         > "$LOG" 2>&1 &
 else
-    RUST_LOG=info "$MESH_LLM" \
+    RUST_LOG=info "${LAUNCH_PREFIX[@]}" "$MESH_LLM" \
         --model "$MODEL_SPEC" \
         --mlx \
         --no-draft \
@@ -103,13 +125,18 @@ fi
 echo "Testing /v1/chat/completions..."
 RESPONSE=$(curl -sf "http://localhost:${API_PORT}/v1/chat/completions" \
     -H "Content-Type: application/json" \
-    -d '{
-        "model": "any",
-        "messages": [{"role": "user", "content": "What is 2+2? Reply with one word only."}],
-        "max_tokens": 32,
-        "temperature": 0,
-        "enable_thinking": false
-    }' 2>&1)
+    -d "$(python3 - "$PROMPT_TEXT" <<'PY'
+import json, sys
+prompt = sys.argv[1]
+print(json.dumps({
+    "model": "any",
+    "messages": [{"role": "user", "content": prompt}],
+    "max_tokens": 32,
+    "temperature": 0,
+    "enable_thinking": False
+}))
+PY
+)" 2>&1)
 
 if [ $? -ne 0 ]; then
     echo "❌ Inference request failed"
@@ -126,6 +153,24 @@ if [ -z "$CONTENT" ]; then
     exit 1
 fi
 
+if echo "$CONTENT" | grep -F "<think>" >/dev/null 2>&1; then
+    echo "❌ Unexpected reasoning output with enable_thinking=false"
+    echo "Content: $CONTENT"
+    exit 1
+fi
+
+if [ -n "$EXPECT_CONTAINS" ] && ! echo "$CONTENT" | grep -F "$EXPECT_CONTAINS" >/dev/null 2>&1; then
+    echo "❌ Response did not contain expected text: $EXPECT_CONTAINS"
+    echo "Content: $CONTENT"
+    exit 1
+fi
+
+if [ -n "$FORBID_CONTAINS" ] && echo "$CONTENT" | grep -F "$FORBID_CONTAINS" >/dev/null 2>&1; then
+    echo "❌ Response contained forbidden text: $FORBID_CONTAINS"
+    echo "Content: $CONTENT"
+    exit 1
+fi
+
 FINISH_REASON=$(echo "$RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0].get('finish_reason',''))" 2>/dev/null || echo "")
 if [ -z "$FINISH_REASON" ]; then
     echo "❌ Missing finish_reason in response"
@@ -134,6 +179,57 @@ if [ -z "$FINISH_REASON" ]; then
 fi
 
 echo "✅ Inference response: $CONTENT"
+
+if [ -n "$THINKING_MODE" ]; then
+    echo "Testing explicit reasoning output..."
+    THINKING_RESPONSE=$(curl -sf "http://localhost:${API_PORT}/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "$(python3 - "$PROMPT_TEXT" <<'PY'
+import json, sys
+prompt = sys.argv[1]
+print(json.dumps({
+    "model": "any",
+    "messages": [{"role": "user", "content": prompt}],
+    "max_tokens": 64,
+    "temperature": 0,
+    "enable_thinking": True
+}))
+PY
+)" 2>&1)
+
+    THINKING_CONTENT=$(echo "$THINKING_RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['choices'][0]['message']['content'])" 2>/dev/null || echo "")
+    if [ -z "$THINKING_CONTENT" ]; then
+        echo "❌ Empty response from explicit reasoning request"
+        echo "Raw response: $THINKING_RESPONSE"
+        exit 1
+    fi
+    case "$THINKING_MODE" in
+        tagged)
+            if ! echo "$THINKING_CONTENT" | grep -F "<think>" >/dev/null 2>&1; then
+                echo "❌ Explicit reasoning response did not contain <think> tags"
+                echo "Content: $THINKING_CONTENT"
+                exit 1
+            fi
+            ;;
+        multiline)
+            if [ "$THINKING_CONTENT" = "$CONTENT" ]; then
+                echo "❌ Explicit reasoning response matched non-thinking response"
+                echo "Content: $THINKING_CONTENT"
+                exit 1
+            fi
+            if ! printf '%s' "$THINKING_CONTENT" | python3 -c "import sys; s=sys.stdin.read(); raise SystemExit(0 if '\n' in s else 1)"; then
+                echo "❌ Explicit reasoning response was not multiline"
+                echo "Content: $THINKING_CONTENT"
+                exit 1
+            fi
+            ;;
+        *)
+            echo "❌ Unknown thinking mode: $THINKING_MODE"
+            exit 1
+            ;;
+    esac
+    echo "✅ Explicit reasoning response: $THINKING_CONTENT"
+fi
 
 echo "Testing /v1/models..."
 MODELS=$(curl -sf "http://localhost:${API_PORT}/v1/models" 2>&1)

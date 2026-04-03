@@ -278,7 +278,7 @@ fn detects_chatml_from_tokenizer_config() {
     match template {
         PromptTemplate::HuggingFace {
             fallback,
-            default_enable_thinking,
+            reasoning_defaults,
             ..
         } => {
             assert_eq!(
@@ -287,7 +287,7 @@ fn detects_chatml_from_tokenizer_config() {
                     default_system_prompt: Some("You are a helpful assistant.".to_string())
                 }
             );
-            assert_eq!(default_enable_thinking, None);
+            assert_eq!(reasoning_defaults, ReasoningDefaults::default());
         }
         other => panic!("expected huggingface template, got {other:?}"),
     }
@@ -354,6 +354,213 @@ fn qwen3_templates_honor_explicit_enable_thinking_true() {
     assert_eq!(prompt, "<|im_start|>assistant\n");
 }
 
+fn corpus_fixture(repo: &str) -> HfTemplateFixture {
+    hf_template_corpus()
+        .into_iter()
+        .find(|fixture| fixture.repo == repo)
+        .unwrap_or_else(|| panic!("missing fixture for {repo}"))
+}
+
+#[test]
+fn glm_templates_default_enable_thinking_to_false() {
+    let root = std::env::temp_dir().join(format!(
+        "mesh-llm-template-glm-thinking-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("chat_template.jinja"),
+        "{%- if add_generation_prompt %}<|assistant|>{{ '/nothink' if (enable_thinking is defined and not enable_thinking) else '' }}{%- endif %}",
+    )
+    .unwrap();
+
+    let template = PromptTemplate::detect(
+        &root,
+        &serde_json::json!({"model_type":"glm","architectures":["GlmForCausalLM"]}),
+    );
+    let prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+    assert_eq!(prompt, "<|assistant|>/nothink");
+}
+
+#[test]
+fn kimi_templates_map_enable_thinking_to_thinking() {
+    let root = std::env::temp_dir().join(format!(
+        "mesh-llm-template-kimi-thinking-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("chat_template.jinja"),
+        "{%- if add_generation_prompt %}{%- if thinking is defined and thinking is false -%}<think></think>{%- else -%}<think>{%- endif -%}{%- endif %}",
+    )
+    .unwrap();
+
+    let template = PromptTemplate::detect(
+        &root,
+        &serde_json::json!({"model_type":"kimi","architectures":["KimiForCausalLM"]}),
+    );
+    let prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+    assert_eq!(prompt, "<think></think>");
+
+    let explicit_prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"enable_thinking": true}
+        }))
+        .unwrap();
+    assert_eq!(explicit_prompt, "<think>");
+}
+
+#[test]
+fn gpt_oss_templates_map_enable_thinking_to_reasoning_effort() {
+    let root = std::env::temp_dir().join(format!(
+        "mesh-llm-template-gpt-oss-thinking-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("chat_template.jinja"),
+        "{{ reasoning_effort | default('missing') }}",
+    )
+    .unwrap();
+
+    let template = PromptTemplate::detect(
+        &root,
+        &serde_json::json!({"model_type":"gpt_oss","architectures":["GptOssForCausalLM"]}),
+    );
+    let prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+    assert_eq!(prompt, "low");
+
+    let explicit_prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "enable_thinking": true
+        }))
+        .unwrap();
+    assert_eq!(explicit_prompt, "medium");
+}
+
+#[test]
+fn lfm2_templates_map_enable_thinking_to_keep_past_thinking() {
+    let root = std::env::temp_dir().join(format!(
+        "mesh-llm-template-lfm2-thinking-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("chat_template.jinja"),
+        "{{ 'keep' if keep_past_thinking | default(false) else 'strip' }}",
+    )
+    .unwrap();
+
+    let template = PromptTemplate::detect(
+        &root,
+        &serde_json::json!({"model_type":"lfm2","architectures":["LlamaForCausalLM"]}),
+    );
+    let prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+    assert_eq!(prompt, "strip");
+
+    let explicit_prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "enable_thinking": true
+        }))
+        .unwrap();
+    assert_eq!(explicit_prompt, "keep");
+}
+
+#[test]
+fn glm_fixture_defaults_to_nothink() {
+    let fixture = corpus_fixture("lmstudio-community/GLM-4.6V-Flash-MLX-4bit");
+    let root = write_hf_fixture_dir(&fixture);
+    let template = PromptTemplate::detect(&root, &fixture_config(&fixture.family));
+    let prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            "tools": [{"type": "function", "function": {"name": "run", "description": "Run a command"}}],
+            "add_generation_prompt": true
+        }))
+        .unwrap();
+
+    assert!(prompt.contains("/nothink"));
+}
+
+#[test]
+fn kimi_fixture_defaults_to_no_thinking() {
+    let fixture = corpus_fixture("mlx-community/Kimi-K2.5");
+    let root = write_hf_fixture_dir(&fixture);
+    let template = PromptTemplate::detect(&root, &fixture_config(&fixture.family));
+    let prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            "add_generation_prompt": true
+        }))
+        .unwrap();
+
+    assert!(prompt.contains("<think></think>"));
+    assert!(!prompt.contains("<|im_assistant|>assistant<|im_middle|>\n  <think>\n"));
+}
+
+#[test]
+fn gpt_oss_fixture_defaults_to_low_reasoning_effort() {
+    let fixture = corpus_fixture("mlx-community/gpt-oss-20b-MXFP4-Q8");
+    let root = write_hf_fixture_dir(&fixture);
+    let template = PromptTemplate::detect(&root, &fixture_config(&fixture.family));
+    let prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "builtin_tools": ["browser", "python"],
+            "add_generation_prompt": true
+        }))
+        .unwrap();
+
+    assert!(prompt.contains("Reasoning: low"));
+}
+
+#[test]
+fn lfm2_fixture_defaults_to_stripping_past_thinking() {
+    let fixture = corpus_fixture("lmstudio-community/LFM2-24B-A2B-MLX-4bit");
+    let root = write_hf_fixture_dir(&fixture);
+    let template = PromptTemplate::detect(&root, &fixture_config(&fixture.family));
+    let prompt = template
+        .render_request(&json!({
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "<think>\ninternal\n</think>\nhi"},
+                {"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image"}]},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "again"}
+            ],
+            "add_generation_prompt": true
+        }))
+        .unwrap();
+
+    assert!(!prompt.contains("internal"));
+    assert!(prompt.contains("hi<|im_end|>"));
+}
+
 #[test]
 fn renders_llama3_prompt_from_hf_template() {
     let root =
@@ -379,6 +586,22 @@ fn renders_llama3_prompt_from_hf_template() {
     assert!(prompt.starts_with("<|begin_of_text|>"));
     assert!(prompt.contains("<|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|>"));
     assert!(prompt.contains("<|start_header_id|>assistant<|end_header_id|>"));
+}
+
+#[test]
+fn llama_hf_template_does_not_enter_tool_mode_when_tools_are_absent() {
+    let fixture = corpus_fixture("mlx-community/Llama-3.2-1B-Instruct-4bit");
+    let root = write_hf_fixture_dir(&fixture);
+    let template = PromptTemplate::detect(&root, &fixture_config(&fixture.family));
+    let prompt = template
+        .render_request(&json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "add_generation_prompt": true
+        }))
+        .unwrap();
+
+    assert!(!prompt.contains("Environment: ipython"));
+    assert!(!prompt.contains("Given the following functions"));
 }
 
 #[test]
@@ -564,8 +787,13 @@ fn real_hf_template_corpus_behaves_as_expected() {
         if fixture.expect_hf_render {
             validate_hf_template(&normalized)
                 .unwrap_or_else(|err| panic!("{} should compile: {err}", fixture.repo));
-            let prompt = render_hf_template(&normalized, &special_tokens, None, &req)
-                .unwrap_or_else(|err| panic!("{} should render via HF path: {err}", fixture.repo));
+            let prompt = render_hf_template(
+                &normalized,
+                &special_tokens,
+                &ReasoningDefaults::default(),
+                &req,
+            )
+            .unwrap_or_else(|err| panic!("{} should render via HF path: {err}", fixture.repo));
             assert!(
                 !prompt.trim().is_empty(),
                 "{} rendered an empty prompt",
@@ -573,8 +801,13 @@ fn real_hf_template_corpus_behaves_as_expected() {
             );
         } else {
             if validate_hf_template(&normalized).is_ok() {
-                render_hf_template(&normalized, &special_tokens, None, &req)
-                    .expect_err("fixture should still require fallback");
+                render_hf_template(
+                    &normalized,
+                    &special_tokens,
+                    &ReasoningDefaults::default(),
+                    &req,
+                )
+                .expect_err("fixture should still require fallback");
             }
 
             let prompt = PromptTemplate::detect(&root, &config)

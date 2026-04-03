@@ -4,8 +4,11 @@
 //! No Python, no subprocess — just Rust + MLX C library.
 
 use anyhow::{bail, Context, Result};
+use mlx_rs::array;
+use mlx_rs::ops::dequantize_device;
 use mlx_rs::ops::indexing::{IndexOp, TryIndexMutOp};
 use mlx_rs::Array;
+use mlx_rs::{Dtype, StreamOrDevice};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
@@ -22,18 +25,53 @@ pub struct ModelConfig {
     pub num_key_value_heads: i32,
     #[serde(default)]
     pub head_dim: Option<i32>,
+    #[serde(default)]
+    pub query_pre_attn_scalar: Option<f32>,
+    #[serde(default)]
+    pub global_head_dim: Option<i32>,
     pub vocab_size: i32,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub vocab_size_per_layer_input: Option<i32>,
     pub rms_norm_eps: f32,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
     #[allow(dead_code)]
     pub max_position_embeddings: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_bool")]
     pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub hidden_activation: Option<String>,
+    #[serde(default)]
+    pub hidden_size_per_layer_input: Option<i32>,
+    #[serde(default)]
+    pub num_kv_shared_layers: Option<i32>,
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_rope_parameters")]
+    pub rope_parameters: Option<HashMap<String, RopeParameters>>,
+    #[serde(default)]
+    pub final_logit_softcapping: Option<f32>,
     pub quantization: Option<QuantConfig>,
     /// EOS token ID(s) — can be a single int or array in config.json.
     #[serde(default, deserialize_with = "deserialize_eos_token_id")]
     pub eos_token_id: Vec<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct RopeParameters {
+    #[serde(default)]
+    pub partial_rotary_factor: Option<f32>,
+    #[serde(default)]
+    pub rope_theta: Option<f32>,
+}
+
+fn deserialize_nullable_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error> {
+    use serde::Deserialize;
+
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(false))
 }
 
 fn deserialize_eos_token_id<'de, D: serde::Deserializer<'de>>(
@@ -52,6 +90,31 @@ fn deserialize_eos_token_id<'de, D: serde::Deserializer<'de>>(
     })
 }
 
+fn deserialize_rope_parameters<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<HashMap<String, RopeParameters>>, D::Error> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RopeParametersField {
+        PerLayer(HashMap<String, RopeParameters>),
+        Flat(RopeParameters),
+    }
+
+    Ok(
+        match Option::<RopeParametersField>::deserialize(deserializer)? {
+            None => None,
+            Some(RopeParametersField::PerLayer(map)) => Some(map),
+            Some(RopeParametersField::Flat(params)) => {
+                let mut map = HashMap::new();
+                map.insert("default".to_string(), params);
+                Some(map)
+            }
+        },
+    )
+}
+
 fn default_rope_theta() -> f32 {
     10000.0
 }
@@ -60,6 +123,14 @@ fn default_rope_theta() -> f32 {
 pub struct QuantConfig {
     pub group_size: i32,
     pub bits: i32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QuantOverride {
+    #[serde(default)]
+    group_size: Option<i32>,
+    #[serde(default)]
+    bits: Option<i32>,
 }
 
 // ── Layer primitives ──
@@ -71,19 +142,24 @@ pub struct QuantizedLinear {
     bias: Option<Array>,
     group_size: i32,
     bits: i32,
+    dense_weight_t: Option<Array>,
 }
 
 impl QuantizedLinear {
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let out = mlx_rs::ops::quantized_matmul(
-            x,
-            &self.weight,
-            &self.scales,
-            &self.biases,
-            true,
-            self.group_size,
-            self.bits,
-        )?;
+        let out = if let Some(dense_weight_t) = &self.dense_weight_t {
+            mlx_rs::ops::matmul(x, dense_weight_t)?
+        } else {
+            mlx_rs::ops::quantized_matmul(
+                x,
+                &self.weight,
+                &self.scales,
+                &self.biases,
+                true,
+                self.group_size,
+                self.bits,
+            )?
+        };
         Ok(if let Some(ref bias) = self.bias {
             &out + bias
         } else {
@@ -92,14 +168,50 @@ impl QuantizedLinear {
     }
 }
 
+fn cpu_dense_weight_t(
+    weight: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+    bits: i32,
+) -> Result<Array> {
+    let dense_cpu = dequantize_device(
+        weight,
+        scales,
+        biases,
+        group_size,
+        bits,
+        StreamOrDevice::cpu(),
+    )?;
+    let dense_cpu = if dense_cpu.dtype() == Dtype::Float32 {
+        dense_cpu
+    } else if matches!(dense_cpu.dtype(), Dtype::Bfloat16 | Dtype::Float16) {
+        dense_cpu.as_dtype(Dtype::Float32)?
+    } else {
+        bail!(
+            "unsupported dense dequantized dtype for CPU fallback: {:?}",
+            dense_cpu.dtype()
+        );
+    };
+    let dense = Array::from_slice(dense_cpu.as_slice::<f32>(), dense_cpu.shape());
+
+    Ok(dense.transpose_axes(&[1, 0])?)
+}
+
 pub struct RMSNorm {
     weight: Array,
     eps: f32,
+    add_unit_offset: bool,
 }
 
 impl RMSNorm {
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        Ok(mlx_rs::fast::rms_norm(x, &self.weight, self.eps)?)
+        if self.add_unit_offset {
+            let weight = self.weight.add(&array!(1.0f32))?;
+            Ok(mlx_rs::fast::rms_norm(x, &weight, self.eps)?)
+        } else {
+            Ok(mlx_rs::fast::rms_norm(x, &self.weight, self.eps)?)
+        }
     }
 }
 
@@ -112,22 +224,27 @@ pub struct Attention {
     o_proj: QuantizedLinear,
     q_norm: Option<RMSNorm>,
     k_norm: Option<RMSNorm>,
+    v_norm: Option<RMSNorm>,
     num_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
     scale: f32,
+    rope_dim: i32,
     rope_theta: f32,
+    kv_shared_source: Option<usize>,
 }
 
 impl Attention {
-    pub fn forward(&self, x: &Array, cache: &mut KVCache) -> Result<Array> {
+    pub fn forward(
+        &self,
+        x: &Array,
+        cache: &mut KVCache,
+        shared_cache: Option<&KVCache>,
+    ) -> Result<Array> {
         let shape = x.shape();
         let (b, l) = (shape[0], shape[1]);
 
         let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
-
         let q = q.reshape(&[b, l, self.num_heads, self.head_dim])?;
         let q = if let Some(norm) = &self.q_norm {
             norm.forward(&q)?
@@ -135,38 +252,33 @@ impl Attention {
             q
         }
         .transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.reshape(&[b, l, self.num_kv_heads, self.head_dim])?;
-        let k = if let Some(norm) = &self.k_norm {
-            norm.forward(&k)?
-        } else {
-            k
-        }
-        .transpose_axes(&[0, 2, 1, 3])?;
-        let v = v
-            .reshape(&[b, l, self.num_kv_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
 
         let offset = cache.offset as i32;
-        let q = mlx_rs::fast::rope(
-            &q,
-            self.head_dim,
-            false,
-            Some(self.rope_theta),
-            1.0,
-            offset,
-            None::<&Array>,
-        )?;
-        let k = mlx_rs::fast::rope(
-            &k,
-            self.head_dim,
-            false,
-            Some(self.rope_theta),
-            1.0,
-            offset,
-            None::<&Array>,
-        )?;
-
-        let (k, v) = cache.update(k, v)?;
+        let q = apply_rope(&q, self.rope_dim, self.head_dim, self.rope_theta, offset)?;
+        let (k, v) = if let Some(shared_cache) = shared_cache {
+            shared_cache
+                .views()
+                .context("Gemma4 shared KV cache was empty")?
+        } else {
+            let k = self.k_proj.forward(x)?;
+            let v = self.v_proj.forward(x)?;
+            let k = k.reshape(&[b, l, self.num_kv_heads, self.head_dim])?;
+            let k = if let Some(norm) = &self.k_norm {
+                norm.forward(&k)?
+            } else {
+                k
+            }
+            .transpose_axes(&[0, 2, 1, 3])?;
+            let v = v.reshape(&[b, l, self.num_kv_heads, self.head_dim])?;
+            let v = if let Some(norm) = &self.v_norm {
+                norm.forward(&v)?
+            } else {
+                v
+            }
+            .transpose_axes(&[0, 2, 1, 3])?;
+            let k = apply_rope(&k, self.rope_dim, self.head_dim, self.rope_theta, offset)?;
+            cache.update(k, v)?
+        };
 
         // Causal mask for prefill (multi-token). Decode (l=1) needs no mask.
         let mask = if l > 1 {
@@ -185,18 +297,71 @@ impl Attention {
     }
 }
 
+fn apply_rope(
+    x: &Array,
+    rope_dim: i32,
+    head_dim: i32,
+    rope_theta: f32,
+    offset: i32,
+) -> Result<Array> {
+    if rope_dim == head_dim {
+        return Ok(mlx_rs::fast::rope(
+            x,
+            head_dim,
+            false,
+            Some(rope_theta),
+            1.0,
+            offset,
+            None::<&Array>,
+        )?);
+    }
+
+    let rotated = x.index((
+        std::ops::RangeFull,
+        std::ops::RangeFull,
+        std::ops::RangeFull,
+        ..rope_dim,
+    ));
+    let rotated = mlx_rs::fast::rope(
+        &rotated,
+        rope_dim,
+        false,
+        Some(rope_theta),
+        1.0,
+        offset,
+        None::<&Array>,
+    )?;
+    let tail = x.index((
+        std::ops::RangeFull,
+        std::ops::RangeFull,
+        std::ops::RangeFull,
+        rope_dim..,
+    ));
+    Ok(mlx_rs::ops::concatenate_axis(&[&rotated, &tail], 3)?)
+}
+
 // ── MLP ──
 
 pub struct MLP {
     gate_proj: QuantizedLinear,
     up_proj: QuantizedLinear,
     down_proj: QuantizedLinear,
+    activation: Activation,
+}
+
+#[derive(Clone, Copy)]
+pub enum Activation {
+    Silu,
+    GeluApproximate,
 }
 
 impl MLP {
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = &mlx_rs::ops::sigmoid(&gate)? * &gate; // SiLU
+        let gate = match self.activation {
+            Activation::Silu => &mlx_rs::ops::sigmoid(&gate)? * &gate,
+            Activation::GeluApproximate => mlx_rs::nn::gelu_approximate(&gate)?,
+        };
         let up = self.up_proj.forward(x)?;
         self.down_proj.forward(&(&gate * &up))
     }
@@ -207,15 +372,65 @@ impl MLP {
 pub struct Layer {
     attn: Attention,
     mlp: MLP,
-    attn_norm: RMSNorm,
-    mlp_norm: RMSNorm,
+    attn_in_norm: RMSNorm,
+    attn_out_norm: Option<RMSNorm>,
+    mlp_in_norm: RMSNorm,
+    mlp_out_norm: Option<RMSNorm>,
+    per_layer_input: Option<PerLayerInputBlock>,
+    layer_scalar: Option<Array>,
 }
 
 impl Layer {
-    pub fn forward(&self, x: &Array, cache: &mut KVCache) -> Result<Array> {
-        let h = &self.attn.forward(&self.attn_norm.forward(x)?, cache)? + x;
-        Ok(&self.mlp.forward(&self.mlp_norm.forward(&h)?)? + &h)
+    pub fn forward(
+        &self,
+        x: &Array,
+        per_layer_input: Option<&Array>,
+        cache: &mut KVCache,
+        shared_cache: Option<&KVCache>,
+    ) -> Result<Array> {
+        let attn = self
+            .attn
+            .forward(&self.attn_in_norm.forward(x)?, cache, shared_cache)?;
+        let attn = if let Some(norm) = &self.attn_out_norm {
+            norm.forward(&attn)?
+        } else {
+            attn
+        };
+        let h = &attn + x;
+        let mlp = self.mlp.forward(&self.mlp_in_norm.forward(&h)?)?;
+        let mlp = if let Some(norm) = &self.mlp_out_norm {
+            norm.forward(&mlp)?
+        } else {
+            mlp
+        };
+        let mut out = &mlp + &h;
+
+        if let (Some(block), Some(per_layer_input)) = (&self.per_layer_input, per_layer_input) {
+            let residual = out.clone();
+            let mut gated = block.input_gate.forward(&out)?;
+            gated = match block.activation {
+                Activation::Silu => &mlx_rs::ops::sigmoid(&gated)? * &gated,
+                Activation::GeluApproximate => mlx_rs::nn::gelu_approximate(&gated)?,
+            };
+            gated = gated.multiply(per_layer_input)?;
+            gated = block.projection.forward(&gated)?;
+            gated = block.post_norm.forward(&gated)?;
+            out = &gated + &residual;
+        }
+
+        if let Some(layer_scalar) = &self.layer_scalar {
+            out = out.multiply(layer_scalar)?;
+        }
+
+        Ok(out)
     }
+}
+
+pub struct PerLayerInputBlock {
+    input_gate: QuantizedLinear,
+    projection: QuantizedLinear,
+    post_norm: RMSNorm,
+    activation: Activation,
 }
 
 // ── KV cache ──
@@ -254,6 +469,23 @@ impl KVCache {
             out.push(v);
         }
         out
+    }
+
+    pub fn views(&self) -> Option<(Array, Array)> {
+        use std::ops::RangeFull;
+
+        if self.offset == 0 {
+            return None;
+        }
+        let end_i = self.offset as i32;
+        Some((
+            self.keys
+                .as_ref()?
+                .index((RangeFull, RangeFull, ..end_i, RangeFull)),
+            self.values
+                .as_ref()?
+                .index((RangeFull, RangeFull, ..end_i, RangeFull)),
+        ))
     }
 
     pub fn update(&mut self, k: Array, v: Array) -> Result<(Array, Array)> {
@@ -366,20 +598,55 @@ impl QuantizedEmbedding {
             bias: None,
             group_size: self.group_size,
             bits: self.bits,
+            dense_weight_t: None,
         }
     }
+}
+
+fn quant_params_for(
+    config: &Value,
+    prefix: &str,
+    default_group_size: i32,
+    default_bits: i32,
+) -> (i32, i32) {
+    let override_cfg = config
+        .get("quantization")
+        .and_then(Value::as_object)
+        .and_then(|q| q.get(prefix))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<QuantOverride>(value).ok());
+
+    (
+        override_cfg
+            .as_ref()
+            .and_then(|cfg| cfg.group_size)
+            .unwrap_or(default_group_size),
+        override_cfg
+            .as_ref()
+            .and_then(|cfg| cfg.bits)
+            .unwrap_or(default_bits),
+    )
 }
 
 // ── Full model ──
 
 pub struct MlxModel {
     embed_tokens: QuantizedEmbedding,
+    embed_scale: f32,
+    embed_tokens_per_layer: Option<QuantizedEmbedding>,
+    embed_tokens_per_layer_scale: Option<f32>,
+    per_layer_projection_norm: Option<RMSNorm>,
+    per_layer_model_projection: Option<QuantizedLinear>,
+    per_layer_model_projection_scale: Option<f32>,
+    per_layer_input_scale: Option<f32>,
     layers: Vec<Layer>,
     norm: RMSNorm,
     lm_head: Option<QuantizedLinear>,
+    final_logit_softcapping: Option<f32>,
     pub config: ModelConfig,
     pub tokenizer: tokenizers::Tokenizer,
     pub prompt_template: crate::mlx::template::PromptTemplate,
+    tokenwise_prefill: bool,
 }
 
 impl MlxModel {
@@ -391,8 +658,10 @@ impl MlxModel {
         let config_json: Value =
             serde_json::from_str(&config_text).context("parsing config.json")?;
         ensure_supported_mlx_model(dir, &config_json)?;
+        let effective_config_json = effective_text_config_json(&config_json);
         let config: ModelConfig =
-            serde_json::from_str(&config_text).context("parsing config.json")?;
+            serde_json::from_value(effective_config_json).context("parsing config.json")?;
+        let arch = model_architecture(&config_json);
 
         let qcfg = config
             .quantization
@@ -418,50 +687,137 @@ impl MlxModel {
             tensors.len(),
             start.elapsed().as_secs_f64()
         );
+        let prefixes = tensor_prefixes(&tensors)?;
 
         let load_qlinear = |prefix: &str| -> Result<QuantizedLinear> {
+            let (group_size, bits) = quant_params_for(&config_json, prefix, group_size, bits);
+            let weight = tensors
+                .get(&format!("{prefix}.weight"))
+                .cloned()
+                .with_context(|| format!("missing {prefix}.weight"))?;
+            let scales = tensors
+                .get(&format!("{prefix}.scales"))
+                .cloned()
+                .with_context(|| format!("missing {prefix}.scales"))?;
+            let biases = tensors
+                .get(&format!("{prefix}.biases"))
+                .cloned()
+                .with_context(|| format!("missing {prefix}.biases"))?;
+            // Some Gemma4 MLX checkpoints use 5-bit weights for a subset of MLP
+            // blocks, and current Metal qmm kernels are missing for that shape.
+            let dense_weight_t = if bits == 5 {
+                Some(cpu_dense_weight_t(
+                    &weight, &scales, &biases, group_size, bits,
+                )?)
+            } else {
+                None
+            };
             Ok(QuantizedLinear {
-                weight: tensors
-                    .get(&format!("{prefix}.weight"))
-                    .cloned()
-                    .with_context(|| format!("missing {prefix}.weight"))?,
-                scales: tensors
-                    .get(&format!("{prefix}.scales"))
-                    .cloned()
-                    .with_context(|| format!("missing {prefix}.scales"))?,
-                biases: tensors
-                    .get(&format!("{prefix}.biases"))
-                    .cloned()
-                    .with_context(|| format!("missing {prefix}.biases"))?,
+                weight,
+                scales,
+                biases,
                 bias: tensors.get(&format!("{prefix}.bias")).cloned(),
                 group_size,
                 bits,
+                dense_weight_t,
             })
         };
 
-        let embed_tokens = QuantizedEmbedding {
-            weight: tensors
-                .get("model.embed_tokens.weight")
-                .cloned()
-                .context("missing model.embed_tokens.weight")?,
-            scales: tensors
-                .get("model.embed_tokens.scales")
-                .cloned()
-                .context("missing model.embed_tokens.scales")?,
-            biases: tensors
-                .get("model.embed_tokens.biases")
-                .cloned()
-                .context("missing model.embed_tokens.biases")?,
+        let (embed_group_size, embed_bits) = quant_params_for(
+            &config_json,
+            &format!("{}.embed_tokens", prefixes.model),
             group_size,
             bits,
+        );
+        let embed_tokens = QuantizedEmbedding {
+            weight: tensors
+                .get(&format!("{}.embed_tokens.weight", prefixes.model))
+                .cloned()
+                .with_context(|| format!("missing {}.embed_tokens.weight", prefixes.model))?,
+            scales: tensors
+                .get(&format!("{}.embed_tokens.scales", prefixes.model))
+                .cloned()
+                .with_context(|| format!("missing {}.embed_tokens.scales", prefixes.model))?,
+            biases: tensors
+                .get(&format!("{}.embed_tokens.biases", prefixes.model))
+                .cloned()
+                .with_context(|| format!("missing {}.embed_tokens.biases", prefixes.model))?,
+            group_size: embed_group_size,
+            bits: embed_bits,
+        };
+        let embed_scale = if arch.is_gemma3() || arch.is_gemma4() {
+            (config.hidden_size as f32).sqrt()
+        } else {
+            1.0
+        };
+        let embed_tokens_per_layer = if arch.is_gemma4() {
+            let (group_size, bits) = quant_params_for(
+                &config_json,
+                &format!("{}.embed_tokens_per_layer", prefixes.model),
+                group_size,
+                bits,
+            );
+            Some(QuantizedEmbedding {
+                weight: tensors
+                    .get(&format!("{}.embed_tokens_per_layer.weight", prefixes.model))
+                    .cloned()
+                    .with_context(|| {
+                        format!("missing {}.embed_tokens_per_layer.weight", prefixes.model)
+                    })?,
+                scales: tensors
+                    .get(&format!("{}.embed_tokens_per_layer.scales", prefixes.model))
+                    .cloned()
+                    .with_context(|| {
+                        format!("missing {}.embed_tokens_per_layer.scales", prefixes.model)
+                    })?,
+                biases: tensors
+                    .get(&format!("{}.embed_tokens_per_layer.biases", prefixes.model))
+                    .cloned()
+                    .with_context(|| {
+                        format!("missing {}.embed_tokens_per_layer.biases", prefixes.model)
+                    })?,
+                group_size,
+                bits,
+            })
+        } else {
+            None
+        };
+        let per_layer_projection_norm = if arch.is_gemma4() {
+            Some(RMSNorm {
+                weight: tensors
+                    .get(&format!(
+                        "{}.per_layer_projection_norm.weight",
+                        prefixes.model
+                    ))
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "missing {}.per_layer_projection_norm.weight",
+                            prefixes.model
+                        )
+                    })?,
+                eps: config.rms_norm_eps,
+                add_unit_offset: false,
+            })
+        } else {
+            None
+        };
+        let per_layer_model_projection = if arch.is_gemma4() {
+            Some(load_qlinear(&format!(
+                "{}.per_layer_model_projection",
+                prefixes.model
+            ))?)
+        } else {
+            None
         };
 
         let norm = RMSNorm {
             weight: tensors
-                .get("model.norm.weight")
+                .get(&format!("{}.norm.weight", prefixes.model))
                 .cloned()
-                .context("missing model.norm.weight")?,
+                .with_context(|| format!("missing {}.norm.weight", prefixes.model))?,
             eps: config.rms_norm_eps,
+            add_unit_offset: arch.is_gemma3(),
         };
 
         // Qwen3-class configs can declare an explicit head_dim that differs
@@ -469,11 +825,77 @@ impl MlxModel {
         let head_dim = config
             .head_dim
             .unwrap_or_else(|| config.hidden_size / config.num_attention_heads);
-        let scale = 1.0 / (head_dim as f32).sqrt();
+        let activation = match config.hidden_activation.as_deref() {
+            Some("gelu_pytorch_tanh") | Some("gelu") => Activation::GeluApproximate,
+            _ => Activation::Silu,
+        };
+        let first_kv_shared_layer_idx = config
+            .num_kv_shared_layers
+            .map(|n| (config.num_hidden_layers - n).max(0) as usize)
+            .unwrap_or(config.num_hidden_layers as usize);
+        let non_shared_layer_types = config
+            .layer_types
+            .as_ref()
+            .map(|types| types[..first_kv_shared_layer_idx.min(types.len())].to_vec());
 
         let mut layers = Vec::new();
         for i in 0..config.num_hidden_layers {
-            let p = format!("model.layers.{i}");
+            let p = format!("{}.layers.{i}", prefixes.model);
+            let layer_type = config
+                .layer_types
+                .as_ref()
+                .and_then(|types| types.get(i as usize))
+                .map(String::as_str);
+            let is_full_attention =
+                arch.is_gemma4() && matches!(layer_type, Some("full_attention"));
+            let layer_head_dim = if is_full_attention {
+                config.global_head_dim.unwrap_or(head_dim)
+            } else {
+                head_dim
+            };
+            let rope_parameters = layer_type.and_then(|name| {
+                config
+                    .rope_parameters
+                    .as_ref()
+                    .and_then(|map| map.get(name))
+            });
+            let rope_dim = if is_full_attention {
+                ((layer_head_dim as f32)
+                    * rope_parameters
+                        .and_then(|params| params.partial_rotary_factor)
+                        .unwrap_or(1.0))
+                .round() as i32
+            } else {
+                layer_head_dim
+            };
+            let rope_theta = rope_parameters
+                .and_then(|params| params.rope_theta)
+                .unwrap_or(config.rope_theta);
+            let kv_shared_source = if arch.is_gemma4() && (i as usize) >= first_kv_shared_layer_idx
+            {
+                non_shared_layer_types.as_ref().and_then(|types| {
+                    layer_type.and_then(|current| {
+                        types
+                            .iter()
+                            .rposition(|candidate| candidate == current)
+                            .map(|index| index)
+                    })
+                })
+            } else {
+                None
+            };
+            let scale = if arch.is_gemma4() {
+                1.0
+            } else if let Some(query_pre_attn_scalar) = config.query_pre_attn_scalar {
+                1.0 / query_pre_attn_scalar.sqrt()
+            } else {
+                1.0 / (layer_head_dim as f32).sqrt()
+            };
+            let mlp_in_norm_key = if arch.is_gemma3() || arch.is_gemma4() {
+                format!("{p}.pre_feedforward_layernorm.weight")
+            } else {
+                format!("{p}.post_attention_layernorm.weight")
+            };
             layers.push(Layer {
                 attn: Attention {
                     q_proj: load_qlinear(&format!("{p}.self_attn.q_proj"))?,
@@ -486,6 +908,7 @@ impl MlxModel {
                         .map(|weight| RMSNorm {
                             weight,
                             eps: config.rms_norm_eps,
+                            add_unit_offset: arch.is_gemma3(),
                         }),
                     k_norm: tensors
                         .get(&format!("{p}.self_attn.k_norm.weight"))
@@ -493,39 +916,110 @@ impl MlxModel {
                         .map(|weight| RMSNorm {
                             weight,
                             eps: config.rms_norm_eps,
+                            add_unit_offset: arch.is_gemma3(),
                         }),
+                    v_norm: arch.is_gemma4().then(|| RMSNorm {
+                        weight: mlx_rs::ops::ones::<f32>(&[layer_head_dim])
+                            .expect("allocating v_norm scale"),
+                        eps: config.rms_norm_eps,
+                        add_unit_offset: false,
+                    }),
                     num_heads: config.num_attention_heads,
                     num_kv_heads: config.num_key_value_heads,
-                    head_dim,
+                    head_dim: layer_head_dim,
                     scale,
-                    rope_theta: config.rope_theta,
+                    rope_dim,
+                    rope_theta,
+                    kv_shared_source,
                 },
                 mlp: MLP {
                     gate_proj: load_qlinear(&format!("{p}.mlp.gate_proj"))?,
                     up_proj: load_qlinear(&format!("{p}.mlp.up_proj"))?,
                     down_proj: load_qlinear(&format!("{p}.mlp.down_proj"))?,
+                    activation: activation,
                 },
-                attn_norm: RMSNorm {
+                attn_in_norm: RMSNorm {
                     weight: tensors
                         .get(&format!("{p}.input_layernorm.weight"))
                         .cloned()
                         .with_context(|| format!("missing {p}.input_layernorm.weight"))?,
                     eps: config.rms_norm_eps,
+                    add_unit_offset: arch.is_gemma3(),
                 },
-                mlp_norm: RMSNorm {
-                    weight: tensors
-                        .get(&format!("{p}.post_attention_layernorm.weight"))
-                        .cloned()
-                        .with_context(|| format!("missing {p}.post_attention_layernorm.weight"))?,
+                attn_out_norm: (arch.is_gemma3() || arch.is_gemma4())
+                    .then(|| -> Result<RMSNorm> {
+                        Ok(RMSNorm {
+                            weight: tensors
+                                .get(&format!("{p}.post_attention_layernorm.weight"))
+                                .cloned()
+                                .with_context(|| {
+                                    format!("missing {p}.post_attention_layernorm.weight")
+                                })?,
+                            eps: config.rms_norm_eps,
+                            add_unit_offset: arch.is_gemma3(),
+                        })
+                    })
+                    .transpose()?,
+                mlp_in_norm: RMSNorm {
+                    weight: tensors.get(&mlp_in_norm_key).cloned().with_context(|| {
+                        if arch.is_gemma3() {
+                            format!("missing {p}.pre_feedforward_layernorm.weight")
+                        } else {
+                            format!("missing {p}.post_attention_layernorm.weight")
+                        }
+                    })?,
                     eps: config.rms_norm_eps,
+                    add_unit_offset: arch.is_gemma3(),
                 },
+                mlp_out_norm: (arch.is_gemma3() || arch.is_gemma4())
+                    .then(|| -> Result<RMSNorm> {
+                        Ok(RMSNorm {
+                            weight: tensors
+                                .get(&format!("{p}.post_feedforward_layernorm.weight"))
+                                .cloned()
+                                .with_context(|| {
+                                    format!("missing {p}.post_feedforward_layernorm.weight")
+                                })?,
+                            eps: config.rms_norm_eps,
+                            add_unit_offset: arch.is_gemma3(),
+                        })
+                    })
+                    .transpose()?,
+                per_layer_input: arch
+                    .is_gemma4()
+                    .then(|| -> Result<PerLayerInputBlock> {
+                        Ok(PerLayerInputBlock {
+                            input_gate: load_qlinear(&format!("{p}.per_layer_input_gate"))?,
+                            projection: load_qlinear(&format!("{p}.per_layer_projection"))?,
+                            post_norm: RMSNorm {
+                                weight: tensors
+                                    .get(&format!("{p}.post_per_layer_input_norm.weight"))
+                                    .cloned()
+                                    .with_context(|| {
+                                        format!("missing {p}.post_per_layer_input_norm.weight")
+                                    })?,
+                                eps: config.rms_norm_eps,
+                                add_unit_offset: false,
+                            },
+                            activation,
+                        })
+                    })
+                    .transpose()?,
+                layer_scalar: arch
+                    .is_gemma4()
+                    .then(|| tensors.get(&format!("{p}.layer_scalar")).cloned())
+                    .flatten(),
             });
         }
 
         let lm_head = if config.tie_word_embeddings {
             None
-        } else if tensors.contains_key("lm_head.weight") {
-            Some(load_qlinear("lm_head")?)
+        } else if let Some(prefix) = prefixes.lm_head.as_deref() {
+            if tensors.contains_key(&format!("{prefix}.weight")) {
+                Some(load_qlinear(prefix)?)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -536,12 +1030,28 @@ impl MlxModel {
 
         Ok(MlxModel {
             embed_tokens,
+            embed_scale,
+            embed_tokens_per_layer,
+            embed_tokens_per_layer_scale: arch.is_gemma4().then(|| {
+                config
+                    .hidden_size_per_layer_input
+                    .map(|dim| (dim as f32).sqrt())
+                    .unwrap_or(1.0)
+            }),
+            per_layer_projection_norm,
+            per_layer_model_projection,
+            per_layer_model_projection_scale: arch
+                .is_gemma4()
+                .then_some((config.hidden_size as f32).powf(-0.5)),
+            per_layer_input_scale: arch.is_gemma4().then_some(2.0f32.powf(-0.5)),
             layers,
             norm,
             lm_head,
+            final_logit_softcapping: config.final_logit_softcapping,
             config,
             tokenizer,
             prompt_template,
+            tokenwise_prefill: arch.is_gemma4(),
         })
     }
 
@@ -549,16 +1059,82 @@ impl MlxModel {
     /// Returns logits [1, seq_len, vocab_size].
     pub fn forward(&self, tokens: &Array, caches: &mut [KVCache]) -> Result<Array> {
         let mut h = self.embed_tokens.forward(tokens)?;
+        if self.embed_scale != 1.0 {
+            h = h.multiply(&array!(self.embed_scale))?;
+        }
+        let per_layer_inputs = if let (
+            Some(embed_tokens_per_layer),
+            Some(embed_tokens_per_layer_scale),
+            Some(per_layer_projection_norm),
+            Some(per_layer_model_projection),
+            Some(per_layer_model_projection_scale),
+            Some(per_layer_input_scale),
+            Some(hidden_size_per_layer_input),
+        ) = (
+            &self.embed_tokens_per_layer,
+            self.embed_tokens_per_layer_scale,
+            &self.per_layer_projection_norm,
+            &self.per_layer_model_projection,
+            self.per_layer_model_projection_scale,
+            self.per_layer_input_scale,
+            self.config.hidden_size_per_layer_input,
+        ) {
+            let per_layer_inputs = embed_tokens_per_layer
+                .forward(tokens)?
+                .multiply(&array!(embed_tokens_per_layer_scale))?
+                .reshape(&[
+                    tokens.shape()[0],
+                    tokens.shape()[1],
+                    self.config.num_hidden_layers,
+                    hidden_size_per_layer_input,
+                ])?;
+            let per_layer_projection = per_layer_model_projection
+                .forward(&h)?
+                .multiply(&array!(per_layer_model_projection_scale))?
+                .reshape(&[
+                    h.shape()[0],
+                    h.shape()[1],
+                    self.config.num_hidden_layers,
+                    hidden_size_per_layer_input,
+                ])?;
+            let per_layer_projection = per_layer_projection_norm.forward(&per_layer_projection)?;
+            Some(
+                (&per_layer_projection + &per_layer_inputs)
+                    .multiply(&array!(per_layer_input_scale))?,
+            )
+        } else {
+            None
+        };
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &mut caches[i])?;
+            let layer_input = per_layer_inputs.as_ref().map(|inputs| {
+                inputs.index((
+                    std::ops::RangeFull,
+                    std::ops::RangeFull,
+                    i as i32,
+                    std::ops::RangeFull,
+                ))
+            });
+            let (before, current_and_after) = caches.split_at_mut(i);
+            let current_cache = &mut current_and_after[0];
+            let shared_cache = layer
+                .attn
+                .kv_shared_source
+                .and_then(|source| before.get(source));
+            h = layer.forward(&h, layer_input.as_ref(), current_cache, shared_cache)?;
         }
         let h = self.norm.forward(&h)?;
 
-        Ok(if let Some(ref lm_head) = self.lm_head {
+        let logits = if let Some(ref lm_head) = self.lm_head {
             lm_head.forward(&h)?
         } else {
             self.embed_tokens.as_linear().forward(&h)?
-        })
+        };
+        if let Some(softcap) = self.final_logit_softcapping {
+            let scaled = logits.divide(&array!(softcap))?;
+            Ok(mlx_rs::ops::tanh(&scaled)?.multiply(&array!(softcap))?)
+        } else {
+            Ok(logits)
+        }
     }
 
     pub fn new_caches(&self) -> Vec<KVCache> {
@@ -566,6 +1142,116 @@ impl MlxModel {
             .map(|_| KVCache::new())
             .collect()
     }
+
+    pub fn tokenwise_prefill(&self) -> bool {
+        self.tokenwise_prefill
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelArchitecture {
+    LlamaLike,
+    Gemma3,
+    Gemma4,
+}
+
+impl ModelArchitecture {
+    fn is_gemma3(self) -> bool {
+        matches!(self, Self::Gemma3)
+    }
+
+    fn is_gemma4(self) -> bool {
+        matches!(self, Self::Gemma4)
+    }
+}
+
+struct TensorPrefixes {
+    model: String,
+    lm_head: Option<String>,
+}
+
+fn model_architecture(config: &Value) -> ModelArchitecture {
+    let model_type = config
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|value| value.get("model_type"))
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if model_type.starts_with("gemma4") {
+        ModelArchitecture::Gemma4
+    } else if model_type.starts_with("gemma3") {
+        ModelArchitecture::Gemma3
+    } else {
+        ModelArchitecture::LlamaLike
+    }
+}
+
+fn effective_text_config_json(config: &Value) -> Value {
+    let Some(text_config) = config
+        .get("text_config")
+        .and_then(|value| value.as_object())
+    else {
+        return config.clone();
+    };
+
+    let mut merged = serde_json::Map::new();
+    for (key, value) in text_config {
+        merged.insert(key.clone(), value.clone());
+    }
+    for key in [
+        "quantization",
+        "eos_token_id",
+        "rope_theta",
+        "rms_norm_eps",
+        "head_dim",
+        "max_position_embeddings",
+        "tie_word_embeddings",
+        "hidden_activation",
+        "query_pre_attn_scalar",
+        "global_head_dim",
+        "vocab_size_per_layer_input",
+        "vocab_size",
+        "hidden_size_per_layer_input",
+        "num_kv_shared_layers",
+        "layer_types",
+        "rope_parameters",
+        "final_logit_softcapping",
+    ] {
+        if !merged.contains_key(key) || merged.get(key).is_some_and(Value::is_null) {
+            if let Some(value) = config.get(key) {
+                merged.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    if !merged.contains_key("architectures") {
+        if let Some(value) = config.get("architectures") {
+            merged.insert("architectures".to_string(), value.clone());
+        }
+    }
+
+    Value::Object(merged)
+}
+
+fn tensor_prefixes(tensors: &HashMap<String, Array>) -> Result<TensorPrefixes> {
+    if tensors.contains_key("model.embed_tokens.weight") {
+        return Ok(TensorPrefixes {
+            model: "model".to_string(),
+            lm_head: Some("lm_head".to_string()),
+        });
+    }
+    if tensors.contains_key("language_model.model.embed_tokens.weight") {
+        return Ok(TensorPrefixes {
+            model: "language_model.model".to_string(),
+            lm_head: Some("language_model.lm_head".to_string()),
+        });
+    }
+    bail!("unsupported MLX tensor prefix layout")
 }
 
 /// Argmax over the last position's logits. Returns the token ID.
@@ -651,9 +1337,17 @@ fn config_supports_mlx(config: &Value) -> bool {
             "llama"
                 | "qwen2"
                 | "qwen3"
+                | "gemma3"
+                | "gemma3_text"
+                | "gemma4"
+                | "gemma4_text"
                 | "llamaforcausallm"
                 | "qwen2forcausallm"
                 | "qwen3forcausallm"
+                | "gemma3forcausallm"
+                | "gemma3forconditionalgeneration"
+                | "gemma4forcausallm"
+                | "gemma4forconditionalgeneration"
         )
     })
 }
@@ -692,7 +1386,7 @@ fn ensure_supported_mlx_model(dir: &Path, config: &Value) -> Result<()> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "none".to_string());
     bail!(
-        "unsupported MLX model architecture in {} (model_type={}, architectures={}); supported MLX models currently cover Llama/Qwen-style safetensors checkpoints",
+        "unsupported MLX model architecture in {} (model_type={}, architectures={}); supported MLX models currently cover Llama/Qwen/Gemma3/Gemma4-style safetensors checkpoints",
         dir.display(),
         model_type,
         architectures,
@@ -806,14 +1500,45 @@ mod tests {
             "model_type": "llama",
             "architectures": ["LlamaForCausalLM"]
         });
-        let unsupported: Value = serde_json::json!({
+        let gemma3: Value = serde_json::json!({
             "model_type": "gemma3",
             "architectures": ["Gemma3ForConditionalGeneration"]
+        });
+        let gemma4: Value = serde_json::json!({
+            "model_type": "gemma4",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "text_config": {"model_type": "gemma4_text"}
         });
 
         assert!(config_supports_mlx(&qwen));
         assert!(config_supports_mlx(&llama));
-        assert!(!config_supports_mlx(&unsupported));
+        assert!(config_supports_mlx(&gemma3));
+        assert!(config_supports_mlx(&gemma4));
+    }
+
+    #[test]
+    fn config_rejects_other_reasoning_families_for_runtime_loading() {
+        let glm: Value = serde_json::json!({
+            "model_type": "glm",
+            "architectures": ["GlmForCausalLM"]
+        });
+        let kimi: Value = serde_json::json!({
+            "model_type": "kimi_k25",
+            "architectures": ["KimiK25ForConditionalGeneration"]
+        });
+        let gpt_oss: Value = serde_json::json!({
+            "model_type": "gpt_oss",
+            "architectures": ["GptOssForCausalLM"]
+        });
+        let lfm2: Value = serde_json::json!({
+            "model_type": "lfm2_moe",
+            "architectures": ["Lfm2MoeForCausalLM"]
+        });
+
+        assert!(!config_supports_mlx(&glm));
+        assert!(!config_supports_mlx(&kimi));
+        assert!(!config_supports_mlx(&gpt_oss));
+        assert!(!config_supports_mlx(&lfm2));
     }
 
     #[test]
@@ -855,15 +1580,290 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let config = serde_json::json!({
-            "model_type": "gemma3",
-            "architectures": ["Gemma3ForConditionalGeneration"]
+            "model_type": "gemma2",
+            "architectures": ["Gemma2ForCausalLM"]
         });
 
         let err = ensure_supported_mlx_model(&root, &config)
             .unwrap_err()
             .to_string();
         assert!(err.contains("unsupported MLX model architecture"));
-        assert!(err.contains("model_type=gemma3"));
-        assert!(err.contains("Gemma3ForConditionalGeneration"));
+        assert!(err.contains("model_type=gemma2"));
+        assert!(err.contains("Gemma2ForCausalLM"));
+    }
+
+    #[test]
+    fn unsupported_reasoning_family_errors_are_explicit() {
+        let root = std::env::temp_dir().join(format!(
+            "mesh-llm-mlx-unsupported-reasoning-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        for config in [
+            serde_json::json!({
+                "model_type": "glm",
+                "architectures": ["GlmForCausalLM"]
+            }),
+            serde_json::json!({
+                "model_type": "kimi_k25",
+                "architectures": ["KimiK25ForConditionalGeneration"]
+            }),
+            serde_json::json!({
+                "model_type": "gpt_oss",
+                "architectures": ["GptOssForCausalLM"]
+            }),
+            serde_json::json!({
+                "model_type": "lfm2_moe",
+                "architectures": ["Lfm2MoeForCausalLM"]
+            }),
+        ] {
+            let err = ensure_supported_mlx_model(&root, &config)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unsupported MLX model architecture"));
+            assert!(err.contains("model_type="));
+            assert!(err.contains("architectures="));
+        }
+    }
+
+    #[test]
+    fn effective_text_config_extracts_gemma3_text_config() {
+        let config = serde_json::json!({
+            "model_type": "gemma3",
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "quantization": {"group_size": 64, "bits": 4},
+            "eos_token_id": [1, 106],
+            "tie_word_embeddings": null,
+            "head_dim": 256,
+            "query_pre_attn_scalar": 256,
+            "rms_norm_eps": 0.000001,
+            "rope_theta": 1000000,
+            "max_position_embeddings": 32768,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "text_config": {
+                "model_type": "gemma3_text",
+                "hidden_size": 1152,
+                "num_hidden_layers": 26,
+                "intermediate_size": 6912,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 1,
+                "vocab_size": 262144
+            }
+        });
+
+        let effective = effective_text_config_json(&config);
+        let parsed: ModelConfig = serde_json::from_value(effective).unwrap();
+        assert_eq!(parsed.hidden_size, 1152);
+        assert_eq!(parsed.head_dim, Some(256));
+        assert_eq!(parsed.query_pre_attn_scalar, Some(256.0));
+        assert_eq!(
+            parsed.hidden_activation.as_deref(),
+            Some("gelu_pytorch_tanh")
+        );
+        assert!(!parsed.tie_word_embeddings);
+        assert_eq!(parsed.eos_token_id, vec![1, 106]);
+    }
+
+    #[test]
+    fn model_architecture_detects_gemma3_from_text_config() {
+        let config = serde_json::json!({
+            "model_type": "gemma3",
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "text_config": {"model_type": "gemma3_text"}
+        });
+
+        assert_eq!(model_architecture(&config), ModelArchitecture::Gemma3);
+    }
+
+    #[test]
+    fn effective_text_config_extracts_gemma4_text_config() {
+        let config = serde_json::json!({
+            "model_type": "gemma4",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "quantization": {"group_size": 64, "bits": 4},
+            "eos_token_id": [1, 106],
+            "tie_word_embeddings": false,
+            "rms_norm_eps": 0.000001,
+            "max_position_embeddings": 32768,
+            "rope_theta": 10000.0,
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 2560,
+                "hidden_size_per_layer_input": 256,
+                "num_hidden_layers": 42,
+                "intermediate_size": 10240,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "num_kv_shared_layers": 18,
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "query_pre_attn_scalar": 256.0,
+                "vocab_size": 262400,
+                "vocab_size_per_layer_input": 128,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "final_logit_softcapping": 30.0
+            }
+        });
+
+        let effective = effective_text_config_json(&config);
+        let parsed: ModelConfig = serde_json::from_value(effective).unwrap();
+        assert_eq!(parsed.hidden_size, 2560);
+        assert_eq!(parsed.hidden_size_per_layer_input, Some(256));
+        assert_eq!(parsed.head_dim, Some(256));
+        assert_eq!(parsed.global_head_dim, Some(512));
+        assert_eq!(parsed.num_kv_shared_layers, Some(18));
+        assert_eq!(parsed.vocab_size_per_layer_input, Some(128));
+        assert_eq!(
+            parsed.layer_types.as_deref(),
+            Some(
+                &[
+                    "sliding_attention".to_string(),
+                    "full_attention".to_string()
+                ][..]
+            )
+        );
+        assert_eq!(parsed.final_logit_softcapping, Some(30.0));
+    }
+
+    #[test]
+    fn model_architecture_detects_gemma4_from_text_config() {
+        let config = serde_json::json!({
+            "model_type": "gemma4",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "text_config": {"model_type": "gemma4_text"}
+        });
+
+        assert_eq!(model_architecture(&config), ModelArchitecture::Gemma4);
+    }
+
+    #[test]
+    fn qwen3_flat_rope_parameters_are_accepted() {
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": 1024,
+            "num_hidden_layers": 28,
+            "intermediate_size": 3072,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 151936,
+            "rms_norm_eps": 0.000001,
+            "max_position_embeddings": 40960,
+            "tie_word_embeddings": true,
+            "quantization": {
+                "group_size": 64,
+                "bits": 4
+            },
+            "eos_token_id": 151645,
+            "rope_theta": 1000000.0,
+            "rope_parameters": {
+                "rope_theta": 1000000.0,
+                "rope_type": "default"
+            }
+        }))
+        .unwrap();
+
+        let params = config.rope_parameters.unwrap();
+        assert_eq!(
+            params.get("default").and_then(|p| p.rope_theta),
+            Some(1000000.0)
+        );
+    }
+
+    #[test]
+    fn gemma3_uses_scaled_embeddings() {
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": 1152,
+            "num_hidden_layers": 26,
+            "intermediate_size": 6912,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 256,
+            "query_pre_attn_scalar": 256,
+            "vocab_size": 262144,
+            "rms_norm_eps": 0.000001,
+            "max_position_embeddings": 32768,
+            "tie_word_embeddings": null,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "quantization": {
+                "group_size": 64,
+                "bits": 4
+            },
+            "eos_token_id": [1, 106]
+        }))
+        .unwrap();
+
+        let embed_scale = (config.hidden_size as f32).sqrt();
+        assert!((embed_scale - 33.941124).abs() < 0.001);
+    }
+
+    #[test]
+    fn gemma4_uses_scaled_main_and_per_layer_embeddings() {
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": 2560,
+            "hidden_size_per_layer_input": 256,
+            "num_hidden_layers": 42,
+            "intermediate_size": 10240,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "num_kv_shared_layers": 18,
+            "vocab_size": 262400,
+            "vocab_size_per_layer_input": 128,
+            "rms_norm_eps": 0.000001,
+            "max_position_embeddings": 32768,
+            "tie_word_embeddings": false,
+            "query_pre_attn_scalar": 256.0,
+            "rope_theta": 10000.0,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "quantization": {
+                "group_size": 64,
+                "bits": 4
+            },
+            "eos_token_id": [1, 106]
+        }))
+        .unwrap();
+
+        let embed_scale = (config.hidden_size as f32).sqrt();
+        let per_layer_scale = (config.hidden_size_per_layer_input.unwrap() as f32).sqrt();
+        assert!((embed_scale - 50.596443).abs() < 0.001);
+        assert!((per_layer_scale - 16.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn quant_params_for_uses_tensor_specific_overrides() {
+        let config = serde_json::json!({
+            "quantization": {
+                "group_size": 64,
+                "bits": 4,
+                "language_model.model.embed_tokens": {"group_size": 64, "bits": 6},
+                "language_model.model.layers.0.self_attn.q_proj": {"group_size": 64, "bits": 8}
+            }
+        });
+
+        assert_eq!(
+            quant_params_for(&config, "language_model.model.embed_tokens", 64, 4),
+            (64, 6)
+        );
+        assert_eq!(
+            quant_params_for(
+                &config,
+                "language_model.model.layers.0.self_attn.q_proj",
+                64,
+                4
+            ),
+            (64, 8)
+        );
+        assert_eq!(
+            quant_params_for(
+                &config,
+                "language_model.model.layers.0.mlp.down_proj",
+                64,
+                4
+            ),
+            (64, 4)
+        );
     }
 }

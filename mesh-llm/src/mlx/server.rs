@@ -70,6 +70,8 @@ pub async fn start_mlx_server(
         model.config.vocab_size,
     );
 
+    let context_length = model.config.max_position_embeddings as u32;
+
     let state = Arc::new(Mutex::new(InferState {
         model,
         model_name,
@@ -113,6 +115,7 @@ pub async fn start_mlx_server(
 
     Ok(InferenceServerProcess {
         handle: InferenceServerHandle::in_process(shutdown_tx),
+        context_length,
         death_rx,
     })
 }
@@ -407,6 +410,15 @@ fn prefill_logits(
     caches: &mut [model::KVCache],
 ) -> Result<Array> {
     let total = prompt_tokens.len();
+
+    if model.tokenwise_prefill() {
+        let mut logits = None;
+        for &token in prompt_tokens {
+            let input = Array::from_slice(&[token], &[1, 1]);
+            logits = Some(model.forward(&input, caches)?);
+        }
+        return logits.context("tokenwise prefill received empty prompt");
+    }
 
     if total <= PREFILL_STEP_SIZE {
         // Small prompt — single forward pass, no eval barriers
