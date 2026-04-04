@@ -142,6 +142,9 @@ print(json.dumps({
     "messages": [{"role": "user", "content": prompt}],
     "max_tokens": 32,
     "temperature": 0,
+    "top_p": 1,
+    "top_k": 1,
+    "seed": 123,
     "enable_thinking": False
 }))
 PY
@@ -218,6 +221,9 @@ print(json.dumps({
     "messages": [{"role": "user", "content": prompt}],
     "max_tokens": 64,
     "temperature": 0,
+    "top_p": 1,
+    "top_k": 1,
+    "seed": 123,
     "enable_thinking": True
 }))
 PY

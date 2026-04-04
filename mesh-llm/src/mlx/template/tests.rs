@@ -199,6 +199,34 @@ fn normalizes_tojson_keyword_arguments() {
 }
 
 #[test]
+fn detects_old_qwen_reasoning_tags_from_split_template() {
+    let template = "{{ content | split('</think>') | last }}";
+    let reasoning = detect_reasoning_template(template);
+    assert!(reasoning.supports_explicit_reasoning);
+    assert_eq!(
+        reasoning.tagged_reasoning,
+        vec![TaggedReasoningBlock {
+            start: "<think>".to_string(),
+            end: "</think>".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn detects_gemma4_reasoning_channel_markers() {
+    let template = "{% if add_generation_prompt %}<|channel>thought{{ reasoning_content }}<channel|>{% endif %}";
+    let reasoning = detect_reasoning_template(template);
+    assert!(reasoning.supports_explicit_reasoning);
+    assert_eq!(
+        reasoning.tagged_reasoning,
+        vec![TaggedReasoningBlock {
+            start: "<|channel>thought".to_string(),
+            end: "<channel|>".to_string(),
+        }]
+    );
+}
+
+#[test]
 fn prefers_chat_template_jinja_over_tokenizer_config() {
     let root = std::env::temp_dir().join(format!(
         "mesh-llm-template-jinja-precedence-{}",

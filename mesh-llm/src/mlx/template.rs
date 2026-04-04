@@ -12,6 +12,7 @@ pub enum PromptTemplate {
         source_file: String,
         behavior: crate::models::ModelPromptBehavior,
         reasoning_defaults: ReasoningDefaults,
+        reasoning_template: ReasoningTemplate,
         fallback: Box<PromptTemplate>,
     },
     ChatMl {
@@ -37,11 +38,24 @@ pub(crate) struct ReasoningDefaults {
     reasoning_effort: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReasoningTemplate {
+    pub supports_explicit_reasoning: bool,
+    pub tagged_reasoning: Vec<TaggedReasoningBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaggedReasoningBlock {
+    pub start: String,
+    pub end: String,
+}
+
 impl PromptTemplate {
     pub fn detect(dir: &Path, config: &Value) -> Self {
         let fallback = heuristic_prompt_template(config);
         if let Some((source_file, template)) = read_template_text(dir) {
             let template = normalize_hf_template(&template);
+            let reasoning_template = detect_reasoning_template(&template);
             if let Err(err) = validate_hf_template(&template) {
                 tracing::warn!(
                     "MLX prompt template: failed to compile HF template from {}: {err}; falling back to {:?}",
@@ -70,6 +84,7 @@ impl PromptTemplate {
                 source_file,
                 behavior,
                 reasoning_defaults: reasoning_defaults(config),
+                reasoning_template,
                 fallback: Box::new(fallback),
             };
         }
@@ -150,6 +165,17 @@ impl PromptTemplate {
                     .as_array()
                     .context("missing messages array")?;
                 Ok(render_llama3(messages))
+            }
+        }
+    }
+
+    pub fn reasoning_template(&self) -> ReasoningTemplate {
+        match self {
+            PromptTemplate::HuggingFace {
+                reasoning_template, ..
+            } => reasoning_template.clone(),
+            PromptTemplate::ChatMl { .. } | PromptTemplate::Gemma3 | PromptTemplate::Llama3 => {
+                ReasoningTemplate::default()
             }
         }
     }
@@ -366,6 +392,65 @@ fn reasoning_defaults(config: &Value) -> ReasoningDefaults {
     }
 
     ReasoningDefaults::default()
+}
+
+fn detect_reasoning_template(template: &str) -> ReasoningTemplate {
+    let mut tagged_reasoning = Vec::new();
+
+    if is_old_qwen_reasoning_template(template) || template_mentions_think_tags(template) {
+        tagged_reasoning.push(TaggedReasoningBlock {
+            start: "<think>".to_string(),
+            end: "</think>".to_string(),
+        });
+    }
+
+    if template.contains("<|channel>thought") && template.contains("<channel|>") {
+        tagged_reasoning.push(TaggedReasoningBlock {
+            start: "<|channel>thought".to_string(),
+            end: "<channel|>".to_string(),
+        });
+    }
+
+    tagged_reasoning
+        .sort_by(|left, right| left.start.cmp(&right.start).then(left.end.cmp(&right.end)));
+    tagged_reasoning.dedup();
+
+    ReasoningTemplate {
+        supports_explicit_reasoning: template_supports_explicit_reasoning(template)
+            || !tagged_reasoning.is_empty(),
+        tagged_reasoning,
+    }
+}
+
+fn template_supports_explicit_reasoning(template: &str) -> bool {
+    [
+        "enable_thinking",
+        "thinking",
+        "keep_past_thinking",
+        "reasoning_effort",
+        "reasoning_content",
+    ]
+    .into_iter()
+    .any(|needle| template.contains(needle))
+}
+
+fn template_mentions_think_tags(template: &str) -> bool {
+    template.contains("<think>") && template.contains("</think>")
+}
+
+fn is_old_qwen_reasoning_template(template: &str) -> bool {
+    let splits_on_end_think = [
+        "split('</think>')",
+        "split(\"</think>\")",
+        "| split('</think>')",
+        "| split(\"</think>\")",
+    ]
+    .into_iter()
+    .any(|needle| template.contains(needle));
+
+    splits_on_end_think
+        && !template.contains("reasoning_content")
+        && !template.contains("<SPECIAL_12>")
 }
 
 fn template_kwarg(req: &Value, key: &str) -> Option<Value> {

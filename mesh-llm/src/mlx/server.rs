@@ -51,84 +51,113 @@ enum StreamEvent {
 
 #[derive(Clone, Default)]
 struct ResponsePolicy {
-    strip_think_blocks: bool,
+    strip_reasoning_blocks: bool,
+    tagged_reasoning: Vec<crate::mlx::template::TaggedReasoningBlock>,
 }
 
 struct ResponseFilter {
     policy: ResponsePolicy,
-    think: ThinkBlockFilter,
+    tagged_reasoning: Vec<TaggedBlockFilter>,
 }
 
-#[derive(Default)]
-struct ThinkBlockFilter {
+struct TaggedBlockFilter {
+    start: String,
+    end: String,
     inside_think: bool,
     carry: String,
 }
 
 impl ResponseFilter {
     fn new(policy: ResponsePolicy) -> Self {
+        let tagged_reasoning = policy
+            .tagged_reasoning
+            .iter()
+            .cloned()
+            .map(TaggedBlockFilter::new)
+            .collect();
         Self {
             policy,
-            think: ThinkBlockFilter::default(),
+            tagged_reasoning,
         }
     }
 
     fn push(&mut self, text: &str) -> String {
-        if !self.policy.strip_think_blocks {
+        if !self.policy.strip_reasoning_blocks {
             return text.to_string();
         }
-        self.think.push(text)
+        let mut filtered = text.to_string();
+        for block in &mut self.tagged_reasoning {
+            filtered = block.push(&filtered);
+        }
+        filtered
     }
 
     fn finish(&mut self) -> String {
-        if !self.policy.strip_think_blocks {
+        if !self.policy.strip_reasoning_blocks {
             return String::new();
         }
-        self.think.finish()
+        let mut tail = String::new();
+        for (index, block) in self.tagged_reasoning.iter_mut().enumerate() {
+            let flushed = block.finish();
+            if index == 0 {
+                tail = flushed;
+            } else if !tail.is_empty() {
+                tail = block.push(&tail);
+                tail.push_str(&block.finish());
+            }
+        }
+        tail
     }
 }
 
-impl ThinkBlockFilter {
-    fn push(&mut self, text: &str) -> String {
-        const START: &str = "<think>";
-        const END: &str = "</think>";
+impl TaggedBlockFilter {
+    fn new(block: crate::mlx::template::TaggedReasoningBlock) -> Self {
+        Self {
+            start: block.start,
+            end: block.end,
+            inside_think: false,
+            carry: String::new(),
+        }
+    }
 
+    fn push(&mut self, text: &str) -> String {
         let mut input = std::mem::take(&mut self.carry);
         input.push_str(text);
         let mut out = String::new();
 
         loop {
             if self.inside_think {
-                if let Some(idx) = input.find(END) {
-                    input.drain(..idx + END.len());
+                if let Some(idx) = input.find(&self.end) {
+                    input.drain(..idx + self.end.len());
                     self.inside_think = false;
                     continue;
                 }
-                let keep = partial_tag_suffix_len(&input, &[END]);
+                let keep = partial_tag_suffix_len(&input, &[self.end.as_str()]);
                 if keep > 0 {
                     self.carry = input[input.len() - keep..].to_string();
                 }
                 return out;
             }
 
-            let next_start = input.find(START);
-            let next_end = input.find(END);
+            let next_start = input.find(&self.start);
+            let next_end = input.find(&self.end);
             match (next_start, next_end) {
                 (Some(start), Some(end)) if end < start => {
                     out.push_str(&input[..end]);
-                    input.drain(..end + END.len());
+                    input.drain(..end + self.end.len());
                 }
                 (Some(start), _) => {
                     out.push_str(&input[..start]);
-                    input.drain(..start + START.len());
+                    input.drain(..start + self.start.len());
                     self.inside_think = true;
                 }
                 (None, Some(end)) => {
                     out.push_str(&input[..end]);
-                    input.drain(..end + END.len());
+                    input.drain(..end + self.end.len());
                 }
                 (None, None) => {
-                    let keep = partial_tag_suffix_len(&input, &[START, END]);
+                    let keep =
+                        partial_tag_suffix_len(&input, &[self.start.as_str(), self.end.as_str()]);
                     out.push_str(&input[..input.len() - keep]);
                     if keep > 0 {
                         self.carry = input[input.len() - keep..].to_string();
@@ -373,9 +402,11 @@ async fn handle_chat_completions(
     let (generation, prompt) = {
         let state = state.lock().await;
         let generation = parse_generation_config(&req, &state.model);
+        let reasoning_template = state.model.prompt_template.reasoning_template();
         let prompt_req = prepare_reasoning_request(
             &req,
             state.model.reasoning_family,
+            &reasoning_template,
             &generation.response_policy,
         );
         let prompt = render_chat_prompt_from_request(&state.model.prompt_template, &prompt_req)?;
@@ -400,9 +431,13 @@ fn render_chat_prompt_from_request(
 fn prepare_reasoning_request(
     req: &serde_json::Value,
     reasoning_family: model::ReasoningFamily,
+    reasoning_template: &crate::mlx::template::ReasoningTemplate,
     policy: &ResponsePolicy,
 ) -> serde_json::Value {
-    if !policy.strip_think_blocks || reasoning_family == model::ReasoningFamily::None {
+    if !policy.strip_reasoning_blocks
+        || (reasoning_family == model::ReasoningFamily::None
+            && !reasoning_template.supports_explicit_reasoning)
+    {
         return req.clone();
     }
 
@@ -1075,19 +1110,29 @@ fn default_stop_sequences_for(
 }
 
 fn response_policy(req: &serde_json::Value, model: &MlxModel) -> ResponsePolicy {
-    response_policy_for(req, model.reasoning_family)
+    response_policy_for(
+        req,
+        model.reasoning_family,
+        &model.prompt_template.reasoning_template(),
+    )
 }
 
 fn response_policy_for(
     req: &serde_json::Value,
     reasoning_family: model::ReasoningFamily,
+    reasoning_template: &crate::mlx::template::ReasoningTemplate,
 ) -> ResponsePolicy {
     ResponsePolicy {
-        strip_think_blocks: reasoning_disabled(req, reasoning_family),
+        strip_reasoning_blocks: reasoning_disabled(req, reasoning_family, reasoning_template),
+        tagged_reasoning: reasoning_template.tagged_reasoning.clone(),
     }
 }
 
-fn reasoning_disabled(req: &serde_json::Value, family: model::ReasoningFamily) -> bool {
+fn reasoning_disabled(
+    req: &serde_json::Value,
+    family: model::ReasoningFamily,
+    reasoning_template: &crate::mlx::template::ReasoningTemplate,
+) -> bool {
     match family {
         model::ReasoningFamily::Qwen3 | model::ReasoningFamily::Glm => {
             request_bool_kwarg(req, "enable_thinking").unwrap_or(false) == false
@@ -1116,7 +1161,22 @@ fn reasoning_disabled(req: &serde_json::Value, family: model::ReasoningFamily) -
                 )
             }
         }
-        model::ReasoningFamily::None => false,
+        model::ReasoningFamily::None => {
+            if !reasoning_template.supports_explicit_reasoning {
+                false
+            } else if let Some(value) = request_bool_kwarg(req, "thinking") {
+                !value
+            } else if let Some(value) = request_bool_kwarg(req, "keep_past_thinking") {
+                !value
+            } else if let Some(value) = request_bool_kwarg(req, "enable_thinking") {
+                !value
+            } else {
+                matches!(
+                    request_string_kwarg(req, "reasoning_effort").as_deref(),
+                    Some("low")
+                )
+            }
+        }
     }
 }
 
@@ -1154,7 +1214,11 @@ mod tests {
     #[test]
     fn think_block_filter_strips_tagged_reasoning_across_chunks() {
         let mut filter = ResponseFilter::new(ResponsePolicy {
-            strip_think_blocks: true,
+            strip_reasoning_blocks: true,
+            tagged_reasoning: vec![crate::mlx::template::TaggedReasoningBlock {
+                start: "<think>".to_string(),
+                end: "</think>".to_string(),
+            }],
         });
         assert_eq!(filter.push("<thi"), "");
         assert_eq!(filter.push("nk>internal"), "");
@@ -1163,12 +1227,29 @@ mod tests {
     }
 
     #[test]
+    fn tagged_block_filter_strips_gemma4_reasoning_markers() {
+        let mut filter = ResponseFilter::new(ResponsePolicy {
+            strip_reasoning_blocks: true,
+            tagged_reasoning: vec![crate::mlx::template::TaggedReasoningBlock {
+                start: "<|channel>thought".to_string(),
+                end: "<channel|>".to_string(),
+            }],
+        });
+        assert_eq!(filter.push("<|channel>thoughthidden"), "");
+        assert_eq!(filter.push("<channel|>blue"), "blue");
+    }
+
+    #[test]
     fn qwen3_generation_config_adds_chatml_stops_and_disables_thinking_by_default() {
         let stops = default_stop_sequences_for(Some("chatml"), model::ReasoningFamily::Qwen3);
         assert!(stops.contains(&"<|im_end|>".to_string()));
         assert!(stops.contains(&"<|im_start|>".to_string()));
-        let policy = response_policy_for(&serde_json::json!({}), model::ReasoningFamily::Qwen3);
-        assert!(policy.strip_think_blocks);
+        let policy = response_policy_for(
+            &serde_json::json!({}),
+            model::ReasoningFamily::Qwen3,
+            &crate::mlx::template::ReasoningTemplate::default(),
+        );
+        assert!(policy.strip_reasoning_blocks);
     }
 
     #[test]
@@ -1176,16 +1257,21 @@ mod tests {
         let policy = response_policy_for(
             &serde_json::json!({"enable_thinking": true}),
             model::ReasoningFamily::Qwen3,
+            &crate::mlx::template::ReasoningTemplate::default(),
         );
-        assert!(!policy.strip_think_blocks);
+        assert!(!policy.strip_reasoning_blocks);
     }
 
     #[test]
     fn kimi_generation_config_maps_default_to_think_filtering() {
         let stops = default_stop_sequences_for(Some("hf_template"), model::ReasoningFamily::Kimi);
         assert!(stops.contains(&"<|im_end|>".to_string()));
-        let policy = response_policy_for(&serde_json::json!({}), model::ReasoningFamily::Kimi);
-        assert!(policy.strip_think_blocks);
+        let policy = response_policy_for(
+            &serde_json::json!({}),
+            model::ReasoningFamily::Kimi,
+            &crate::mlx::template::ReasoningTemplate::default(),
+        );
+        assert!(policy.strip_reasoning_blocks);
     }
 
     #[test]
@@ -1193,30 +1279,62 @@ mod tests {
         let stops = default_stop_sequences_for(Some("hf_template"), model::ReasoningFamily::Glm);
         assert!(stops.contains(&"<|user|>".to_string()));
         assert!(stops.contains(&"<|assistant|>".to_string()));
-        let policy = response_policy_for(&serde_json::json!({}), model::ReasoningFamily::Glm);
-        assert!(policy.strip_think_blocks);
+        let policy = response_policy_for(
+            &serde_json::json!({}),
+            model::ReasoningFamily::Glm,
+            &crate::mlx::template::ReasoningTemplate::default(),
+        );
+        assert!(policy.strip_reasoning_blocks);
     }
 
     #[test]
     fn gpt_oss_generation_config_defaults_to_reasoning_suppression() {
-        let policy = response_policy_for(&serde_json::json!({}), model::ReasoningFamily::GptOss);
-        assert!(policy.strip_think_blocks);
+        let policy = response_policy_for(
+            &serde_json::json!({}),
+            model::ReasoningFamily::GptOss,
+            &crate::mlx::template::ReasoningTemplate::default(),
+        );
+        assert!(policy.strip_reasoning_blocks);
         let explicit = response_policy_for(
             &serde_json::json!({"reasoning_effort":"medium"}),
             model::ReasoningFamily::GptOss,
+            &crate::mlx::template::ReasoningTemplate::default(),
         );
-        assert!(!explicit.strip_think_blocks);
+        assert!(!explicit.strip_reasoning_blocks);
     }
 
     #[test]
     fn lfm2_generation_config_defaults_to_strip_past_thinking() {
-        let policy = response_policy_for(&serde_json::json!({}), model::ReasoningFamily::Lfm2);
-        assert!(policy.strip_think_blocks);
+        let policy = response_policy_for(
+            &serde_json::json!({}),
+            model::ReasoningFamily::Lfm2,
+            &crate::mlx::template::ReasoningTemplate::default(),
+        );
+        assert!(policy.strip_reasoning_blocks);
         let explicit = response_policy_for(
             &serde_json::json!({"keep_past_thinking":true}),
             model::ReasoningFamily::Lfm2,
+            &crate::mlx::template::ReasoningTemplate::default(),
         );
-        assert!(!explicit.strip_think_blocks);
+        assert!(!explicit.strip_reasoning_blocks);
+    }
+
+    #[test]
+    fn unknown_reasoning_family_can_still_strip_when_template_supports_reasoning_toggle() {
+        let reasoning_template = crate::mlx::template::ReasoningTemplate {
+            supports_explicit_reasoning: true,
+            tagged_reasoning: vec![crate::mlx::template::TaggedReasoningBlock {
+                start: "<think>".to_string(),
+                end: "</think>".to_string(),
+            }],
+        };
+        let policy = response_policy_for(
+            &serde_json::json!({"enable_thinking": false}),
+            model::ReasoningFamily::None,
+            &reasoning_template,
+        );
+        assert!(policy.strip_reasoning_blocks);
+        assert_eq!(policy.tagged_reasoning.len(), 1);
     }
 
     #[test]
@@ -1227,8 +1345,10 @@ mod tests {
         let patched = prepare_reasoning_request(
             &req,
             model::ReasoningFamily::Qwen3,
+            &crate::mlx::template::ReasoningTemplate::default(),
             &ResponsePolicy {
-                strip_think_blocks: true,
+                strip_reasoning_blocks: true,
+                tagged_reasoning: Vec::new(),
             },
         );
         let messages = patched["messages"].as_array().unwrap();
@@ -1247,8 +1367,10 @@ mod tests {
         let patched = prepare_reasoning_request(
             &req,
             model::ReasoningFamily::Qwen3,
+            &crate::mlx::template::ReasoningTemplate::default(),
             &ResponsePolicy {
-                strip_think_blocks: false,
+                strip_reasoning_blocks: false,
+                tagged_reasoning: Vec::new(),
             },
         );
         assert_eq!(patched, req);
@@ -1269,8 +1391,10 @@ mod tests {
             let patched = prepare_reasoning_request(
                 &req,
                 family,
+                &crate::mlx::template::ReasoningTemplate::default(),
                 &ResponsePolicy {
-                    strip_think_blocks: true,
+                    strip_reasoning_blocks: true,
+                    tagged_reasoning: Vec::new(),
                 },
             );
             let messages = patched["messages"].as_array().unwrap();
@@ -1293,8 +1417,10 @@ mod tests {
         let patched = prepare_reasoning_request(
             &req,
             model::ReasoningFamily::Qwen3,
+            &crate::mlx::template::ReasoningTemplate::default(),
             &ResponsePolicy {
-                strip_think_blocks: true,
+                strip_reasoning_blocks: true,
+                tagged_reasoning: Vec::new(),
             },
         );
         let messages = patched["messages"].as_array().unwrap();
