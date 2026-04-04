@@ -4,6 +4,15 @@ This plan turns the inference plugin architecture note into an implementation se
 
 The intent is to move backend-specific runtime behavior into plugins without moving mesh-wide planning and routing policy out of `mesh-llm`.
 
+It assumes the pure plugin DSL from [PLUGINS.md](/Users/jdumay/.codex/worktrees/59c2/mesh-llm/PLUGINS.md):
+
+- `provides`
+- `mcp`
+- `http`
+- `inference`
+
+Inference backends should register through `inference`, not through ad hoc host-specific wiring.
+
 ## Scope
 
 This plan covers:
@@ -48,6 +57,11 @@ Owns serving/runtime execution:
 - stop runtime
 - describe runtime endpoint and context
 
+In the plugin DSL, this should map cleanly to `inference` contributions for both:
+
+- attached external endpoints
+- plugin-hosted backends
+
 ### `MoeRankingProvider`
 
 Optional backend-specific ranking/analysis provider:
@@ -55,6 +69,8 @@ Optional backend-specific ranking/analysis provider:
 - inspect backend-specific model topology
 - generate ranking artifacts
 - expose provenance and strategy metadata
+
+If ranking utilities are projected outward for humans or tooling, those should appear under `mcp` or `http`, not as a separate top-level plugin concept.
 
 Llama is expected to implement both contracts eventually.
 
@@ -91,6 +107,8 @@ Add a host-side provider dispatch layer that can:
 
 At this phase, llama can still be implemented in-process in core behind the provider adapter.
 
+That provider layer should already be shaped so the eventual plugin contribution is just an `inference` entry, not a separate bespoke registration path.
+
 ### Phase 4: move local llama runtime behind the provider
 
 Replace direct local `llama-server` launch calls with the provider contract.
@@ -106,6 +124,8 @@ Keep the same local endpoint semantics:
 - local OpenAI-compatible HTTP surface
 - host-owned proxy remains unchanged
 
+The MLX plugin should be a clean proof that the `inference` section is sufficient for a plugin-hosted backend.
+
 ### Phase 6: move distributed llama runtime behind the provider
 
 Replace direct distributed launch logic with provider-owned execution:
@@ -115,6 +135,12 @@ Replace direct distributed launch logic with provider-owned execution:
 - backend-specific launch flags
 
 Core election still decides placement.
+
+The resulting llama plugin should still read as one coherent plugin with:
+
+- `inference` for the runtime backend
+- optional `mcp` or `http` projections for debugging or operator tooling
+- `provides` for any stable contracts we want core to depend on
 
 ### Phase 7: split MoE ranking generation from MoE ranking policy
 

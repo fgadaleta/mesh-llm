@@ -2,6 +2,14 @@
 
 This note defines the architectural split for moving the current `llama` and MLX integration toward plugins without moving mesh orchestration policy into plugins.
 
+It assumes the pure plugin model described in [PLUGINS.md](/Users/jdumay/.codex/worktrees/59c2/mesh-llm/PLUGINS.md):
+
+- the author-facing DSL is surface-first
+- local and external MCP contributions both live under `mcp`
+- attached and plugin-hosted inference backends both live under `inference`
+- capabilities are declared explicitly under `provides`
+- runtime execution remains service-oriented under the hood
+
 ## Goal
 
 Move backend-specific inference runtime behavior out of core while keeping mesh-wide planning, routing, and failover decisions in `mesh-llm`.
@@ -89,6 +97,11 @@ The output should be host-usable runtime metadata:
 
 The endpoint descriptor should fit the existing plugin endpoint registration model, so `mesh-llm` continues to route through the same host-owned inference endpoint registry.
 
+At the DSL level, this means inference backends should surface through the plugin's `inference` section, regardless of whether they are:
+
+- attached external OpenAI-compatible endpoints
+- plugin-hosted local runtimes
+
 ### 2. `MoeRankingProvider`
 
 This is optional and backend-specific.
@@ -101,6 +114,8 @@ It should support:
 - import or export ranking artifacts if needed
 
 This contract is especially relevant for llama/GGUF because the ranking tools are backend-specific. MLX probably does not implement this initially.
+
+If we expose ranking or analysis utilities to users, those can still be projected through the plugin DSL in `mcp` or `http`. The contract itself remains backend-facing and planner-facing rather than MCP-native.
 
 ## Core Planner
 
@@ -137,6 +152,8 @@ Move the local runtime path behind `InferenceEndpointProvider`:
 
 This replaces the hard-coded local launch path in `runtime/local.rs`.
 
+The resulting plugin should look like an `inference` contribution first, not like a special-case core backend.
+
 ### Phase 2: distributed llama runtime plugin
 
 Move distributed host and worker runtime behavior into the same llama plugin:
@@ -147,6 +164,12 @@ Move distributed host and worker runtime behavior into the same llama plugin:
 - backend-specific analysis tool invocation
 
 Core election still decides host vs worker vs shard placement. The plugin only executes the assigned role.
+
+If the llama plugin exposes operator-facing debugging or analysis endpoints, those should be declared under the same surface-first DSL:
+
+- `mcp` for local or attached MCP-facing tools and resources
+- `http` for local HTTP routes
+- `inference` for the backend endpoint itself
 
 ## MLX Split
 
@@ -165,6 +188,8 @@ That makes MLX a straightforward `InferenceEndpointProvider` plugin:
 - plugin-hosted endpoint
 - no distributed worker/runtime contract at first
 - no `MoeRankingProvider` at first
+
+At the manifest level, MLX should contribute a single `inference` provider entry rather than requiring separate top-level service and routing sections.
 
 ## Why The MoE Branch Matters
 
