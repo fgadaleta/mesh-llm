@@ -41,10 +41,6 @@ scripts/run-validation-matrix.py --skip-build --backend mlx
 # shorten the behavior run for local debugging
 scripts/run-validation-matrix.py --suite behavior --skip-build --cases qwen25 --max-prompts 3
 
-# compatibility wrappers
-scripts/run-mlx-parity-matrix.sh --skip-build
-scripts/run-behavior-matrix.sh --skip-build
-
 # store artifacts somewhere else
 scripts/run-validation-matrix.py --root /tmp/mesh-llm-validation
 ```
