@@ -2,6 +2,38 @@ name: Behavior Regression
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - '**'
+    paths:
+      - '.github/workflows/behavior.yml'
+      - '.github/cache-version.txt'
+      - 'Justfile'
+      - 'scripts/build-*.sh'
+      - 'scripts/build-*.ps1'
+      - 'scripts/ci-mt-bench-behavior.py'
+      - 'scripts/ci-exact-smoke.py'
+      - 'scripts/run-validation-matrix.py'
+      - 'testdata/validation/**'
+      - 'mesh-llm/src/launch.rs'
+      - 'mesh-llm/src/mlx/**'
+      - 'mesh-llm/src/models/**'
+      - 'mesh-llm/src/network/proxy.rs'
+  pull_request:
+    paths:
+      - '.github/workflows/behavior.yml'
+      - '.github/cache-version.txt'
+      - 'Justfile'
+      - 'scripts/build-*.sh'
+      - 'scripts/build-*.ps1'
+      - 'scripts/ci-mt-bench-behavior.py'
+      - 'scripts/ci-exact-smoke.py'
+      - 'scripts/run-validation-matrix.py'
+      - 'testdata/validation/**'
+      - 'mesh-llm/src/launch.rs'
+      - 'mesh-llm/src/mlx/**'
+      - 'mesh-llm/src/models/**'
+      - 'mesh-llm/src/network/proxy.rs'
   schedule:
     - cron: "0 20 * * *"
 
