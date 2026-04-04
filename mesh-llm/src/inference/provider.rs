@@ -265,6 +265,13 @@ pub fn select_worker_provider(_request: &InferenceWorkerRequest) -> &'static dyn
     &BUILTIN_LLAMA_PROVIDER
 }
 
+pub fn provider_requires_worker_runtime(model_path: &Path) -> bool {
+    let request = InferenceEndpointRequest::local(model_path, 0, 0, 0);
+    select_local_endpoint_provider(&request)
+        .capabilities()
+        .requires_worker_runtime
+}
+
 pub fn primary_backend_label_for_model(
     model_path: &Path,
     model_bytes: u64,

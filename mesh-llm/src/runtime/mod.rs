@@ -1124,21 +1124,34 @@ async fn run_auto(
     // Clean up stale processes from previous runs
     launch::kill_orphan_rpc_servers().await;
 
-    // Start rpc-server
-    let worker_request = provider::InferenceWorkerRequest::default()
-        .with_device_hint(cli.device.as_deref())
-        .with_model_path(Some(&model));
-    let worker_provider = provider::select_worker_provider(&worker_request);
-    let rpc_port = worker_provider
-        .start_worker(&bin_dir, cli.llama_flavor, &worker_request)
-        .await?;
-    tracing::info!(
-        "{} worker runtime on 127.0.0.1:{rpc_port} serving {model_name}",
-        worker_provider.backend_label()
-    );
+    let rpc_port: Option<u16> = if !provider::provider_requires_worker_runtime(&model) {
+        tracing::info!(
+            "provider does not require a worker runtime for {}",
+            model_name
+        );
+        None
+    } else {
+        let worker_request = provider::InferenceWorkerRequest::default()
+            .with_device_hint(cli.device.as_deref())
+            .with_model_path(Some(&model));
+        let worker_provider = provider::select_worker_provider(&worker_request);
+        let port = worker_provider
+            .start_worker(&bin_dir, cli.llama_flavor, &worker_request)
+            .await?;
+        tracing::info!(
+            "{} worker runtime on 127.0.0.1:{port} serving {model_name}",
+            worker_provider.backend_label()
+        );
+        Some(port)
+    };
 
-    let tunnel_mgr =
-        tunnel::Manager::start(node.clone(), rpc_port, channels.rpc, channels.http).await?;
+    let tunnel_mgr = tunnel::Manager::start(
+        node.clone(),
+        rpc_port.unwrap_or(0),
+        channels.rpc,
+        channels.http,
+    )
+    .await?;
 
     // Election publishes per-model targets
     let (target_tx, target_rx) = tokio::sync::watch::channel(election::ModelTargets::default());
@@ -1260,7 +1273,7 @@ async fn run_auto(
     let (primary_stop_tx, primary_stop_rx) = tokio::sync::watch::channel(false);
     let primary_task = tokio::spawn(async move {
         election::election_loop(
-            node2, tunnel_mgr2, api_port, rpc_port, bin_dir2, model2, model_name_for_election,
+            node2, tunnel_mgr2, api_port, rpc_port.unwrap_or(0), bin_dir2, model2, model_name_for_election,
             draft2, draft_max, force_split, llama_flavor, cli.ctx_size, primary_target_tx,
             primary_stop_rx,
             move |is_host, llama_ready| {
