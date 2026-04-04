@@ -12,7 +12,7 @@ use self::local::{
 use self::proxy::{api_proxy, bootstrap_proxy};
 use crate::api;
 use crate::cli::{Cli, Command};
-use crate::inference::{election, launch};
+use crate::inference::{election, launch, provider};
 use crate::mesh;
 use crate::mesh::NodeRole;
 use crate::models;
@@ -1245,6 +1245,12 @@ async fn run_auto(
             plugin_manager.clone(),
             affinity_router.clone(),
         );
+        let primary_backend = provider::primary_backend_label_for_model(
+            &model,
+            election::total_model_bytes(&model),
+            node.vram_bytes(),
+        );
+        cs.set_primary_backend(primary_backend.into()).await;
         cs.set_runtime_control(control_tx.clone()).await;
         cs.set_nostr_relays(nostr_relays(&cli.nostr_relay)).await;
         cs.set_nostr_discovery(cli.nostr_discovery).await;
