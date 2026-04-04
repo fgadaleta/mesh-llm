@@ -1418,6 +1418,7 @@ pub async fn run_plugin_process(name: String) -> Result<()> {
 mod tests {
     use super::config::{MeshConfig, PluginConfigEntry};
     use super::*;
+    use crate::inference::provider;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -1887,5 +1888,71 @@ mod tests {
                 supports_streaming: true,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn managed_inference_endpoints_can_sync_into_provider_registry() {
+        provider::clear_registered_providers_for_tests();
+
+        let plugin_manager = PluginManager::for_test_bridge(&["mlx"], Arc::new(NoopTestBridge));
+        let mut manifests = BTreeMap::new();
+        manifests.insert(
+            "mlx".into(),
+            proto::PluginManifest {
+                endpoints: vec![proto::EndpointManifest {
+                    endpoint_id: "local-mlx".into(),
+                    kind: proto::EndpointKind::Inference as i32,
+                    transport_kind: proto::EndpointTransportKind::EndpointTransportHttp as i32,
+                    protocol: Some("openai_compatible".into()),
+                    address: Some("http://127.0.0.1:8091/v1".into()),
+                    args: Vec::new(),
+                    namespace: None,
+                    supports_streaming: true,
+                    managed_by_plugin: true,
+                }],
+                ..Default::default()
+            },
+        );
+        plugin_manager.set_test_manifests(manifests).await;
+
+        let registrations = plugin_manager
+            .managed_inference_endpoints()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|endpoint| {
+                let provider_id =
+                    provider::plugin_provider_id(&endpoint.plugin_name, &endpoint.endpoint_id);
+                (
+                    provider::PluginInferenceProviderRegistration::new(
+                        provider_id.clone(),
+                        endpoint.plugin_name.clone(),
+                        provider::InferenceProviderCapabilities {
+                            supports_local_runtime: true,
+                            supports_distributed_host_runtime: false,
+                            requires_worker_runtime: false,
+                            supports_moe_shard_runtime: false,
+                        },
+                    ),
+                    Arc::new(provider::PluginManagedEndpointProvider::new(
+                        provider_id,
+                        endpoint.plugin_name,
+                        endpoint.endpoint_id,
+                        endpoint.protocol,
+                        endpoint.address,
+                    )) as Arc<dyn provider::InferenceProvider>,
+                )
+            })
+            .collect();
+        provider::sync_plugin_providers(registrations);
+
+        let selection = provider::select_local_endpoint_provider(
+            &provider::InferenceEndpointRequest::local("/tmp/model.gguf", 8080, 1, 1)
+                .with_preferred_provider_id(Some("plugin.mlx.local-mlx")),
+        );
+        assert_eq!(selection.provider_id(), "plugin.mlx.local-mlx");
+        assert_eq!(selection.backend_label(), "mlx");
+
+        provider::clear_registered_providers_for_tests();
     }
 }

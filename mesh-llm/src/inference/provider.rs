@@ -661,7 +661,7 @@ const fn never_match_worker_runtime(_request: &InferenceWorkerRequest) -> bool {
 }
 
 #[cfg(test)]
-fn clear_registered_providers_for_tests() {
+pub(crate) fn clear_registered_providers_for_tests() {
     registered_provider_descriptors()
         .write()
         .expect("registered inference provider lock poisoned")
