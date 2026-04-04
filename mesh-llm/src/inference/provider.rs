@@ -223,6 +223,12 @@ pub trait MoeRankingProvider: Send + Sync {
         model_path: &Path,
     ) -> Option<crate::inference::moe::SharedRankingArtifact>;
 
+    fn import_shared_ranking_artifact(
+        &self,
+        model_path: &Path,
+        artifact: &crate::inference::moe::SharedRankingArtifact,
+    ) -> Result<bool>;
+
     fn ensure_full_analyze_ranking(
         &self,
         bin_dir: &Path,
@@ -525,6 +531,14 @@ impl MoeRankingProvider for BuiltinLlamaMoeRankingProvider {
         model_path: &Path,
     ) -> Option<crate::inference::moe::SharedRankingArtifact> {
         crate::inference::moe::best_shared_ranking_artifact(model_path)
+    }
+
+    fn import_shared_ranking_artifact(
+        &self,
+        model_path: &Path,
+        artifact: &crate::inference::moe::SharedRankingArtifact,
+    ) -> Result<bool> {
+        crate::inference::moe::cache_shared_ranking_if_stronger(model_path, artifact)
     }
 
     fn ensure_full_analyze_ranking(
@@ -1251,6 +1265,24 @@ pub fn best_shared_moe_ranking_artifact_for_model(
         .best_shared_ranking_artifact(model_path)
 }
 
+pub fn import_shared_moe_ranking_artifact_for_model(
+    model_path: &Path,
+    artifact: &crate::inference::moe::SharedRankingArtifact,
+    preferred_provider_id: Option<&str>,
+) -> Result<bool> {
+    let selection =
+        select_moe_ranking_provider(model_path, preferred_provider_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no MoE ranking provider available for {}",
+                model_path.display()
+            )
+        })?;
+    selection
+        .moe_ranking_provider()
+        .expect("selection should include a MoE ranking provider")
+        .import_shared_ranking_artifact(model_path, artifact)
+}
+
 pub fn ensure_full_analyze_ranking_for_model(
     bin_dir: &Path,
     model_name: &str,
@@ -1812,6 +1844,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cached_origin, "local-heuristic-cache");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_llama_selection_imports_shared_ranking_via_provider() {
+        let _guard = provider_registry_test_lock()
+            .lock()
+            .expect("provider registry test lock poisoned");
+        clear_registered_providers_for_tests();
+
+        let dir =
+            std::env::temp_dir().join(format!("mesh-llm-provider-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("import.gguf");
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"GGUF").unwrap();
+        file.write_all(&3u32.to_le_bytes()).unwrap();
+        file.write_all(&1i64.to_le_bytes()).unwrap();
+        file.write_all(&3i64.to_le_bytes()).unwrap();
+
+        write_gguf_string(&mut file, "general.alignment");
+        file.write_all(&4u32.to_le_bytes()).unwrap();
+        file.write_all(&32u32.to_le_bytes()).unwrap();
+
+        write_gguf_string(&mut file, "qwen.expert_count");
+        file.write_all(&4u32.to_le_bytes()).unwrap();
+        file.write_all(&4u32.to_le_bytes()).unwrap();
+
+        write_gguf_string(&mut file, "qwen.expert_used_count");
+        file.write_all(&4u32.to_le_bytes()).unwrap();
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+
+        write_gguf_string(&mut file, "blk.0.ffn_gate_inp.weight");
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        file.write_all(&2i64.to_le_bytes()).unwrap();
+        file.write_all(&4i64.to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&0u64.to_le_bytes()).unwrap();
+
+        let meta_end = file.stream_position().unwrap();
+        for dim in [2u64, 4u64] {
+            file.write_all(&dim.to_le_bytes()).unwrap();
+        }
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&0u64.to_le_bytes()).unwrap();
+        file.write_all(&meta_end.to_le_bytes()).unwrap();
+
+        for value in [
+            10.0f32, 1.0, 1.0, 1.0, //
+            1.0, 9.0, 1.0, 1.0,
+        ] {
+            file.write_all(&value.to_le_bytes()).unwrap();
+        }
+        drop(file);
+
+        let artifact = crate::inference::moe::SharedRankingArtifact {
+            kind: crate::inference::moe::SharedRankingKind::Analyze,
+            origin: crate::inference::moe::SharedRankingOrigin::PeerImport,
+            ranking: vec![0, 3, 2, 1],
+            micro_prompt_count: None,
+            micro_tokens: None,
+            micro_layer_scope: None,
+        };
+        let imported =
+            import_shared_moe_ranking_artifact_for_model(&path, &artifact, None).unwrap();
+        assert!(imported);
+
+        let cached = best_shared_moe_ranking_artifact_for_model(&path, None).unwrap();
+        assert_eq!(
+            cached.origin,
+            crate::inference::moe::SharedRankingOrigin::PeerImport
+        );
+        assert_eq!(cached.ranking, vec![0, 3, 2, 1]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

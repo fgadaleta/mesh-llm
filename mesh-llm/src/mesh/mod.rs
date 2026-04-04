@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::{watch, Mutex};
 
-use crate::inference::moe;
+use crate::inference::{moe, provider};
 use crate::protocol::*;
 
 /// Demand signal for a model — tracks interest via API requests and --model declarations.
@@ -528,8 +528,12 @@ fn import_remote_moe_rankings(descriptors: &[ServedModelDescriptor]) -> bool {
             origin: moe::SharedRankingOrigin::PeerImport,
             ..remote_artifact
         };
-        if moe::cache_shared_ranking_if_stronger(path.as_path(), &imported_artifact)
-            .unwrap_or(false)
+        if provider::import_shared_moe_ranking_artifact_for_model(
+            path.as_path(),
+            &imported_artifact,
+            None,
+        )
+        .unwrap_or(false)
         {
             imported = true;
         }
