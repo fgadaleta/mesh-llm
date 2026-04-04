@@ -9,7 +9,7 @@ pub enum ModelsCommand {
     /// List built-in catalog models.
     #[command(hide = true)]
     List,
-    /// Search for GGUF models in the catalog or on Hugging Face.
+    /// Search for catalog models and downloadable GGUF/MLX artifacts on Hugging Face.
     Search {
         /// Search terms.
         #[arg(required = true)]

@@ -1,9 +1,10 @@
 use crate::cli::models::ModelsCommand;
 use crate::models::{
-    capabilities, catalog, download_exact_ref, find_catalog_model_exact, huggingface_hub_cache_dir,
-    legacy_models_dir, legacy_models_present, path_is_in_legacy_models_dir,
-    scan_installed_model_entries, search_catalog_models, search_huggingface, show_exact_model,
-    InstalledModelEntry, InstalledModelKind, ResolveFormatPreference, SearchProgress,
+    capabilities, catalog, catalog_model_kind_label, download_exact_ref, find_catalog_model_exact,
+    huggingface_hub_cache_dir, legacy_models_dir, legacy_models_present,
+    path_is_in_legacy_models_dir, scan_installed_model_entries, search_catalog_models,
+    search_huggingface, show_exact_model, InstalledModelEntry, InstalledModelKind,
+    ResolveFormatPreference, SearchProgress,
 };
 use crate::system::hardware;
 use anyhow::{anyhow, Result};
@@ -22,17 +23,19 @@ pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize
             println!("{}", summary);
         }
         println!();
-        for model in results.into_iter().take(limit) {
-            println!("• {}  {}", model.name, model.size);
-            println!("  {}", model.description);
+        for (index, model) in results.into_iter().take(limit).enumerate() {
+            println!("{}. 📦 {}  {}", index + 1, model.name, model.size);
+            println!("   type: {}", catalog_model_kind_label(model));
+            println!("   {}", model.description);
             if let Some(fit) = fit_hint_for_size_label(&model.size) {
-                println!("  {}", fit);
+                println!("   {}", fit);
             }
+            println!();
         }
         return Ok(());
     }
 
-    eprintln!("🔎 Searching Hugging Face GGUF repos for '{query}'...");
+    eprintln!("🔎 Searching Hugging Face model repos for '{query}'...");
     let mut announced_repo_scan = false;
     let results = search_huggingface(&query, limit, |progress| match progress {
         SearchProgress::SearchingHub => {}
@@ -56,11 +59,11 @@ pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize
     })
     .await?;
     if results.is_empty() {
-        eprintln!("🔎 No Hugging Face GGUF matches for '{query}'.");
+        eprintln!("🔎 No Hugging Face model matches for '{query}'.");
         return Ok(());
     }
 
-    println!("🔎 Hugging Face GGUF matches for '{query}'");
+    println!("🔎 Hugging Face matches for '{query}'");
     if let Some(summary) = local_capacity_summary() {
         println!("{}", summary);
     }
@@ -68,6 +71,7 @@ pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize
     for (index, result) in results.iter().enumerate() {
         println!("{}. 📦 {}", index + 1, result.file);
         println!("   repo: {}", result.repo_id);
+        println!("   type: {}", result.kind);
         let mut stats = Vec::new();
         if let Some(size) = &result.size_label {
             stats.push(format!("📏 {}", size));
@@ -112,21 +116,22 @@ pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize
 pub fn run_model_recommended() {
     println!("📚 Recommended models");
     println!();
-    for model in catalog::MODEL_CATALOG.iter() {
+    for (index, model) in catalog::MODEL_CATALOG.iter().enumerate() {
         let model_capabilities = capabilities::infer_catalog_capabilities(model);
-        println!("• {}  {}", model.name, model.size);
-        println!("  {}", model.description);
+        println!("{}. 📦 {}  {}", index + 1, model.name, model.size);
+        println!("   type: {}", catalog_model_kind_label(model));
+        println!("   {}", model.description);
         if let Some(draft) = model.draft.as_deref() {
-            println!("  🧠 Draft: {}", draft);
+            println!("   🧠 Draft: {}", draft);
         }
         if let Some(label) = model_capabilities.vision_label() {
-            println!("  👁️ Vision: {}", label);
+            println!("   👁️ Vision: {}", label);
         }
         if let Some(label) = model_capabilities.reasoning_label() {
-            println!("  🧠 Reasoning: {}", label);
+            println!("   🧠 Reasoning: {}", label);
         }
         if model.moe.is_some() {
-            println!("  🧩 MoE: yes");
+            println!("   🧩 MoE: yes");
         }
         println!();
     }
@@ -210,6 +215,7 @@ pub async fn run_model_show(model_ref: &str) -> Result<()> {
     }
     println!();
     println!("Ref: {}", details.exact_ref);
+    println!("Type: {}", details.kind);
     println!("Source: {}", format_source_label(details.source));
     if let Some(size) = details.size_label {
         println!("Size: {size}");

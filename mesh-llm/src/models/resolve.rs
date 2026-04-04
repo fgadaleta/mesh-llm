@@ -9,6 +9,7 @@ pub struct ModelDetails {
     pub display_name: String,
     pub exact_ref: String,
     pub source: &'static str,
+    pub kind: &'static str,
     pub download_url: String,
     pub size_label: Option<String>,
     pub description: Option<String>,
@@ -31,15 +32,15 @@ pub enum MlxSelectionPolicy {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum RepoArtifactKind {
+pub(super) enum RepoArtifactKind {
     Gguf,
     Mlx,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RepoArtifactCandidate {
-    kind: RepoArtifactKind,
-    file: String,
+pub(super) struct RepoArtifactCandidate {
+    pub kind: RepoArtifactKind,
+    pub file: String,
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +116,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
             display_name: model.name.to_string(),
             exact_ref: model.name.to_string(),
             source: "catalog",
+            kind: catalog_model_kind_label(model),
             download_url: match (
                 model.source_repo(),
                 model.source_revision(),
@@ -171,6 +173,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                     .to_string(),
                 exact_ref,
                 source: "huggingface",
+                kind: artifact_kind_label_for_file(&file),
                 download_url,
                 size_label,
                 description: catalog.map(|model| model.description.to_string()),
@@ -189,6 +192,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                 display_name: filename,
                 exact_ref: url.clone(),
                 source: "url",
+                kind: artifact_kind_label_for_file(&url),
                 download_url: url,
                 size_label,
                 description: catalog.map(|model| model.description.to_string()),
@@ -437,7 +441,7 @@ fn is_supported_huggingface_file_ref(input: &str) -> bool {
         || input.ends_with("model.safetensors.index.json")
 }
 
-fn artifact_kind_for_file(file: &str) -> Option<RepoArtifactKind> {
+pub(super) fn artifact_kind_for_file(file: &str) -> Option<RepoArtifactKind> {
     if file.ends_with(".gguf") {
         return Some(RepoArtifactKind::Gguf);
     }
@@ -485,7 +489,7 @@ fn ensure_explicit_mlx_selection(
     Ok(())
 }
 
-fn collect_repo_artifact_candidates(siblings: &[String]) -> Vec<RepoArtifactCandidate> {
+pub(super) fn collect_repo_artifact_candidates(siblings: &[String]) -> Vec<RepoArtifactCandidate> {
     let mut gguf = Vec::new();
     let mut mlx = Vec::new();
     for sibling in siblings {
@@ -499,9 +503,7 @@ fn collect_repo_artifact_candidates(siblings: &[String]) -> Vec<RepoArtifactCand
             });
             continue;
         }
-        if sibling.ends_with("model.safetensors.index.json")
-            || sibling.ends_with("model.safetensors")
-        {
+        if sibling == "model.safetensors.index.json" || sibling == "model.safetensors" {
             mlx.push(RepoArtifactCandidate {
                 kind: RepoArtifactKind::Mlx,
                 file: sibling.clone(),
@@ -528,6 +530,34 @@ fn collect_repo_artifact_candidates(siblings: &[String]) -> Vec<RepoArtifactCand
     }
     gguf.extend(mlx);
     gguf
+}
+
+pub(super) fn artifact_kind_label(kind: RepoArtifactKind) -> &'static str {
+    match kind {
+        RepoArtifactKind::Gguf => "gguf",
+        RepoArtifactKind::Mlx => "mlx",
+    }
+}
+
+pub(super) fn artifact_kind_label_for_file(file: &str) -> &'static str {
+    artifact_kind_for_file(file)
+        .map(artifact_kind_label)
+        .unwrap_or("unknown")
+}
+
+pub fn catalog_model_kind_label(model: &catalog::CatalogModel) -> &'static str {
+    if model
+        .source_file()
+        .map(|file| {
+            file.ends_with("model.safetensors") || file.ends_with("model.safetensors.index.json")
+        })
+        .unwrap_or(false)
+        || model.url.contains("model.safetensors")
+    {
+        "mlx"
+    } else {
+        "gguf"
+    }
 }
 
 fn format_repo_artifact_suggestions(
