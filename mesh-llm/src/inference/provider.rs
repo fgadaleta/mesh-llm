@@ -304,6 +304,14 @@ impl InferenceProviderRegistry {
         providers.push(descriptor);
     }
 
+    pub fn replace_plugin_providers(&self, descriptors: Vec<InferenceProviderDescriptor>) {
+        let mut providers = registered_provider_descriptors()
+            .write()
+            .expect("registered inference provider lock poisoned");
+        providers.retain(|existing| !existing.selection.provider_id().starts_with("plugin."));
+        providers.extend(descriptors);
+    }
+
     fn select_provider(
         &self,
         preferred_provider_id: Option<&str>,
@@ -511,6 +519,66 @@ impl PluginInferenceProviderRegistration {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PluginManagedEndpointProvider {
+    provider_id: String,
+    plugin_name: String,
+    endpoint_id: String,
+    protocol: Option<String>,
+    address: Option<String>,
+}
+
+impl PluginManagedEndpointProvider {
+    pub fn new(
+        provider_id: impl Into<String>,
+        plugin_name: impl Into<String>,
+        endpoint_id: impl Into<String>,
+        protocol: Option<String>,
+        address: Option<String>,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            plugin_name: plugin_name.into(),
+            endpoint_id: endpoint_id.into(),
+            protocol,
+            address,
+        }
+    }
+
+    fn unsupported_launch_error(&self) -> anyhow::Error {
+        let protocol = self.protocol.as_deref().unwrap_or("unknown");
+        let address = self.address.as_deref().unwrap_or("<unadvertised>");
+        anyhow::anyhow!(
+            "Plugin-managed inference provider '{}' (plugin '{}' endpoint '{}' protocol '{}' address '{}') is registered for selection but runtime launch is not wired yet",
+            self.provider_id,
+            self.plugin_name,
+            self.endpoint_id,
+            protocol,
+            address
+        )
+    }
+}
+
+impl InferenceProvider for PluginManagedEndpointProvider {
+    fn start_endpoint<'a>(
+        &'a self,
+        _bin_dir: &'a Path,
+        _binary_flavor: Option<crate::inference::launch::BinaryFlavor>,
+        _request: &'a InferenceEndpointRequest,
+    ) -> ProviderFuture<'a, InferenceServerProcess> {
+        Box::pin(async move { Err(self.unsupported_launch_error()) })
+    }
+
+    fn start_worker<'a>(
+        &'a self,
+        _bin_dir: &'a Path,
+        _binary_flavor: Option<crate::inference::launch::BinaryFlavor>,
+        _request: &'a InferenceWorkerRequest,
+    ) -> ProviderFuture<'a, u16> {
+        Box::pin(async move { Err(self.unsupported_launch_error()) })
+    }
+}
+
 fn builtin_llama_selection() -> InferenceProviderSelection {
     InferenceProviderSelection::new(
         "builtin.llama",
@@ -558,6 +626,23 @@ pub fn register_plugin_provider(
     provider: Arc<dyn InferenceProvider>,
 ) {
     register_provider(registration.into_descriptor(provider));
+}
+
+pub fn sync_plugin_providers(
+    registrations: Vec<(
+        PluginInferenceProviderRegistration,
+        Arc<dyn InferenceProvider>,
+    )>,
+) {
+    let descriptors = registrations
+        .into_iter()
+        .map(|(registration, provider)| registration.into_descriptor(provider))
+        .collect();
+    provider_registry().replace_plugin_providers(descriptors);
+}
+
+pub fn plugin_provider_id(plugin_name: &str, endpoint_id: &str) -> String {
+    format!("plugin.{plugin_name}.{endpoint_id}")
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

@@ -193,6 +193,15 @@ pub struct InferenceEndpointRoute {
     pub models: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedInferenceEndpoint {
+    pub plugin_name: String,
+    pub endpoint_id: String,
+    pub protocol: Option<String>,
+    pub address: Option<String>,
+    pub supports_streaming: bool,
+}
+
 #[derive(Clone)]
 pub struct PluginManager {
     inner: Arc<PluginManagerInner>,
@@ -511,6 +520,40 @@ impl PluginManager {
         Ok(endpoints
             .into_iter()
             .find(|endpoint| endpoint.models.iter().any(|candidate| candidate == model)))
+    }
+
+    pub async fn managed_inference_endpoints(&self) -> Result<Vec<ManagedInferenceEndpoint>> {
+        let summaries = self.list().await;
+        let mut endpoints = Vec::new();
+        for summary in summaries {
+            let Ok(Some(manifest)) = self.manifest(&summary.name).await else {
+                continue;
+            };
+            for endpoint in manifest.endpoints {
+                if proto::EndpointKind::try_from(endpoint.kind)
+                    .unwrap_or(proto::EndpointKind::Unspecified)
+                    != proto::EndpointKind::Inference
+                {
+                    continue;
+                }
+                if !endpoint.managed_by_plugin {
+                    continue;
+                }
+                endpoints.push(ManagedInferenceEndpoint {
+                    plugin_name: summary.name.clone(),
+                    endpoint_id: endpoint.endpoint_id,
+                    protocol: endpoint.protocol,
+                    address: endpoint.address,
+                    supports_streaming: endpoint.supports_streaming,
+                });
+            }
+        }
+        endpoints.sort_by(|a, b| {
+            a.plugin_name
+                .cmp(&b.plugin_name)
+                .then_with(|| a.endpoint_id.cmp(&b.endpoint_id))
+        });
+        Ok(endpoints)
     }
 
     pub async fn capability_providers(&self) -> Result<Vec<PluginCapabilityProvider>> {
@@ -1382,6 +1425,32 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    struct NoopTestBridge;
+
+    impl PluginRpcBridge for NoopTestBridge {
+        fn handle_request(
+            &self,
+            _plugin_name: String,
+            _method: String,
+            _params_json: String,
+        ) -> BridgeFuture<Result<RpcResult, proto::ErrorResponse>> {
+            Box::pin(async {
+                Ok(RpcResult {
+                    result_json: "{}".into(),
+                })
+            })
+        }
+
+        fn handle_notification(
+            &self,
+            _plugin_name: String,
+            _method: String,
+            _params_json: String,
+        ) -> BridgeFuture<()> {
+            Box::pin(async {})
+        }
+    }
+
     fn private_host_mode() -> PluginHostMode {
         PluginHostMode {
             mesh_visibility: MeshVisibility::Private,
@@ -1768,6 +1837,55 @@ mod tests {
                 "endpoint:inference".to_string(),
                 "endpoint:inference/openai_compatible".to_string()
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_inference_endpoints_only_export_plugin_managed_inference_entries() {
+        let plugin_manager = PluginManager::for_test_bridge(&["mlx"], Arc::new(NoopTestBridge));
+        let mut manifests = BTreeMap::new();
+        manifests.insert(
+            "mlx".into(),
+            proto::PluginManifest {
+                endpoints: vec![
+                    proto::EndpointManifest {
+                        endpoint_id: "local-mlx".into(),
+                        kind: proto::EndpointKind::Inference as i32,
+                        transport_kind: proto::EndpointTransportKind::EndpointTransportHttp as i32,
+                        protocol: Some("openai_compatible".into()),
+                        address: Some("http://127.0.0.1:8091/v1".into()),
+                        args: Vec::new(),
+                        namespace: None,
+                        supports_streaming: true,
+                        managed_by_plugin: true,
+                    },
+                    proto::EndpointManifest {
+                        endpoint_id: "attached".into(),
+                        kind: proto::EndpointKind::Inference as i32,
+                        transport_kind: proto::EndpointTransportKind::EndpointTransportHttp as i32,
+                        protocol: Some("openai_compatible".into()),
+                        address: Some("http://127.0.0.1:8000/api/v1".into()),
+                        args: Vec::new(),
+                        namespace: None,
+                        supports_streaming: true,
+                        managed_by_plugin: false,
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        plugin_manager.set_test_manifests(manifests).await;
+
+        let endpoints = plugin_manager.managed_inference_endpoints().await.unwrap();
+        assert_eq!(
+            endpoints,
+            vec![ManagedInferenceEndpoint {
+                plugin_name: "mlx".into(),
+                endpoint_id: "local-mlx".into(),
+                protocol: Some("openai_compatible".into()),
+                address: Some("http://127.0.0.1:8091/v1".into()),
+                supports_streaming: true,
+            }]
         );
     }
 }
