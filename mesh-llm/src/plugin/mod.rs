@@ -146,6 +146,8 @@ pub struct PluginEndpointSummary {
     pub managed_by_plugin: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub models: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -153,6 +155,17 @@ struct EndpointHealthRecord {
     state: String,
     available: bool,
     detail: Option<String>,
+    models: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InferenceEndpointRoute {
+    pub plugin_name: String,
+    pub endpoint_id: String,
+    pub address: String,
+    pub protocol: Option<String>,
+    pub supports_streaming: bool,
+    pub models: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -305,6 +318,7 @@ impl PluginManager {
                     supports_streaming: endpoint.supports_streaming,
                     managed_by_plugin: endpoint.managed_by_plugin,
                     detail: health.detail,
+                    models: health.models,
                 });
             }
         }
@@ -390,6 +404,31 @@ impl PluginManager {
             .get(plugin_name)
             .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
         plugin.call_tool(tool_name, arguments_json).await
+    }
+
+    pub async fn inference_models(&self) -> Result<Vec<String>> {
+        let mut models = Vec::new();
+        for endpoint in self.inference_endpoints().await? {
+            models.extend(endpoint.models);
+        }
+        models.sort();
+        models.dedup();
+        Ok(models)
+    }
+
+    pub async fn inference_endpoint_for_model(
+        &self,
+        model: &str,
+    ) -> Result<Option<InferenceEndpointRoute>> {
+        let mut endpoints = self.inference_endpoints().await?;
+        endpoints.sort_by(|a, b| {
+            a.plugin_name
+                .cmp(&b.plugin_name)
+                .then_with(|| a.endpoint_id.cmp(&b.endpoint_id))
+        });
+        Ok(endpoints
+            .into_iter()
+            .find(|endpoint| endpoint.models.iter().any(|candidate| candidate == model)))
     }
 
     pub async fn mcp_request<T, P>(&self, plugin_name: &str, method: &str, params: P) -> Result<T>
@@ -718,6 +757,44 @@ impl PluginManager {
         let mut registry = self.inner.endpoint_health.lock().await;
         registry.retain(|key, _| !key.starts_with(&format!("{plugin_name}:")));
     }
+
+    async fn inference_endpoints(&self) -> Result<Vec<InferenceEndpointRoute>> {
+        let summaries = self.list().await;
+        let endpoint_health = self.inner.endpoint_health.lock().await.clone();
+        let mut endpoints = Vec::new();
+        for summary in summaries {
+            let Ok(Some(manifest)) = self.manifest(&summary.name).await else {
+                continue;
+            };
+            for endpoint in manifest.endpoints {
+                if proto::EndpointKind::try_from(endpoint.kind)
+                    .unwrap_or(proto::EndpointKind::Unspecified)
+                    != proto::EndpointKind::Inference
+                {
+                    continue;
+                }
+                let Some(address) = endpoint.address.clone() else {
+                    continue;
+                };
+                let health = endpoint_health
+                    .get(&endpoint_key(&summary.name, &endpoint.endpoint_id))
+                    .cloned()
+                    .unwrap_or_else(|| endpoint_state_from_plugin_status(&summary));
+                if !health.available {
+                    continue;
+                }
+                endpoints.push(InferenceEndpointRoute {
+                    plugin_name: summary.name.clone(),
+                    endpoint_id: endpoint.endpoint_id,
+                    address,
+                    protocol: endpoint.protocol,
+                    supports_streaming: endpoint.supports_streaming,
+                    models: health.models,
+                });
+            }
+        }
+        Ok(endpoints)
+    }
 }
 
 pub(crate) fn plugin_manifest_overview(manifest: &proto::PluginManifest) -> PluginManifestOverview {
@@ -847,6 +924,7 @@ fn endpoint_state_from_plugin_status(summary: &PluginSummary) -> EndpointHealthR
             state: "unavailable".into(),
             available: false,
             detail: summary.error.clone(),
+            models: Vec::new(),
         };
     }
 
@@ -855,21 +933,25 @@ fn endpoint_state_from_plugin_status(summary: &PluginSummary) -> EndpointHealthR
             state: "healthy".into(),
             available: true,
             detail: None,
+            models: Vec::new(),
         },
         "starting" | "restarting" => EndpointHealthRecord {
             state: "starting".into(),
             available: false,
             detail: summary.error.clone(),
+            models: Vec::new(),
         },
         "degraded" => EndpointHealthRecord {
             state: "unhealthy".into(),
             available: false,
             detail: summary.error.clone(),
+            models: Vec::new(),
         },
         _ => EndpointHealthRecord {
             state: "unavailable".into(),
             available: false,
             detail: summary.error.clone(),
+            models: Vec::new(),
         },
     }
 }
@@ -902,6 +984,7 @@ async fn endpoint_health_for_summary(
             state: "healthy".into(),
             available: true,
             detail: None,
+            models: Vec::new(),
         },
     }
 }
@@ -933,6 +1016,7 @@ async fn probe_openai_compatible_http_endpoint(address: &str) -> EndpointHealthR
                 state: "unhealthy".into(),
                 available: false,
                 detail: Some(format!("invalid endpoint address '{address}'")),
+                models: Vec::new(),
             };
         }
     };
@@ -947,6 +1031,7 @@ async fn probe_openai_compatible_http_endpoint(address: &str) -> EndpointHealthR
                 state: "unhealthy".into(),
                 available: false,
                 detail: Some(format!("build health probe client: {err}")),
+                models: Vec::new(),
             };
         }
     };
@@ -956,18 +1041,34 @@ async fn probe_openai_compatible_http_endpoint(address: &str) -> EndpointHealthR
             state: "healthy".into(),
             available: true,
             detail: Some(format!("GET {} -> {}", models_url, response.status())),
+            models: parse_models_response(response).await.unwrap_or_default(),
         },
         Ok(response) => EndpointHealthRecord {
             state: "unhealthy".into(),
             available: false,
             detail: Some(format!("GET {} -> {}", models_url, response.status())),
+            models: Vec::new(),
         },
         Err(err) => EndpointHealthRecord {
             state: "unhealthy".into(),
             available: false,
             detail: Some(format!("GET {} failed: {}", models_url, err)),
+            models: Vec::new(),
         },
     }
+}
+
+async fn parse_models_response(response: reqwest::Response) -> Result<Vec<String>> {
+    let body = response.json::<Value>().await?;
+    let models = body
+        .get("data")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>();
+    Ok(models)
 }
 
 fn endpoint_models_url(address: &str) -> Option<Url> {
@@ -1154,6 +1255,7 @@ mod tests {
                 state: "healthy".into(),
                 available: true,
                 detail: None,
+                models: Vec::new(),
             }
         );
     }
@@ -1179,6 +1281,7 @@ mod tests {
                 state: "starting".into(),
                 available: false,
                 detail: Some("timed out".into()),
+                models: Vec::new(),
             }
         );
     }
