@@ -754,7 +754,20 @@ pub async fn start_llama_server(
     if let Some(mode) = split_mode {
         args.push("--split-mode".to_string());
         args.push(mode.as_arg().to_string());
-        tracing::info!("Split mode: {} (tensor parallelism across local GPUs)", mode.as_arg());
+        match mode {
+            SplitMode::Layer => {
+                tracing::info!(
+                    "Split mode: {} (layer-based / pipeline parallelism)",
+                    mode.as_arg()
+                );
+            }
+            SplitMode::Row => {
+                tracing::info!(
+                    "Split mode: {} (tensor parallelism across local GPUs)",
+                    mode.as_arg()
+                );
+            }
+        }
     }
     let local_device = resolve_device_for_binary(&llama_server.path, llama_server.flavor, None)?;
     if let Some(draft_path) = draft {
@@ -1029,7 +1042,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod tests {
     use super::{
         compute_context_size, parse_available_devices, preferred_device, temp_log_path,
-        BinaryFlavor,
+        BinaryFlavor, SplitMode,
     };
     use std::path::Path;
 
@@ -1131,5 +1144,17 @@ No devices found
             file_name.contains(suffix),
             "expected filename '{file_name}' to contain suffix '{suffix}'"
         );
+    }
+
+    // ── SplitMode ──
+
+    #[test]
+    fn split_mode_layer_arg() {
+        assert_eq!(SplitMode::Layer.as_arg(), "layer");
+    }
+
+    #[test]
+    fn split_mode_row_arg() {
+        assert_eq!(SplitMode::Row.as_arg(), "row");
     }
 }

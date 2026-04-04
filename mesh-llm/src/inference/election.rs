@@ -18,19 +18,35 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
 
+/// Returns `true` when `flavor` and `gpu_count` together call for row-split
+/// tensor parallelism.
+///
+/// Row split requires a backend that implements `ggml_backend_split_buffer_type`
+/// (CUDA and ROCm).  When no flavor is specified the binary may still be a CUDA
+/// or ROCm build discovered automatically, so `None` is treated as potentially
+/// supported; if the binary turns out to be CPU/Metal/Vulkan, llama.cpp falls
+/// back safely.
+fn should_use_row_split(flavor: Option<BinaryFlavor>, gpu_count: u8) -> bool {
+    let backend_supported = matches!(
+        flavor,
+        Some(BinaryFlavor::Cuda) | Some(BinaryFlavor::Rocm) | None
+    );
+    backend_supported && gpu_count > 1
+}
+
 /// Returns `Some(SplitMode::Row)` when the local machine has multiple GPUs and
 /// the llama.cpp backend supports row-level tensor parallelism (CUDA, ROCm).
 ///
 /// Row split shards weight matrices across local GPUs so all GPUs are active on
 /// every token — faster than layer (pipeline) split where GPUs take turns.
 /// This does NOT work over RPC (network) — only for GPUs on the same machine.
-fn local_multi_gpu_split_mode(flavor: Option<BinaryFlavor>) -> Option<SplitMode> {
-    let supports_row = matches!(flavor, Some(BinaryFlavor::Cuda) | Some(BinaryFlavor::Rocm));
-    if !supports_row {
-        return None;
-    }
+///
+/// When no explicit flavor is provided the resolved binary may still be CUDA/ROCm
+/// (auto-detected from the binary name), so `None` is treated as potentially
+/// supported.
+pub(crate) fn local_multi_gpu_split_mode(flavor: Option<BinaryFlavor>) -> Option<SplitMode> {
     let hw = hardware::query(&[hardware::Metric::GpuCount]);
-    if hw.gpu_count > 1 {
+    if should_use_row_split(flavor, hw.gpu_count) {
         tracing::info!(
             "Local multi-GPU detected ({} GPUs) — using row split for tensor parallelism",
             hw.gpu_count
@@ -1661,5 +1677,46 @@ mod tests {
         let targets = ModelTargets::default();
         let result = targets.pick_from(&[]);
         assert_eq!(result, InferenceTarget::None);
+    }
+
+    // ── Row-split / tensor-parallelism selection ──
+
+    #[test]
+    fn row_split_enabled_for_cuda_multi_gpu() {
+        assert!(should_use_row_split(Some(BinaryFlavor::Cuda), 2));
+        assert!(should_use_row_split(Some(BinaryFlavor::Cuda), 8));
+    }
+
+    #[test]
+    fn row_split_enabled_for_rocm_multi_gpu() {
+        assert!(should_use_row_split(Some(BinaryFlavor::Rocm), 2));
+    }
+
+    #[test]
+    fn row_split_enabled_for_unknown_flavor_multi_gpu() {
+        // None means auto-detected; the resolved binary may still be CUDA/ROCm.
+        assert!(should_use_row_split(None, 2));
+        assert!(should_use_row_split(None, 4));
+    }
+
+    #[test]
+    fn row_split_disabled_for_single_gpu() {
+        assert!(!should_use_row_split(Some(BinaryFlavor::Cuda), 1));
+        assert!(!should_use_row_split(Some(BinaryFlavor::Rocm), 1));
+        assert!(!should_use_row_split(None, 1));
+    }
+
+    #[test]
+    fn row_split_disabled_for_zero_gpus() {
+        assert!(!should_use_row_split(Some(BinaryFlavor::Cuda), 0));
+        assert!(!should_use_row_split(None, 0));
+    }
+
+    #[test]
+    fn row_split_disabled_for_non_cuda_backends() {
+        // Metal, Vulkan, CPU don't support ggml_backend_split_buffer_type.
+        assert!(!should_use_row_split(Some(BinaryFlavor::Metal), 8));
+        assert!(!should_use_row_split(Some(BinaryFlavor::Vulkan), 4));
+        assert!(!should_use_row_split(Some(BinaryFlavor::Cpu), 4));
     }
 }
