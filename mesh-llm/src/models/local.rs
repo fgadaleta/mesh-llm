@@ -410,6 +410,16 @@ fn scan_hf_cache_models(names: &mut Vec<String>, seen: &mut HashSet<String>, min
     }
 }
 
+#[cfg(target_os = "macos")]
+fn snapshot_is_mlx_model_dir(path: &Path) -> bool {
+    crate::mlx::is_mlx_model_dir(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snapshot_is_mlx_model_dir(_path: &Path) -> bool {
+    false
+}
+
 fn scan_hf_cache_installed_entries(
     entries: &mut Vec<InstalledModelEntry>,
     seen: &mut HashSet<String>,
@@ -426,7 +436,7 @@ fn scan_hf_cache_installed_entries(
         }
         for revision in &repo.revisions {
             let snapshot = &revision.snapshot_path;
-            if crate::mlx::is_mlx_model_dir(snapshot) {
+            if snapshot_is_mlx_model_dir(snapshot) {
                 push_installed_model_entry(snapshot, entries, seen, min_size_bytes);
             }
             for file in &revision.files {
