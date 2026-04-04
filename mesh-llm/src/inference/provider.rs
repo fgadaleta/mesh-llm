@@ -238,6 +238,13 @@ pub trait MoeRankingProvider: Send + Sync {
         model_path: &Path,
         options: &crate::inference::moe::MoeRuntimeOptions,
     ) -> Result<crate::inference::moe::SharedRankingArtifact>;
+
+    fn resolve_heuristic_ranking(
+        &self,
+        model_path: &Path,
+        expert_count: u32,
+        method: crate::inference::moe::HeuristicScoreMethod,
+    ) -> Result<(Vec<u32>, String, String)>;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -656,6 +663,34 @@ impl MoeRankingProvider for BuiltinLlamaMoeRankingProvider {
             artifact.origin.label()
         );
         Ok(artifact)
+    }
+
+    fn resolve_heuristic_ranking(
+        &self,
+        model_path: &Path,
+        expert_count: u32,
+        method: crate::inference::moe::HeuristicScoreMethod,
+    ) -> Result<(Vec<u32>, String, String)> {
+        let cached =
+            crate::inference::moe::heuristic_ranking_cache_path_for_method(model_path, method);
+        if let Some(ranking) = crate::inference::moe::load_cached_ranking(&cached) {
+            return Ok((
+                ranking,
+                format!("heuristic-{}", method.cache_suffix()),
+                "local-heuristic-cache".to_string(),
+            ));
+        }
+        let ranking = crate::inference::moe::compute_heuristic_ranking_with_method(
+            model_path,
+            expert_count,
+            method,
+        )?;
+        crate::inference::moe::write_cached_ranking(&cached, &ranking)?;
+        Ok((
+            ranking,
+            format!("heuristic-{}", method.cache_suffix()),
+            "local-heuristic".to_string(),
+        ))
     }
 }
 
@@ -1236,6 +1271,25 @@ pub fn ensure_micro_analyze_ranking_for_model(
         .moe_ranking_provider()
         .expect("selection should include a MoE ranking provider")
         .ensure_micro_analyze_ranking(bin_dir, model_name, model_path, options)
+}
+
+pub fn resolve_heuristic_ranking_for_model(
+    model_path: &Path,
+    expert_count: u32,
+    method: crate::inference::moe::HeuristicScoreMethod,
+    preferred_provider_id: Option<&str>,
+) -> Result<(Vec<u32>, String, String)> {
+    let selection =
+        select_moe_ranking_provider(model_path, preferred_provider_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no MoE ranking provider available for {}",
+                model_path.display()
+            )
+        })?;
+    selection
+        .moe_ranking_provider()
+        .expect("selection should include a MoE ranking provider")
+        .resolve_heuristic_ranking(model_path, expert_count, method)
 }
 
 /// Start a distributed-host endpoint through the selected inference provider.

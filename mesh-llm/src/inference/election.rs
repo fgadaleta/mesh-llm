@@ -614,25 +614,31 @@ fn resolve_runtime_moe_config(
             "sequential-fallback".to_string(),
             "fallback".to_string(),
         ),
-        moe::MoeRankingStrategy::HeuristicMean => resolve_heuristic_runtime_ranking(
+        moe::MoeRankingStrategy::HeuristicMean => provider::resolve_heuristic_ranking_for_model(
             model_path,
             base.n_expert,
             moe::HeuristicScoreMethod::MeanL2,
+            None,
         )?,
-        moe::MoeRankingStrategy::HeuristicMax => resolve_heuristic_runtime_ranking(
+        moe::MoeRankingStrategy::HeuristicMax => provider::resolve_heuristic_ranking_for_model(
             model_path,
             base.n_expert,
             moe::HeuristicScoreMethod::MaxL2,
+            None,
         )?,
-        moe::MoeRankingStrategy::HeuristicMeanPlusStd => resolve_heuristic_runtime_ranking(
-            model_path,
-            base.n_expert,
-            moe::HeuristicScoreMethod::MeanPlusStd,
-        )?,
-        moe::MoeRankingStrategy::HeuristicArch => resolve_heuristic_runtime_ranking(
+        moe::MoeRankingStrategy::HeuristicMeanPlusStd => {
+            provider::resolve_heuristic_ranking_for_model(
+                model_path,
+                base.n_expert,
+                moe::HeuristicScoreMethod::MeanPlusStd,
+                None,
+            )?
+        }
+        moe::MoeRankingStrategy::HeuristicArch => provider::resolve_heuristic_ranking_for_model(
             model_path,
             base.n_expert,
             moe::HeuristicScoreMethod::ArchitectureAware,
+            None,
         )?,
     };
 
@@ -659,7 +665,8 @@ fn refresh_auto_moe_config_from_cache(
     if !matches!(cfg.ranking_strategy, moe::MoeRankingStrategy::Auto) {
         return false;
     }
-    let Some(artifact) = moe::best_shared_ranking_artifact(model_path) else {
+    let Some(artifact) = provider::best_shared_moe_ranking_artifact_for_model(model_path, None)
+    else {
         return false;
     };
     if cfg.config.ranking == artifact.ranking
@@ -678,28 +685,6 @@ fn refresh_auto_moe_config_from_cache(
     cfg.ranking_source = artifact.kind.label().to_string();
     cfg.ranking_origin = artifact.origin.label().to_string();
     true
-}
-
-fn resolve_heuristic_runtime_ranking(
-    model_path: &Path,
-    expert_count: u32,
-    method: moe::HeuristicScoreMethod,
-) -> anyhow::Result<(Vec<u32>, String, String)> {
-    let cached = moe::heuristic_ranking_cache_path_for_method(model_path, method);
-    if let Some(ranking) = moe::load_cached_ranking(&cached) {
-        return Ok((
-            ranking,
-            format!("heuristic-{}", method.cache_suffix()),
-            "local-heuristic-cache".to_string(),
-        ));
-    }
-    let ranking = moe::compute_heuristic_ranking_with_method(model_path, expert_count, method)?;
-    moe::write_cached_ranking(&cached, &ranking)?;
-    Ok((
-        ranking,
-        format!("heuristic-{}", method.cache_suffix()),
-        "local-heuristic".to_string(),
-    ))
 }
 
 /// Background election loop for a single model.
