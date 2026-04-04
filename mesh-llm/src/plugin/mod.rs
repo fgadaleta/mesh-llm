@@ -190,8 +190,6 @@ pub struct InferenceEndpointRoute {
     pub plugin_name: String,
     pub endpoint_id: String,
     pub address: String,
-    pub protocol: Option<String>,
-    pub supports_streaming: bool,
     pub models: Vec<String>,
 }
 
@@ -426,20 +424,6 @@ impl PluginManager {
     #[cfg(test)]
     pub async fn set_test_manifests(&self, manifests: BTreeMap<String, proto::PluginManifest>) {
         *self.inner.test_manifests.lock().await = manifests;
-    }
-
-    pub async fn is_enabled(&self, name: &str) -> bool {
-        if let Some(plugin) = self.inner.plugins.get(name) {
-            plugin.is_enabled_running().await
-        } else if cfg!(test) && self.is_test_bridge_enabled(name) {
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn is_available(&self, name: &str) -> bool {
-        self.inner.plugins.contains_key(name) || self.is_test_bridge_enabled(name)
     }
 
     pub async fn tools(&self, name: &str) -> Result<Vec<ToolSummary>> {
@@ -866,84 +850,6 @@ impl PluginManager {
         connect_side_stream(endpoint, response.transport_kind).await
     }
 
-    pub async fn cancel_stream(
-        &self,
-        plugin_name: &str,
-        notification: proto::CancelStreamNotification,
-    ) -> Result<()> {
-        if self.is_test_bridge_enabled(plugin_name) {
-            bail!(
-                "Plugin '{}' does not support stream control in bridge mode",
-                plugin_name
-            );
-        }
-        if let Some(summary) = self.inner.inactive.get(plugin_name) {
-            bail!(
-                "Plugin '{}' is disabled: {}",
-                plugin_name,
-                summary.error.as_deref().unwrap_or("unavailable")
-            );
-        }
-        let plugin = self
-            .inner
-            .plugins
-            .get(plugin_name)
-            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
-        plugin.cancel_stream(notification).await
-    }
-
-    pub async fn close_stream(
-        &self,
-        plugin_name: &str,
-        notification: proto::CloseStreamNotification,
-    ) -> Result<()> {
-        if self.is_test_bridge_enabled(plugin_name) {
-            bail!(
-                "Plugin '{}' does not support stream control in bridge mode",
-                plugin_name
-            );
-        }
-        if let Some(summary) = self.inner.inactive.get(plugin_name) {
-            bail!(
-                "Plugin '{}' is disabled: {}",
-                plugin_name,
-                summary.error.as_deref().unwrap_or("unavailable")
-            );
-        }
-        let plugin = self
-            .inner
-            .plugins
-            .get(plugin_name)
-            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
-        plugin.close_stream(notification).await
-    }
-
-    pub async fn report_stream_error(
-        &self,
-        plugin_name: &str,
-        error: proto::StreamError,
-    ) -> Result<()> {
-        if self.is_test_bridge_enabled(plugin_name) {
-            bail!(
-                "Plugin '{}' does not support stream control in bridge mode",
-                plugin_name
-            );
-        }
-        if let Some(summary) = self.inner.inactive.get(plugin_name) {
-            bail!(
-                "Plugin '{}' is disabled: {}",
-                plugin_name,
-                summary.error.as_deref().unwrap_or("unavailable")
-            );
-        }
-        let plugin = self
-            .inner
-            .plugins
-            .get(plugin_name)
-            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
-        plugin.report_stream_error(error).await
-    }
-
     fn start_supervisor(&self) {
         let manager = self.clone();
         tokio::spawn(async move {
@@ -1064,8 +970,6 @@ impl PluginManager {
                     plugin_name: summary.name.clone(),
                     endpoint_id: endpoint.endpoint_id,
                     address,
-                    protocol: endpoint.protocol,
-                    supports_streaming: endpoint.supports_streaming,
                     models: health.models,
                 });
             }

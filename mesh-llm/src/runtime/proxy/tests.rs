@@ -283,8 +283,6 @@ async fn start_inference_endpoint_plugin_manager(
             plugin_name: plugin::LEMONADE_PLUGIN_ID.into(),
             endpoint_id: "lemonade".into(),
             address,
-            protocol: Some("openai_compatible".into()),
-            supports_streaming: true,
             models,
         }])
         .await;

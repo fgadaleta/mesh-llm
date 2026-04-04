@@ -99,11 +99,6 @@ impl ExternalPlugin {
         summary
     }
 
-    pub(crate) async fn is_enabled_running(&self) -> bool {
-        let summary = self.summary.lock().await;
-        summary.enabled && summary.status == "running"
-    }
-
     pub(crate) async fn supervise(&self) -> Result<()> {
         if self.is_disabled().await {
             return Ok(());
@@ -518,36 +513,6 @@ impl ExternalPlugin {
     pub(crate) async fn send_mesh_event(&self, event: proto::MeshEvent) -> Result<()> {
         self.send_unsolicited(proto::envelope::Payload::MeshEvent(event), "mesh events")
             .await
-    }
-
-    pub(crate) async fn cancel_stream(
-        &self,
-        notification: proto::CancelStreamNotification,
-    ) -> Result<()> {
-        self.send_unsolicited(
-            proto::envelope::Payload::CancelStreamNotification(notification),
-            "stream cancellation notifications",
-        )
-        .await
-    }
-
-    pub(crate) async fn close_stream(
-        &self,
-        notification: proto::CloseStreamNotification,
-    ) -> Result<()> {
-        self.send_unsolicited(
-            proto::envelope::Payload::CloseStreamNotification(notification),
-            "stream close notifications",
-        )
-        .await
-    }
-
-    pub(crate) async fn report_stream_error(&self, error: proto::StreamError) -> Result<()> {
-        self.send_unsolicited(
-            proto::envelope::Payload::StreamError(error),
-            "stream errors",
-        )
-        .await
     }
 
     async fn request(&self, payload: proto::envelope::Payload) -> Result<proto::Envelope> {
