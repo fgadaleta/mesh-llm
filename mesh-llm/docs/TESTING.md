@@ -16,6 +16,9 @@ Outputs:
 - exact summary TSV: `MLX_VALIDATION_RESULTS/<stamp>/exact-summary.tsv`
 - behavior summary TSV: `MLX_VALIDATION_RESULTS/<stamp>/behavior-summary.tsv`
 - combined summary TSV: `MLX_VALIDATION_RESULTS/<stamp>/validation-summary.tsv`
+- exact baseline comparison TSV: `MLX_VALIDATION_RESULTS/<stamp>/exact-baseline-comparison.tsv`
+- behavior baseline comparison TSV: `MLX_VALIDATION_RESULTS/<stamp>/behavior-baseline-comparison.tsv`
+- parity-vs-baseline TSV: `MLX_VALIDATION_RESULTS/<stamp>/parity-vs-canonical-baseline.tsv`
 - raw logs per case:
   - `MLX_VALIDATION_RESULTS/<stamp>/exact/<case-id>/`
   - `MLX_VALIDATION_RESULTS/<stamp>/behavior/<case-id>/`
@@ -47,11 +50,24 @@ scripts/run-validation-matrix.py --root /tmp/mesh-llm-validation
 
 The shared matrix definition lives in:
 
-- `scripts/validation-matrix.json`
+- `testdata/validation/matrix.json`
+- `testdata/validation/baselines.json`
 
 Each row pins the exact GGUF and MLX artifacts to avoid model drift and tags the
 row with an expectation class such as `strict` or `weak-but-stable` so tiny
 model weirdness stays explicit instead of silently redefining success.
+
+Baseline policy:
+
+- `GGUF` is the canonical checked-in baseline.
+- New `GGUF` runs are compared against the checked-in `GGUF` baseline to catch
+  reference-backend regressions.
+- `MLX` runs are compared against both:
+  - the checked-in `MLX` baseline for backend self-consistency
+  - the checked-in `GGUF` baseline for parity
+- Behavior baselines stay summary-based rather than full-output goldens. Record
+  only stable facts such as exit code, failed prompt count, and flagged prompt
+  ids/categories after you accept a behavior run.
 
 ## Single-model permutations
 

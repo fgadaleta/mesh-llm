@@ -20,7 +20,8 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MATRIX = REPO_ROOT / "scripts" / "validation-matrix.json"
+DEFAULT_MATRIX = REPO_ROOT / "testdata" / "validation" / "matrix.json"
+DEFAULT_BASELINES = REPO_ROOT / "testdata" / "validation" / "baselines.json"
 DEFAULT_ROOT = REPO_ROOT / "MLX_VALIDATION_RESULTS"
 
 
@@ -50,6 +51,12 @@ def ensure_build(skip_build: bool) -> None:
 
 
 def load_matrix(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_baselines(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.exists():
+        return {}
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -188,6 +195,20 @@ def run_exact_case(
 
 def behavior_report_path(root: Path, stamp: str, case_id: str) -> Path:
     return case_dir(root, stamp, "behavior", case_id) / "report.json"
+
+
+def flagged_prompt_summary(report_path: Path) -> list[str]:
+    if not report_path.exists():
+        return []
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    flagged: list[str] = []
+    for result in payload.get("results", []):
+        if result.get("passed", True):
+            continue
+        prompt_id = result.get("prompt_id", "")
+        category = result.get("category", "")
+        flagged.append(f"{category}#{prompt_id}")
+    return flagged
 
 
 def run_behavior_case(
@@ -356,6 +377,205 @@ def aggregate(root: Path, stamp: str, models: list[dict[str, Any]]) -> None:
     aggregate_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def compare_exact_against_baseline(
+    baseline_cfg: dict[str, Any],
+    root: Path,
+    stamp: str,
+    models: list[dict[str, Any]],
+    backend_filter: str,
+) -> None:
+    exact_path = summary_path(root, stamp, "exact")
+    if not exact_path.exists():
+        return
+    actual_rows: dict[tuple[str, str], tuple[str, str]] = {}
+    for line in exact_path.read_text(encoding="utf-8").splitlines()[1:]:
+        model_id, _label, _expectation, backend, case_id, exit_code = line.split("\t")
+        actual_rows[(model_id, backend)] = (case_id, exit_code)
+
+    compare_path = root / stamp / "exact-baseline-comparison.tsv"
+    header = [
+        "model_id",
+        "backend",
+        "case_id",
+        "expected_exit",
+        "actual_exit",
+        "status",
+    ]
+    lines = ["\t".join(header)]
+    for model in models:
+        for backend in requested_backends(model, backend_filter):
+            expected = baseline_cfg.get("exact", {}).get(backend, {}).get(model["id"])
+            actual = actual_rows.get((model["id"], backend))
+            if expected is None:
+                status = "no-baseline"
+                lines.append(
+                    "\t".join(
+                        [
+                            model["id"],
+                            backend,
+                            actual[0] if actual else "",
+                            "",
+                            actual[1] if actual else "",
+                            status,
+                        ]
+                    )
+                )
+                continue
+            expected_exit = str(expected.get("exit", ""))
+            actual_exit = actual[1] if actual else ""
+            status = "match" if actual_exit == expected_exit else "mismatch"
+            lines.append(
+                "\t".join(
+                    [
+                        model["id"],
+                        backend,
+                        actual[0] if actual else expected.get("case_id", ""),
+                        expected_exit,
+                        actual_exit,
+                        status,
+                    ]
+                )
+            )
+    compare_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def compare_behavior_against_baseline(
+    baseline_cfg: dict[str, Any],
+    root: Path,
+    stamp: str,
+    models: list[dict[str, Any]],
+    backend_filter: str,
+) -> None:
+    behavior_path = summary_path(root, stamp, "behavior")
+    if not behavior_path.exists():
+        return
+    actual_rows: dict[tuple[str, str], dict[str, str]] = {}
+    for line in behavior_path.read_text(encoding="utf-8").splitlines()[1:]:
+        model_id, _label, _expectation, backend, case_id, exit_code, failed_prompts, prompt_count = line.split("\t")
+        report_path = behavior_report_path(root, stamp, case_id)
+        actual_rows[(model_id, backend)] = {
+            "case_id": case_id,
+            "exit": exit_code,
+            "failed_prompt_count": failed_prompts,
+            "prompt_count": prompt_count,
+            "flagged": ",".join(flagged_prompt_summary(report_path)),
+        }
+
+    compare_path = root / stamp / "behavior-baseline-comparison.tsv"
+    header = [
+        "model_id",
+        "backend",
+        "case_id",
+        "expected_exit",
+        "actual_exit",
+        "expected_failed_prompts",
+        "actual_failed_prompts",
+        "expected_flagged",
+        "actual_flagged",
+        "status",
+    ]
+    lines = ["\t".join(header)]
+    for model in models:
+        for backend in requested_backends(model, backend_filter):
+            expected = baseline_cfg.get("behavior", {}).get(backend, {}).get(model["id"])
+            actual = actual_rows.get((model["id"], backend))
+            if expected is None:
+                status = "no-baseline"
+                lines.append(
+                    "\t".join(
+                        [
+                            model["id"],
+                            backend,
+                            actual["case_id"] if actual else "",
+                            "",
+                            actual["exit"] if actual else "",
+                            "",
+                            actual["failed_prompt_count"] if actual else "",
+                            "",
+                            actual["flagged"] if actual else "",
+                            status,
+                        ]
+                    )
+                )
+                continue
+            expected_exit = str(expected.get("exit", ""))
+            expected_failed = str(expected.get("failed_prompt_count", ""))
+            expected_flagged = ",".join(expected.get("flagged_prompt_ids", []))
+            actual_exit = actual["exit"] if actual else ""
+            actual_failed = actual["failed_prompt_count"] if actual else ""
+            actual_flagged = actual["flagged"] if actual else ""
+            status = (
+                "match"
+                if actual_exit == expected_exit
+                and actual_failed == expected_failed
+                and actual_flagged == expected_flagged
+                else "mismatch"
+            )
+            lines.append(
+                "\t".join(
+                    [
+                        model["id"],
+                        backend,
+                        actual["case_id"] if actual else expected.get("case_id", ""),
+                        expected_exit,
+                        actual_exit,
+                        expected_failed,
+                        actual_failed,
+                        expected_flagged,
+                        actual_flagged,
+                        status,
+                    ]
+                )
+            )
+    compare_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def compare_parity_to_canonical(
+    baseline_cfg: dict[str, Any],
+    root: Path,
+    stamp: str,
+    models: list[dict[str, Any]],
+) -> None:
+    exact_path = summary_path(root, stamp, "exact")
+    if not exact_path.exists():
+        return
+    canonical_backend = baseline_cfg.get("canonical_backend", "gguf")
+    actual_rows: dict[tuple[str, str], tuple[str, str]] = {}
+    for line in exact_path.read_text(encoding="utf-8").splitlines()[1:]:
+        model_id, _label, _expectation, backend, case_id, exit_code = line.split("\t")
+        actual_rows[(model_id, backend)] = (case_id, exit_code)
+
+    compare_path = root / stamp / "parity-vs-canonical-baseline.tsv"
+    header = [
+        "model_id",
+        "canonical_backend",
+        "canonical_expected_exit",
+        "actual_mlx_exit",
+        "status",
+    ]
+    lines = ["\t".join(header)]
+    for model in models:
+        canonical = baseline_cfg.get("exact", {}).get(canonical_backend, {}).get(model["id"])
+        mlx_actual = actual_rows.get((model["id"], "mlx"))
+        if canonical is None or mlx_actual is None:
+            continue
+        canonical_exit = str(canonical.get("exit", ""))
+        mlx_exit = mlx_actual[1]
+        status = "within-threshold" if canonical_exit == mlx_exit else "mlx-differs"
+        lines.append(
+            "\t".join(
+                [
+                    model["id"],
+                    canonical_backend,
+                    canonical_exit,
+                    mlx_exit,
+                    status,
+                ]
+            )
+        )
+    compare_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=["exact", "behavior", "all"], default="all")
@@ -363,6 +583,7 @@ def main() -> int:
     parser.add_argument("--stamp", default="")
     parser.add_argument("--root", default=str(DEFAULT_ROOT))
     parser.add_argument("--matrix", default=str(DEFAULT_MATRIX))
+    parser.add_argument("--baselines", default=str(DEFAULT_BASELINES))
     parser.add_argument("--cases", default="", help="Comma-separated model ids, labels, or case ids")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--dataset", default="")
@@ -375,6 +596,7 @@ def main() -> int:
         raise SystemExit("❌ MLX validation requires macOS")
 
     matrix = load_matrix(Path(args.matrix))
+    baselines = load_baselines(Path(args.baselines) if args.baselines else None)
     stamp = args.stamp or subprocess.check_output(["date", "+%Y%m%d-%H%M%S"], text=True).strip()
     root = Path(args.root)
     selectors = {item.strip() for item in args.cases.split(",") if item.strip()}
@@ -408,6 +630,9 @@ def main() -> int:
                 overall_rc = overall_rc or rc
 
     aggregate(root, stamp, models)
+    compare_exact_against_baseline(baselines, root, stamp, models, args.backend)
+    compare_behavior_against_baseline(baselines, root, stamp, models, args.backend)
+    compare_parity_to_canonical(baselines, root, stamp, models)
 
     if args.suite in ("exact", "all"):
         exact_path = summary_path(root, stamp, "exact")
@@ -424,6 +649,18 @@ def main() -> int:
     if aggregate_path.exists():
         print("\n=== Combined summary ===")
         print(aggregate_path.read_text(encoding="utf-8"), end="")
+    exact_compare_path = root / stamp / "exact-baseline-comparison.tsv"
+    if exact_compare_path.exists():
+        print("\n=== Exact baseline comparison ===")
+        print(exact_compare_path.read_text(encoding="utf-8"), end="")
+    behavior_compare_path = root / stamp / "behavior-baseline-comparison.tsv"
+    if behavior_compare_path.exists():
+        print("\n=== Behavior baseline comparison ===")
+        print(behavior_compare_path.read_text(encoding="utf-8"), end="")
+    parity_compare_path = root / stamp / "parity-vs-canonical-baseline.tsv"
+    if parity_compare_path.exists():
+        print("\n=== Parity vs canonical baseline ===")
+        print(parity_compare_path.read_text(encoding="utf-8"), end="")
     print(f"\nRaw artifacts: {root / stamp}")
     return overall_rc
 
