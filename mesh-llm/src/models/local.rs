@@ -460,6 +460,112 @@ pub fn find_model_path(stem: &str) -> PathBuf {
     canonical_dir.join(&filename)
 }
 
+/// Strip common GGUF quantization suffixes from a lowercased stem.
+/// e.g. "qwen3vl-2b-instruct-q4_k_m" → "qwen3vl-2b-instruct"
+fn strip_quant_suffix(stem: &str) -> &str {
+    // Quant suffixes are typically the last hyphen-separated component:
+    // Q4_K_M, Q8_0, BF16, F16, F32, IQ4_NL, etc.
+    if let Some(pos) = stem.rfind('-') {
+        let suffix = &stem[pos + 1..];
+        // Starts with 'q', 'iq', 'f', or 'bf' followed by a digit → quant suffix
+        let is_quant = suffix.starts_with("q")
+            || suffix.starts_with("iq")
+            || suffix.starts_with("f16")
+            || suffix.starts_with("f32")
+            || suffix.starts_with("bf16");
+        if is_quant {
+            return &stem[..pos];
+        }
+    }
+    stem
+}
+
+pub fn find_mmproj_path(model_name: &str, model_path: &Path) -> Option<PathBuf> {
+    if let Some(path) = crate::models::catalog::MODEL_CATALOG
+        .iter()
+        .find(|m| {
+            m.name == model_name || m.file.strip_suffix(".gguf").unwrap_or(&m.file) == model_name
+        })
+        .and_then(|m| m.mmproj.as_ref())
+        .map(|asset| crate::models::catalog::models_dir().join(&asset.file))
+        .filter(|p| p.exists())
+    {
+        return Some(path);
+    }
+
+    // The legacy flat ~/.models/ directory mixes models from completely different
+    // families in a single directory.  Filename-based heuristics are not reliable
+    // enough there, so we skip the sibling scan entirely for that layout.
+    // (Catalog-based lookup above still works for known vision models.)
+    if model_path.starts_with(legacy_models_dir()) {
+        return None;
+    }
+
+    // Scan the model's parent directory for a matching mmproj file.
+    // This is safe for the HF hub cache because each model lives in its own
+    // isolated snapshot subdirectory alongside only its companion files.
+    //
+    // The mmproj filename must contain both "mmproj" AND a model-name component
+    // that matches the model being loaded.
+    //
+    // Supported naming patterns:
+    //   <model>-mmproj[-<quant>].gguf   e.g. Qwen3.5-0.8B-mmproj-BF16.gguf
+    //   mmproj-<model>[-<quant>].gguf   e.g. mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf
+    let parent = model_path.parent()?;
+    let model_stem = model_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())?;
+    // Strip the quant suffix from the model stem to get the base model name
+    // e.g. "qwen3vl-2b-instruct-q4_k_m" → "qwen3vl-2b-instruct"
+    let model_base = strip_quant_suffix(&model_stem);
+    let mut candidates = std::fs::read_dir(parent)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path != model_path)
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("gguf"))
+        .filter(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| {
+                    let lower = stem.to_ascii_lowercase();
+                    if !lower.contains("mmproj") {
+                        return false;
+                    }
+                    // Try pattern: <model>-mmproj... (model name before mmproj)
+                    if let Some((prefix, _)) = lower
+                        .split_once("-mmproj")
+                        .or_else(|| lower.split_once("_mmproj"))
+                    {
+                        if model_base.starts_with(prefix) || model_stem.starts_with(prefix) {
+                            return true;
+                        }
+                    }
+                    // Try pattern: mmproj-<model>... (model name after mmproj)
+                    if let Some(after) = lower
+                        .strip_prefix("mmproj-")
+                        .or_else(|| lower.strip_prefix("mmproj_"))
+                    {
+                        let mmproj_model_base = strip_quant_suffix(after);
+                        if model_base.starts_with(mmproj_model_base)
+                            || mmproj_model_base.starts_with(model_base)
+                        {
+                            return true;
+                        }
+                    }
+                    false
+                })
+                .unwrap_or(false)
+        });
+
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(candidate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +688,88 @@ mod tests {
         restore_env("HF_HUB_CACHE", prev_hub_cache);
         restore_env("HF_HOME", prev_hf_home);
         restore_env("XDG_CACHE_HOME", prev_xdg);
+    }
+
+    #[test]
+    fn mmproj_path_falls_back_to_single_sibling_sidecar() {
+        let temp = std::env::temp_dir().join(format!(
+            "mesh-llm-mmproj-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let model = temp.join("Qwen3VL-2B-Instruct-Q4_K_M.gguf");
+        let mmproj = temp.join("mmproj-Qwen3VL-2B-Instruct-Q8_0.gguf");
+        std::fs::write(&model, b"model").unwrap();
+        std::fs::write(&mmproj, b"mmproj").unwrap();
+
+        let found = find_mmproj_path("Qwen3VL-2B-Instruct-Q4_K_M", &model);
+        assert_eq!(found.as_deref(), Some(mmproj.as_path()));
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn mmproj_path_ignores_ambiguous_sibling_sidecars() {
+        let temp = std::env::temp_dir().join(format!(
+            "mesh-llm-mmproj-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let model = temp.join("Qwen3VL-2B-Instruct-Q4_K_M.gguf");
+        let mmproj_a = temp.join("mmproj-a.gguf");
+        let mmproj_b = temp.join("mmproj-b.gguf");
+        std::fs::write(&model, b"model").unwrap();
+        std::fs::write(&mmproj_a, b"mmproj").unwrap();
+        std::fs::write(&mmproj_b, b"mmproj").unwrap();
+
+        assert!(find_mmproj_path("Qwen3VL-2B-Instruct-Q4_K_M", &model).is_none());
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    #[serial]
+    fn mmproj_path_skips_scan_inside_legacy_dir() {
+        // Models inside ~/.models/ must never trigger the sibling scan, even
+        // when a matching-named mmproj file sits right beside them.  The flat
+        // directory mixes models from many families and reliable matching is
+        // impossible, so we bail out early for that layout.
+        let temp = std::env::temp_dir().join(format!(
+            "mesh-llm-mmproj-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake_home = temp.clone();
+        let legacy = fake_home.join(".models");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        // Place a non-vision model and a stray unrelated mmproj in the flat dir.
+        let model = legacy.join("Hermes-2-Pro-Mistral-7B-Q4_K_M.gguf");
+        let unrelated_mmproj = legacy.join("Qwen3.5-0.8B-mmproj-BF16.gguf");
+        std::fs::write(&model, b"model").unwrap();
+        std::fs::write(&unrelated_mmproj, b"mmproj").unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &fake_home);
+
+        // Sibling scan is skipped entirely for the legacy dir → no mmproj returned.
+        assert!(find_mmproj_path("Hermes-2-Pro-Mistral-7B-Q4_K_M", &model).is_none());
+
+        // Also verify that even a correctly-named matching mmproj is ignored.
+        let matching_mmproj = legacy.join("Hermes-2-Pro-Mistral-7B-mmproj-BF16.gguf");
+        std::fs::write(&matching_mmproj, b"mmproj").unwrap();
+        assert!(find_mmproj_path("Hermes-2-Pro-Mistral-7B-Q4_K_M", &model).is_none());
+
+        restore_env("HOME", prev_home);
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     fn restore_env(key: &str, value: Option<std::ffi::OsString>) {

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use argon2::Argon2;
@@ -41,10 +42,12 @@ struct SecretPayload {
 
 /// Return the default keystore path: `~/.mesh-llm/owner-keystore.json`.
 pub fn default_keystore_path() -> Result<PathBuf, CryptoError> {
-    let home = dirs::home_dir().ok_or_else(|| CryptoError::Io(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "cannot determine home directory",
-    )))?;
+    let home = dirs::home_dir().ok_or_else(|| {
+        CryptoError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cannot determine home directory",
+        ))
+    })?;
     Ok(home.join(".mesh-llm").join("owner-keystore.json"))
 }
 
@@ -73,26 +76,14 @@ pub fn save_keystore(
     };
 
     let json = serde_json::to_string_pretty(&keystore)?;
-    std::fs::write(path, json)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
-    }
-
+    write_keystore_atomically(path, json.as_bytes())?;
     Ok(())
 }
 
 /// Load an owner keypair from disk.
 ///
 /// If the keystore is encrypted, `passphrase` must be provided.
-pub fn load_keystore(
-    path: &Path,
-    passphrase: Option<&str>,
-) -> Result<OwnerKeypair, CryptoError> {
+pub fn load_keystore(path: &Path, passphrase: Option<&str>) -> Result<OwnerKeypair, CryptoError> {
     if !path.exists() {
         return Err(CryptoError::KeystoreNotFound {
             path: path.display().to_string(),
@@ -103,7 +94,9 @@ pub fn load_keystore(
     let ks: KeystoreV1 = serde_json::from_str(&raw)?;
 
     if ks.version != KEYSTORE_VERSION {
-        return Err(CryptoError::UnsupportedVersion { version: ks.version });
+        return Err(CryptoError::UnsupportedVersion {
+            version: ks.version,
+        });
     }
 
     if ks.encrypted {
@@ -122,11 +115,36 @@ pub fn keystore_metadata(path: &Path) -> Result<KeystoreInfo, CryptoError> {
     }
     let raw = std::fs::read_to_string(path)?;
     let ks: KeystoreV1 = serde_json::from_str(&raw)?;
+    let signing_public_key =
+        ks.signing_public_key
+            .clone()
+            .ok_or_else(|| CryptoError::InvalidKeyMaterial {
+                reason: "missing signing_public_key in keystore metadata".into(),
+            })?;
+    let signing_public_key_bytes: [u8; 32] = hex::decode(&signing_public_key)
+        .map_err(|e| CryptoError::InvalidKeyMaterial {
+            reason: format!("bad signing public key hex: {e}"),
+        })?
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKeyMaterial {
+            reason: "signing public key must be 32 bytes".into(),
+        })?;
+    let signing_public_key = ed25519_dalek::VerifyingKey::from_bytes(&signing_public_key_bytes)
+        .map_err(|e| CryptoError::InvalidKeyMaterial {
+            reason: format!("invalid signing public key: {e}"),
+        })?;
+    let verified_owner_id = super::keys::owner_id_from_verifying_key(&signing_public_key);
+    if ks.owner_id != verified_owner_id {
+        return Err(CryptoError::VerificationFailed {
+            reason: "owner_id does not match signing public key".into(),
+        });
+    }
+
     Ok(KeystoreInfo {
-        owner_id: ks.owner_id,
+        owner_id: verified_owner_id,
         created_at: ks.created_at,
         encrypted: ks.encrypted,
-        signing_public_key: ks.signing_public_key,
+        signing_public_key: Some(hex::encode(signing_public_key.as_bytes())),
         encryption_public_key: ks.encryption_public_key,
     })
 }
@@ -197,6 +215,54 @@ fn build_encrypted_keystore(
     })
 }
 
+fn write_keystore_atomically(path: &Path, bytes: &[u8]) -> Result<(), CryptoError> {
+    let parent = path.parent().ok_or_else(|| {
+        CryptoError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("keystore path {} has no parent directory", path.display()),
+        ))
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        CryptoError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("keystore path {} has no file name", path.display()),
+        ))
+    })?;
+    let tmp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+
+    let write_result = (|| -> Result<(), CryptoError> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    write_result
+}
+
 fn plaintext_keystore(ks: &KeystoreV1) -> Result<OwnerKeypair, CryptoError> {
     let sign_hex = ks
         .signing_secret_key
@@ -227,31 +293,39 @@ fn decrypt_keystore(
 ) -> Result<OwnerKeypair, CryptoError> {
     let pass = passphrase.ok_or(CryptoError::DecryptionFailed)?;
 
-    let salt = hex::decode(ks.argon2_salt.as_deref().unwrap_or_default())
+    let salt = hex::decode(
+        ks.argon2_salt
+            .as_deref()
+            .ok_or(CryptoError::DecryptionFailed)?,
+    )
+    .map_err(|_| CryptoError::DecryptionFailed)?;
+    let nonce_bytes = hex::decode(ks.nonce.as_deref().ok_or(CryptoError::DecryptionFailed)?)
         .map_err(|_| CryptoError::DecryptionFailed)?;
-    let nonce_bytes = hex::decode(ks.nonce.as_deref().unwrap_or_default())
-        .map_err(|_| CryptoError::DecryptionFailed)?;
-    let ct = hex::decode(ks.ciphertext.as_deref().unwrap_or_default())
-        .map_err(|_| CryptoError::DecryptionFailed)?;
+    let ct = hex::decode(
+        ks.ciphertext
+            .as_deref()
+            .ok_or(CryptoError::DecryptionFailed)?,
+    )
+    .map_err(|_| CryptoError::DecryptionFailed)?;
 
-    let sym_key = derive_key(pass, &salt)?;
-
-    if nonce_bytes.len() != 12 {
+    if salt.len() != 16 || nonce_bytes.len() != 12 || ct.is_empty() {
         return Err(CryptoError::DecryptionFailed);
     }
+
+    let sym_key = derive_key(pass, &salt)?;
     let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(sym_key.as_ref()));
     let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
     let plaintext = cipher
         .decrypt(nonce, ct.as_ref())
         .map_err(|_| CryptoError::DecryptionFailed)?;
 
-    let payload: SecretPayload = serde_json::from_slice(&plaintext)
-        .map_err(|_| CryptoError::DecryptionFailed)?;
+    let payload: SecretPayload =
+        serde_json::from_slice(&plaintext).map_err(|_| CryptoError::DecryptionFailed)?;
 
     let sign_bytes =
         hex::decode(&payload.signing_secret_key).map_err(|_| CryptoError::DecryptionFailed)?;
-    let enc_bytes = hex::decode(&payload.encryption_secret_key)
-        .map_err(|_| CryptoError::DecryptionFailed)?;
+    let enc_bytes =
+        hex::decode(&payload.encryption_secret_key).map_err(|_| CryptoError::DecryptionFailed)?;
 
     OwnerKeypair::from_bytes(&sign_bytes, &enc_bytes)
 }
@@ -359,6 +433,48 @@ mod tests {
         let info = keystore_metadata(&path).unwrap();
         assert_eq!(info.owner_id, expected_id);
         assert!(info.encrypted);
+
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn metadata_rejects_owner_id_spoofing() {
+        let path = temp_keystore_path();
+        let kp = OwnerKeypair::generate();
+
+        save_keystore(&path, &kp, Some("secret")).unwrap();
+
+        let mut raw: KeystoreV1 =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        raw.owner_id = "0000000000000000000000000000000000000000000000000000000000000000".into();
+        fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+        let result = keystore_metadata(&path);
+        assert!(
+            matches!(result, Err(CryptoError::VerificationFailed { .. })),
+            "spoofed owner_id should be rejected"
+        );
+
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn encrypted_keystore_requires_all_encrypted_fields() {
+        let path = temp_keystore_path();
+        let kp = OwnerKeypair::generate();
+
+        save_keystore(&path, &kp, Some("secret")).unwrap();
+
+        let mut raw: KeystoreV1 =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        raw.argon2_salt = None;
+        fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+        let result = load_keystore(&path, Some("secret"));
+        assert!(
+            matches!(result, Err(CryptoError::DecryptionFailed)),
+            "missing encrypted fields should fail cleanly"
+        );
 
         fs::remove_dir_all(path.parent().unwrap()).ok();
     }

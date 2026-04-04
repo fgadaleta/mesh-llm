@@ -53,13 +53,18 @@ fn canonical_signed_bytes(
     payload: &[u8],
 ) -> Vec<u8> {
     let mut buf = Vec::new();
+    let sender_owner_id_bytes = sender_owner_id.as_bytes();
+    let message_type_bytes = message_type.as_bytes();
+
     // Domain separation tag to prevent cross-protocol signature reuse.
     buf.extend_from_slice(b"mesh-llm-envelope-v1:");
     buf.extend_from_slice(&version.to_le_bytes());
-    buf.extend_from_slice(sender_owner_id.as_bytes());
+    buf.extend_from_slice(&(sender_owner_id_bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(sender_owner_id_bytes);
     buf.extend_from_slice(sender_box_public_key);
     buf.extend_from_slice(recipient_box_public_key);
-    buf.extend_from_slice(message_type.as_bytes());
+    buf.extend_from_slice(&(message_type_bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(message_type_bytes);
     buf.extend_from_slice(&timestamp_unix_ms.to_le_bytes());
     // Include a hash of the payload rather than the raw payload to keep
     // the signed data compact for large payloads.
@@ -134,43 +139,39 @@ pub fn open_message(
     }
 
     // 1. Parse sender public keys.
-    let sender_sign_pk_bytes: [u8; 32] =
-        hex::decode(&envelope.sender_sign_public_key)
-            .map_err(|_| CryptoError::InvalidKeyMaterial {
-                reason: "bad sender signing key hex".into(),
-            })?
-            .try_into()
-            .map_err(|_| CryptoError::InvalidKeyMaterial {
-                reason: "sender signing key must be 32 bytes".into(),
-            })?;
+    let sender_sign_pk_bytes: [u8; 32] = hex::decode(&envelope.sender_sign_public_key)
+        .map_err(|_| CryptoError::InvalidKeyMaterial {
+            reason: "bad sender signing key hex".into(),
+        })?
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKeyMaterial {
+            reason: "sender signing key must be 32 bytes".into(),
+        })?;
 
-    let sender_box_pk_bytes: [u8; 32] =
-        hex::decode(&envelope.sender_box_public_key)
-            .map_err(|_| CryptoError::InvalidKeyMaterial {
-                reason: "bad sender box key hex".into(),
-            })?
-            .try_into()
-            .map_err(|_| CryptoError::InvalidKeyMaterial {
-                reason: "sender box key must be 32 bytes".into(),
-            })?;
+    let sender_box_pk_bytes: [u8; 32] = hex::decode(&envelope.sender_box_public_key)
+        .map_err(|_| CryptoError::InvalidKeyMaterial {
+            reason: "bad sender box key hex".into(),
+        })?
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKeyMaterial {
+            reason: "sender box key must be 32 bytes".into(),
+        })?;
 
-    let recipient_box_pk_bytes: [u8; 32] =
-        hex::decode(&envelope.recipient_box_public_key)
-            .map_err(|_| CryptoError::InvalidKeyMaterial {
-                reason: "bad recipient box key hex".into(),
-            })?
-            .try_into()
-            .map_err(|_| CryptoError::InvalidKeyMaterial {
-                reason: "recipient box key must be 32 bytes".into(),
-            })?;
+    let recipient_box_pk_bytes: [u8; 32] = hex::decode(&envelope.recipient_box_public_key)
+        .map_err(|_| CryptoError::InvalidKeyMaterial {
+            reason: "bad recipient box key hex".into(),
+        })?
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKeyMaterial {
+            reason: "recipient box key must be 32 bytes".into(),
+        })?;
 
     let sender_box_pk = crypto_box::PublicKey::from(sender_box_pk_bytes);
 
     // 2. Verify sender_owner_id matches the signing key (prevents identity spoofing).
     let sender_verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&sender_sign_pk_bytes)
         .map_err(|_| CryptoError::InvalidSignature)?;
-    let expected_owner_id =
-        super::keys::owner_id_from_verifying_key(&sender_verifying_key);
+    let expected_owner_id = super::keys::owner_id_from_verifying_key(&sender_verifying_key);
     if envelope.sender_owner_id != expected_owner_id {
         return Err(CryptoError::VerificationFailed {
             reason: "sender_owner_id does not match signing public key".into(),
@@ -312,7 +313,8 @@ mod tests {
         .unwrap();
 
         // Spoof the owner_id to a different value.
-        envelope.sender_owner_id = "0000000000000000000000000000000000000000000000000000000000000000".into();
+        envelope.sender_owner_id =
+            "0000000000000000000000000000000000000000000000000000000000000000".into();
 
         let result = open_message(&recipient, &envelope);
         assert!(
@@ -342,5 +344,32 @@ mod tests {
             matches!(result, Err(CryptoError::VerificationFailed { .. })),
             "unknown version should be rejected"
         );
+    }
+
+    #[test]
+    fn canonical_bytes_length_prefix_variable_fields() {
+        let sender_box_key = [7u8; 32];
+        let recipient_box_key = [9u8; 32];
+
+        let left = canonical_signed_bytes(
+            1,
+            "ab",
+            &sender_box_key,
+            &recipient_box_key,
+            "c",
+            42,
+            b"payload",
+        );
+        let right = canonical_signed_bytes(
+            1,
+            "a",
+            &sender_box_key,
+            &recipient_box_key,
+            "bc",
+            42,
+            b"payload",
+        );
+
+        assert_ne!(left, right, "variable-length fields must be unambiguous");
     }
 }

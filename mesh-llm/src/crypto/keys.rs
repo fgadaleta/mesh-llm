@@ -45,11 +45,12 @@ impl OwnerKeypair {
         signing_bytes: &[u8],
         encryption_bytes: &[u8],
     ) -> Result<Self, CryptoError> {
-        let signing_arr: [u8; 32] = signing_bytes.try_into().map_err(|_| {
-            CryptoError::InvalidKeyMaterial {
-                reason: "signing key must be 32 bytes".into(),
-            }
-        })?;
+        let signing_arr: [u8; 32] =
+            signing_bytes
+                .try_into()
+                .map_err(|_| CryptoError::InvalidKeyMaterial {
+                    reason: "signing key must be 32 bytes".into(),
+                })?;
         let encryption_arr: [u8; 32] =
             encryption_bytes
                 .try_into()

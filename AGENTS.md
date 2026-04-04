@@ -144,6 +144,19 @@ Read `mesh-llm/docs/TESTING.md` before running tests. It has all test scenarios,
 
 Before committing Rust changes, format only the changed Rust files from the repo root, for example with `cargo fmt --all -- path/to/file.rs`, and include those formatting changes in the commit.
 
+## Pull Requests
+
+Pull request titles and descriptions should be user-focused by default.
+
+- Title PRs around the user-visible change or capability, not the implementation detail.
+- Start the description with what the user can now do, see, or understand after the change.
+- Keep architectural refactors, internal state reshaping, and code-organization notes out of the opening summary unless they directly change user behavior.
+- If there are important architectural changes, add a separate `## Architecture` section.
+- If there are protocol or compatibility implications, add a separate `## Protocol` section that clearly calls out compatibility, migration, or breaking-change impact.
+- If the PR changes CLI behavior or touches user-facing CLI flows, include example commands and representative output in the PR description.
+- If the PR changes the UI, include at least one screenshot in the PR description.
+- Validation and screenshots should stay separate from the user-facing summary.
+
 ### Deploy to Remote
 
 ```bash
@@ -177,6 +190,16 @@ pkill -f mesh-llm; pkill -f rpc-server; pkill -f llama-server
 11. Verify expected peer count.
 12. Test inference through every model in `/v1/models`.
 13. Test `/v1/` passthrough on port 3131.
+
+### Debugging llama-server startup
+
+If llama-server fails to start (stuck at "⏳ Starting llama-server..."), check its log file. Rust's `std::env::temp_dir()` on macOS points to the per-user temp dir, **not** `/tmp`:
+
+```bash
+cat "$(python3 -c 'import tempfile; print(tempfile.gettempdir())')/mesh-llm-llama-server.log"
+```
+
+Typical path: `/var/folders/XX/.../T/mesh-llm-llama-server.log`. rpc-server logs are in the same directory as `mesh-llm-rpc-{port}.log`.
 
 ### Common failures
 - **nohup over SSH doesn't stick** — use `bash -c "nohup ... & disown"`, verify process survives disconnect.

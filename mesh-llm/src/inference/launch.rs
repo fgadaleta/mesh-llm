@@ -188,7 +188,8 @@ fn resolve_binary_path(
 }
 
 fn temp_log_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(name)
+    let mesh_pid = std::process::id();
+    std::env::temp_dir().join(format!("mesh-llm-{mesh_pid}-{name}"))
 }
 
 #[derive(Clone, Debug)]
@@ -391,7 +392,7 @@ pub async fn start_rpc_server(
 
     tracing::info!("Starting rpc-server on :{port} (device: {device})");
 
-    let rpc_log = temp_log_path(&format!("mesh-llm-rpc-{port}.log"));
+    let rpc_log = temp_log_path(&format!("rpc-server-{port}.log"));
     let rpc_log_file = std::fs::File::create(&rpc_log)
         .with_context(|| format!("Failed to create rpc-server log file {}", rpc_log.display()))?;
     let rpc_log_file2 = rpc_log_file.try_clone()?;
@@ -615,7 +616,7 @@ pub async fn start_llama_server(
         rpc_arg
     );
 
-    let llama_log = temp_log_path("mesh-llm-llama-server.log");
+    let llama_log = temp_log_path("llama-server.log");
     let log_file = std::fs::File::create(&llama_log).with_context(|| {
         format!(
             "Failed to create llama-server log file {}",
@@ -780,7 +781,7 @@ pub async fn start_llama_server(
         })?;
 
     // Wait for health check
-    let url = format!("http://localhost:{http_port}/health");
+    let url = format!("http://127.0.0.1:{http_port}/health");
     for i in 0..600 {
         if i > 0 && i % 10 == 0 {
             let bytes = crate::network::tunnel::bytes_transferred();
@@ -995,7 +996,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_context_size, parse_available_devices, preferred_device, BinaryFlavor};
+    use super::{
+        compute_context_size, parse_available_devices, preferred_device, temp_log_path,
+        BinaryFlavor,
+    };
     use std::path::Path;
 
     #[test]
@@ -1075,6 +1079,26 @@ No devices found
         assert_eq!(
             compute_context_size(None, model_bytes, my_vram, total_group_vram),
             16384
+        );
+    }
+
+    #[test]
+    fn temp_log_path_includes_pid_and_suffix() {
+        let suffix = "rpc-server.log";
+        let path = temp_log_path(suffix);
+        let file_name = path
+            .file_name()
+            .expect("temp_log_path should produce a filename")
+            .to_string_lossy();
+        let pid = std::process::id().to_string();
+
+        assert!(
+            file_name.contains(&pid),
+            "expected filename '{file_name}' to contain current pid '{pid}'"
+        );
+        assert!(
+            file_name.contains(suffix),
+            "expected filename '{file_name}' to contain suffix '{suffix}'"
         );
     }
 }

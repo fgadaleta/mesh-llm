@@ -4,12 +4,17 @@ use anyhow::{Context, Result};
 use hf_hub::api::Progress as HfProgress;
 use hf_hub::{Repo, RepoType};
 use serde::Deserialize;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::LazyLock;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-
 #[derive(Clone, Debug, Deserialize)]
 pub struct CatalogAsset {
     pub file: String,
@@ -237,8 +242,47 @@ fn expand_split_asset(asset: &HfAsset) -> Result<Vec<HfAsset>> {
         .collect())
 }
 
+#[cfg(test)]
+type DownloadHfAssetsOverrideFn =
+    Arc<dyn Fn(&str, Vec<HfAsset>) -> Result<Vec<PathBuf>> + Send + Sync>;
+
+#[cfg(test)]
+static DOWNLOAD_HF_ASSETS_OVERRIDE: LazyLock<Mutex<HashMap<String, DownloadHfAssetsOverrideFn>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+struct DownloadHfAssetsOverrideGuard(String);
+
+#[cfg(test)]
+impl DownloadHfAssetsOverrideGuard {
+    fn set(label: String, func: DownloadHfAssetsOverrideFn) -> Self {
+        let mut map = DOWNLOAD_HF_ASSETS_OVERRIDE.lock().unwrap();
+        map.insert(label.clone(), func);
+        DownloadHfAssetsOverrideGuard(label)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DownloadHfAssetsOverrideGuard {
+    fn drop(&mut self) {
+        let mut map = DOWNLOAD_HF_ASSETS_OVERRIDE.lock().unwrap();
+        map.remove(&self.0);
+    }
+}
+
 async fn download_hf_assets(label: &str, assets: Vec<HfAsset>) -> Result<Vec<PathBuf>> {
     let label = label.to_string();
+    #[cfg(test)]
+    {
+        let func = DOWNLOAD_HF_ASSETS_OVERRIDE
+            .lock()
+            .unwrap()
+            .get(&label)
+            .cloned();
+        if let Some(func) = func {
+            return func(&label, assets);
+        }
+    }
     tokio::task::spawn_blocking(move || download_hf_assets_blocking(&label, assets))
         .await
         .context("Join Hugging Face download task")?
@@ -416,7 +460,7 @@ pub async fn download_hf_repo_file(
     paths.sort();
     paths
         .into_iter()
-        .find(|path| path.ends_with(&asset.file))
+        .find(|path| path_suffix_matches_ignore_case(path, &asset.file))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Downloaded Hugging Face asset not found in cache: {repo}/{file}@{revision}"
@@ -434,13 +478,19 @@ pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
         .map(hf_asset_from_url)
         .collect();
     if let Some(assets) = hf_assets {
+        let source = model.source_file().unwrap_or(model.file.as_str());
         let mut paths = download_hf_assets(&model.name, assets).await?;
         paths.sort();
+        if let Some(path) = paths
+            .iter()
+            .find(|path| path_suffix_matches_ignore_case(path, source))
+            .cloned()
+        {
+            return Ok(path);
+        }
         return paths
             .into_iter()
-            .find(|path| {
-                path.file_name().and_then(|value| value.to_str()) == Some(model.file.as_str())
-            })
+            .find(|path| path_suffix_matches_ignore_case(path, &model.file))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Downloaded model path not found in cache for {}",
@@ -539,6 +589,35 @@ pub async fn download_model(model: &CatalogModel) -> Result<PathBuf> {
 /// Download any URL to a destination path with resume support.
 pub async fn download_url(url: &str, dest: &Path) -> Result<()> {
     download_with_resume(dest, url).await
+}
+
+fn path_suffix_matches_ignore_case(path: &Path, expected: &str) -> bool {
+    let expected_parts = expected
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    if expected_parts.is_empty() {
+        return false;
+    }
+
+    let mut path_parts = path.iter().rev();
+
+    for expected_part in expected_parts.iter().rev() {
+        let Some(path_part) = path_parts.next() else {
+            return false;
+        };
+
+        let Some(path_part) = path_part.to_str() else {
+            return false;
+        };
+
+        if !path_part.eq_ignore_ascii_case(expected_part) {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Download a HuggingFace GGUF URL, auto-detecting split files (-00001-of-NNNNN.gguf).
@@ -954,5 +1033,189 @@ mod tests {
         assert!(files[0].1.contains("-00001-of-"));
         assert!(files[1].1.contains("-00002-of-"));
         assert!(files[2].1.contains("-00003-of-"));
+    }
+
+    #[test]
+    fn path_file_name_matches_nested_path_ignore_case() {
+        let path = Path::new("/tmp/cache/Subdir/Model.Q4_K_M.gguf");
+        assert!(path_suffix_matches_ignore_case(
+            path,
+            "subdir/model.q4_k_m.gguf"
+        ));
+    }
+
+    #[test]
+    fn path_file_name_matches_rejects_wrong_suffix() {
+        let path = Path::new("/tmp/cache/other/Model.Q4_K_M.gguf");
+        assert!(!path_suffix_matches_ignore_case(
+            path,
+            "subdir/model.q4_k_m.gguf"
+        ));
+    }
+
+    #[tokio::test]
+    async fn download_hf_repo_file_matches_cache_file_case_insensitively() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cached_file = std::env::temp_dir()
+            .join(format!("mesh-llm-hf-case-repo-{unique}"))
+            .join("qwen2.5-coder-7b-instruct-q4_k_m.gguf");
+        std::fs::create_dir_all(cached_file.parent().unwrap()).unwrap();
+        std::fs::write(&cached_file, b"gguf").unwrap();
+
+        {
+            let label =
+                "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf@main"
+                    .to_string();
+            let _guard = DownloadHfAssetsOverrideGuard::set(
+                label,
+                Arc::new({
+                    let cached = cached_file.clone();
+                    move |_, _| Ok(vec![cached.clone()])
+                }),
+            );
+            let resolved = download_hf_repo_file(
+                "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+                Some("main"),
+                "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+            )
+            .await
+            .unwrap();
+            assert_eq!(resolved, cached_file);
+        }
+
+        {
+            let label =
+                "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf@main"
+                    .to_string();
+            let _guard = DownloadHfAssetsOverrideGuard::set(label, Arc::new(|_, _| Ok(Vec::new())));
+            assert!(download_hf_repo_file(
+                "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+                Some("main"),
+                "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn download_hf_repo_file_matches_nested_cache_path_case_insensitively() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cached_file = std::env::temp_dir()
+            .join(format!("mesh-llm-hf-nested-repo-{unique}"))
+            .join("nested")
+            .join("Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf");
+        std::fs::create_dir_all(cached_file.parent().unwrap()).unwrap();
+        std::fs::write(&cached_file, b"gguf").unwrap();
+
+        let label =
+            "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/nested/qwen2.5-coder-7b-instruct-q4_k_m.gguf@main"
+                .to_string();
+        let _guard = DownloadHfAssetsOverrideGuard::set(
+            label,
+            Arc::new({
+                let cached = cached_file.clone();
+                move |_, _| Ok(vec![cached.clone()])
+            }),
+        );
+
+        let resolved = download_hf_repo_file(
+            "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+            Some("main"),
+            "nested/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, cached_file);
+    }
+
+    #[tokio::test]
+    async fn download_model_matches_hf_cache_file_case_insensitively() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cached_file = std::env::temp_dir()
+            .join(format!("mesh-llm-hf-case-model-{unique}"))
+            .join("qwen2.5-coder-7b-instruct-q4_k_m.gguf");
+        std::fs::create_dir_all(cached_file.parent().unwrap()).unwrap();
+        std::fs::write(&cached_file, b"gguf").unwrap();
+
+        let model = CatalogModel {
+            name: "Qwen2.5-Coder-7B-Instruct-Q4_K_M".to_string(),
+            file: "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf".to_string(),
+            url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf".to_string(),
+            size: "4.4GB".to_string(),
+            description: "".to_string(),
+            draft: None,
+            moe: None,
+            extra_files: Vec::new(),
+            mmproj: None,
+        };
+
+        {
+            let label = model.name.clone();
+            let _guard = DownloadHfAssetsOverrideGuard::set(
+                label,
+                Arc::new({
+                    let cached = cached_file.clone();
+                    move |_, _| Ok(vec![cached.clone()])
+                }),
+            );
+            let resolved = download_model(&model).await.unwrap();
+            assert_eq!(resolved, cached_file);
+        }
+
+        {
+            let label = model.name.clone();
+            let _guard = DownloadHfAssetsOverrideGuard::set(label, Arc::new(|_, _| Ok(Vec::new())));
+            assert!(download_model(&model).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn download_model_prefers_nested_source_path_over_same_basename() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mesh-llm-hf-nested-model-{unique}"));
+        let wrong_file = root.join("another").join("model.gguf");
+        let expected_file = root.join("nested").join("model.gguf");
+        std::fs::create_dir_all(wrong_file.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(expected_file.parent().unwrap()).unwrap();
+        std::fs::write(&wrong_file, b"wrong").unwrap();
+        std::fs::write(&expected_file, b"right").unwrap();
+
+        let model = CatalogModel {
+            name: "Nested-Path-Model".to_string(),
+            file: "model.gguf".to_string(),
+            url: "https://huggingface.co/org/repo/resolve/main/nested/MODEL.gguf".to_string(),
+            size: "1GB".to_string(),
+            description: "".to_string(),
+            draft: None,
+            moe: None,
+            extra_files: Vec::new(),
+            mmproj: None,
+        };
+
+        let label = model.name.clone();
+        let _guard = DownloadHfAssetsOverrideGuard::set(
+            label,
+            Arc::new({
+                let wrong = wrong_file.clone();
+                let expected = expected_file.clone();
+                move |_, _| Ok(vec![wrong.clone(), expected.clone()])
+            }),
+        );
+
+        let resolved = download_model(&model).await.unwrap();
+        assert_eq!(resolved, expected_file);
     }
 }
