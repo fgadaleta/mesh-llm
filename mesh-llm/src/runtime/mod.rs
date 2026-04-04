@@ -1,3 +1,4 @@
+mod config;
 mod discovery;
 mod local;
 mod proxy;
@@ -79,6 +80,9 @@ pub(crate) async fn run() -> Result<()> {
     if crate::cli::commands::dispatch(&cli).await? {
         return Ok(());
     }
+
+    let mesh_cfg = crate::runtime::config::load_mesh_config(cli.mesh_config.clone())
+        .context("failed to load mesh config")?;
 
     // Clean up orphan processes from previous runs (skip for client — never runs llama-server).
     // This intentionally happens after subcommand dispatch so control commands
@@ -286,7 +290,7 @@ pub(crate) async fn run() -> Result<()> {
         None => detect_bin_dir()?,
     };
 
-    run_auto(cli, resolved_models, requested_model_names, bin_dir).await
+    run_auto(cli, resolved_models, requested_model_names, bin_dir, mesh_cfg).await
 }
 
 /// Resolve a model path: local file, catalog name, or HuggingFace URL.
@@ -804,6 +808,7 @@ async fn run_auto(
     resolved_models: Vec<PathBuf>,
     requested_model_names: Vec<String>,
     bin_dir: PathBuf,
+    authored_cfg: crate::runtime::config::AuthoredMeshConfig,
 ) -> Result<()> {
     let resolved_plugins = load_resolved_plugins(&cli)?;
     let api_port = cli.port;
@@ -834,6 +839,10 @@ async fn run_auto(
         cli.enumerate_host,
     )
     .await?;
+    let _local_mesh_state = crate::runtime::config::hydrate_local_mesh_config(
+        authored_cfg,
+        &node.id().to_string(),
+    );
     node.start_accepting();
     let token = node.invite_token();
     node.set_blackboard_name(blackboard_display_name(&cli, &node))
@@ -863,7 +872,7 @@ async fn run_auto(
                 std::time::Duration::from_secs(30),
                 tokio::task::spawn_blocking(move || {
                     let hw = hardware::survey();
-                    if hw.gpu_count == 0 {
+                    if hw.gpus.is_empty() {
                         tracing::debug!("no GPUs detected — skipping memory bandwidth benchmark");
                         return None;
                     }
@@ -878,7 +887,11 @@ async fn run_auto(
             .and_then(|r| r.ok())
             .flatten();
 
-            if let Some(ref per_gpu) = result {
+            if let Some(ref per_gpu_facts) = result {
+                let per_gpu: Vec<f64> = per_gpu_facts
+                    .iter()
+                    .filter_map(|g| g.bandwidth_gbps)
+                    .collect();
                 let total: f64 = per_gpu.iter().sum();
                 tracing::info!(
                     "Memory bandwidth fingerprint: {} GPUs, {:.1} GB/s total",
@@ -888,8 +901,8 @@ async fn run_auto(
                 for (i, gbps) in per_gpu.iter().enumerate() {
                     tracing::debug!("  GPU {}: {:.1} GB/s", i, gbps);
                 }
+                *bw_arc.lock().await = Some(per_gpu);
             }
-            *bw_arc.lock().await = result;
         });
     } else {
         tracing::debug!("client node — skipping memory bandwidth benchmark");

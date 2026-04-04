@@ -1,19 +1,42 @@
 /// Hardware detection via Collector trait pattern.
 /// VRAM formula preserved byte-identical from mesh.rs:detect_vram_bytes().
+use serde::{Deserialize, Serialize};
 
 #[cfg(any(target_os = "windows", test))]
 use serde_json::Value;
 
+/// Per-GPU hardware facts, in PCIe device-enumeration order.
+///
+/// `bandwidth_gbps` is `None` until the memory bandwidth benchmark completes.
+/// All other fields are populated during `survey()` / `query()`.
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuFacts {
+    /// Zero-based device-enumeration index (PCIe order from nvidia-smi / rocm-smi).
+    pub index: usize,
+    /// GPU model name (e.g. "NVIDIA A100-SXM4-80GB").
+    pub name: String,
+    /// Total VRAM in bytes.
+    pub vram_bytes: u64,
+    /// Memory bandwidth p90 in GB/s. `None` until benchmark runs.
+    pub bandwidth_gbps: Option<f64>,
+}
+
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct HardwareSurvey {
     pub vram_bytes: u64,
-    pub gpu_name: Option<String>,
-    pub gpu_count: u8,
     pub hostname: Option<String>,
     pub is_soc: bool,
-    /// Per-GPU VRAM in bytes, same order as gpu_name list.
-    /// Unified-memory SoCs report a single entry.
-    pub gpu_vram: Vec<u64>,
+    /// Per-GPU hardware facts, in device-enumeration order.
+    pub gpus: Vec<GpuFacts>,
+}
+
+impl HardwareSurvey {
+    /// Returns a summarized GPU name string for gossip/display.
+    /// Single GPU → name, N identical → "N× name", mixed → "a, b".
+    pub fn gpu_name_summary(&self) -> Option<String> {
+        let names: Vec<String> = self.gpus.iter().map(|g| g.name.clone()).collect();
+        summarize_gpu_name(&names)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,7 +120,6 @@ pub fn parse_rocm_gpu_vrams(output: &str) -> Vec<u64> {
 }
 
 /// Summarize GPU names: empty→None, 1→name, N identical→"N× name", N mixed→"a, b".
-#[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub fn summarize_gpu_name(names: &[String]) -> Option<String> {
     match names.len() {
         0 => None,
@@ -268,6 +290,10 @@ impl Collector for DefaultCollector {
             if metrics.contains(&Metric::IsSoc) {
                 survey.is_soc = true;
             }
+
+            let mut mac_vram_bytes: Option<u64> = None;
+            let mut mac_name: Option<String> = None;
+
             if metrics.contains(&Metric::VramBytes) {
                 let out = std::process::Command::new("sysctl")
                     .args(["-n", "hw.memsize"])
@@ -278,7 +304,7 @@ impl Collector for DefaultCollector {
                         if let Ok(bytes) = s.trim().parse::<u64>() {
                             // ~75% usable for Metal on unified memory (mesh.rs:263)
                             survey.vram_bytes = (bytes as f64 * 0.75) as u64;
-                            survey.gpu_vram = vec![bytes];
+                            mac_vram_bytes = Some(bytes);
                         }
                     }
                 }
@@ -290,18 +316,32 @@ impl Collector for DefaultCollector {
                     .ok();
                 if let Some(out) = out {
                     if let Ok(s) = String::from_utf8(out.stdout) {
-                        survey.gpu_name = parse_macos_cpu_brand(&s);
+                        mac_name = parse_macos_cpu_brand(&s);
                     }
                 }
             }
-            if metrics.contains(&Metric::GpuCount) {
-                survey.gpu_count = 1;
+
+            if metrics.contains(&Metric::GpuName)
+                || metrics.contains(&Metric::GpuCount)
+                || metrics.contains(&Metric::VramBytes)
+            {
+                if let (Some(name), Some(vram_bytes)) = (mac_name, mac_vram_bytes) {
+                    survey.gpus = vec![GpuFacts {
+                        index: 0,
+                        name,
+                        vram_bytes,
+                        bandwidth_gbps: None,
+                    }];
+                }
             }
         }
 
         #[cfg(target_os = "linux")]
         {
             let system_ram = read_system_ram_bytes();
+
+            let mut linux_vrams: Vec<u64> = Vec::new();
+            let mut linux_names: Vec<String> = Vec::new();
 
             if metrics.contains(&Metric::VramBytes) {
                 // Try NVIDIA (mesh.rs:284-316)
@@ -330,7 +370,7 @@ impl Collector for DefaultCollector {
                 })();
 
                 if let Some((vram, per_gpu)) = nvidia_vram {
-                    survey.gpu_vram = per_gpu;
+                    linux_vrams = per_gpu;
                     let ram_offload = system_ram.saturating_sub(vram);
                     survey.vram_bytes = vram + (ram_offload as f64 * 0.75) as u64;
                 } else {
@@ -354,7 +394,7 @@ impl Collector for DefaultCollector {
 
                     if let Some(per_gpu) = rocm_vram {
                         let vram: u64 = per_gpu.iter().sum();
-                        survey.gpu_vram = per_gpu;
+                        linux_vrams = per_gpu;
                         let ram_offload = system_ram.saturating_sub(vram);
                         survey.vram_bytes = vram + (ram_offload as f64 * 0.75) as u64;
                     } else if system_ram > 0 {
@@ -382,13 +422,8 @@ impl Collector for DefaultCollector {
                     }
                 })();
 
-                if let Some(ref names) = nvidia_names {
-                    if metrics.contains(&Metric::GpuName) {
-                        survey.gpu_name = summarize_gpu_name(names);
-                    }
-                    if metrics.contains(&Metric::GpuCount) {
-                        survey.gpu_count = u8::try_from(names.len()).unwrap_or(u8::MAX);
-                    }
+                if let Some(names) = nvidia_names {
+                    linux_names = names;
                 } else {
                     let out = std::process::Command::new("rocm-smi")
                         .args(["--showproductname"])
@@ -397,17 +432,23 @@ impl Collector for DefaultCollector {
                     if let Some(out) = out {
                         if out.status.success() {
                             if let Ok(s) = String::from_utf8(out.stdout) {
-                                let names = parse_rocm_gpu_names(&s);
-                                if metrics.contains(&Metric::GpuName) {
-                                    survey.gpu_name = summarize_gpu_name(&names);
-                                }
-                                if metrics.contains(&Metric::GpuCount) {
-                                    survey.gpu_count = u8::try_from(names.len()).unwrap_or(u8::MAX);
-                                }
+                                linux_names = parse_rocm_gpu_names(&s);
                             }
                         }
                     }
                 }
+            }
+
+            if !linux_names.is_empty() || !linux_vrams.is_empty() {
+                let count = linux_names.len().max(linux_vrams.len());
+                survey.gpus = (0..count)
+                    .map(|i| GpuFacts {
+                        index: i,
+                        name: linux_names.get(i).cloned().unwrap_or_default(),
+                        vram_bytes: linux_vrams.get(i).copied().unwrap_or(0),
+                        bandwidth_gbps: None,
+                    })
+                    .collect();
             }
         }
 
@@ -439,7 +480,7 @@ impl Collector for DefaultCollector {
                 None
             };
 
-            let nvidia_vram = if want_vram {
+            let nvidia_vrams = if want_vram {
                 std::process::Command::new("nvidia-smi")
                     .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
                     .output()
@@ -466,11 +507,14 @@ impl Collector for DefaultCollector {
                 Vec::new()
             };
 
+            let mut win_names: Vec<String> = Vec::new();
+            let mut win_vrams: Vec<u64> = Vec::new();
+
             if want_vram {
-                if let Some(per_gpu) = nvidia_vram {
+                if let Some(per_gpu) = nvidia_vrams {
                     let total: u64 = per_gpu.iter().sum();
                     if total > 0 {
-                        survey.gpu_vram = per_gpu;
+                        win_vrams = per_gpu;
                         let ram_offload = system_ram.saturating_sub(total);
                         survey.vram_bytes = total + (ram_offload as f64 * 0.75) as u64;
                     }
@@ -482,7 +526,7 @@ impl Collector for DefaultCollector {
                         .collect();
                     let total: u64 = per_gpu.iter().sum();
                     if total > 0 {
-                        survey.gpu_vram = per_gpu;
+                        win_vrams = per_gpu;
                         let ram_offload = system_ram.saturating_sub(total);
                         survey.vram_bytes = total + (ram_offload as f64 * 0.75) as u64;
                     } else if system_ram > 0 {
@@ -492,23 +536,23 @@ impl Collector for DefaultCollector {
             }
 
             if want_gpu_info {
-                if let Some(ref names) = nvidia_names {
-                    if metrics.contains(&Metric::GpuName) {
-                        survey.gpu_name = summarize_gpu_name(names);
-                    }
-                    if metrics.contains(&Metric::GpuCount) {
-                        survey.gpu_count = u8::try_from(names.len()).unwrap_or(u8::MAX);
-                    }
+                if let Some(names) = nvidia_names {
+                    win_names = names;
                 } else {
-                    let names: Vec<String> =
-                        windows_gpus.iter().map(|(name, _)| name.clone()).collect();
-                    if metrics.contains(&Metric::GpuName) {
-                        survey.gpu_name = summarize_gpu_name(&names);
-                    }
-                    if metrics.contains(&Metric::GpuCount) {
-                        survey.gpu_count = u8::try_from(names.len()).unwrap_or(u8::MAX);
-                    }
+                    win_names = windows_gpus.iter().map(|(name, _)| name.clone()).collect();
                 }
+            }
+
+            if !win_names.is_empty() || !win_vrams.is_empty() {
+                let count = win_names.len().max(win_vrams.len());
+                survey.gpus = (0..count)
+                    .map(|i| GpuFacts {
+                        index: i,
+                        name: win_names.get(i).cloned().unwrap_or_default(),
+                        vram_bytes: win_vrams.get(i).copied().unwrap_or(0),
+                        bandwidth_gbps: None,
+                    })
+                    .collect();
             }
         }
 
@@ -525,9 +569,12 @@ impl Collector for TegraCollector {
             survey.is_soc = true;
         }
 
+        let mut tegra_name: Option<String> = None;
+        let mut tegra_vram: Option<u64> = None;
+
         if metrics.contains(&Metric::GpuName) {
             if let Ok(model) = std::fs::read_to_string("/sys/firmware/devicetree/base/model") {
-                survey.gpu_name = parse_tegra_model_name(&model);
+                tegra_name = parse_tegra_model_name(&model);
             }
         }
 
@@ -545,12 +592,22 @@ impl Collector for TegraCollector {
             .or_else(try_tegrastats_ram);
             if let Some(ram) = total_ram {
                 survey.vram_bytes = (ram as f64 * 0.75) as u64;
-                survey.gpu_vram = vec![ram];
+                tegra_vram = Some(ram);
             }
         }
 
-        if metrics.contains(&Metric::GpuCount) {
-            survey.gpu_count = 1;
+        if (metrics.contains(&Metric::GpuName)
+            || metrics.contains(&Metric::GpuCount)
+            || metrics.contains(&Metric::VramBytes))
+        {
+            if let (Some(name), Some(vram_bytes)) = (tegra_name, tegra_vram) {
+                survey.gpus = vec![GpuFacts {
+                    index: 0,
+                    name,
+                    vram_bytes,
+                    bandwidth_gbps: None,
+                }];
+            }
         }
 
         survey
@@ -747,8 +804,7 @@ card1,not-a-number,512000000";
     fn test_hardware_survey_default() {
         let s = HardwareSurvey::default();
         assert_eq!(s.vram_bytes, 0);
-        assert_eq!(s.gpu_name, None);
-        assert_eq!(s.gpu_count, 0);
+        assert!(s.gpus.is_empty());
         assert_eq!(s.hostname, None);
     }
 
@@ -762,7 +818,6 @@ card1,not-a-number,512000000";
     #[test]
     fn test_query_vram_only() {
         let result = query(&[Metric::VramBytes]);
-        assert_eq!(result.gpu_name, None);
         assert_eq!(result.hostname, None);
     }
 
@@ -770,7 +825,6 @@ card1,not-a-number,512000000";
     fn test_query_multiple_metrics() {
         let result = query(&[Metric::GpuName, Metric::VramBytes]);
         assert_eq!(result.hostname, None);
-        assert_eq!(result.gpu_count, 0);
     }
 
     #[test]
@@ -783,8 +837,7 @@ card1,not-a-number,512000000";
             Metric::Hostname,
         ]);
         assert_eq!(s.vram_bytes, q.vram_bytes);
-        assert_eq!(s.gpu_name, q.gpu_name);
-        assert_eq!(s.gpu_count, q.gpu_count);
+        assert_eq!(s.gpus.len(), q.gpus.len());
         assert_eq!(s.hostname.is_some(), q.hostname.is_some());
     }
 
@@ -891,8 +944,7 @@ card1,not-a-number,512000000";
     #[test]
     fn test_query_hostname_only() {
         let result = query(&[Metric::Hostname]);
-        assert_eq!(result.gpu_name, None);
-        assert_eq!(result.gpu_count, 0);
+        assert!(result.gpus.is_empty());
         assert_eq!(result.vram_bytes, 0);
     }
 
@@ -907,8 +959,7 @@ card1,not-a-number,512000000";
     fn test_query_is_soc_only() {
         let result = query(&[Metric::IsSoc]);
         assert_eq!(result.vram_bytes, 0);
-        assert_eq!(result.gpu_name, None);
-        assert_eq!(result.gpu_count, 0);
+        assert!(result.gpus.is_empty());
         assert_eq!(result.hostname, None);
         let _ = result.is_soc;
     }
@@ -956,5 +1007,67 @@ card1,not-a-number,512000000";
             parse_tegra_model_name("NVIDIA Jetson AGX Orin Developer Kit\0"),
             Some("Jetson AGX Orin".to_string())
         );
+    }
+
+    #[test]
+    fn test_gpu_name_summary_empty() {
+        let s = HardwareSurvey::default();
+        assert_eq!(s.gpu_name_summary(), None);
+    }
+
+    #[test]
+    fn test_gpu_name_summary_single() {
+        let s = HardwareSurvey {
+            gpus: vec![GpuFacts {
+                index: 0,
+                name: "NVIDIA A100".to_string(),
+                vram_bytes: 0,
+                bandwidth_gbps: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(s.gpu_name_summary(), Some("NVIDIA A100".to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_gpus_are_never_empty_name_or_zero_vram() {
+        let s = DefaultCollector.collect(&[Metric::GpuName, Metric::VramBytes]);
+        for gpu in &s.gpus {
+            assert!(!gpu.name.is_empty(), "gpu entry has empty name: {gpu:?}");
+            assert!(gpu.vram_bytes > 0, "gpu entry has zero vram: {gpu:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tegra_gpus_are_never_empty_name_or_zero_vram() {
+        let s = TegraCollector.collect(&[Metric::GpuName, Metric::VramBytes]);
+        for gpu in &s.gpus {
+            assert!(!gpu.name.is_empty(), "gpu entry has empty name: {gpu:?}");
+            assert!(gpu.vram_bytes > 0, "gpu entry has zero vram: {gpu:?}");
+        }
+    }
+
+    #[test]
+    fn test_gpu_name_summary_identical() {
+        let s = HardwareSurvey {
+            gpus: vec![
+                GpuFacts {
+                    index: 0,
+                    name: "A100".to_string(),
+                    vram_bytes: 0,
+                    bandwidth_gbps: None,
+                },
+                GpuFacts {
+                    index: 1,
+                    name: "A100".to_string(),
+                    vram_bytes: 0,
+                    bandwidth_gbps: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(s.gpu_name_summary(), Some("2× A100".to_string()));
     }
 }

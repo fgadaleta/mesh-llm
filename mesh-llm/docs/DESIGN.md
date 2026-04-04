@@ -244,3 +244,58 @@ Opt-in mesh advertisement via Nostr relays (NIP-89, kind 31990):
 - Publish watchdog: if publisher dies, another node takes over
 - `score_mesh()`: region match (+200), capacity, node count, VRAM, sticky preference (+500)
 - `smart_auto()`: picks best mesh or recommends starting new one with models for your VRAM
+
+## Mesh Config
+
+An optional versioned TOML file (`~/.mesh-llm/mesh.toml` by default) records per-node assignments for the mesh. The path can be overridden with `--mesh-config <path>` or the `MESH_LLM_MESH_CONFIG` environment variable.
+
+### Schema
+
+All configs must declare `version = 1`. Unsupported versions fail fast with a descriptive error. A missing file loads an empty default config with no error.
+
+```toml
+version = 1
+
+[[nodes]]
+node_id = "worker1"
+hostname = "worker1.local"   # optional
+placement_mode = "separate"  # optional: "pooled" (default) or "separate"
+
+[[nodes.models]]
+name = "Qwen2.5-7B"
+model_key = "mk-qwen"        # optional: catalog key
+path = "/path/to/model.gguf" # optional: local file path override
+ctx_size = 8192              # optional: context window for this model
+moe_experts = 24             # optional: MoE expert count hint
+gpu_index = 0                # optional: GPU device index hint
+split = { start = 0, end = 21, total = 33 }  # optional: layer split range
+
+[[nodes.models]]
+name = "GLM-4.7-Flash"
+```
+
+The `nodes` field is a TOML array of tables (`[[nodes]]`). Each entry carries `node_id` as a field. The `models` sub-array uses the same inline-array-of-tables format (`[[nodes.models]]`).
+
+### Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `version` | `u32` | Must be `1`. Other values are rejected. |
+| `nodes` | array | Array of per-node assignment entries. |
+| `nodes[].node_id` | `string` | Identifies the node. Must be unique within the array. |
+| `nodes[].hostname` | optional `string` | Hostname hint for the node. |
+| `nodes[].placement_mode` | optional string | `"pooled"` (default) or `"separate"`. |
+| `nodes[].models` | array | Array of model assignment entries for this node. |
+| `nodes[].models[].name` | `string` | Model display name. |
+| `nodes[].models[].model_key` | optional `string` | Catalog model key. |
+| `nodes[].models[].path` | optional `string` | Local GGUF path override. |
+| `nodes[].models[].ctx_size` | optional `u32` | Context window size for this model. |
+| `nodes[].models[].moe_experts` | optional `u32` | MoE expert count hint. |
+| `nodes[].models[].gpu_index` | optional `u32` | GPU device index hint. |
+| `nodes[].models[].split` | optional table | Absolute layer split: `{ start, end, total }`. Persisted but not enforced at runtime. |
+
+### Runtime Hydration
+
+Config is loaded at startup and projected to a `NodeConfig` for the local node. The runtime projection includes `node_id`, `hostname`, and a `models` list of `ModelAssignment { name, path, ctx_size, moe_experts }`. Fields dropped from the runtime view: `split`, `placement_mode`, `gpu_index`, and `model_key`.
+
+**Runtime hydration is inert: no automatic behavior changes.** Loading the config does not auto-apply models, change election, alter routing, or launch processes. The config is stored in memory only.

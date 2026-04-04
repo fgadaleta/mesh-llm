@@ -1256,17 +1256,17 @@ impl Node {
         let gpu_name = if matches!(role, NodeRole::Client) {
             None
         } else {
-            hw.gpu_name
+            hw.gpu_name_summary()
         };
         let hostname = hw.hostname;
         let is_soc = Some(hw.is_soc);
-        let gpu_vram = if hw.gpu_vram.is_empty() {
+        let gpu_vram = if hw.gpus.is_empty() {
             None
         } else {
             Some(
-                hw.gpu_vram
+                hw.gpus
                     .iter()
-                    .map(|b| b.to_string())
+                    .map(|g| g.vram_bytes.to_string())
                     .collect::<Vec<_>>()
                     .join(","),
             )

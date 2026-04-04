@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::system::hardware::HardwareSurvey;
+use crate::system::hardware::{GpuFacts, HardwareSurvey};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BenchmarkOutput {
@@ -22,67 +22,11 @@ pub struct BenchmarkOutput {
     pub hbm: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct GpuBandwidth {
-    pub name: String,
-    pub vram_bytes: u64,
-    pub p50_gbps: f64,
-    pub p90_gbps: f64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkFingerprint {
-    pub gpus: Vec<GpuBandwidth>, // per-GPU identity + bandwidth, in device order
+    pub gpus: Vec<GpuFacts>,
     pub is_soc: bool,
     pub timestamp_secs: u64,
-}
-
-/// Normalize `HardwareSurvey.gpu_name` into a per-GPU list of names.
-/// - Splits on ',' and trims whitespace for robustness.
-/// - Expands summarized forms like "8× NVIDIA A100" into 8 identical entries.
-/// - If the expanded list length does not match `gpu_vram.len()` but `gpu_vram` is
-///   non-empty, falls back to assuming all GPUs share the same summarized name and
-///   returns `gpu_vram.len()` copies of it.
-fn per_gpu_names(hw: &HardwareSurvey) -> Vec<String> {
-    let raw = match hw.gpu_name.as_deref() {
-        Some(s) => s.trim(),
-        None => return Vec::new(),
-    };
-
-    if raw.is_empty() {
-        return Vec::new();
-    }
-
-    let mut names: Vec<String> = Vec::new();
-
-    for part in raw.split(',') {
-        let part_trimmed = part.trim();
-        if part_trimmed.is_empty() {
-            continue;
-        }
-
-        // Handle summarized "N× name" form (e.g., "8× NVIDIA A100").
-        if let Some((count_str, name)) = part_trimmed.split_once('×') {
-            if let Ok(count) = count_str.trim().parse::<usize>() {
-                let name_trimmed = name.trim();
-                for _ in 0..count {
-                    names.push(name_trimmed.to_string());
-                }
-                continue;
-            }
-        }
-
-        // Fallback: treat as a single GPU name.
-        names.push(part_trimmed.to_string());
-    }
-
-    if names.len() == hw.gpu_vram.len() || hw.gpu_vram.is_empty() {
-        return names;
-    }
-
-    // As a last resort, assume all GPUs share the same summarized name.
-    let gpu_count = hw.gpu_vram.len();
-    vec![raw.to_string(); gpu_count]
 }
 
 /// Returns true if the current hardware differs from the fingerprint's recorded hardware.
@@ -92,14 +36,14 @@ pub fn hardware_changed(fingerprint: &BenchmarkFingerprint, hw: &HardwareSurvey)
         return true;
     }
 
-    let hw_names: Vec<String> = per_gpu_names(hw);
+    let hw_gpus = &hw.gpus;
 
-    if fingerprint.gpus.len() != hw_names.len() || fingerprint.gpus.len() != hw.gpu_vram.len() {
+    if fingerprint.gpus.len() != hw_gpus.len() {
         return true;
     }
 
     for (i, cached) in fingerprint.gpus.iter().enumerate() {
-        if cached.name != hw_names[i] || cached.vram_bytes != hw.gpu_vram[i] {
+        if cached.name != hw_gpus[i].name || cached.vram_bytes != hw_gpus[i].vram_bytes {
             return true;
         }
     }
@@ -124,12 +68,16 @@ fn benchmark_binary_name_for(os: &str, base: &str) -> String {
 }
 
 fn detect_benchmark_binary_for(os: &str, hw: &HardwareSurvey, bin_dir: &Path) -> Option<PathBuf> {
-    if hw.gpu_count == 0 {
+    if hw.gpus.is_empty() {
         tracing::debug!("no GPUs detected — skipping benchmark");
         return None;
     }
 
-    let gpu_upper = hw.gpu_name.as_deref().unwrap_or("").to_uppercase();
+    let gpu_upper = hw
+        .gpus
+        .first()
+        .map(|g| g.name.to_uppercase())
+        .unwrap_or_default();
 
     let candidate_name = if os == "macos" && hw.is_soc {
         benchmark_binary_name_for(os, "membench-fingerprint")
@@ -145,16 +93,18 @@ fn detect_benchmark_binary_for(os: &str, hw: &HardwareSurvey, bin_dir: &Path) ->
             tracing::warn!("Jetson benchmark is unvalidated for ARM CUDA — attempting");
             benchmark_binary_name_for(os, "membench-fingerprint-cuda")
         } else {
+            let gpu_name = hw.gpus.first().map(|g| g.name.as_str()).unwrap_or("");
             tracing::warn!(
                 "could not identify benchmark binary for this GPU platform: {:?}",
-                hw.gpu_name
+                gpu_name
             );
             return None;
         }
     } else {
+        let gpu_name = hw.gpus.first().map(|g| g.name.as_str()).unwrap_or("");
         tracing::warn!(
             "could not identify benchmark binary for this GPU platform: {:?}",
-            hw.gpu_name
+            gpu_name
         );
         return None;
     };
@@ -312,15 +262,20 @@ pub fn run_benchmark(binary: &Path, timeout: Duration) -> Option<Vec<BenchmarkOu
 /// benchmark binary and persist the result.
 ///
 /// Not `async` — intended for use inside `tokio::task::spawn_blocking`.
-pub fn run_or_load(hw: &HardwareSurvey, bin_dir: &Path, timeout: Duration) -> Option<Vec<f64>> {
+pub fn run_or_load(
+    hw: &HardwareSurvey,
+    bin_dir: &Path,
+    timeout: Duration,
+) -> Option<Vec<GpuFacts>> {
     let path = fingerprint_path();
 
-    // Cache-hit path
     if let Some(ref cached) = load_fingerprint(&path) {
         if !hardware_changed(cached, hw) {
-            let per_gpu: Vec<f64> = cached.gpus.iter().map(|g| g.p90_gbps).collect();
-            tracing::info!("Using cached bandwidth fingerprint: {} GPUs", per_gpu.len());
-            return Some(per_gpu);
+            tracing::info!(
+                "Using cached bandwidth fingerprint: {} GPUs",
+                cached.gpus.len()
+            );
+            return Some(cached.gpus.clone());
         }
     }
 
@@ -329,36 +284,23 @@ pub fn run_or_load(hw: &HardwareSurvey, bin_dir: &Path, timeout: Duration) -> Op
     let binary = detect_benchmark_binary(hw, bin_dir)?;
     let outputs = run_benchmark(&binary, timeout)?;
 
-    // Build per-GPU entries by zipping benchmark output with hw survey data.
-    // Both are in device order (nvidia-smi / CUDA enumerate the same order).
-    let hw_names: Vec<&str> = hw
-        .gpu_name
-        .as_deref()
-        .map(|s| s.split(", ").map(str::trim).collect())
-        .unwrap_or_default();
+    let count = if hw.gpus.is_empty() {
+        outputs.len()
+    } else {
+        outputs.len().min(hw.gpus.len())
+    };
 
-    let count = outputs
-        .len()
-        .min(hw.gpu_vram.len())
-        .min(if hw_names.is_empty() {
-            usize::MAX
-        } else {
-            hw_names.len()
-        });
-
-    let gpus: Vec<GpuBandwidth> = (0..count)
-        .map(|i| GpuBandwidth {
-            name: hw_names.get(i).copied().unwrap_or("").trim().to_owned(),
-            vram_bytes: hw.gpu_vram.get(i).copied().unwrap_or(0),
-            p50_gbps: outputs[i].p50_gbps,
-            p90_gbps: outputs[i].p90_gbps,
+    let gpus: Vec<GpuFacts> = (0..count)
+        .map(|i| GpuFacts {
+            index: i,
+            name: hw.gpus.get(i).map(|g| g.name.clone()).unwrap_or_default(),
+            vram_bytes: hw.gpus.get(i).map(|g| g.vram_bytes).unwrap_or(0),
+            bandwidth_gbps: Some(outputs[i].p90_gbps),
         })
         .collect();
 
-    let per_gpu: Vec<f64> = gpus.iter().map(|g| g.p90_gbps).collect();
-
     let fingerprint = BenchmarkFingerprint {
-        gpus,
+        gpus: gpus.clone(),
         is_soc: hw.is_soc,
         timestamp_secs: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -367,29 +309,22 @@ pub fn run_or_load(hw: &HardwareSurvey, bin_dir: &Path, timeout: Duration) -> Op
     };
 
     save_fingerprint(&path, &fingerprint);
-    Some(per_gpu)
+    Some(gpus)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_survey(
-        gpu_count: u8,
-        gpu_vram: Vec<u64>,
-        gpu_name: Option<&str>,
-        is_soc: bool,
-    ) -> HardwareSurvey {
+    fn make_survey(gpus: Vec<GpuFacts>, is_soc: bool) -> HardwareSurvey {
         HardwareSurvey {
-            gpu_count,
-            gpu_vram,
-            gpu_name: gpu_name.map(str::to_owned),
+            gpus,
             is_soc,
             ..Default::default()
         }
     }
 
-    fn make_fingerprint(gpus: Vec<GpuBandwidth>, is_soc: bool) -> BenchmarkFingerprint {
+    fn make_fingerprint(gpus: Vec<GpuFacts>, is_soc: bool) -> BenchmarkFingerprint {
         BenchmarkFingerprint {
             gpus,
             is_soc,
@@ -397,68 +332,58 @@ mod tests {
         }
     }
 
-    // 1. Same hardware → false
+    fn gpu(index: usize, name: &str, vram_bytes: u64) -> GpuFacts {
+        GpuFacts {
+            index,
+            name: name.to_string(),
+            vram_bytes,
+            bandwidth_gbps: None,
+        }
+    }
+
+    fn gpu_with_bw(index: usize, name: &str, vram_bytes: u64, bw: f64) -> GpuFacts {
+        GpuFacts {
+            index,
+            name: name.to_string(),
+            vram_bytes,
+            bandwidth_gbps: Some(bw),
+        }
+    }
+
     #[test]
     fn test_hardware_changed_same() {
-        let hw = make_survey(1, vec![80_000_000_000], Some("A100"), false);
-        let fp = make_fingerprint(
-            vec![GpuBandwidth {
-                name: "A100".into(),
-                vram_bytes: 80_000_000_000,
-                p50_gbps: 1935.0,
-                p90_gbps: 1948.7,
-            }],
-            false,
-        );
+        let hw = make_survey(vec![gpu(0, "A100", 80_000_000_000)], false);
+        let fp = make_fingerprint(vec![gpu_with_bw(0, "A100", 80_000_000_000, 1948.7)], false);
         assert!(!hardware_changed(&fp, &hw));
     }
 
-    // 2. VRAM differs → true
     #[test]
     fn test_hardware_changed_vram() {
-        let hw = make_survey(1, vec![40_000_000_000], Some("A100"), false);
-        let fp = make_fingerprint(
-            vec![GpuBandwidth {
-                name: "A100".into(),
-                vram_bytes: 80_000_000_000,
-                p50_gbps: 1935.0,
-                p90_gbps: 1948.7,
-            }],
-            false,
-        );
+        let hw = make_survey(vec![gpu(0, "A100", 40_000_000_000)], false);
+        let fp = make_fingerprint(vec![gpu_with_bw(0, "A100", 80_000_000_000, 1948.7)], false);
         assert!(hardware_changed(&fp, &hw));
     }
 
-    // 3. GPU count differs → true
     #[test]
     fn test_hardware_changed_gpu_count() {
         let hw = make_survey(
-            2,
-            vec![80_000_000_000, 80_000_000_000],
-            Some("A100, A100"),
+            vec![
+                gpu(0, "A100", 80_000_000_000),
+                gpu(1, "A100", 80_000_000_000),
+            ],
             false,
         );
-        let fp = make_fingerprint(
-            vec![GpuBandwidth {
-                name: "A100".into(),
-                vram_bytes: 80_000_000_000,
-                p50_gbps: 1935.0,
-                p90_gbps: 1948.7,
-            }],
-            false,
-        );
+        let fp = make_fingerprint(vec![gpu_with_bw(0, "A100", 80_000_000_000, 1948.7)], false);
         assert!(hardware_changed(&fp, &hw));
     }
 
-    // 4. is_soc differs → true
     #[test]
     fn test_hardware_changed_soc_flag() {
-        let hw = make_survey(1, vec![16_000_000_000], None, false);
-        let fp = make_fingerprint(vec![], true); // is_soc: true vs false
+        let hw = make_survey(vec![], false);
+        let fp = make_fingerprint(vec![], true);
         assert!(hardware_changed(&fp, &hw));
     }
 
-    // 5. Parse single CUDA GPU JSON — assert p90_gbps == 1948.7
     #[test]
     fn test_benchmark_output_deserialize_cuda_single() {
         let json_str = r#"[{"device":"NVIDIA A100-SXM4-80GB","buffer_mb":512,"runs":20,"p50_gbps":1935.2,"p90_gbps":1948.7,"noise_pct":0.4,"runtime_s":1.23,"rated_gbps":2000,"rated_estimated":false,"efficiency_pct":96.8,"bus_width_bits":5120,"mem_clock_mhz":1215}]"#;
@@ -467,7 +392,6 @@ mod tests {
         assert_eq!(outputs[0].p90_gbps, 1948.7);
     }
 
-    // 6. Parse 2-device JSON — assert both entries deserialize
     #[test]
     fn test_benchmark_output_deserialize_multi_gpu() {
         let json_str = r#"[{"device":"NVIDIA A100","buffer_mb":512,"runs":20,"p50_gbps":1935.2,"p90_gbps":1948.7,"noise_pct":0.4,"runtime_s":1.23,"rated_gbps":2000,"rated_estimated":false,"efficiency_pct":96.8,"bus_width_bits":5120,"mem_clock_mhz":1215},{"device":"NVIDIA A6000","buffer_mb":512,"runs":20,"p50_gbps":768.0,"p90_gbps":780.1,"noise_pct":0.6,"runtime_s":1.15,"rated_gbps":768,"rated_estimated":false,"efficiency_pct":100.0,"bus_width_bits":384,"mem_clock_mhz":2000}]"#;
@@ -475,7 +399,6 @@ mod tests {
         assert_eq!(outputs.len(), 2);
     }
 
-    // 7. Error JSON (object, not array) → Err, no panic
     #[test]
     fn test_benchmark_output_deserialize_error_json() {
         let json_str = r#"{"error":"No CUDA-capable device found"}"#;
@@ -483,7 +406,6 @@ mod tests {
         assert!(result.is_err(), "expected Err, got Ok");
     }
 
-    // 8. parse_benchmark_output: single GPU → Some(vec with 1 entry, p90 == 1948.7)
     #[test]
     fn test_parse_benchmark_output_single_gpu() {
         let json = r#"[{"device":"NVIDIA A100-SXM4-80GB","buffer_mb":512,"runs":20,"p50_gbps":1935.2,"p90_gbps":1948.7,"noise_pct":0.4,"runtime_s":1.23,"rated_gbps":2000,"rated_estimated":false,"efficiency_pct":96.8,"bus_width_bits":5120,"mem_clock_mhz":1215}]"#;
@@ -492,7 +414,6 @@ mod tests {
         assert_eq!(result[0].p90_gbps, 1948.7);
     }
 
-    // 9. parse_benchmark_output: two GPUs → Some(vec with 2 entries), sum ~2728.8
     #[test]
     fn test_parse_benchmark_output_multi_gpu_sum() {
         let json = r#"[{"device":"NVIDIA A100","buffer_mb":512,"runs":20,"p50_gbps":1935.2,"p90_gbps":1948.7,"noise_pct":0.4,"runtime_s":1.23,"rated_gbps":2000,"rated_estimated":false,"efficiency_pct":96.8,"bus_width_bits":5120,"mem_clock_mhz":1215},{"device":"NVIDIA A6000","buffer_mb":512,"runs":20,"p50_gbps":768.0,"p90_gbps":780.1,"noise_pct":0.6,"runtime_s":1.15,"rated_gbps":768,"rated_estimated":false,"efficiency_pct":100.0,"bus_width_bits":384,"mem_clock_mhz":2000}]"#;
@@ -505,7 +426,6 @@ mod tests {
         );
     }
 
-    // 10. parse_benchmark_output: error object → None
     #[test]
     fn test_parse_benchmark_output_error_json() {
         let json = r#"{"error": "No CUDA devices found"}"#;
@@ -513,20 +433,15 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // 11. parse_benchmark_output: empty array → None
     #[test]
     fn test_parse_benchmark_output_empty_array() {
         let result = parse_benchmark_output(b"[]");
         assert!(result.is_none());
     }
 
-    // 12. detect_benchmark_binary: gpu_count == 0 → None (no process spawned)
     #[test]
     fn test_detect_benchmark_binary_gpu_count_zero() {
-        let hw = HardwareSurvey {
-            gpu_count: 0,
-            ..Default::default()
-        };
+        let hw = HardwareSurvey::default();
         let result = detect_benchmark_binary(&hw, Path::new("/tmp"));
         assert!(result.is_none());
     }
@@ -545,16 +460,14 @@ mod tests {
 
     #[test]
     fn test_detect_benchmark_binary_windows_cuda_missing_is_soft_failure() {
-        let hw = make_survey(1, vec![24_000_000_000], Some("NVIDIA RTX 4090"), false);
+        let hw = make_survey(vec![gpu(0, "NVIDIA RTX 4090", 24_000_000_000)], false);
         assert!(detect_benchmark_binary_for("windows", &hw, Path::new("C:\\bench")).is_none());
     }
 
     #[test]
     fn test_detect_benchmark_binary_windows_hip_missing_is_soft_failure() {
         let hw = make_survey(
-            1,
-            vec![24_000_000_000],
-            Some("AMD Radeon RX 7900 XTX"),
+            vec![gpu(0, "AMD Radeon RX 7900 XTX", 24_000_000_000)],
             false,
         );
         assert!(detect_benchmark_binary_for("windows", &hw, Path::new("C:\\bench")).is_none());
@@ -562,21 +475,15 @@ mod tests {
 
     #[test]
     fn test_detect_benchmark_binary_windows_intel_missing_is_soft_failure() {
-        let hw = make_survey(1, vec![16_000_000_000], Some("Intel Arc A770"), false);
+        let hw = make_survey(vec![gpu(0, "Intel Arc A770", 16_000_000_000)], false);
         assert!(detect_benchmark_binary_for("windows", &hw, Path::new("C:\\bench")).is_none());
     }
 
-    // 13. hardware_changed: same VRAM, different GPU name → true
     #[test]
     fn test_hardware_changed_gpu_name() {
-        let hw = make_survey(1, vec![80_000_000_000], Some("NVIDIA A6000"), false);
+        let hw = make_survey(vec![gpu(0, "NVIDIA A6000", 80_000_000_000)], false);
         let fp = make_fingerprint(
-            vec![GpuBandwidth {
-                name: "NVIDIA A100".into(),
-                vram_bytes: 80_000_000_000,
-                p50_gbps: 1935.0,
-                p90_gbps: 1948.7,
-            }],
+            vec![gpu_with_bw(0, "NVIDIA A100", 80_000_000_000, 1948.7)],
             false,
         );
         assert!(
@@ -585,31 +492,24 @@ mod tests {
         );
     }
 
-    // 14. Cache round-trip: save → load → hardware_changed returns false for same hw
     #[test]
     fn test_fingerprint_cache_roundtrip() {
         let path = std::env::temp_dir().join("mesh-llm-test-fingerprint-roundtrip.json");
         let fp = make_fingerprint(
-            vec![GpuBandwidth {
-                name: "NVIDIA A100".into(),
-                vram_bytes: 80_000_000_000,
-                p50_gbps: 1935.2,
-                p90_gbps: 1948.7,
-            }],
+            vec![gpu_with_bw(0, "NVIDIA A100", 80_000_000_000, 1948.7)],
             false,
         );
         save_fingerprint(&path, &fp);
         let loaded = load_fingerprint(&path).expect("fingerprint should round-trip");
         let _ = std::fs::remove_file(&path);
 
-        let hw = make_survey(1, vec![80_000_000_000], Some("NVIDIA A100"), false);
+        let hw = make_survey(vec![gpu(0, "NVIDIA A100", 80_000_000_000)], false);
         assert!(
             !hardware_changed(&loaded, &hw),
             "same hardware should not trigger hardware_changed after round-trip"
         );
     }
 
-    // 15. Old cache format (hardware_key field) fails to parse → load_fingerprint returns None
     #[test]
     fn test_old_cache_format_fails_parse() {
         let old_json = r#"{

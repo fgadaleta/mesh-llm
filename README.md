@@ -230,6 +230,40 @@ On Linux this is a user service, so if you want it to keep running after reboot 
 sudo loginctl enable-linger "$USER"
 ```
 
+## Mesh config
+
+An optional TOML file lets you record per-node assignments for your mesh. The default path is `~/.mesh-llm/mesh.toml`. If the file does not exist, mesh-llm starts with an empty default config and no error.
+
+Override the path with the `--mesh-config <path>` flag or the `MESH_LLM_MESH_CONFIG` environment variable:
+
+```bash
+mesh-llm --auto --mesh-config /etc/mesh/my-mesh.toml
+MESH_LLM_MESH_CONFIG=/etc/mesh/my-mesh.toml mesh-llm --auto
+```
+
+A minimal config looks like this:
+
+```toml
+version = 1
+
+[[nodes]]
+node_id = "worker1"
+
+[[nodes.models]]
+name = "Qwen2.5-7B"
+
+[[nodes]]
+node_id = "worker2"
+
+[[nodes.models]]
+name = "GLM-4.7-Flash"
+ctx_size = 4096
+```
+
+Each entry in the `nodes` array has a `node_id` field. Per-node fields include an optional `hostname` and an optional `placement_mode` (`"pooled"` or `"separate"`). Each model in the `models` array is identified by its `name`. Optional per-model fields include `ctx_size`, `gpu_index`, `model_key`, `path`, `moe_experts`, and `split` (`{ start, end, total }` absolute layer range). The `split` field is persisted in the file but not acted on at runtime.
+
+Config is loaded at startup and stored in memory. It does not auto-apply models, change election, alter routing, or launch processes.
+
 ## Web console
 
 ```bash

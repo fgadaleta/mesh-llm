@@ -360,3 +360,51 @@ pkill -f mesh-llm; pkill -f rpc-server; pkill -f llama-server
 ```
 
 Always kill all three — child processes can orphan.
+
+## Mesh Config Unit Tests
+
+These tests live in `mesh-llm/src/runtime/config.rs` and run without any running node or GPU.
+
+Use `--mesh-config <path>` to point a running node at a custom config file during manual testing.
+
+### Running the tests
+
+1. Parse a minimal authored TOML:
+   ```bash
+   cargo test -p mesh-llm mesh_config_parses_minimal_authored_toml -- --exact
+   ```
+
+2. Semantic round-trip (save then load):
+   ```bash
+   cargo test -p mesh-llm mesh_config_semantic_round_trip -- --exact
+   ```
+
+3. Projection drops authored split metadata:
+   ```bash
+   cargo test -p mesh-llm mesh_config_projection_drops_authored_split_metadata -- --exact
+   ```
+
+4. CLI flag does not conflict with plugin config flag:
+   ```bash
+   cargo test -p mesh-llm cli_mesh_config_flag_does_not_conflict_with_plugin_config -- --exact
+   ```
+
+5. Runtime hydration stores config without applying models:
+   ```bash
+   cargo test -p mesh-llm runtime_hydrates_mesh_config_without_model_application -- --exact
+   ```
+
+6. Run all mesh config tests together:
+   ```bash
+   cargo test -p mesh-llm mesh_config
+   cargo test -p mesh-llm runtime_hydrat
+   cargo test -p mesh-llm cli_mesh_config
+   ```
+
+### What these tests verify
+
+- `mesh_config_parses_minimal_authored_toml`: a `version = 1` TOML with one node and one model parses cleanly.
+- `mesh_config_semantic_round_trip`: a config saved with `save_mesh_config` and reloaded with `load_mesh_config` preserves all fields.
+- `mesh_config_projection_drops_authored_split_metadata`: `project_node_config` returns a `LocalNodeConfig` that has no `split` field — the type itself enforces the projection boundary.
+- `cli_mesh_config_flag_does_not_conflict_with_plugin_config`: `--config` (plugin config) and `--mesh-config` (mesh config) can both be passed on the same command line without conflict.
+- `runtime_hydrates_mesh_config_without_model_application`: `hydrate_local_mesh_config` populates `LocalMeshConfigState` correctly and does not call any model-launch or routing mutators.

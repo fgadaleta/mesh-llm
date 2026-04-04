@@ -177,6 +177,11 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     pub(crate) config: Option<PathBuf>,
 
+    /// Advanced: path to a mesh config TOML file (default: ~/.mesh-llm/mesh.toml).
+    /// Overrides MESH_LLM_MESH_CONFIG environment variable.
+    #[arg(long = "mesh-config", hide = true, value_name = "PATH")]
+    pub(crate) mesh_config: Option<PathBuf>,
+
     /// Internal: set when this node joined via Nostr discovery (not --join).
     #[arg(skip)]
     pub(crate) nostr_discovery: bool,
