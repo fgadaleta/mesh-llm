@@ -251,7 +251,7 @@ async fn start_blobstore_plugin_manager() -> (plugin::PluginManager, std::path::
 
 async fn start_inference_endpoint_plugin_manager(
     address: String,
-    model: &str,
+    models: Vec<String>,
 ) -> plugin::PluginManager {
     let plugin_manager = plugin::PluginManager::for_test_bridge(&[], Arc::new(NoopTestBridge));
     plugin_manager
@@ -261,7 +261,7 @@ async fn start_inference_endpoint_plugin_manager(
             address,
             protocol: Some("openai_compatible".into()),
             supports_streaming: true,
-            models: vec![model.to_string()],
+            models,
         }])
         .await;
     plugin_manager
@@ -622,7 +622,7 @@ async fn test_api_proxy_routes_to_registered_inference_endpoint() {
             .await;
     let plugin_manager = start_inference_endpoint_plugin_manager(
         format!("http://127.0.0.1:{upstream_port}/api/v1"),
-        "lemonade-test",
+        vec!["lemonade-test".into()],
     )
     .await;
     let (proxy_addr, proxy_handle) =
@@ -654,7 +654,7 @@ async fn test_api_proxy_routes_to_registered_inference_endpoint() {
 async fn test_api_proxy_lists_registered_inference_models() {
     let plugin_manager = start_inference_endpoint_plugin_manager(
         "http://127.0.0.1:8000/api/v1".into(),
-        "lemonade-test",
+        vec!["lemonade-test".into()],
     )
     .await;
     let (proxy_addr, proxy_handle) =
@@ -667,13 +667,81 @@ async fn test_api_proxy_lists_registered_inference_models() {
     .await;
     let body = response.split("\r\n\r\n").nth(1).unwrap_or_default();
     let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    let entries = json["data"].as_array().cloned().unwrap_or_default();
 
     assert!(response.starts_with("HTTP/1.1 200 OK"));
-    assert!(json["data"]
+    assert!(entries.iter().any(|entry| entry["id"] == "lemonade-test"));
+
+    proxy_handle.abort();
+}
+
+#[tokio::test]
+async fn test_api_proxy_lemonade_integration_when_enabled() {
+    if std::env::var("MESH_LLM_TEST_LEMONADE").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let models_response = client
+        .get("http://localhost:8000/api/v1/models")
+        .send()
+        .await
+        .expect("Lemonade should be reachable when MESH_LLM_TEST_LEMONADE=1")
+        .error_for_status()
+        .expect("Lemonade /models should succeed")
+        .json::<serde_json::Value>()
+        .await
+        .expect("Lemonade /models should return JSON");
+    let models = models_response["data"]
         .as_array()
-        .unwrap_or(&Vec::new())
-        .iter()
-        .any(|entry| entry["id"] == "lemonade-test"));
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| entry["id"].as_str().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    assert!(
+        !models.is_empty(),
+        "Lemonade reported no models at http://localhost:8000/api/v1/models"
+    );
+    let model = models[0].clone();
+
+    let plugin_manager = start_inference_endpoint_plugin_manager(
+        "http://localhost:8000/api/v1".into(),
+        models.clone(),
+    )
+    .await;
+    let (proxy_addr, proxy_handle) =
+        spawn_api_proxy_test_harness_with_plugin_manager(local_targets(&[]), plugin_manager).await;
+
+    let models_response = send_request_and_read_response(
+        proxy_addr,
+        vec![b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec()],
+    )
+    .await;
+    let models_body = models_response.split("\r\n\r\n").nth(1).unwrap_or_default();
+    let models_json: serde_json::Value = serde_json::from_str(models_body).unwrap();
+    let model_entries = models_json["data"].as_array().cloned().unwrap_or_default();
+    assert!(model_entries.iter().any(|entry| entry["id"] == model));
+
+    let body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with the word ok."}],
+        "stream": false,
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let response = send_request_and_read_response(proxy_addr, vec![request.into_bytes()]).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected Lemonade proxy response: {response}"
+    );
 
     proxy_handle.abort();
 }
