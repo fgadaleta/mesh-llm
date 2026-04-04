@@ -1,5 +1,30 @@
 # Testing mesh-llm
 
+## Local GGUF/MLX parity rerun
+
+Use the checked-in exact parity suite when you want to rerun the local backend
+comparison matrix and preserve raw per-case artifacts:
+
+```bash
+just build
+scripts/run-mlx-parity-matrix.sh --stamp rerun-$(date +%Y%m%d-%H%M%S)
+```
+
+Outputs:
+
+- summary TSV: `MLX_VALIDATION_RESULTS/<stamp>/exact-summary.tsv`
+- raw logs per case: `MLX_VALIDATION_RESULTS/<stamp>/<case-id>/`
+
+Useful options:
+
+```bash
+# rerun only a couple of cases
+scripts/run-mlx-parity-matrix.sh --skip-build --cases qwen25-gguf-exact,qwen25-mlx-exact
+
+# store artifacts somewhere else
+scripts/run-mlx-parity-matrix.sh --root /tmp/mesh-llm-validation
+```
+
 ## Single-model permutations
 
 ### 1. Solo (single node)
