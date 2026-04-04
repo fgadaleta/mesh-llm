@@ -224,6 +224,16 @@ fn detects_gemma4_reasoning_channel_markers() {
             end: "<channel|>".to_string(),
         }]
     );
+    assert!(reasoning.default_stop_sequences.is_empty());
+}
+
+#[test]
+fn detects_gemma4_turn_stop_marker() {
+    let template = "{% if add_generation_prompt %}<|turn>model\n{% endif %}{% for message in messages %}<turn|>\n{% endfor %}";
+    let reasoning = detect_reasoning_template(template);
+    assert!(reasoning
+        .default_stop_sequences
+        .contains(&"<turn|>".to_string()));
 }
 
 #[test]

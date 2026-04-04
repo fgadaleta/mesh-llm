@@ -668,6 +668,22 @@ fn prefill_logits(
     model.forward(&input, caches)
 }
 
+fn replay_last_prompt_token_logits(
+    model: &MlxModel,
+    prompt_tokens: &[u32],
+    caches: &mut [model::KVCache],
+) -> Result<Array> {
+    let last = *prompt_tokens
+        .last()
+        .context("replay_last_prompt_token_logits called with empty prompt")?;
+    let rewind_to = caches[0].offset.saturating_sub(1);
+    for cache in caches.iter_mut() {
+        cache.trim_to(rewind_to);
+    }
+    let input = Array::from_slice(&[last], &[1, 1]);
+    model.forward(&input, caches)
+}
+
 /// Find the longest common prefix between cached tokens and new tokens.
 fn common_prefix_len(cached: &[u32], new: &[u32]) -> usize {
     cached
@@ -752,17 +768,15 @@ fn run_inference(
     // Prefill only the new suffix
     let mut next_token = if suffix.is_empty() {
         // Entire prompt was cached — re-forward last token to get logits
-        let last = prompt_tokens[prompt_tokens.len() - 1];
-        // Rewind one position so the last token gets forwarded
-        let rewind_to = caches[0].offset.saturating_sub(1);
-        for c in &mut caches {
-            c.trim_to(rewind_to);
-        }
-        let input = Array::from_slice(&[last], &[1, 1]);
-        let logits = state.model.forward(&input, &mut caches)?;
+        let logits = replay_last_prompt_token_logits(&state.model, &prompt_tokens, &mut caches)?;
         sampler.sample_next_token(&logits)?
     } else {
         let logits = prefill_logits(&state.model, suffix, &mut caches)?;
+        let logits = if state.model.tokenwise_prefill() {
+            replay_last_prompt_token_logits(&state.model, &prompt_tokens, &mut caches)?
+        } else {
+            logits
+        };
         sampler.sample_next_token(&logits)?
     };
     tracing::info!(
@@ -848,16 +862,15 @@ fn run_inference_streaming(
 
     // Prefill only the new suffix
     let mut next_token = if suffix.is_empty() {
-        let rewind_to = caches[0].offset.saturating_sub(1);
-        for c in &mut caches {
-            c.trim_to(rewind_to);
-        }
-        let last = prompt_tokens[prompt_tokens.len() - 1];
-        let input = Array::from_slice(&[last], &[1, 1]);
-        let logits = state.model.forward(&input, &mut caches)?;
+        let logits = replay_last_prompt_token_logits(&state.model, &prompt_tokens, &mut caches)?;
         sampler.sample_next_token(&logits)?
     } else {
         let logits = prefill_logits(&state.model, suffix, &mut caches)?;
+        let logits = if state.model.tokenwise_prefill() {
+            replay_last_prompt_token_logits(&state.model, &prompt_tokens, &mut caches)?
+        } else {
+            logits
+        };
         sampler.sample_next_token(&logits)?
     };
 
@@ -1071,10 +1084,19 @@ fn parse_stop_sequences(stop: Option<&serde_json::Value>) -> Vec<String> {
 }
 
 fn default_stop_sequences(model: &MlxModel) -> Vec<String> {
-    default_stop_sequences_for(
+    let mut stops = default_stop_sequences_for(
         model.prompt_template.behavior().prompt_template.as_deref(),
         model.reasoning_family,
-    )
+    );
+    stops.extend(
+        model
+            .prompt_template
+            .reasoning_template()
+            .default_stop_sequences,
+    );
+    stops.sort();
+    stops.dedup();
+    stops
 }
 
 fn default_stop_sequences_for(
@@ -1240,6 +1262,16 @@ mod tests {
     }
 
     #[test]
+    fn template_derived_stop_sequences_cover_gemma4_turn_end() {
+        let mut stops =
+            default_stop_sequences_for(Some("hf_template"), model::ReasoningFamily::None);
+        stops.extend(vec!["<turn|>".to_string()]);
+        stops.sort();
+        stops.dedup();
+        assert!(stops.contains(&"<turn|>".to_string()));
+    }
+
+    #[test]
     fn qwen3_generation_config_adds_chatml_stops_and_disables_thinking_by_default() {
         let stops = default_stop_sequences_for(Some("chatml"), model::ReasoningFamily::Qwen3);
         assert!(stops.contains(&"<|im_end|>".to_string()));
@@ -1327,6 +1359,7 @@ mod tests {
                 start: "<think>".to_string(),
                 end: "</think>".to_string(),
             }],
+            default_stop_sequences: Vec::new(),
         };
         let policy = response_policy_for(
             &serde_json::json!({"enable_thinking": false}),

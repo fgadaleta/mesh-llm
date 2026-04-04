@@ -42,6 +42,7 @@ pub(crate) struct ReasoningDefaults {
 pub(crate) struct ReasoningTemplate {
     pub supports_explicit_reasoning: bool,
     pub tagged_reasoning: Vec<TaggedReasoningBlock>,
+    pub default_stop_sequences: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,7 +420,28 @@ fn detect_reasoning_template(template: &str) -> ReasoningTemplate {
         supports_explicit_reasoning: template_supports_explicit_reasoning(template)
             || !tagged_reasoning.is_empty(),
         tagged_reasoning,
+        default_stop_sequences: detect_default_stop_sequences(template),
     }
+}
+
+fn detect_default_stop_sequences(template: &str) -> Vec<String> {
+    let mut stops = Vec::new();
+
+    for stop in [
+        "<|im_end|>",
+        "<|im_start|>",
+        "<|eot_id|>",
+        "<end_of_turn>",
+        "<turn|>",
+    ] {
+        if template.contains(stop) {
+            stops.push(stop.to_string());
+        }
+    }
+
+    stops.sort();
+    stops.dedup();
+    stops
 }
 
 fn template_supports_explicit_reasoning(template: &str) -> bool {
