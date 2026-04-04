@@ -15,7 +15,7 @@ env:
   MODEL_URL: https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q8_0.gguf
   MODEL_FILE: SmolLM2-135M-Instruct-Q8_0.gguf
   SCCACHE_GHA_ENABLED: "true"
-  LLAMA_BRANCH: rebase-upstream-master
+  LLAMA_BRANCH: commitllm-capture-04042026
 
 jobs:
   changes:

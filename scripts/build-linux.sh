@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 LLAMA_DIR="$REPO_ROOT/llama.cpp"
-LLAMA_BRANCH="${LLAMA_BRANCH:-rebase-upstream-master}"
+LLAMA_BRANCH="${LLAMA_BRANCH:-commitllm-capture-04042026}"
 BUILD_DIR="$LLAMA_DIR/build"
 MESH_DIR="$REPO_ROOT/mesh-llm"
 UI_DIR="$MESH_DIR/ui"

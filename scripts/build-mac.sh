@@ -43,7 +43,7 @@ configure_compiler_cache() {
     fi
 }
 
-LLAMA_BRANCH="${LLAMA_BRANCH:-rebase-upstream-master}"
+LLAMA_BRANCH="${LLAMA_BRANCH:-commitllm-capture-04042026}"
 
 clone_or_update_llama() {
     if [[ ! -d "$LLAMA_DIR" ]]; then
