@@ -1848,7 +1848,7 @@ impl MlxModel {
         let config_json: Value =
             serde_json::from_str(&config_text).context("parsing config.json")?;
         ensure_supported_mlx_model(dir, &config_json)?;
-        let effective_config_json = effective_text_config_json(&config_json);
+        let effective_config_json = normalized_model_config_json(&config_json);
         let config: ModelConfig =
             serde_json::from_value(effective_config_json).context("parsing config.json")?;
         let arch = model_architecture(&config_json);
@@ -3221,6 +3221,22 @@ fn effective_text_config_json(config: &Value) -> Value {
     Value::Object(merged)
 }
 
+fn normalized_model_config_json(config: &Value) -> Value {
+    let mut normalized = effective_text_config_json(config);
+    let Some(object) = normalized.as_object_mut() else {
+        return normalized;
+    };
+
+    if !object.contains_key("hidden_activation") {
+        if let Some(value) = object.get("hidden_act").cloned() {
+            object.insert("hidden_activation".to_string(), value);
+        }
+    }
+    object.remove("hidden_act");
+
+    normalized
+}
+
 fn tensor_prefixes(tensors: &HashMap<String, Array>) -> Result<TensorPrefixes> {
     if tensors.contains_key("model.embed_tokens.weight") {
         return Ok(TensorPrefixes {
@@ -3907,6 +3923,53 @@ mod tests {
         assert_eq!(config.final_logit_softcapping, Some(30.0));
         assert_eq!(config.sliding_window, Some(4096));
         assert_eq!(config.cache_implementation.as_deref(), Some("hybrid"));
+    }
+
+    #[test]
+    fn gemma2_real_hf_config_parses() {
+        let raw = serde_json::json!({
+            "architectures": ["Gemma2ForCausalLM"],
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "attn_logit_softcapping": 50.0,
+            "bos_token_id": 2,
+            "cache_implementation": "hybrid",
+            "eos_token_id": [1, 107],
+            "final_logit_softcapping": 30.0,
+            "head_dim": 256,
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_activation": "gelu_pytorch_tanh",
+            "hidden_size": 2304,
+            "initializer_range": 0.02,
+            "intermediate_size": 9216,
+            "max_position_embeddings": 8192,
+            "model_type": "gemma2",
+            "num_attention_heads": 8,
+            "num_hidden_layers": 26,
+            "num_key_value_heads": 4,
+            "pad_token_id": 0,
+            "quantization": {
+                "group_size": 64,
+                "bits": 4
+            },
+            "query_pre_attn_scalar": 256,
+            "rms_norm_eps": 1e-06,
+            "rope_theta": 10000.0,
+            "sliding_window": 4096,
+            "torch_dtype": "bfloat16",
+            "transformers_version": "4.42.4",
+            "use_cache": true,
+            "vocab_size": 256000
+        });
+        let config: ModelConfig =
+            serde_json::from_value(normalized_model_config_json(&raw)).unwrap();
+
+        assert_eq!(config.eos_token_id, vec![1, 107]);
+        assert_eq!(config.cache_implementation.as_deref(), Some("hybrid"));
+        assert_eq!(
+            config.hidden_activation.as_deref(),
+            Some("gelu_pytorch_tanh")
+        );
     }
 
     #[test]
