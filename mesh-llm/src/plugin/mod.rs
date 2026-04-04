@@ -33,6 +33,7 @@ use mesh_llm_plugin::MeshVisibility;
 
 pub const BLACKBOARD_PLUGIN_ID: &str = "blackboard";
 pub const BLOBSTORE_PLUGIN_ID: &str = "blobstore";
+pub const MLX_PLUGIN_ID: &str = "mlx";
 pub(crate) const PROTOCOL_VERSION: u32 = mesh_llm_plugin::PROTOCOL_VERSION;
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -66,6 +67,14 @@ pub struct ToolCallResult {
 #[derive(Clone, Debug)]
 pub struct RpcResult {
     pub result_json: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedInferenceEndpoint {
+    pub plugin_name: String,
+    pub endpoint_id: String,
+    pub address: Option<String>,
+    pub supports_streaming: bool,
 }
 
 pub(crate) type BridgeFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -312,6 +321,41 @@ impl PluginManager {
         plugin.mcp_request(method, params).await
     }
 
+    pub async fn ensure_managed_inference_endpoint(
+        &self,
+        plugin_name: &str,
+        endpoint_id: &str,
+        model_path: &std::path::Path,
+        requested_port: Option<u16>,
+        ctx_size_override: Option<u32>,
+    ) -> Result<mesh_llm_plugin::EnsureInferenceEndpointResponse> {
+        self.mcp_request(
+            plugin_name,
+            "inference/ensure_endpoint",
+            mesh_llm_plugin::EnsureInferenceEndpointRequest {
+                endpoint_id: endpoint_id.to_string(),
+                model_path: model_path.display().to_string(),
+                requested_port,
+                ctx_size_override,
+            },
+        )
+        .await
+    }
+
+    pub async fn managed_inference_endpoints(&self) -> Result<Vec<ManagedInferenceEndpoint>> {
+        let mut endpoints = Vec::new();
+        #[cfg(target_os = "macos")]
+        if self.is_available(MLX_PLUGIN_ID) {
+            endpoints.push(ManagedInferenceEndpoint {
+                plugin_name: MLX_PLUGIN_ID.to_string(),
+                endpoint_id: "local-mlx".into(),
+                address: None,
+                supports_streaming: true,
+            });
+        }
+        Ok(endpoints)
+    }
+
     pub async fn mcp_notify<P>(&self, plugin_name: &str, method: &str, params: P) -> Result<()>
     where
         P: Serialize,
@@ -429,6 +473,8 @@ pub async fn run_plugin_process(name: String) -> Result<()> {
     match name.as_str() {
         BLACKBOARD_PLUGIN_ID => crate::plugins::blackboard::run_plugin(name).await,
         BLOBSTORE_PLUGIN_ID => crate::plugins::blobstore::run_plugin(name).await,
+        #[cfg(target_os = "macos")]
+        MLX_PLUGIN_ID => crate::plugins::mlx::run_plugin(name).await,
         _ => bail!("Unknown built-in plugin '{}'", name),
     }
 }
@@ -447,9 +493,14 @@ mod tests {
     #[test]
     fn resolves_default_blackboard_plugin() {
         let resolved = resolve_plugins(&MeshConfig::default(), private_host_mode()).unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved.externals.len(), 3);
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(resolved.externals.len(), 2);
         assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
         assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved.externals[2].name, MLX_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
@@ -465,8 +516,13 @@ mod tests {
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved.externals.len(), 2);
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(resolved.externals.len(), 1);
         assert_eq!(resolved.externals[0].name, BLOBSTORE_PLUGIN_ID);
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved.externals[1].name, MLX_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
@@ -482,8 +538,13 @@ mod tests {
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved.externals.len(), 2);
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(resolved.externals.len(), 1);
         assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved.externals[1].name, MLX_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
@@ -496,9 +557,14 @@ mod tests {
             },
         )
         .unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved.externals.len(), 3);
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(resolved.externals.len(), 2);
         assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
         assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved.externals[2].name, MLX_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
@@ -514,11 +580,96 @@ mod tests {
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved.externals.len(), 4);
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(resolved.externals.len(), 3);
         assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
         assert_eq!(resolved.externals[1].name, "demo");
         assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
+        #[cfg(target_os = "macos")]
+        assert_eq!(resolved.externals[3].name, MLX_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    struct EnsureEndpointTestBridge;
+
+    #[cfg(target_os = "macos")]
+    impl PluginRpcBridge for EnsureEndpointTestBridge {
+        fn handle_request(
+            &self,
+            plugin_name: String,
+            method: String,
+            params_json: String,
+        ) -> BridgeFuture<Result<RpcResult, proto::ErrorResponse>> {
+            Box::pin(async move {
+                assert_eq!(plugin_name, MLX_PLUGIN_ID);
+                assert_eq!(method, "inference/ensure_endpoint");
+                let request: mesh_llm_plugin::EnsureInferenceEndpointRequest =
+                    serde_json::from_str(&params_json).unwrap();
+                assert_eq!(request.endpoint_id, "local-mlx");
+                Ok(RpcResult {
+                    result_json: serde_json::to_string(
+                        &mesh_llm_plugin::EnsureInferenceEndpointResponse {
+                            address: format!(
+                                "http://127.0.0.1:{}",
+                                request.requested_port.unwrap_or(8123)
+                            ),
+                            backend_label: "mlx".into(),
+                            context_length: 32768,
+                        },
+                    )
+                    .unwrap(),
+                })
+            })
+        }
+
+        fn handle_notification(
+            &self,
+            _plugin_name: String,
+            _method: String,
+            _params_json: String,
+        ) -> BridgeFuture<()> {
+            Box::pin(async move {})
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn managed_inference_endpoints_include_mlx_when_available() {
+        let plugin_manager =
+            PluginManager::for_test_bridge(&[MLX_PLUGIN_ID], Arc::new(EnsureEndpointTestBridge));
+        let endpoints = plugin_manager.managed_inference_endpoints().await.unwrap();
+        assert_eq!(
+            endpoints,
+            vec![ManagedInferenceEndpoint {
+                plugin_name: MLX_PLUGIN_ID.into(),
+                endpoint_id: "local-mlx".into(),
+                address: None,
+                supports_streaming: true,
+            }]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn ensure_managed_inference_endpoint_routes_through_plugin_bridge() {
+        let plugin_manager =
+            PluginManager::for_test_bridge(&[MLX_PLUGIN_ID], Arc::new(EnsureEndpointTestBridge));
+        let response = plugin_manager
+            .ensure_managed_inference_endpoint(
+                MLX_PLUGIN_ID,
+                "local-mlx",
+                std::path::Path::new("/tmp/model"),
+                Some(8123),
+                Some(32768),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.address, "http://127.0.0.1:8123");
+        assert_eq!(response.backend_label, "mlx");
+        assert_eq!(response.context_length, 32768);
     }
 
     #[test]

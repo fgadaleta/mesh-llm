@@ -14,6 +14,13 @@ pub(crate) async fn run_plugin_command(command: &PluginCommand, cli: &Cli) -> Re
             eprintln!("Blobstore is auto-registered by mesh-llm. Nothing to install.");
             eprintln!("Disable it with [[plugin]] name = \"blobstore\" enabled = false in the config if needed.");
         }
+        #[cfg(target_os = "macos")]
+        PluginCommand::Install { name } if name == plugin::MLX_PLUGIN_ID => {
+            eprintln!("MLX is auto-registered by mesh-llm on macOS. Nothing to install.");
+            eprintln!(
+                "Disable it with [[plugin]] name = \"mlx\" enabled = false in the config if needed."
+            );
+        }
         PluginCommand::Install { name } => {
             let config = plugin::config_path(cli.config.as_deref())?;
             anyhow::bail!(

@@ -1,4 +1,4 @@
-use super::{PluginSummary, BLACKBOARD_PLUGIN_ID, BLOBSTORE_PLUGIN_ID};
+use super::{PluginSummary, BLACKBOARD_PLUGIN_ID, BLOBSTORE_PLUGIN_ID, MLX_PLUGIN_ID};
 use anyhow::{bail, Context, Result};
 use mesh_llm_plugin::MeshVisibility;
 use serde::Deserialize;
@@ -67,6 +67,8 @@ pub fn resolve_plugins(config: &MeshConfig, _host_mode: PluginHostMode) -> Resul
     let mut names = BTreeMap::<String, ()>::new();
     let mut blackboard_enabled = true;
     let mut blobstore_enabled = true;
+    #[cfg(target_os = "macos")]
+    let mut mlx_enabled = true;
     for entry in &config.plugins {
         if names.insert(entry.name.clone(), ()).is_some() {
             bail!("Duplicate plugin entry '{}'", entry.name);
@@ -92,6 +94,17 @@ pub fn resolve_plugins(config: &MeshConfig, _host_mode: PluginHostMode) -> Resul
             blobstore_enabled = enabled;
             continue;
         }
+        #[cfg(target_os = "macos")]
+        if entry.name == MLX_PLUGIN_ID {
+            if entry.command.is_some() || !entry.args.is_empty() {
+                bail!(
+                    "Plugin '{}' is served by mesh-llm itself; only `enabled` may be set",
+                    MLX_PLUGIN_ID
+                );
+            }
+            mlx_enabled = enabled;
+            continue;
+        }
         if !enabled {
             continue;
         }
@@ -111,6 +124,10 @@ pub fn resolve_plugins(config: &MeshConfig, _host_mode: PluginHostMode) -> Resul
     }
     if blobstore_enabled {
         externals.push(blobstore_plugin_spec()?);
+    }
+    #[cfg(target_os = "macos")]
+    if mlx_enabled {
+        externals.push(mlx_plugin_spec()?);
     }
 
     Ok(ResolvedPlugins {
@@ -140,5 +157,18 @@ pub fn blobstore_plugin_spec() -> Result<ExternalPluginSpec> {
         name: BLOBSTORE_PLUGIN_ID.to_string(),
         command,
         args: vec!["--plugin".into(), BLOBSTORE_PLUGIN_ID.into()],
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub fn mlx_plugin_spec() -> Result<ExternalPluginSpec> {
+    let command = std::env::current_exe()
+        .context("Cannot determine mesh-llm executable path")?
+        .display()
+        .to_string();
+    Ok(ExternalPluginSpec {
+        name: MLX_PLUGIN_ID.to_string(),
+        command,
+        args: vec!["--plugin".into(), MLX_PLUGIN_ID.into()],
     })
 }

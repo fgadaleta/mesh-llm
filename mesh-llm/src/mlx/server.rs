@@ -266,6 +266,7 @@ pub async fn start_mlx_server(
         handle: InferenceServerHandle::in_process(shutdown_tx),
         context_length,
         death_rx,
+        listen_port: port,
     })
 }
 

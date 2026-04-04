@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -88,6 +88,7 @@ pub struct InferenceServerProcess {
     pub handle: InferenceServerHandle,
     pub death_rx: tokio::sync::oneshot::Receiver<()>,
     pub context_length: u32,
+    pub listen_port: u16,
 }
 
 /// Backend-neutral request to start a serving endpoint for a model.
@@ -573,6 +574,14 @@ impl PluginInferenceProviderRegistration {
         self,
         provider: Arc<dyn InferenceProvider>,
     ) -> InferenceProviderDescriptor {
+        self.into_descriptor_with_local_match(provider, never_match_local_endpoint)
+    }
+
+    pub fn into_descriptor_with_local_match(
+        self,
+        provider: Arc<dyn InferenceProvider>,
+        matches_local_endpoint: fn(&InferenceEndpointRequest) -> bool,
+    ) -> InferenceProviderDescriptor {
         InferenceProviderDescriptor::new(
             InferenceProviderSelection::new(
                 self.provider_id,
@@ -580,10 +589,87 @@ impl PluginInferenceProviderRegistration {
                 self.capabilities,
                 provider,
             ),
-            never_match_local_endpoint,
+            matches_local_endpoint,
             never_match_distributed_endpoint,
             never_match_worker_runtime,
         )
+    }
+}
+
+#[derive(Clone)]
+pub struct PluginManagedEndpointProvider {
+    provider_id: String,
+    plugin_name: String,
+    endpoint_id: String,
+    address: Option<String>,
+    plugin_manager: crate::plugin::PluginManager,
+}
+
+impl PluginManagedEndpointProvider {
+    pub fn new(
+        provider_id: impl Into<String>,
+        plugin_name: impl Into<String>,
+        endpoint_id: impl Into<String>,
+        address: Option<String>,
+        plugin_manager: crate::plugin::PluginManager,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            plugin_name: plugin_name.into(),
+            endpoint_id: endpoint_id.into(),
+            address,
+            plugin_manager,
+        }
+    }
+}
+
+impl InferenceProvider for PluginManagedEndpointProvider {
+    fn start_endpoint<'a>(
+        &'a self,
+        _bin_dir: &'a Path,
+        _binary_flavor: Option<crate::inference::launch::BinaryFlavor>,
+        request: &'a InferenceEndpointRequest,
+    ) -> ProviderFuture<'a, InferenceServerProcess> {
+        Box::pin(async move {
+            let ensured = self
+                .plugin_manager
+                .ensure_managed_inference_endpoint(
+                    &self.plugin_name,
+                    &self.endpoint_id,
+                    request.model_path.as_path(),
+                    Some(request.listen_port),
+                    request.ctx_size_override,
+                )
+                .await?;
+            let listen_port = parse_endpoint_port(&ensured.address).with_context(|| {
+                format!(
+                    "Plugin-managed inference provider '{}' returned invalid address '{}'",
+                    self.provider_id, ensured.address
+                )
+            })?;
+            Ok(in_process_endpoint_process(
+                listen_port,
+                ensured.context_length,
+            ))
+        })
+    }
+
+    fn start_worker<'a>(
+        &'a self,
+        _bin_dir: &'a Path,
+        _binary_flavor: Option<crate::inference::launch::BinaryFlavor>,
+        _request: &'a InferenceWorkerRequest,
+    ) -> ProviderFuture<'a, u16> {
+        Box::pin(async move {
+            let advertised = self.address.as_deref().unwrap_or("<unadvertised>");
+            anyhow::bail!(
+                "Plugin-managed inference provider '{}' (plugin '{}' endpoint '{}' address '{}') does not support worker runtime launch",
+                self.provider_id,
+                self.plugin_name,
+                self.endpoint_id,
+                advertised
+            )
+        })
     }
 }
 
@@ -668,6 +754,46 @@ pub fn register_plugin_provider(
     register_provider(registration.into_descriptor(provider));
 }
 
+pub fn plugin_provider_id(plugin_name: &str, endpoint_id: &str) -> String {
+    format!("plugin.{plugin_name}.{endpoint_id}")
+}
+
+fn parse_endpoint_port(address: &str) -> Result<u16> {
+    let without_scheme = address
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(address);
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let (_, port) = host_port
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("address '{address}' does not include a usable port"))?;
+    port.parse::<u16>()
+        .with_context(|| format!("address '{address}' returned an invalid port"))
+}
+
+fn in_process_endpoint_process(listen_port: u16, context_length: u32) -> InferenceServerProcess {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = InferenceServerHandle::in_process(shutdown_tx);
+    let (death_tx, death_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        loop {
+            if shutdown_rx.changed().await.is_err() {
+                break;
+            }
+            if *shutdown_rx.borrow() {
+                break;
+            }
+        }
+        let _ = death_tx.send(());
+    });
+    InferenceServerProcess {
+        handle,
+        death_rx,
+        context_length,
+        listen_port,
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 const fn never_match_local_endpoint(_request: &InferenceEndpointRequest) -> bool {
     false
@@ -684,7 +810,7 @@ const fn never_match_worker_runtime(_request: &InferenceWorkerRequest) -> bool {
 }
 
 #[cfg(test)]
-fn clear_registered_providers_for_tests() {
+pub(crate) fn clear_registered_providers_for_tests() {
     registered_provider_descriptors()
         .write()
         .expect("registered inference provider lock poisoned")
@@ -917,7 +1043,7 @@ pub async fn start_distributed_host(
         .start_endpoint(bin_dir, binary_flavor, &request)
         .await
     {
-        Ok(process) => Some((listen_port, process)),
+        Ok(process) => Some((process.listen_port, process)),
         Err(e) => {
             eprintln!(
                 "  Failed to start {} ({}) runtime: {e}",
@@ -1069,5 +1195,52 @@ mod tests {
         assert_eq!(explicit_selection.backend_label(), "plugin-notes");
 
         clear_registered_providers_for_tests();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plugin_registration_with_local_match_overrides_builtin_mlx_selection() {
+        let _guard = provider_registry_test_lock()
+            .lock()
+            .expect("provider registry test lock poisoned");
+        clear_registered_providers_for_tests();
+
+        let root =
+            std::env::temp_dir().join(format!("mesh-llm-provider-mlx-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"model_type":"deepseek_v3","architectures":["DeepseekV3ForCausalLM"]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(root.join("model.safetensors"), b"placeholder").unwrap();
+
+        register_provider(
+            PluginInferenceProviderRegistration::new(
+                "plugin.mlx.local-mlx",
+                "mlx",
+                InferenceProviderCapabilities {
+                    supports_local_runtime: true,
+                    supports_distributed_host_runtime: false,
+                    requires_worker_runtime: false,
+                    supports_moe_shard_runtime: false,
+                },
+            )
+            .into_descriptor_with_local_match(
+                Arc::new(TestLocalProvider),
+                matches_builtin_mlx_local_endpoint,
+            ),
+        );
+
+        let request = InferenceEndpointRequest::local(&root, 8080, 1, 1);
+        let selection = select_local_endpoint_provider(&request);
+
+        assert_eq!(selection.provider_id(), "plugin.mlx.local-mlx");
+        assert_eq!(selection.backend_label(), "mlx");
+
+        clear_registered_providers_for_tests();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

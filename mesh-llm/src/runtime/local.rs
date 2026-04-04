@@ -200,7 +200,7 @@ pub(super) async fn start_runtime_local_model(
     Ok((
         model_name,
         LocalRuntimeModelHandle {
-            port,
+            port: process.listen_port,
             backend: selected_provider.backend_label().into(),
             process: process.handle,
             context_length: process.context_length,

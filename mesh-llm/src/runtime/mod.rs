@@ -25,6 +25,45 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+async fn sync_plugin_managed_inference_providers(
+    plugin_manager: &plugin::PluginManager,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    fn matches_plugin_mlx_local_endpoint(request: &provider::InferenceEndpointRequest) -> bool {
+        crate::mlx::is_mlx_model_dir(request.model_path.as_path())
+    }
+
+    let endpoints = plugin_manager.managed_inference_endpoints().await?;
+    for endpoint in endpoints {
+        let provider_id =
+            provider::plugin_provider_id(&endpoint.plugin_name, &endpoint.endpoint_id);
+        let registration = provider::PluginInferenceProviderRegistration::new(
+            provider_id.clone(),
+            endpoint.plugin_name.clone(),
+            provider::InferenceProviderCapabilities {
+                supports_local_runtime: true,
+                supports_distributed_host_runtime: false,
+                requires_worker_runtime: false,
+                supports_moe_shard_runtime: false,
+            },
+        );
+        let provider = Arc::new(provider::PluginManagedEndpointProvider::new(
+            provider_id,
+            endpoint.plugin_name,
+            endpoint.endpoint_id,
+            endpoint.address,
+            plugin_manager.clone(),
+        )) as Arc<dyn provider::InferenceProvider>;
+        #[cfg(target_os = "macos")]
+        provider::register_provider(
+            registration
+                .into_descriptor_with_local_match(provider, matches_plugin_mlx_local_endpoint),
+        );
+    }
+    Ok(())
+}
 
 pub(crate) async fn run() -> Result<()> {
     tracing_subscriber::fmt()
@@ -826,6 +865,7 @@ pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
     let plugin_manager =
         plugin::PluginManager::start(&resolved_plugins, plugin_host_mode(&cli), plugin_mesh_tx)
             .await?;
+    sync_plugin_managed_inference_providers(&plugin_manager).await?;
     node.set_plugin_manager(plugin_manager.clone()).await;
     node.start_plugin_channel_forwarder(plugin_mesh_rx);
 
@@ -882,6 +922,7 @@ async fn run_auto(
     let plugin_manager =
         plugin::PluginManager::start(&resolved_plugins, plugin_host_mode(&cli), plugin_mesh_tx)
             .await?;
+    sync_plugin_managed_inference_providers(&plugin_manager).await?;
     node.set_plugin_manager(plugin_manager.clone()).await;
     node.start_plugin_channel_forwarder(plugin_mesh_rx);
 

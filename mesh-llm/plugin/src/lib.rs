@@ -33,8 +33,8 @@ pub use io::{
     write_envelope, LocalStream,
 };
 pub use runtime::{
-    MeshVisibility, Plugin, PluginInitializeRequest, PluginMetadata, PluginRuntime,
-    PluginStartupPolicy, SimplePlugin,
+    EnsureInferenceEndpointRequest, EnsureInferenceEndpointResponse, MeshVisibility, Plugin,
+    PluginInitializeRequest, PluginMetadata, PluginRuntime, PluginStartupPolicy, SimplePlugin,
 };
 
 #[allow(dead_code)]
