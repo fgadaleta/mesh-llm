@@ -57,7 +57,8 @@ clone_or_update_llama() {
     current_branch="$(git branch --show-current)"
     if [[ "$current_branch" != "$LLAMA_BRANCH" ]]; then
         echo "⚠️  llama.cpp is on branch '$current_branch', switching to $LLAMA_BRANCH..."
-        git checkout "$LLAMA_BRANCH"
+        git fetch origin "$LLAMA_BRANCH"
+        git checkout -B "$LLAMA_BRANCH" "origin/$LLAMA_BRANCH"
     fi
     echo "Pulling latest $LLAMA_BRANCH from origin..."
     git pull --ff-only origin "$LLAMA_BRANCH"

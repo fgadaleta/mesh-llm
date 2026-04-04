@@ -246,7 +246,8 @@ else
     CURRENT_BRANCH=$(git branch --show-current)
     if [[ "$CURRENT_BRANCH" != "$LLAMA_BRANCH" ]]; then
         echo "⚠️  llama.cpp is on branch '$CURRENT_BRANCH', switching to $LLAMA_BRANCH..."
-        git checkout "$LLAMA_BRANCH"
+        git fetch origin "$LLAMA_BRANCH"
+        git checkout -B "$LLAMA_BRANCH" "origin/$LLAMA_BRANCH"
     fi
     echo "Pulling latest $LLAMA_BRANCH from origin..."
     git pull --ff-only origin "$LLAMA_BRANCH"

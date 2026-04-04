@@ -5,7 +5,7 @@
 //! Every mesh change: kill llama-server, re-elect, winner starts fresh.
 //! mesh-llm owns :api_port and proxies to the right host by model name.
 
-use crate::inference::{launch, moe};
+use crate::inference::{launch, moe, verify};
 use crate::mesh;
 use crate::models;
 use crate::network::tunnel;
@@ -289,6 +289,7 @@ pub async fn election_loop(
     mut on_process: impl FnMut(Option<LocalProcessInfo>) + Send,
 ) {
     let mut peer_rx = node.peer_change_rx.clone();
+    let verification_tracker = verify::VerificationTracker::new();
 
     // Track the set of model-group worker IDs to detect when we actually need to restart
     let mut last_worker_set: Vec<iroh::EndpointId> = vec![];
@@ -334,6 +335,7 @@ pub async fn election_loop(
                 ctx_size_override,
                 target_tx,
                 stop_rx,
+                verification_tracker,
                 &mut on_change,
                 &mut on_process,
             )
@@ -438,6 +440,7 @@ pub async fn election_loop(
                     &model_name,
                     InferenceTarget::Local(local_port),
                     &target_tx,
+                    Some(&verification_tracker),
                 )
                 .await;
             }
@@ -460,7 +463,7 @@ pub async fn election_loop(
                     llama_process = None;
                     currently_host = false;
                     current_local_port = None;
-                    update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
+                    update_targets(&node, &model_name, InferenceTarget::None, &target_tx, Some(&verification_tracker)).await;
                     on_process(None);
                     on_change(false, false);
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -482,7 +485,14 @@ pub async fn election_loop(
             tunnel_mgr.set_http_port(0);
             node.set_role(NodeRole::Worker).await;
             current_local_port = None;
-            update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
+            update_targets(
+                &node,
+                &model_name,
+                InferenceTarget::None,
+                &target_tx,
+                Some(&verification_tracker),
+            )
+            .await;
             on_process(None);
             on_change(false, false);
             currently_host = false;
@@ -510,7 +520,14 @@ pub async fn election_loop(
                         min_vram as f64 / 1e9,
                         total_vram as f64 / 1e9
                     );
-                    update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
+                    update_targets(
+                        &node,
+                        &model_name,
+                        InferenceTarget::None,
+                        &target_tx,
+                        Some(&verification_tracker),
+                    )
+                    .await;
                     on_change(false, false);
                     last_worker_set = new_worker_set;
                     if peer_rx.changed().await.is_err() {
@@ -580,6 +597,7 @@ pub async fn election_loop(
                 &model_name,
                 InferenceTarget::Local(llama_port),
                 &target_tx,
+                Some(&verification_tracker),
             )
             .await;
             llama_process = Some(process);
@@ -614,6 +632,7 @@ pub async fn election_loop(
                         &model_name,
                         InferenceTarget::Remote(host.id),
                         &target_tx,
+                        Some(&verification_tracker),
                     )
                     .await;
                     eprintln!(
@@ -622,10 +641,24 @@ pub async fn election_loop(
                         host.id.fmt_short()
                     );
                 } else {
-                    update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
+                    update_targets(
+                        &node,
+                        &model_name,
+                        InferenceTarget::None,
+                        &target_tx,
+                        Some(&verification_tracker),
+                    )
+                    .await;
                 }
             } else {
-                update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
+                update_targets(
+                    &node,
+                    &model_name,
+                    InferenceTarget::None,
+                    &target_tx,
+                    Some(&verification_tracker),
+                )
+                .await;
             }
             on_change(false, false);
         }
@@ -646,7 +679,7 @@ pub async fn election_loop(
                 eprintln!("🔄 [{}] llama-server died — restarting...", model_name);
                 llama_process = None;
                 currently_host = false;
-                update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
+                update_targets(&node, &model_name, InferenceTarget::None, &target_tx, Some(&verification_tracker)).await;
                 on_change(false, false);
             }
             res = stop_rx.changed() => {
@@ -667,7 +700,14 @@ pub async fn election_loop(
         }
         tunnel_mgr.set_http_port(0);
         node.set_role(NodeRole::Worker).await;
-        update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
+        update_targets(
+            &node,
+            &model_name,
+            InferenceTarget::None,
+            &target_tx,
+            Some(&verification_tracker),
+        )
+        .await;
         on_process(None);
         on_change(false, false);
     }
@@ -694,6 +734,7 @@ async fn moe_election_loop(
     ctx_size_override: Option<u32>,
     target_tx: Arc<watch::Sender<ModelTargets>>,
     mut stop_rx: watch::Receiver<bool>,
+    verification_tracker: verify::VerificationTracker,
     on_change: &mut impl FnMut(bool, bool),
     on_process: &mut impl FnMut(Option<LocalProcessInfo>),
 ) {
@@ -818,6 +859,7 @@ async fn moe_election_loop(
                             &model_name,
                             InferenceTarget::Local(llama_port),
                             &target_tx,
+                            Some(&verification_tracker),
                         )
                         .await;
                         on_change(true, true);
@@ -936,6 +978,17 @@ async fn moe_election_loop(
 
                     // Build and publish MoE target map
                     let targets = build_moe_targets(&all_ids, my_id, llama_port, &model_name);
+                    // Challenge all remote MoE peers
+                    for &peer_id in &all_ids {
+                        if peer_id != my_id {
+                            verify::spawn_challenge(
+                                node.clone(),
+                                peer_id,
+                                verification_tracker.clone(),
+                                model_name.clone(),
+                            );
+                        }
+                    }
                     target_tx.send_replace(targets);
 
                     on_change(true, true);
@@ -979,7 +1032,14 @@ async fn moe_election_loop(
         }
         tunnel_mgr.set_http_port(0);
         node.set_role(NodeRole::Worker).await;
-        update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
+        update_targets(
+            &node,
+            &model_name,
+            InferenceTarget::None,
+            &target_tx,
+            Some(&verification_tracker),
+        )
+        .await;
         on_process(None);
         on_change(false, false);
     }
@@ -1014,6 +1074,7 @@ async fn update_targets(
     my_model: &str,
     my_target: InferenceTarget,
     target_tx: &Arc<watch::Sender<ModelTargets>>,
+    tracker: Option<&verify::VerificationTracker>,
 ) {
     let peers = node.peers().await;
     let mut targets: HashMap<String, Vec<InferenceTarget>> = HashMap::new();
@@ -1051,6 +1112,18 @@ async fn update_targets(
     for p in &peers {
         let peer_models = p.routable_models();
         extend_targets_from_peer(&mut targets, &peer_models, &p.role, p.id);
+    }
+
+    // Challenge any new remote peers we're about to route to
+    if let Some(tracker) = tracker {
+        for (model, hosts) in &targets {
+            for host in hosts {
+                if let InferenceTarget::Remote(peer_id) | InferenceTarget::MoeRemote(peer_id) = host
+                {
+                    verify::spawn_challenge(node.clone(), *peer_id, tracker.clone(), model.clone());
+                }
+            }
+        }
     }
 
     let count: usize = targets.values().map(|v| v.len()).sum();

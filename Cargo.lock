@@ -567,6 +567,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bincode",
+ "chrono",
  "hex",
  "mesh-llm-plugin",
  "rmcp",

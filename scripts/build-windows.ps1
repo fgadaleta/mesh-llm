@@ -600,7 +600,8 @@ Invoke-InRepo {
             $currentBranch = (& git branch --show-current).Trim()
             if ($currentBranch -ne $llamaBranch) {
                 Write-Host "Switching llama.cpp from '$currentBranch' to $llamaBranch..."
-                Invoke-NativeCommand "git" @("checkout", $llamaBranch)
+                Invoke-NativeCommand "git" @("fetch", "origin", $llamaBranch)
+                Invoke-NativeCommand "git" @("checkout", "-B", $llamaBranch, "origin/$llamaBranch")
             }
             Write-Host "Pulling latest $llamaBranch from origin..."
             Invoke-NativeCommand "git" @("pull", "--ff-only", "origin", $llamaBranch)

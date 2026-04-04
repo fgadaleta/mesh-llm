@@ -10,6 +10,7 @@ mesh-llm-plugin = { path = "../mesh-llm/plugin" }
 verilm-core = { git = "https://github.com/lambdaclass/commitllm.git", package = "verilm-core" }
 verilm-verify = { git = "https://github.com/lambdaclass/commitllm.git", package = "verilm-verify" }
 anyhow = "1"
+chrono = "0.4"
 base64 = "0.22"
 bincode = "1"
 rmcp = { version = "1.2", features = ["server"] }

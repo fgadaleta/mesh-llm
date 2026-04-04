@@ -18,16 +18,15 @@
 
 use anyhow::Result;
 use mesh_llm_plugin::{
-    json_schema_for,
-    plugin_server_info, proto, structured_tool_result, tool_error, tool_with_schema,
-    PluginMetadata, PluginRuntime, SimplePlugin, ToolRouter,
+    json_schema_for, plugin_server_info, proto, structured_tool_result, tool_error,
+    tool_with_schema, PluginMetadata, PluginRuntime, SimplePlugin, ToolRouter,
 };
 use rmcp::model::ServerInfo;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -181,6 +180,8 @@ struct PluginState {
     recent_results: Vec<VerificationResult>,
     /// Received receipts awaiting verification.
     pending_receipts: HashMap<String, ReceiptMessage>,
+    /// Insertion order for pending_receipts so we evict oldest first.
+    pending_receipts_order: VecDeque<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +222,7 @@ impl Default for PluginState {
             total_failed: 0,
             recent_results: Vec::new(),
             pending_receipts: HashMap::new(),
+            pending_receipts_order: VecDeque::new(),
         }
     }
 }
@@ -288,6 +290,13 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
+fn epoch_ms_to_rfc3339(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let nanos = ((ms % 1000) * 1_000_000) as u32;
+    let dt = chrono::DateTime::from_timestamp(secs, nanos).unwrap_or_default();
+    dt.to_rfc3339()
+}
+
 // ---------------------------------------------------------------------------
 // Verification logic
 // ---------------------------------------------------------------------------
@@ -320,8 +329,8 @@ fn verify_receipt_binary(
 fn hash_gguf_file(path: &str) -> Result<(String, u64, Option<String>)> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| anyhow::anyhow!("cannot open {path}: {e}"))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| anyhow::anyhow!("cannot open {path}: {e}"))?;
 
     let metadata = file.metadata()?;
     let file_size = metadata.len();
@@ -368,10 +377,7 @@ fn build_plugin(state: Arc<Mutex<PluginState>>) -> SimplePlugin {
 
     SimplePlugin::new(
         PluginMetadata::new(PLUGIN_ID, env!("CARGO_PKG_VERSION"), server_info())
-            .with_capabilities(vec![
-                format!("channel:{CHANNEL}"),
-                "mesh-events".into(),
-            ]),
+            .with_capabilities(vec![format!("channel:{CHANNEL}"), "mesh-events".into()]),
     )
     .with_tool_router(tool_router(state.clone()))
     .with_health(move |_context| {
@@ -416,16 +422,18 @@ fn build_plugin(state: Arc<Mutex<PluginState>>) -> SimplePlugin {
                     if let Ok(receipt_msg) = serde_json::from_value::<ReceiptMessage>(body) {
                         let request_id = receipt_msg.request_id.clone();
                         let mut state = state.lock().await;
-                        state
-                            .pending_receipts
-                            .insert(request_id.clone(), receipt_msg);
+                        // Only track insertion order for genuinely new entries.
+                        if !state.pending_receipts.contains_key(&request_id) {
+                            state.pending_receipts_order.push_back(request_id.clone());
+                        }
+                        state.pending_receipts.insert(request_id, receipt_msg);
 
-                        // Trim pending if too many.
+                        // Evict oldest first (FIFO) when over capacity.
                         while state.pending_receipts.len() > 10_000 {
-                            if let Some(oldest) =
-                                state.pending_receipts.keys().next().cloned()
-                            {
+                            if let Some(oldest) = state.pending_receipts_order.pop_front() {
                                 state.pending_receipts.remove(&oldest);
+                            } else {
+                                break;
                             }
                         }
                     }
@@ -464,17 +472,17 @@ fn tool_router(state: Arc<Mutex<PluginState>>) -> ToolRouter {
                 let args: VerifyReceiptArgs = request.arguments()?;
 
                 // Decode the receipt.
-                let receipt_bytes = base64_decode(&args.receipt_b64)
-                    .map_err(|e| mesh_llm_plugin::PluginError::invalid_params(
-                        format!("bad receipt_b64: {e}"),
-                    ))?;
+                let receipt_bytes = base64_decode(&args.receipt_b64).map_err(|e| {
+                    mesh_llm_plugin::PluginError::invalid_params(format!("bad receipt_b64: {e}"))
+                })?;
 
                 // Get the verifier key.
                 let key_bytes = if let Some(ref key_b64) = args.verifier_key_b64 {
-                    base64_decode(key_b64)
-                        .map_err(|e| mesh_llm_plugin::PluginError::invalid_params(
-                            format!("bad verifier_key_b64: {e}"),
-                        ))?
+                    base64_decode(key_b64).map_err(|e| {
+                        mesh_llm_plugin::PluginError::invalid_params(format!(
+                            "bad verifier_key_b64: {e}"
+                        ))
+                    })?
                 } else {
                     // Try cached keys (future: auto-detect model from receipt).
                     let state = state.lock().await;
@@ -513,16 +521,18 @@ fn tool_router(state: Arc<Mutex<PluginState>>) -> ToolRouter {
                             total: total_ms,
                         };
 
-                        // Record the result for trust scoring.
-                        // (In a full implementation, we'd extract the provider peer ID
-                        //  from the receipt metadata.)
+                        // Record through the canonical verification pathway so
+                        // aggregate counters, peer trust, and recent history stay
+                        // consistent. Until provider metadata is extractable from
+                        // the receipt, attribute to "local".
                         let mut state_guard = state.lock().await;
-                        state_guard.total_verifications += 1;
-                        if verdict == "pass" {
-                            state_guard.total_passed += 1;
-                        } else {
-                            state_guard.total_failed += 1;
-                        }
+                        state_guard.record_verification(&VerificationResult {
+                            request_id: String::new(),
+                            provider_peer_id: "local".into(),
+                            verdict: verdict.clone(),
+                            model_id: String::new(),
+                            failures: failures.iter().map(|f| f.message.clone()).collect(),
+                        });
 
                         let result = VerifyReceiptResult {
                             verdict,
@@ -558,13 +568,11 @@ fn tool_router(state: Arc<Mutex<PluginState>>) -> ToolRouter {
             Box::pin(async move {
                 let args: HashGgufArgs = request.arguments()?;
                 match hash_gguf_file(&args.path) {
-                    Ok((hash, size, name)) => {
-                        structured_tool_result(HashGgufResult {
-                            file_hash: hash,
-                            file_size: size,
-                            model_name: name,
-                        })
-                    }
+                    Ok((hash, size, name)) => structured_tool_result(HashGgufResult {
+                        file_hash: hash,
+                        file_size: size,
+                        model_name: name,
+                    }),
                     Err(e) => Ok(tool_error(format!("Hash error: {e}"))),
                 }
             })
@@ -597,11 +605,7 @@ fn tool_router(state: Arc<Mutex<PluginState>>) -> ToolRouter {
                         }
                     }
 
-                    let trust = state
-                        .peer_trust
-                        .get(peer_id)
-                        .cloned()
-                        .unwrap_or_default();
+                    let trust = state.peer_trust.get(peer_id).cloned().unwrap_or_default();
 
                     entries.push(PeerTrustEntry {
                         peer_id: peer_id.clone(),
@@ -609,7 +613,7 @@ fn tool_router(state: Arc<Mutex<PluginState>>) -> ToolRouter {
                         verifications_failed: trust.failed,
                         trust_score: trust.score(),
                         last_verified_at: if trust.last_verified_epoch_ms > 0 {
-                            Some(format!("{}ms", trust.last_verified_epoch_ms))
+                            Some(epoch_ms_to_rfc3339(trust.last_verified_epoch_ms))
                         } else {
                             None
                         },
