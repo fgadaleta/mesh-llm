@@ -30,8 +30,12 @@ use std::sync::Arc;
 async fn sync_plugin_managed_inference_providers(
     plugin_manager: &plugin::PluginManager,
 ) -> Result<()> {
+    fn never_match_local_endpoint(_request: &provider::InferenceEndpointRequest) -> bool {
+        false
+    }
+
     #[cfg(target_os = "macos")]
-    fn matches_plugin_mlx_local_endpoint(request: &provider::InferenceEndpointRequest) -> bool {
+    fn matches_mlx_model_dir(request: &provider::InferenceEndpointRequest) -> bool {
         crate::mlx::is_mlx_model_dir(request.model_path.as_path())
     }
 
@@ -56,11 +60,16 @@ async fn sync_plugin_managed_inference_providers(
             endpoint.address,
             plugin_manager.clone(),
         )) as Arc<dyn provider::InferenceProvider>;
-        #[cfg(target_os = "macos")]
-        provider::register_provider(
-            registration
-                .into_descriptor_with_local_match(provider, matches_plugin_mlx_local_endpoint),
-        );
+        let descriptor = match endpoint.local_model_matcher {
+            #[cfg(target_os = "macos")]
+            mesh_llm_plugin::InferenceLocalModelMatcher::MlxModelDir => {
+                registration.into_descriptor_with_local_match(provider, matches_mlx_model_dir)
+            }
+            _ => {
+                registration.into_descriptor_with_local_match(provider, never_match_local_endpoint)
+            }
+        };
+        provider::register_provider(descriptor);
     }
     Ok(())
 }

@@ -89,6 +89,16 @@ pub struct InferenceEndpointDescriptor {
     pub endpoint_id: String,
     pub address: Option<String>,
     pub supports_streaming: bool,
+    #[serde(default)]
+    pub local_model_matcher: InferenceLocalModelMatcher,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceLocalModelMatcher {
+    #[default]
+    Never,
+    MlxModelDir,
 }
 
 #[derive(Clone)]

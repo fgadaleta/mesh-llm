@@ -74,6 +74,7 @@ pub struct ManagedInferenceEndpoint {
     pub endpoint_id: String,
     pub address: Option<String>,
     pub supports_streaming: bool,
+    pub local_model_matcher: mesh_llm_plugin::InferenceLocalModelMatcher,
 }
 
 pub(crate) type BridgeFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -385,6 +386,7 @@ impl PluginManager {
                     endpoint_id: descriptor.endpoint_id,
                     address: descriptor.address,
                     supports_streaming: descriptor.supports_streaming,
+                    local_model_matcher: descriptor.local_model_matcher,
                 });
             }
         }
@@ -657,6 +659,8 @@ mod tests {
                                 endpoint_id: "local-mlx".into(),
                                 address: None,
                                 supports_streaming: true,
+                                local_model_matcher:
+                                    mesh_llm_plugin::InferenceLocalModelMatcher::MlxModelDir,
                             },
                         ])
                         .unwrap(),
@@ -711,6 +715,7 @@ mod tests {
                 endpoint_id: "local-mlx".into(),
                 address: None,
                 supports_streaming: true,
+                local_model_matcher: mesh_llm_plugin::InferenceLocalModelMatcher::MlxModelDir,
             }]
         );
     }
