@@ -10,6 +10,8 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
+use super::provider::{InferenceServerHandle, InferenceServerProcess};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum BinaryFlavor {
     Cpu,
@@ -190,53 +192,6 @@ fn resolve_binary_path(
 fn temp_log_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(name)
 }
-
-#[derive(Clone, Debug)]
-pub struct InferenceServerHandle {
-    pid: u32,
-    expected_exit: Arc<AtomicBool>,
-    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
-}
-
-impl InferenceServerHandle {
-    fn process(pid: u32, expected_exit: Arc<AtomicBool>) -> Self {
-        Self {
-            pid,
-            expected_exit,
-            shutdown_tx: None,
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn in_process(shutdown_tx: tokio::sync::watch::Sender<bool>) -> Self {
-        Self {
-            pid: std::process::id(),
-            expected_exit: Arc::new(AtomicBool::new(true)),
-            shutdown_tx: Some(shutdown_tx),
-        }
-    }
-
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    pub async fn shutdown(&self) {
-        if let Some(tx) = &self.shutdown_tx {
-            let _ = tx.send(true);
-            return;
-        }
-        self.expected_exit.store(true, Ordering::Relaxed);
-        terminate_process(self.pid).await;
-    }
-}
-
-#[derive(Debug)]
-pub struct InferenceServerProcess {
-    pub handle: InferenceServerHandle,
-    pub death_rx: tokio::sync::oneshot::Receiver<()>,
-    pub context_length: u32,
-}
-
 pub struct ModelLaunchSpec<'a> {
     pub model: &'a Path,
     pub http_port: u16,
@@ -534,7 +489,7 @@ pub async fn kill_llama_server() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 }
 
-async fn terminate_process(pid: u32) {
+pub(crate) async fn terminate_process(pid: u32) {
     let pid_str = pid.to_string();
 
     #[cfg(not(windows))]

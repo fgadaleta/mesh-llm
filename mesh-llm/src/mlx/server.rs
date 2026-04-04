@@ -5,7 +5,7 @@
 
 use super::model::{self, MlxModel};
 use super::sampling::{Sampler, SamplingParams, StopBuffer};
-use crate::inference::launch::{InferenceServerHandle, InferenceServerProcess};
+use crate::inference::provider::{InferenceServerHandle, InferenceServerProcess};
 use anyhow::{Context, Result};
 use mlx_rs::Array;
 use std::sync::{Arc, Once};
