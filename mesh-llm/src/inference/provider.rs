@@ -1,10 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use tokio::net::TcpListener;
+use url::Url;
 
 /// Backend-neutral runtime handle for a serving instance.
 ///
@@ -57,6 +58,7 @@ pub struct InferenceServerProcess {
     pub handle: InferenceServerHandle,
     pub death_rx: tokio::sync::oneshot::Receiver<()>,
     pub context_length: u32,
+    pub listen_port: u16,
 }
 
 /// Backend-neutral request to start a serving endpoint for a model.
@@ -519,13 +521,14 @@ impl PluginInferenceProviderRegistration {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PluginManagedEndpointProvider {
     provider_id: String,
     plugin_name: String,
     endpoint_id: String,
     protocol: Option<String>,
     address: Option<String>,
+    plugin_manager: crate::plugin::PluginManager,
 }
 
 impl PluginManagedEndpointProvider {
@@ -535,6 +538,7 @@ impl PluginManagedEndpointProvider {
         endpoint_id: impl Into<String>,
         protocol: Option<String>,
         address: Option<String>,
+        plugin_manager: crate::plugin::PluginManager,
     ) -> Self {
         Self {
             provider_id: provider_id.into(),
@@ -542,6 +546,7 @@ impl PluginManagedEndpointProvider {
             endpoint_id: endpoint_id.into(),
             protocol,
             address,
+            plugin_manager,
         }
     }
 
@@ -564,9 +569,30 @@ impl InferenceProvider for PluginManagedEndpointProvider {
         &'a self,
         _bin_dir: &'a Path,
         _binary_flavor: Option<crate::inference::launch::BinaryFlavor>,
-        _request: &'a InferenceEndpointRequest,
+        request: &'a InferenceEndpointRequest,
     ) -> ProviderFuture<'a, InferenceServerProcess> {
-        Box::pin(async move { Err(self.unsupported_launch_error()) })
+        Box::pin(async move {
+            let ensured = self
+                .plugin_manager
+                .ensure_managed_inference_endpoint(
+                    &self.plugin_name,
+                    &self.endpoint_id,
+                    request.model_path.as_path(),
+                    Some(request.listen_port),
+                    request.ctx_size_override,
+                )
+                .await?;
+            let listen_port = parse_endpoint_port(&ensured.address).with_context(|| {
+                format!(
+                    "Plugin-managed inference provider '{}' returned invalid address '{}'",
+                    self.provider_id, ensured.address
+                )
+            })?;
+            Ok(in_process_endpoint_process(
+                listen_port,
+                ensured.context_length,
+            ))
+        })
     }
 
     fn start_worker<'a>(
@@ -643,6 +669,35 @@ pub fn sync_plugin_providers(
 
 pub fn plugin_provider_id(plugin_name: &str, endpoint_id: &str) -> String {
     format!("plugin.{plugin_name}.{endpoint_id}")
+}
+
+fn parse_endpoint_port(address: &str) -> Result<u16> {
+    let url = Url::parse(address)?;
+    url.port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("address '{address}' does not include a usable port"))
+}
+
+fn in_process_endpoint_process(listen_port: u16, context_length: u32) -> InferenceServerProcess {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = InferenceServerHandle::in_process(shutdown_tx);
+    let (death_tx, death_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        loop {
+            if shutdown_rx.changed().await.is_err() {
+                break;
+            }
+            if *shutdown_rx.borrow() {
+                break;
+            }
+        }
+        let _ = death_tx.send(());
+    });
+    InferenceServerProcess {
+        handle,
+        death_rx,
+        context_length,
+        listen_port,
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -894,7 +949,7 @@ pub async fn start_distributed_host(
         .start_endpoint(bin_dir, binary_flavor, &request)
         .await
     {
-        Ok(process) => Some((listen_port, process)),
+        Ok(process) => Some((process.listen_port, process)),
         Err(e) => {
             eprintln!(
                 "  Failed to start {} ({}) runtime: {e}",

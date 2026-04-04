@@ -556,6 +556,70 @@ impl PluginManager {
         Ok(endpoints)
     }
 
+    pub async fn ensure_managed_inference_endpoint(
+        &self,
+        plugin_name: &str,
+        endpoint_id: &str,
+        model_path: &std::path::Path,
+        requested_port: Option<u16>,
+        ctx_size_override: Option<u32>,
+    ) -> Result<mesh_llm_plugin::EnsureInferenceEndpointResponse> {
+        #[cfg(test)]
+        if self.inner.plugins.is_empty() && self.inner.bridged_plugins.contains(plugin_name) {
+            let bridge = self
+                .inner
+                .rpc_bridge
+                .lock()
+                .await
+                .clone()
+                .context("No active test RPC bridge")?;
+            let params_json =
+                serde_json::to_string(&mesh_llm_plugin::EnsureInferenceEndpointRequest {
+                    endpoint_id: endpoint_id.to_string(),
+                    model_path: model_path.display().to_string(),
+                    requested_port,
+                    ctx_size_override,
+                })?;
+            let result = bridge
+                .handle_request(
+                    plugin_name.to_string(),
+                    "inference/ensure_endpoint".into(),
+                    params_json,
+                )
+                .await
+                .map_err(|err| {
+                    self::support::plugin_error(plugin_name, "inference/ensure_endpoint", &err)
+                })?;
+            return serde_json::from_str(&result.result_json).with_context(|| {
+                format!("Decode ensure endpoint result from test plugin '{plugin_name}'")
+            });
+        }
+
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin
+            .mcp_request(
+                "inference/ensure_endpoint",
+                mesh_llm_plugin::EnsureInferenceEndpointRequest {
+                    endpoint_id: endpoint_id.to_string(),
+                    model_path: model_path.display().to_string(),
+                    requested_port,
+                    ctx_size_override,
+                },
+            )
+            .await
+    }
+
     pub async fn capability_providers(&self) -> Result<Vec<PluginCapabilityProvider>> {
         let summaries = self.list().await;
         let endpoint_health = self.inner.endpoint_health.lock().await.clone();
@@ -1419,6 +1483,7 @@ mod tests {
     use super::config::{MeshConfig, PluginConfigEntry};
     use super::*;
     use crate::inference::provider;
+    use crate::inference::provider::InferenceProvider;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -1439,6 +1504,51 @@ mod tests {
                 Ok(RpcResult {
                     result_json: "{}".into(),
                 })
+            })
+        }
+
+        fn handle_notification(
+            &self,
+            _plugin_name: String,
+            _method: String,
+            _params_json: String,
+        ) -> BridgeFuture<()> {
+            Box::pin(async {})
+        }
+    }
+
+    struct EnsureEndpointTestBridge;
+
+    impl PluginRpcBridge for EnsureEndpointTestBridge {
+        fn handle_request(
+            &self,
+            _plugin_name: String,
+            method: String,
+            params_json: String,
+        ) -> BridgeFuture<Result<RpcResult, proto::ErrorResponse>> {
+            Box::pin(async move {
+                match method.as_str() {
+                    "inference/ensure_endpoint" => {
+                        let request: mesh_llm_plugin::EnsureInferenceEndpointRequest =
+                            serde_json::from_str(&params_json).unwrap();
+                        Ok(RpcResult {
+                            result_json: serde_json::to_string(
+                                &mesh_llm_plugin::EnsureInferenceEndpointResponse {
+                                    address: format!(
+                                        "http://127.0.0.1:{}/v1",
+                                        request.requested_port.unwrap_or(8091)
+                                    ),
+                                    backend_label: "mlx".into(),
+                                    context_length: 32768,
+                                },
+                            )
+                            .unwrap(),
+                        })
+                    }
+                    _ => Ok(RpcResult {
+                        result_json: "{}".into(),
+                    }),
+                }
             })
         }
 
@@ -1940,6 +2050,7 @@ mod tests {
                         endpoint.endpoint_id,
                         endpoint.protocol,
                         endpoint.address,
+                        plugin_manager.clone(),
                     )) as Arc<dyn provider::InferenceProvider>,
                 )
             })
@@ -1954,5 +2065,31 @@ mod tests {
         assert_eq!(selection.backend_label(), "mlx");
 
         provider::clear_registered_providers_for_tests();
+    }
+
+    #[tokio::test]
+    async fn plugin_managed_provider_can_ensure_endpoint_via_plugin_rpc() {
+        let plugin_manager =
+            PluginManager::for_test_bridge(&["mlx"], Arc::new(EnsureEndpointTestBridge));
+        let provider = provider::PluginManagedEndpointProvider::new(
+            "plugin.mlx.local-mlx",
+            "mlx",
+            "local-mlx",
+            Some("openai_compatible".into()),
+            Some("http://127.0.0.1:8091/v1".into()),
+            plugin_manager,
+        );
+
+        let process = provider
+            .start_endpoint(
+                std::path::Path::new("."),
+                None,
+                &provider::InferenceEndpointRequest::local("/tmp/model.gguf", 8123, 1, 1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(process.listen_port, 8123);
+        assert_eq!(process.context_length, 32768);
     }
 }

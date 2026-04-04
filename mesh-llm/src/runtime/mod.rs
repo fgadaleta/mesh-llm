@@ -52,6 +52,7 @@ async fn sync_plugin_managed_inference_providers(
                     endpoint.endpoint_id,
                     endpoint.protocol,
                     endpoint.address,
+                    plugin_manager.clone(),
                 )) as Arc<dyn provider::InferenceProvider>,
             )
         })

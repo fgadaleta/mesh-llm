@@ -785,6 +785,7 @@ pub async fn start_llama_server(
                 handle,
                 death_rx,
                 context_length: ctx_size,
+                listen_port: request.listen_port,
             });
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;

@@ -69,6 +69,21 @@ impl From<proto::InitializeRequest> for PluginInitializeRequest {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EnsureInferenceEndpointRequest {
+    pub endpoint_id: String,
+    pub model_path: String,
+    pub requested_port: Option<u16>,
+    pub ctx_size_override: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EnsureInferenceEndpointResponse {
+    pub address: String,
+    pub backend_label: String,
+    pub context_length: u32,
+}
+
 #[derive(Clone)]
 pub struct PluginMetadata {
     plugin_id: String,
@@ -346,6 +361,14 @@ pub trait Plugin: Send {
         Ok(None)
     }
 
+    async fn ensure_inference_endpoint(
+        &mut self,
+        _request: EnsureInferenceEndpointRequest,
+        _context: &mut PluginContext<'_>,
+    ) -> PluginResult<Option<EnsureInferenceEndpointResponse>> {
+        Ok(None)
+    }
+
     async fn handle_rpc(
         &mut self,
         request: proto::RpcRequest,
@@ -409,6 +432,15 @@ pub trait Plugin: Send {
                     Some(result) => json_response(&result),
                     None => Err(PluginError::method_not_found(
                         "Unsupported MCP method 'resources/templates/list'",
+                    )),
+                }
+            }
+            "inference/ensure_endpoint" => {
+                let params: EnsureInferenceEndpointRequest = parse_rpc_params(&request)?;
+                match self.ensure_inference_endpoint(params, context).await? {
+                    Some(result) => json_response(&result),
+                    None => Err(PluginError::method_not_found(
+                        "Unsupported plugin method 'inference/ensure_endpoint'",
                     )),
                 }
             }
