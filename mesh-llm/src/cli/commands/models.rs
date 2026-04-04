@@ -196,7 +196,10 @@ pub fn run_model_installed() {
         if let Some(exact_ref) = installed_entry_exact_ref(entry) {
             println!("   ref: {}", exact_ref);
             println!("   show: mesh-llm models show {}", exact_ref);
-            println!("   download: mesh-llm models download {}", exact_ref);
+        }
+
+        if let Some(run_command) = installed_entry_run_command(entry) {
+            println!("   run: {}", run_command);
         }
 
         if let Some(model) = installed_catalog_model(entry) {
@@ -363,6 +366,25 @@ fn installed_entry_exact_ref(entry: &InstalledModelEntry) -> Option<String> {
                 identity.repo_id, identity.revision, artifact
             ))
         }
+    }
+}
+
+fn installed_entry_run_command(entry: &InstalledModelEntry) -> Option<String> {
+    let path = entry.path.to_str()?;
+    match entry.kind {
+        InstalledModelKind::Gguf => Some(format!("mesh-llm --gguf-file {}", shell_escape(path))),
+        InstalledModelKind::Mlx => Some(format!("mesh-llm --mlx-file {}", shell_escape(path))),
+    }
+}
+
+fn shell_escape(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
     }
 }
 
