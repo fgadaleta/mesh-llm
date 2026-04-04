@@ -1021,26 +1021,44 @@ async fn run_auto(
     };
 
     // ── Lemonade-only mode ──
-    // When --lemonade is set with no --model, skip model resolution and election.
+    // When --lemonade is set with no --model, connect to Lemonade early and use
+    // its first model as our identity. No rpc-server, no election, no llama-server —
     // Lemonade manages all backends (GPU llama.cpp, NPU FLM/RyzenAI, whisper, SD, TTS).
-    // We just proxy to it.
     let use_lemonade = cli.lemonade || cli.lemonade_port.is_some();
-    if use_lemonade && resolved_models.is_empty() {
-        return run_lemonade_only(
-            cli,
-            node,
-            channels,
-            api_port,
-            console_port,
-            plugin_manager,
-            plugin_inference_rx,
-            affinity_router,
-        )
-        .await;
-    }
+    let lemonade_only = use_lemonade && resolved_models.is_empty();
+    let lemonade_primary: Option<(String, Vec<String>)> = if lemonade_only {
+        let port = cli
+            .lemonade_port
+            .unwrap_or(crate::inference::lemonade::DEFAULT_PORT);
+        anyhow::ensure!(
+            crate::inference::lemonade::health_check(port).await,
+            "Lemonade not available on port {port}. \
+             Is it running? Start with: lemonade-server serve"
+        );
+        let models = crate::inference::lemonade::list_models(port)
+            .await
+            .context("Failed to list Lemonade models")?;
+        if models.is_empty() {
+            eprintln!("⚠️  Lemonade is running but has no models loaded.");
+            eprintln!("   Pull a model: lemonade-server pull <model-name>");
+            eprintln!("   List models:  lemonade-server list");
+            return Ok(());
+        }
+        eprintln!("🍋 Lemonade-only mode — all inference delegated to Lemonade on port {port}");
+        eprintln!("   Lemonade manages GPU (llama.cpp), NPU (FLM, RyzenAI), whisper, SD, TTS");
+        for m in &models {
+            eprintln!("  + {m}");
+        }
+        Some((models[0].clone(), models))
+    } else {
+        None
+    };
 
     // Decide which model THIS node will serve
-    let model = if !resolved_models.is_empty() {
+    let model = if let Some((ref primary, _)) = lemonade_primary {
+        // Lemonade provides the model — no local file needed, synthetic path
+        PathBuf::from(primary)
+    } else if !resolved_models.is_empty() {
         // First --model is what we serve (already resolved/downloaded)
         resolved_models[0].clone()
     } else {
@@ -1130,7 +1148,11 @@ async fn run_auto(
     node.set_model_source(model_source).await;
     // Declare which models this node may serve, but do not advertise them as
     // live/routable until their local processes have passed health checks.
-    let all_declared = build_serving_list(&resolved_models, &model_name);
+    let all_declared = if let Some((_, ref lemonade_models)) = lemonade_primary {
+        lemonade_models.clone()
+    } else {
+        build_serving_list(&resolved_models, &model_name)
+    };
     node.set_serving_models(all_declared.clone()).await;
     node.set_hosted_models(Vec::new()).await;
     node.set_models(all_declared.clone()).await;
@@ -1141,7 +1163,7 @@ async fn run_auto(
     // Ensure draft model is available (downloads if needed, <1GB)
     // `--no-draft` disables automatic draft detection, but should not
     // override an explicitly supplied `--draft` value.
-    if !cli.no_draft && cli.draft.is_none() {
+    if !lemonade_only && !cli.no_draft && cli.draft.is_none() {
         if let Some(draft_path) = ensure_draft(&model).await {
             eprintln!("Auto-detected draft model: {}", draft_path.display());
             cli.draft = Some(draft_path);
@@ -1151,15 +1173,21 @@ async fn run_auto(
     // Clean up stale processes from previous runs
     launch::kill_orphan_rpc_servers().await;
 
-    // Start rpc-server
-    let rpc_port = launch::start_rpc_server(
-        &bin_dir,
-        cli.llama_flavor,
-        cli.device.as_deref(),
-        Some(&model),
-    )
-    .await?;
-    tracing::info!("rpc-server on 127.0.0.1:{rpc_port} serving {model_name}");
+    // Start rpc-server (skipped in lemonade-only mode — no local model file)
+    let rpc_port = if !lemonade_only {
+        launch::start_rpc_server(
+            &bin_dir,
+            cli.llama_flavor,
+            cli.device.as_deref(),
+            Some(&model),
+        )
+        .await?
+    } else {
+        0
+    };
+    if !lemonade_only {
+        tracing::info!("rpc-server on 127.0.0.1:{rpc_port} serving {model_name}");
+    }
 
     let tunnel_mgr =
         tunnel::Manager::start(node.clone(), rpc_port, channels.rpc, channels.http).await?;
@@ -1207,7 +1235,11 @@ async fn run_auto(
     // Console (optional)
     let model_name_for_console = model_name.clone();
     let console_state = if let Some(cport) = console_port {
-        let model_size_bytes = election::total_model_bytes(&model);
+        let model_size_bytes = if lemonade_only {
+            0
+        } else {
+            election::total_model_bytes(&model)
+        };
         let cs = api::MeshApi::new(
             node.clone(),
             model_name_for_console.clone(),
@@ -1216,7 +1248,8 @@ async fn run_auto(
             plugin_manager.clone(),
             affinity_router.clone(),
         );
-        cs.set_primary_backend("llama".into()).await;
+        cs.set_primary_backend(if lemonade_only { "lemonade" } else { "llama" }.into())
+            .await;
         cs.set_runtime_control(control_tx.clone()).await;
         cs.set_nostr_relays(nostr_relays(&cli.nostr_relay)).await;
         cs.set_nostr_discovery(cli.nostr_discovery).await;
@@ -1256,29 +1289,31 @@ async fn run_auto(
         None
     };
 
-    // Election loop
-    tracing::info!("Entering auto-election for model: {model_name}");
-    let node2 = node.clone();
-    let tunnel_mgr2 = tunnel_mgr.clone();
-    let bin_dir2 = bin_dir.clone();
-    let model2 = model.clone();
-    let draft2 = cli.draft.clone();
-    let draft_max = cli.draft_max;
-    let force_split = cli.split;
-    let llama_flavor = cli.llama_flavor;
-    let cb_console_port = console_port;
-    let model_name_for_cb = model_name.clone();
-    let model_name_for_election = model_name.clone();
-    let node_for_cb = node.clone();
-    let node_for_primary_process = node.clone();
-    let primary_target_tx = target_tx.clone();
-    let console_state_for_election = console_state.clone();
-    let console_state_for_primary_process = console_state.clone();
-    let primary_process_model_name = model_name.clone();
-    let primary_model_name_for_advertise = model_name.clone();
-    let (primary_stop_tx, primary_stop_rx) = tokio::sync::watch::channel(false);
-    let primary_task = tokio::spawn(async move {
-        election::election_loop(
+    // Election loop (skipped in lemonade-only mode — Lemonade manages all backends).
+    // The lemonade integration block below handles target registration + death watchdog.
+    if !lemonade_only {
+        tracing::info!("Entering auto-election for model: {model_name}");
+        let node2 = node.clone();
+        let tunnel_mgr2 = tunnel_mgr.clone();
+        let bin_dir2 = bin_dir.clone();
+        let model2 = model.clone();
+        let draft2 = cli.draft.clone();
+        let draft_max = cli.draft_max;
+        let force_split = cli.split;
+        let llama_flavor = cli.llama_flavor;
+        let cb_console_port = console_port;
+        let model_name_for_cb = model_name.clone();
+        let model_name_for_election = model_name.clone();
+        let node_for_cb = node.clone();
+        let node_for_primary_process = node.clone();
+        let primary_target_tx = target_tx.clone();
+        let console_state_for_election = console_state.clone();
+        let console_state_for_primary_process = console_state.clone();
+        let primary_process_model_name = model_name.clone();
+        let primary_model_name_for_advertise = model_name.clone();
+        let (primary_stop_tx, primary_stop_rx) = tokio::sync::watch::channel(false);
+        let primary_task = tokio::spawn(async move {
+            election::election_loop(
             node2, tunnel_mgr2, api_port, rpc_port, bin_dir2, model2, model_name_for_election,
             draft2, draft_max, force_split, llama_flavor, cli.ctx_size, primary_target_tx,
             primary_stop_rx,
@@ -1352,65 +1387,65 @@ async fn run_auto(
                 });
             },
         ).await;
-    });
-    managed_models.insert(
-        model_name.clone(),
-        ManagedModelController {
-            stop_tx: primary_stop_tx,
-            task: primary_task,
-        },
-    );
-
-    // Additional model election loops (multi-model per node)
-    // Each additional model gets its own solo election loop — no rpc, no draft, no split.
-    // They share the same target_tx so the proxy sees all models.
-    if resolved_models.len() > 1 {
-        eprintln!(
-            "🔀 Multi-model mode: {} additional model(s)",
-            resolved_models.len() - 1
+        });
+        managed_models.insert(
+            model_name.clone(),
+            ManagedModelController {
+                stop_tx: primary_stop_tx,
+                task: primary_task,
+            },
         );
-        // Announce all models to mesh
-        let all_names: Vec<String> = resolved_models
-            .iter()
-            .map(|m| {
-                m.file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .collect();
-        node.set_models(all_names).await;
-        node.regossip().await;
 
-        for extra_model in resolved_models.iter().skip(1) {
-            let extra_name = {
-                let stem = extra_model
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                router::strip_split_suffix_owned(&stem)
-            };
-            let extra_node = node.clone();
-            let extra_tunnel = tunnel_mgr.clone();
-            let extra_bin = bin_dir.clone();
-            let extra_path = extra_model.clone();
-            let extra_target_tx = target_tx.clone();
-            let extra_model_name = extra_name.clone();
-            let api_port_extra = api_port;
-            let extra_llama_flavor = cli.llama_flavor;
-            let extra_console_state = console_state.clone();
-            let extra_model_name_for_status = extra_model_name.clone();
-            let extra_model_name_for_process = extra_model_name.clone();
-            let extra_model_name_for_advertise = extra_model_name.clone();
-            let extra_node_for_advertise = node.clone();
-            let extra_node_for_process = node.clone();
-            let primary_model_name_for_extra = model_name.clone();
-            let managed_model_name = extra_name.clone();
-            eprintln!("  + {extra_name}");
-            let (extra_stop_tx, extra_stop_rx) = tokio::sync::watch::channel(false);
-            let extra_task = tokio::spawn(async move {
-                election::election_loop(
+        // Additional model election loops (multi-model per node)
+        // Each additional model gets its own solo election loop — no rpc, no draft, no split.
+        // They share the same target_tx so the proxy sees all models.
+        if resolved_models.len() > 1 {
+            eprintln!(
+                "🔀 Multi-model mode: {} additional model(s)",
+                resolved_models.len() - 1
+            );
+            // Announce all models to mesh
+            let all_names: Vec<String> = resolved_models
+                .iter()
+                .map(|m| {
+                    m.file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect();
+            node.set_models(all_names).await;
+            node.regossip().await;
+
+            for extra_model in resolved_models.iter().skip(1) {
+                let extra_name = {
+                    let stem = extra_model
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    router::strip_split_suffix_owned(&stem)
+                };
+                let extra_node = node.clone();
+                let extra_tunnel = tunnel_mgr.clone();
+                let extra_bin = bin_dir.clone();
+                let extra_path = extra_model.clone();
+                let extra_target_tx = target_tx.clone();
+                let extra_model_name = extra_name.clone();
+                let api_port_extra = api_port;
+                let extra_llama_flavor = cli.llama_flavor;
+                let extra_console_state = console_state.clone();
+                let extra_model_name_for_status = extra_model_name.clone();
+                let extra_model_name_for_process = extra_model_name.clone();
+                let extra_model_name_for_advertise = extra_model_name.clone();
+                let extra_node_for_advertise = node.clone();
+                let extra_node_for_process = node.clone();
+                let primary_model_name_for_extra = model_name.clone();
+                let managed_model_name = extra_name.clone();
+                eprintln!("  + {extra_name}");
+                let (extra_stop_tx, extra_stop_rx) = tokio::sync::watch::channel(false);
+                let extra_task = tokio::spawn(async move {
+                    election::election_loop(
                     extra_node, extra_tunnel, api_port_extra, 0, extra_bin, extra_path, extra_model_name.clone(),
                     None, 8, false, extra_llama_flavor, cli.ctx_size, extra_target_tx,
                     extra_stop_rx,
@@ -1465,16 +1500,17 @@ async fn run_auto(
                         });
                     },
                 ).await;
-            });
-            managed_models.insert(
-                managed_model_name,
-                ManagedModelController {
-                    stop_tx: extra_stop_tx,
-                    task: extra_task,
-                },
-            );
+                });
+                managed_models.insert(
+                    managed_model_name,
+                    ManagedModelController {
+                        stop_tx: extra_stop_tx,
+                        task: extra_task,
+                    },
+                );
+            }
         }
-    }
+    } // end if !lemonade_only (election + multi-model)
 
     // ── Lemonade integration ──
     // If --lemonade or --lemonade-port is set, connect to a running Lemonade
@@ -1543,6 +1579,17 @@ async fn run_auto(
         }
     }
 
+    // In lemonade-only mode, print ready message (election callback does this normally)
+    if lemonade_only {
+        eprintln!();
+        eprintln!("  API:     http://localhost:{api_port}");
+        if let Some(cp) = console_port {
+            eprintln!("  Console: http://localhost:{cp}");
+        }
+        update_pi_models_json(&model_name, api_port);
+        eprintln!();
+    }
+
     // Nostr publish loop (if --publish) or watchdog (if --auto, to take over if publisher dies)
     let nostr_publisher = if cli.publish {
         let nostr_keys = nostr::load_or_create_keys()?;
@@ -1587,6 +1634,13 @@ async fn run_auto(
             Some(cmd) = control_rx.recv() => {
                 match cmd {
                     api::RuntimeControlRequest::Load { spec, resp } => {
+                        if lemonade_only {
+                            let _ = resp.send(Err(anyhow::anyhow!(
+                                "In Lemonade-only mode. Use Lemonade to manage models: \
+                                 lemonade-server pull <model>"
+                            )));
+                            continue;
+                        }
                         let mut assigned_runtime_model: Option<String> = None;
                         let result = async {
                             let model_path = resolve_model(&PathBuf::from(&spec)).await?;
@@ -1659,6 +1713,12 @@ async fn run_auto(
                         let _ = resp.send(result);
                     }
                     api::RuntimeControlRequest::Unload { model, resp } => {
+                        if lemonade_only {
+                            let _ = resp.send(Err(anyhow::anyhow!(
+                                "In Lemonade-only mode. Use Lemonade to manage models."
+                            )));
+                            continue;
+                        }
                         let result = if let Some(handle) = runtime_models.remove(&model) {
                             remove_runtime_local_target(&target_tx, &model, handle.port);
                             withdraw_advertised_model(&node, &model).await;
@@ -1770,230 +1830,6 @@ async fn run_auto(
     node.set_hosted_models(Vec::new()).await;
     launch::kill_llama_server().await;
     launch::kill_orphan_rpc_servers().await;
-    Ok(())
-}
-
-/// Lemonade-only mode: no local model, no election. Lemonade manages all backends
-/// (GPU via llama.cpp, NPU via FLM/RyzenAI, whisper, stable-diffusion, TTS).
-/// We run the API proxy and forward everything to Lemonade.
-async fn run_lemonade_only(
-    cli: Cli,
-    node: mesh::Node,
-    _channels: mesh::TunnelChannels,
-    api_port: u16,
-    console_port: Option<u16>,
-    plugin_manager: plugin::PluginManager,
-    mut plugin_inference_rx: tokio::sync::mpsc::Receiver<plugin::PluginInferenceEvent>,
-    affinity_router: affinity::AffinityRouter,
-) -> Result<()> {
-    let lemonade_port = cli
-        .lemonade_port
-        .unwrap_or(crate::inference::lemonade::DEFAULT_PORT);
-
-    // Connect to Lemonade
-    let process = crate::inference::lemonade::connect_external(lemonade_port)
-        .await
-        .context(format!(
-            "Lemonade not available on port {lemonade_port}. \
-             Is it running? Start with: lemonade-server serve"
-        ))?;
-
-    let models = crate::inference::lemonade::list_models(lemonade_port)
-        .await
-        .context("Failed to list Lemonade models")?;
-
-    if models.is_empty() {
-        eprintln!("⚠️  Lemonade is running but has no models loaded.");
-        eprintln!("   Pull a model: lemonade-server pull <model-name>");
-        eprintln!("   List models:  lemonade-server list");
-        return Ok(());
-    }
-
-    // Use first model as the "primary" for gossip bookkeeping
-    let primary_model_name = models[0].clone();
-
-    eprintln!(
-        "🍋 Lemonade-only mode — all inference delegated to Lemonade on port {lemonade_port}"
-    );
-    eprintln!("   Lemonade manages GPU (llama.cpp), NPU (FLM, RyzenAI), whisper, SD, TTS");
-    for m in &models {
-        eprintln!("  + {m}");
-    }
-
-    // Announce models to mesh
-    node.set_serving_models(models.clone()).await;
-    node.set_models(models.clone()).await;
-    node.regossip().await;
-
-    // Election target map — populated directly, no election loop needed
-    let (target_tx, target_rx) = tokio::sync::watch::channel(election::ModelTargets::default());
-    let target_tx = std::sync::Arc::new(target_tx);
-
-    for m in &models {
-        add_runtime_local_target(&target_tx, m, lemonade_port);
-        add_serving_assignment(&node, &primary_model_name, m).await;
-        advertise_model_ready(&node, &primary_model_name, m).await;
-    }
-
-    // Runtime control for load/unload
-    let (control_tx, mut control_rx) =
-        tokio::sync::mpsc::unbounded_channel::<api::RuntimeControlRequest>();
-    let (_runtime_event_tx, mut runtime_event_rx) =
-        tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
-
-    // API proxy
-    let proxy_node = node.clone();
-    let proxy_rx = target_rx.clone();
-    let proxy_affinity = affinity_router.clone();
-    let api_control_tx = control_tx.clone();
-    tokio::spawn(async move {
-        proxy::api_proxy(
-            proxy_node,
-            api_port,
-            proxy_rx,
-            api_control_tx,
-            None,
-            cli.listen_all,
-            proxy_affinity,
-        )
-        .await;
-    });
-
-    // Console
-    let console_state = if let Some(cport) = console_port {
-        let cs = api::MeshApi::new(
-            node.clone(),
-            primary_model_name.clone(),
-            api_port,
-            0,
-            plugin_manager.clone(),
-            affinity_router.clone(),
-        );
-        cs.set_primary_backend("lemonade".into()).await;
-        cs.set_runtime_control(control_tx.clone()).await;
-        if let Some(ref name) = cli.mesh_name {
-            cs.set_mesh_name(name.clone()).await;
-        }
-        let cs2 = cs.clone();
-        let console_rx = target_rx.clone();
-        let mn = primary_model_name.clone();
-        tokio::spawn(async move {
-            let (adapted_tx, adapted_rx) =
-                tokio::sync::watch::channel(election::InferenceTarget::None);
-            tokio::spawn(async move {
-                let mut rx = console_rx;
-                loop {
-                    let targets = rx.borrow().clone();
-                    let target = targets.get(&mn);
-                    adapted_tx.send_replace(target);
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-            });
-            api::start(cport, cs2, adapted_rx, cli.listen_all).await;
-        });
-        Some(cs)
-    } else {
-        None
-    };
-
-    // Show ready message
-    eprintln!();
-    eprintln!("  API:     http://localhost:{api_port}");
-    if let Some(cp) = console_port {
-        eprintln!("  Console: http://localhost:{cp}");
-    }
-    update_pi_models_json(&primary_model_name, api_port);
-    eprintln!();
-
-    // Death watchdog for Lemonade
-    let lemonade_models = models.clone();
-    let death_target_tx = target_tx.clone();
-    let death_node = node.clone();
-    let death_console = console_state.clone();
-    tokio::spawn(async move {
-        let _ = process.death_rx.await;
-        eprintln!("⚠️  Lemonade server disconnected — no backends available");
-        for name in &lemonade_models {
-            remove_runtime_local_target(&death_target_tx, name, lemonade_port);
-            withdraw_advertised_model(&death_node, name).await;
-            remove_serving_assignment(&death_node, name).await;
-            if let Some(ref cs) = death_console {
-                cs.remove_local_process(name).await;
-            }
-        }
-    });
-
-    // Console: register Lemonade processes
-    if let Some(ref cs) = console_state {
-        for m in &models {
-            cs.upsert_local_process(local_process_payload(m, "lemonade", lemonade_port, 0))
-                .await;
-        }
-    }
-
-    // Main control loop
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("\nShutting down...");
-                break;
-            }
-            Some(cmd) = control_rx.recv() => {
-                match cmd {
-                    api::RuntimeControlRequest::Load { spec: _, resp } => {
-                        // In lemonade-only mode, load/unload should go through Lemonade
-                        let _ = resp.send(Err(anyhow::anyhow!(
-                            "In Lemonade-only mode. Use Lemonade to manage models: \
-                             lemonade-server pull <model>"
-                        )));
-                    }
-                    api::RuntimeControlRequest::Unload { model: _, resp } => {
-                        let _ = resp.send(Err(anyhow::anyhow!(
-                            "In Lemonade-only mode. Use Lemonade to manage models."
-                        )));
-                    }
-                }
-            }
-            Some(event) = runtime_event_rx.recv() => {
-                match event {
-                    RuntimeEvent::Exited { model, port } => {
-                        eprintln!("⚠ Lemonade model '{}' exited on :{}", model, port);
-                    }
-                }
-            }
-            Some(event) = plugin_inference_rx.recv() => {
-                match event {
-                    plugin::PluginInferenceEvent::Register { plugin_id, model, port, backend } => {
-                        eprintln!("🔌 Plugin '{plugin_id}' registering model '{model}' on :{port} (backend: {backend})");
-                        add_runtime_local_target(&target_tx, &model, port);
-                        add_serving_assignment(&node, &primary_model_name, &model).await;
-                        advertise_model_ready(&node, &primary_model_name, &model).await;
-                        if let Some(ref cs) = console_state {
-                            cs.upsert_local_process(local_process_payload(
-                                &model, &backend, port, 0,
-                            )).await;
-                        }
-                    }
-                    plugin::PluginInferenceEvent::Unregister { plugin_id, model, port } => {
-                        eprintln!("🔌 Plugin '{plugin_id}' unregistering model '{model}' on :{port}");
-                        remove_runtime_local_target(&target_tx, &model, port);
-                        withdraw_advertised_model(&node, &model).await;
-                        remove_serving_assignment(&node, &model).await;
-                        if let Some(ref cs) = console_state {
-                            cs.remove_local_process(&model).await;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Cleanup
-    node.broadcast_leaving().await;
-    node.set_serving_models(Vec::new()).await;
-    node.set_hosted_models(Vec::new()).await;
     Ok(())
 }
 
