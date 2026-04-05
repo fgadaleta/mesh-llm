@@ -183,6 +183,7 @@ The following no-behavior-change groundwork is already in place on this branch:
 - plugin-style provider registrations can now also attach a `MoeRankingProvider`, so backend-specific ranking work does not have to stay tied to the builtin backend descriptor
 - `MoeRankingProvider` can now also be registered independently of an execution provider, which matches the intended split between backend execution and backend-specific ranking generation
 - the shared inference layer now has a batch sync path for plugin-owned ranking descriptors, so later plugin-host integration does not have to hand-register ranking providers one by one
+- the early MoE ranking-provider methods on the shared branch now use provider-owned request types for detection and cached-ranking lookup, so even the reduced contract is moving away from raw path-based calls
 - the provider contract now advertises explicit capabilities so orchestration can ask what a backend supports instead of inferring it indirectly
 - worker-runtime startup is now gated by provider capabilities instead of being assumed unconditionally in the shared runtime path
 - MoE GGUF detection and cached-ranking lookup now route through a backend-facing `MoeRankingProvider` on the provider seam, so ranking generation can move out of core without rewriting election policy
