@@ -25,6 +25,11 @@ DEFAULT_BASELINES = REPO_ROOT / "testdata" / "validation" / "baselines.json"
 DEFAULT_ROOT = REPO_ROOT / "MLX_VALIDATION_RESULTS"
 
 
+def log(message: str) -> None:
+    sys.stderr.write(message + "\n")
+    sys.stderr.flush()
+
+
 def run(
     cmd: list[str],
     *,
@@ -40,6 +45,31 @@ def run(
         capture_output=capture_output,
         check=False,
     )
+
+
+def run_streaming(
+    cmd: list[str],
+    *,
+    cwd: Path = REPO_ROOT,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    chunks: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+        chunks.append(line)
+    returncode = proc.wait()
+    return subprocess.CompletedProcess(cmd, returncode, "".join(chunks), "")
 
 
 def ensure_build(skip_build: bool) -> None:
@@ -112,15 +142,17 @@ def parse_downloaded_model_path(output: str) -> str:
 
 def download_model_ref(model_ref: str, backend: str) -> str:
     flag = "--gguf" if backend == "gguf" else "--mlx"
-    proc = run(
+    log(f"📥 Preflight download start [{backend}] {model_ref}")
+    proc = run_streaming(
         ["./target/release/mesh-llm", "models", "download", model_ref, flag],
-        capture_output=True,
     )
-    sys.stderr.write(proc.stdout)
-    sys.stderr.write(proc.stderr)
     if proc.returncode != 0:
+        log(f"❌ Preflight download failed [{backend}] {model_ref} (exit {proc.returncode})")
         raise SystemExit(proc.returncode)
-    return parse_downloaded_model_path(proc.stdout)
+    local_path = parse_downloaded_model_path(proc.stdout)
+    log(f"✅ Preflight download complete [{backend}] {model_ref}")
+    log(f"   ↳ {local_path}")
+    return local_path
 
 
 def summary_path(root: Path, stamp: str, suite: str) -> Path:
