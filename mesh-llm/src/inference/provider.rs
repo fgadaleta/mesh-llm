@@ -1,4 +1,5 @@
 use anyhow::Result;
+use reqwest::Url;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
@@ -583,6 +584,15 @@ impl InferenceProviderRegistry {
             .expect("registered inference provider lock poisoned");
         providers.retain(|existing| existing.selection != descriptor.selection);
         providers.push(descriptor);
+    }
+
+    #[allow(dead_code)]
+    pub fn replace_plugin_providers(&self, descriptors: Vec<InferenceProviderDescriptor>) {
+        let mut providers = registered_provider_descriptors()
+            .write()
+            .expect("registered inference provider lock poisoned");
+        providers.retain(|existing| !existing.selection.provider_id().starts_with("plugin."));
+        providers.extend(descriptors);
     }
 
     fn select_provider(
@@ -1492,6 +1502,62 @@ pub fn register_plugin_moe_ranking_provider(
         .push(registration.into_descriptor(ranking_provider));
 }
 
+#[allow(dead_code)]
+pub fn sync_plugin_provider_descriptors(descriptors: Vec<InferenceProviderDescriptor>) {
+    provider_registry().replace_plugin_providers(descriptors);
+}
+
+#[allow(dead_code)]
+pub fn sync_plugin_moe_ranking_provider_descriptors(
+    descriptors: Vec<MoeRankingProviderDescriptor>,
+) {
+    let mut providers = registered_moe_ranking_provider_descriptors()
+        .write()
+        .expect("registered moe ranking provider lock poisoned");
+    providers.retain(|existing| !existing.selection.provider_id().starts_with("plugin."));
+    providers.extend(descriptors);
+}
+
+#[allow(dead_code)]
+pub fn plugin_provider_id(plugin_name: &str, endpoint_id: &str) -> String {
+    format!("plugin.{plugin_name}.{endpoint_id}")
+}
+
+#[allow(dead_code)]
+fn parse_endpoint_port(address: &str) -> Result<u16> {
+    let url = Url::parse(address)?;
+    url.port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("address '{address}' does not include a usable port"))
+}
+
+#[allow(dead_code)]
+fn in_process_endpoint_process(listen_port: u16, context_length: u32) -> InferenceServerProcess {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = InferenceServerHandle::in_process(shutdown_tx);
+    let (death_tx, death_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        loop {
+            if shutdown_rx.changed().await.is_err() {
+                break;
+            }
+            if *shutdown_rx.borrow() {
+                break;
+            }
+        }
+        let _ = death_tx.send(());
+    });
+    InferenceServerProcess {
+        handle,
+        death_rx,
+        context_length,
+        listen_port,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+const fn never_match_model_for_moe_ranking(_model_path: &Path) -> bool {
+    false
+}
 #[cfg_attr(not(test), allow(dead_code))]
 const fn never_match_local_endpoint(_request: &InferenceEndpointRequest) -> bool {
     false
@@ -1504,11 +1570,6 @@ const fn never_match_distributed_endpoint(_request: &InferenceEndpointRequest) -
 
 #[cfg_attr(not(test), allow(dead_code))]
 const fn never_match_worker_runtime(_request: &InferenceWorkerRequest) -> bool {
-    false
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-const fn never_match_model_for_moe_ranking(_model_path: &Path) -> bool {
     false
 }
 
@@ -2280,6 +2341,34 @@ mod tests {
             load_cached_moe_ranking_for_model(Path::new("/tmp/model.gguf"), None),
             Some(vec![9, 4, 1])
         );
+
+        clear_registered_providers_for_tests();
+    }
+
+    #[test]
+    fn sync_plugin_moe_ranking_provider_descriptors_replaces_plugin_entries() {
+        let _guard = provider_registry_test_lock()
+            .lock()
+            .expect("provider registry test lock poisoned");
+        clear_registered_providers_for_tests();
+        register_plugin_moe_ranking_provider(
+            PluginMoeRankingProviderRegistration::new("plugin.old", "plugin-old"),
+            Arc::new(TestRankingProvider),
+        );
+
+        sync_plugin_moe_ranking_provider_descriptors(vec![
+            PluginMoeRankingProviderRegistration::new("plugin.synced", "plugin-synced")
+                .into_descriptor(Arc::new(TestRankingProvider)),
+        ]);
+
+        let fallback =
+            select_moe_ranking_provider(Path::new("/tmp/model.gguf"), Some("plugin.old"))
+                .expect("fallback ranking provider");
+        assert_ne!(fallback.provider_id(), "plugin.old");
+        let selection =
+            select_moe_ranking_provider(Path::new("/tmp/model.gguf"), Some("plugin.synced"))
+                .expect("synced ranking provider");
+        assert_eq!(selection.provider_id(), "plugin.synced");
 
         clear_registered_providers_for_tests();
     }
