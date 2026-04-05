@@ -259,6 +259,11 @@ jobs:
           cp llama.cpp/build/bin/llama-server ci-artifacts/macos-binaries/
           cp llama.cpp/build/bin/llama-moe-split ci-artifacts/macos-binaries/ 2>/dev/null || true
           cp llama.cpp/build/bin/*.dylib ci-artifacts/macos-binaries/ 2>/dev/null || true
+          shopt -s nullglob
+          metallibs=(target/release/build/mlx-sys-*/out/build/lib/mlx.metallib)
+          if [ "${#metallibs[@]}" -gt 0 ]; then
+            cp "${metallibs[0]}" ci-artifacts/macos-binaries/mlx.metallib
+          fi
           tar -czf ci-artifacts/macos-binaries.tgz -C ci-artifacts macos-binaries
 
       - name: Upload macOS binaries
@@ -370,6 +375,9 @@ jobs:
           cp macos-binaries/mesh-llm target/release/mesh-llm
           cp macos-binaries/rpc-server llama.cpp/build/bin/rpc-server
           cp macos-binaries/llama-server llama.cpp/build/bin/llama-server
+          if [ -f macos-binaries/mlx.metallib ]; then
+            cp macos-binaries/mlx.metallib target/release/mlx.metallib
+          fi
           if ls macos-binaries/*.dylib >/dev/null 2>&1; then
             cp macos-binaries/*.dylib llama.cpp/build/bin/
           fi
