@@ -325,6 +325,12 @@ jobs:
           - name: qwen3-0.6b
             id: qwen3
             cache_slug: mlx-community--Qwen3-0.6B-bf16
+          - name: qwen2.5-0.5b-bf16-mlx
+            id: qwen25_dense_mlx
+            cache_slug: mlx-community--Qwen2.5-0.5B-Instruct-bf16
+          - name: qwen3-0.6b-4bit-mlx
+            id: qwen3_quantized_mlx
+            cache_slug: mlx-community--Qwen3-0.6B-4bit
           - name: qwen3-josie-0.6b
             id: josie
             cache_slug: mlx-community--JOSIE-IT1-Qwen3-0.6B-4bit

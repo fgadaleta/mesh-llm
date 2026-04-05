@@ -1839,7 +1839,7 @@ pub struct MlxModel {
 }
 
 impl MlxModel {
-    /// Load a quantized MLX model from a directory containing config.json,
+    /// Load an MLX model from a directory containing config.json,
     /// tokenizer.json, and model.safetensors.
     pub fn load(dir: &Path) -> Result<Self> {
         tracing::info!("MLX: loading model directory {}", dir.display());
@@ -1853,22 +1853,33 @@ impl MlxModel {
             serde_json::from_value(effective_config_json).context("parsing config.json")?;
         let arch = model_architecture(&config_json);
 
-        let qcfg = config
-            .quantization
-            .as_ref()
-            .context("expected quantized model (quantization field in config.json)")?;
-        let group_size = qcfg.group_size;
-        let bits = qcfg.bits;
+        let quantized = config.quantization.as_ref();
+        let default_group_size = quantized.map(|q| q.group_size).unwrap_or(0);
+        let default_bits = quantized.map(|q| q.bits).unwrap_or(0);
 
-        tracing::info!(
-            "MLX: loading {} layers, hidden={}, heads={}/{}, quant={}bit/g{}",
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            bits,
-            group_size,
-        );
+        if let Some(qcfg) = quantized {
+            tracing::info!(
+                "MLX: loading {} layers, hidden={}, heads={}/{}, quant={}bit/g{}",
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                qcfg.bits,
+                qcfg.group_size,
+            );
+        } else {
+            tracing::info!(
+                "MLX: loading {} layers, hidden={}, heads={}/{}, dense_dtype={:?}",
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config_json
+                    .get("torch_dtype")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
+            );
+        }
 
         let start = std::time::Instant::now();
         let mut tensors = load_all_safetensors(dir)?;
@@ -1884,39 +1895,58 @@ impl MlxModel {
                 &prefixes,
                 &config,
                 &config_json,
-                group_size,
-                bits,
+                default_group_size,
+                default_bits,
             )?;
         }
 
         let load_qlinear = |prefix: &str| -> Result<QuantizedLinear> {
-            let (group_size, bits) = quant_params_for(&config_json, prefix, group_size, bits);
             let weight = tensors
                 .get(&format!("{prefix}.weight"))
                 .cloned()
                 .with_context(|| format!("missing {prefix}.weight"))?;
+            let bias = tensors.get(&format!("{prefix}.bias")).cloned();
+            let dense_weight_t = if quantized.is_none() {
+                Some(weight.transpose_axes(&[1, 0])?)
+            } else {
+                let (group_size, bits) =
+                    quant_params_for(&config_json, prefix, default_group_size, default_bits);
+                let scales = tensors
+                    .get(&format!("{prefix}.scales"))
+                    .cloned()
+                    .with_context(|| format!("missing {prefix}.scales"))?;
+                let biases = tensors
+                    .get(&format!("{prefix}.biases"))
+                    .cloned()
+                    .with_context(|| format!("missing {prefix}.biases"))?;
+                // Some Gemma4 MLX checkpoints use 5-bit weights for a subset of MLP
+                // blocks, and current Metal qmm kernels are missing for that shape.
+                if bits == 5 {
+                    Some(cpu_dense_weight_t(
+                        &weight, &scales, &biases, group_size, bits,
+                    )?)
+                } else {
+                    None
+                }
+            };
+            let (group_size, bits) = if quantized.is_some() {
+                quant_params_for(&config_json, prefix, default_group_size, default_bits)
+            } else {
+                (0, 0)
+            };
             let scales = tensors
                 .get(&format!("{prefix}.scales"))
                 .cloned()
-                .with_context(|| format!("missing {prefix}.scales"))?;
+                .unwrap_or_else(|| array!(0.0f32));
             let biases = tensors
                 .get(&format!("{prefix}.biases"))
                 .cloned()
-                .with_context(|| format!("missing {prefix}.biases"))?;
-            // Some Gemma4 MLX checkpoints use 5-bit weights for a subset of MLP
-            // blocks, and current Metal qmm kernels are missing for that shape.
-            let dense_weight_t = if bits == 5 {
-                Some(cpu_dense_weight_t(
-                    &weight, &scales, &biases, group_size, bits,
-                )?)
-            } else {
-                None
-            };
+                .unwrap_or_else(|| array!(0.0f32));
             Ok(QuantizedLinear {
                 weight,
                 scales,
                 biases,
-                bias: tensors.get(&format!("{prefix}.bias")).cloned(),
+                bias,
                 group_size,
                 bits,
                 dense_weight_t,
@@ -1924,7 +1954,8 @@ impl MlxModel {
         };
 
         let load_multi_linear = |prefix: &str| -> Result<QuantizedMultiLinear> {
-            let (group_size, bits) = quant_params_for(&config_json, prefix, group_size, bits);
+            let (group_size, bits) =
+                quant_params_for(&config_json, prefix, default_group_size, default_bits);
             Ok(QuantizedMultiLinear {
                 weight: tensors
                     .get(&format!("{prefix}.weight"))
@@ -1944,7 +1975,8 @@ impl MlxModel {
         };
 
         let load_switch_linear = |prefix: &str| -> Result<QuantizedSwitchLinear> {
-            let (group_size, bits) = quant_params_for(&config_json, prefix, group_size, bits);
+            let (group_size, bits) =
+                quant_params_for(&config_json, prefix, default_group_size, default_bits);
             Ok(QuantizedSwitchLinear {
                 weight: tensors
                     .get(&format!("{prefix}.weight"))
@@ -1979,8 +2011,8 @@ impl MlxModel {
         let (embed_group_size, embed_bits) = quant_params_for(
             &config_json,
             &format!("{}.embed_tokens", prefixes.model),
-            group_size,
-            bits,
+            default_group_size,
+            default_bits,
         );
         let embed_weight = tensors
             .get(&format!("{}.embed_tokens.weight", prefixes.model))
@@ -1989,13 +2021,17 @@ impl MlxModel {
         let embed_scales = tensors
             .get(&format!("{}.embed_tokens.scales", prefixes.model))
             .cloned()
-            .with_context(|| format!("missing {}.embed_tokens.scales", prefixes.model))?;
+            .unwrap_or_else(|| array!(0.0f32));
         let embed_biases = tensors
             .get(&format!("{}.embed_tokens.biases", prefixes.model))
             .cloned()
-            .with_context(|| format!("missing {}.embed_tokens.biases", prefixes.model))?;
-        let embed_dense_weight = None;
-        let embed_dense_weight_t = None;
+            .unwrap_or_else(|| array!(0.0f32));
+        let embed_dense_weight = quantized.is_none().then(|| embed_weight.clone());
+        let embed_dense_weight_t = if quantized.is_none() {
+            Some(embed_weight.transpose_axes(&[1, 0])?)
+        } else {
+            None
+        };
         let embed_tokens = QuantizedEmbedding {
             weight: embed_weight,
             scales: embed_scales,
@@ -2014,8 +2050,8 @@ impl MlxModel {
             let (group_size, bits) = quant_params_for(
                 &config_json,
                 &format!("{}.embed_tokens_per_layer", prefixes.model),
-                group_size,
-                bits,
+                default_group_size,
+                default_bits,
             );
             Some(QuantizedEmbedding {
                 weight: tensors
@@ -2027,19 +2063,24 @@ impl MlxModel {
                 scales: tensors
                     .get(&format!("{}.embed_tokens_per_layer.scales", prefixes.model))
                     .cloned()
-                    .with_context(|| {
-                        format!("missing {}.embed_tokens_per_layer.scales", prefixes.model)
-                    })?,
+                    .unwrap_or_else(|| array!(0.0f32)),
                 biases: tensors
                     .get(&format!("{}.embed_tokens_per_layer.biases", prefixes.model))
                     .cloned()
-                    .with_context(|| {
-                        format!("missing {}.embed_tokens_per_layer.biases", prefixes.model)
-                    })?,
+                    .unwrap_or_else(|| array!(0.0f32)),
                 group_size,
                 bits,
-                dense_weight: None,
-                dense_weight_t: None,
+                dense_weight: quantized.is_none().then(|| {
+                    tensors[&format!("{}.embed_tokens_per_layer.weight", prefixes.model)].clone()
+                }),
+                dense_weight_t: if quantized.is_none() {
+                    Some(
+                        tensors[&format!("{}.embed_tokens_per_layer.weight", prefixes.model)]
+                            .transpose_axes(&[1, 0])?,
+                    )
+                } else {
+                    None
+                },
             })
         } else {
             None
@@ -4160,5 +4201,45 @@ mod tests {
             ),
             (64, 4)
         );
+    }
+
+    #[test]
+    fn dense_model_config_is_allowed_without_quantization_block() {
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": 1024,
+            "num_hidden_layers": 28,
+            "intermediate_size": 3072,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 64,
+            "vocab_size": 151936,
+            "rms_norm_eps": 0.000001,
+            "max_position_embeddings": 40960,
+            "tie_word_embeddings": true,
+            "eos_token_id": 151645
+        }))
+        .unwrap();
+
+        assert!(config.quantization.is_none());
+        assert!(config.tie_word_embeddings);
+    }
+
+    #[test]
+    fn dense_embeddings_can_project_logits_through_as_linear() {
+        let weight = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
+        let embedding = QuantizedEmbedding {
+            weight: weight.clone(),
+            scales: array!(0.0f32),
+            biases: array!(0.0f32),
+            group_size: 0,
+            bits: 0,
+            dense_weight: Some(weight.clone()),
+            dense_weight_t: Some(weight.transpose_axes(&[1, 0]).unwrap()),
+        };
+        let hidden = Array::from_slice(&[10.0f32, 20.0], &[1, 1, 2]);
+
+        let logits = embedding.as_linear().forward(&hidden).unwrap();
+
+        assert_eq!(logits.as_slice::<f32>(), &[50.0, 110.0, 170.0]);
     }
 }

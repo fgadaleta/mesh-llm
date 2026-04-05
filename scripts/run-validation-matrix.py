@@ -481,13 +481,16 @@ def planned_cases(models: list[dict[str, Any]], backend_filter: str, suite: str)
             for model in models:
                 if backend not in requested_backends(model, backend_filter):
                     continue
+                case_id = model[backend].get("exact_case_id")
+                if not case_id:
+                    continue
                 cases.append(
                     {
                         "suite": "exact",
                         "backend": backend,
                         "model_id": model["id"],
                         "label": model["label"],
-                        "case_id": model[backend]["exact_case_id"],
+                        "case_id": case_id,
                     }
                 )
     if suite in ("behavior", "all"):
@@ -495,13 +498,16 @@ def planned_cases(models: list[dict[str, Any]], backend_filter: str, suite: str)
             for model in models:
                 if backend not in requested_backends(model, backend_filter):
                     continue
+                case_id = model[backend].get("behavior_case_id")
+                if not case_id:
+                    continue
                 cases.append(
                     {
                         "suite": "behavior",
                         "backend": backend,
                         "model_id": model["id"],
                         "label": model["label"],
-                        "case_id": model[backend]["behavior_case_id"],
+                        "case_id": case_id,
                     }
                 )
     return cases

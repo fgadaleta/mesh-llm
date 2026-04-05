@@ -111,6 +111,28 @@
       }
     },
     {
+      "id": "qwen25_dense_mlx",
+      "label": "qwen2.5-0.5b-bf16-mlx",
+      "expectation_class": "strict",
+      "notes": "MLX-only dense loader smoke for small tied-embedding Qwen2.5 checkpoints.",
+      "mlx": {
+        "exact_case_id": "qwen25-dense-mlx-exact",
+        "model_ref": "mlx-community/Qwen2.5-0.5B-Instruct-bf16",
+        "template_source": "tokenizer_config.json"
+      }
+    },
+    {
+      "id": "qwen3_quantized_mlx",
+      "label": "qwen3-0.6b-4bit-mlx",
+      "expectation_class": "strict",
+      "notes": "MLX-only quantized control smoke so dense-loader fixes do not regress the working quantized path.",
+      "mlx": {
+        "exact_case_id": "qwen3-quantized-mlx-exact",
+        "model_ref": "mlx-community/Qwen3-0.6B-4bit",
+        "template_source": "tokenizer_config.json"
+      }
+    },
+    {
       "id": "josie",
       "label": "qwen3-josie-0.6b",
       "expectation_class": "weak-but-stable",
