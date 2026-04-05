@@ -261,10 +261,37 @@ impl InferenceWorkerRequest {
 
 type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
-pub trait MoeRankingProvider: Send + Sync {
-    fn detect_moe(&self, model_path: &Path) -> Option<crate::models::gguf::GgufMoeInfo>;
+#[derive(Clone, Debug)]
+pub struct MoeDetectionRequest {
+    pub model_path: PathBuf,
+}
 
-    fn load_cached_ranking(&self, model_path: &Path) -> Option<Vec<u32>>;
+impl MoeDetectionRequest {
+    pub fn new(model_path: impl Into<PathBuf>) -> Self {
+        Self {
+            model_path: model_path.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedRankingRequest {
+    pub model_path: PathBuf,
+}
+
+impl CachedRankingRequest {
+    pub fn new(model_path: impl Into<PathBuf>) -> Self {
+        Self {
+            model_path: model_path.into(),
+        }
+    }
+}
+
+pub trait MoeRankingProvider: Send + Sync {
+    fn detect_moe(&self, request: &MoeDetectionRequest)
+        -> Option<crate::models::gguf::GgufMoeInfo>;
+
+    fn load_cached_ranking(&self, request: &CachedRankingRequest) -> Option<Vec<u32>>;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -607,12 +634,15 @@ pub struct BuiltinLlamaProvider;
 pub struct BuiltinLlamaMoeRankingProvider;
 
 impl MoeRankingProvider for BuiltinLlamaMoeRankingProvider {
-    fn detect_moe(&self, model_path: &Path) -> Option<crate::models::gguf::GgufMoeInfo> {
-        crate::models::gguf::detect_moe(model_path)
+    fn detect_moe(
+        &self,
+        request: &MoeDetectionRequest,
+    ) -> Option<crate::models::gguf::GgufMoeInfo> {
+        crate::models::gguf::detect_moe(&request.model_path)
     }
 
-    fn load_cached_ranking(&self, model_path: &Path) -> Option<Vec<u32>> {
-        let ranking_path = crate::inference::moe::ranking_cache_path(model_path);
+    fn load_cached_ranking(&self, request: &CachedRankingRequest) -> Option<Vec<u32>> {
+        let ranking_path = crate::inference::moe::ranking_cache_path(&request.model_path);
         crate::inference::moe::load_cached_ranking(&ranking_path)
     }
 }
@@ -1098,7 +1128,9 @@ pub fn detect_moe_for_model(
     preferred_provider_id: Option<&str>,
 ) -> Option<crate::models::gguf::GgufMoeInfo> {
     let selection = select_moe_ranking_provider(model_path, preferred_provider_id)?;
-    selection.ranking_provider().detect_moe(model_path)
+    selection
+        .ranking_provider()
+        .detect_moe(&MoeDetectionRequest::new(model_path))
 }
 
 pub fn load_cached_moe_ranking_for_model(
@@ -1106,7 +1138,9 @@ pub fn load_cached_moe_ranking_for_model(
     preferred_provider_id: Option<&str>,
 ) -> Option<Vec<u32>> {
     let selection = select_moe_ranking_provider(model_path, preferred_provider_id)?;
-    selection.ranking_provider().load_cached_ranking(model_path)
+    selection
+        .ranking_provider()
+        .load_cached_ranking(&CachedRankingRequest::new(model_path))
 }
 
 /// Start a distributed-host endpoint through the selected inference provider.
@@ -1362,11 +1396,14 @@ mod tests {
     }
 
     impl MoeRankingProvider for TestRankingProvider {
-        fn detect_moe(&self, _model_path: &Path) -> Option<crate::models::gguf::GgufMoeInfo> {
+        fn detect_moe(
+            &self,
+            _request: &MoeDetectionRequest,
+        ) -> Option<crate::models::gguf::GgufMoeInfo> {
             None
         }
 
-        fn load_cached_ranking(&self, _model_path: &Path) -> Option<Vec<u32>> {
+        fn load_cached_ranking(&self, _request: &CachedRankingRequest) -> Option<Vec<u32>> {
             Some(vec![9, 4, 1])
         }
     }
