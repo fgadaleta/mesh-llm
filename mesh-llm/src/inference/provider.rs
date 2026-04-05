@@ -1255,11 +1255,11 @@ const fn always_match_worker_runtime(_request: &InferenceWorkerRequest) -> bool 
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Debug)]
 pub struct PluginInferenceProviderRegistration {
     provider_id: String,
     backend_label: String,
     capabilities: InferenceProviderCapabilities,
+    moe_ranking_provider: Option<Arc<dyn MoeRankingProvider>>,
 }
 
 impl PluginInferenceProviderRegistration {
@@ -1273,7 +1273,17 @@ impl PluginInferenceProviderRegistration {
             provider_id: provider_id.into(),
             backend_label: backend_label.into(),
             capabilities,
+            moe_ranking_provider: None,
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_moe_ranking_provider(
+        mut self,
+        moe_ranking_provider: Arc<dyn MoeRankingProvider>,
+    ) -> Self {
+        self.moe_ranking_provider = Some(moe_ranking_provider);
+        self
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1281,13 +1291,24 @@ impl PluginInferenceProviderRegistration {
         self,
         provider: Arc<dyn InferenceProvider>,
     ) -> InferenceProviderDescriptor {
-        InferenceProviderDescriptor::new(
+        let selection = if let Some(moe_ranking_provider) = self.moe_ranking_provider {
             InferenceProviderSelection::new(
                 self.provider_id,
                 self.backend_label,
                 self.capabilities,
                 provider,
-            ),
+            )
+            .with_moe_ranking_provider(moe_ranking_provider)
+        } else {
+            InferenceProviderSelection::new(
+                self.provider_id,
+                self.backend_label,
+                self.capabilities,
+                provider,
+            )
+        };
+        InferenceProviderDescriptor::new(
+            selection,
             never_match_local_endpoint,
             never_match_distributed_endpoint,
             never_match_worker_runtime,
@@ -1755,6 +1776,9 @@ mod tests {
     #[derive(Clone, Copy, Debug, Default)]
     struct TestLocalProvider;
 
+    #[derive(Clone, Copy, Debug, Default)]
+    struct TestRankingProvider;
+
     impl InferenceProvider for TestLocalProvider {
         fn start_endpoint<'a>(
             &'a self,
@@ -1776,6 +1800,61 @@ mod tests {
 
         fn prepare_moe_shard(&self, _request: &MoeShardPreparationRequest) -> Result<()> {
             unreachable!("test provider prepare_moe_shard should not run")
+        }
+    }
+
+    impl MoeRankingProvider for TestRankingProvider {
+        fn detect_moe(
+            &self,
+            _request: &MoeDetectionRequest,
+        ) -> Option<crate::models::gguf::GgufMoeInfo> {
+            None
+        }
+
+        fn load_cached_ranking(&self, _request: &CachedRankingRequest) -> Option<Vec<u32>> {
+            Some(vec![9, 4, 1])
+        }
+
+        fn best_shared_ranking_artifact(
+            &self,
+            _request: &SharedRankingArtifactLookupRequest,
+        ) -> Option<crate::inference::moe::SharedRankingArtifact> {
+            Some(crate::inference::moe::SharedRankingArtifact {
+                kind: crate::inference::moe::SharedRankingKind::Analyze,
+                origin: crate::inference::moe::SharedRankingOrigin::PeerImport,
+                ranking: vec![9, 4, 1],
+                micro_prompt_count: None,
+                micro_tokens: None,
+                micro_layer_scope: None,
+            })
+        }
+
+        fn import_shared_ranking_artifact(
+            &self,
+            _request: &SharedRankingArtifactImportRequest,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn ensure_full_analyze_ranking(
+            &self,
+            _request: &FullAnalyzeRankingRequest,
+        ) -> Result<crate::inference::moe::SharedRankingArtifact> {
+            unreachable!("test ranking provider full analyze should not run")
+        }
+
+        fn ensure_micro_analyze_ranking(
+            &self,
+            _request: &MicroAnalyzeRankingRequest,
+        ) -> Result<crate::inference::moe::SharedRankingArtifact> {
+            unreachable!("test ranking provider micro analyze should not run")
+        }
+
+        fn resolve_heuristic_ranking(
+            &self,
+            _request: &HeuristicRankingRequest,
+        ) -> Result<(Vec<u32>, String, String)> {
+            unreachable!("test ranking provider heuristic resolve should not run")
         }
     }
 
@@ -1955,6 +2034,50 @@ mod tests {
         let selection =
             select_moe_ranking_provider(Path::new("/tmp/model.gguf"), Some("plugin.notes"));
         assert!(selection.is_none());
+
+        clear_registered_providers_for_tests();
+    }
+
+    #[test]
+    fn plugin_registration_can_attach_moe_ranking_provider() {
+        let _guard = provider_registry_test_lock()
+            .lock()
+            .expect("provider registry test lock poisoned");
+        clear_registered_providers_for_tests();
+        register_plugin_provider(
+            PluginInferenceProviderRegistration::new(
+                "plugin.ranker",
+                "plugin-ranker",
+                InferenceProviderCapabilities {
+                    supports_local_runtime: true,
+                    supports_distributed_host_runtime: false,
+                    requires_worker_runtime: false,
+                    supports_moe_shard_runtime: false,
+                },
+            )
+            .with_moe_ranking_provider(Arc::new(TestRankingProvider)),
+            Arc::new(TestLocalProvider),
+        );
+
+        let selection =
+            select_moe_ranking_provider(Path::new("/tmp/model.gguf"), Some("plugin.ranker"))
+                .expect("plugin ranking provider");
+        assert_eq!(selection.provider_id(), "plugin.ranker");
+        assert_eq!(
+            load_cached_moe_ranking_for_model(Path::new("/tmp/model.gguf"), Some("plugin.ranker")),
+            Some(vec![9, 4, 1])
+        );
+
+        let artifact = best_shared_moe_ranking_artifact_for_model(
+            Path::new("/tmp/model.gguf"),
+            Some("plugin.ranker"),
+        )
+        .expect("shared artifact");
+        assert_eq!(artifact.ranking, vec![9, 4, 1]);
+        assert_eq!(
+            artifact.origin,
+            crate::inference::moe::SharedRankingOrigin::PeerImport
+        );
 
         clear_registered_providers_for_tests();
     }
