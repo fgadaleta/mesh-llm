@@ -16,6 +16,20 @@ pub(crate) fn matches_mlx_model_dir(_request: &InferenceEndpointRequest) -> bool
     false
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn matches_mlx_worker_runtime(request: &InferenceWorkerRequest) -> bool {
+    request
+        .model_path
+        .as_deref()
+        .map(crate::mlx::is_mlx_model_dir)
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn matches_mlx_worker_runtime(_request: &InferenceWorkerRequest) -> bool {
+    false
+}
+
 /// Backend-neutral runtime handle for a serving instance.
 ///
 /// This sits above any concrete backend implementation:
@@ -577,6 +591,21 @@ impl PluginInferenceProviderRegistration {
         provider: Arc<dyn InferenceProvider>,
         matches_local_endpoint: fn(&InferenceEndpointRequest) -> bool,
     ) -> InferenceProviderDescriptor {
+        self.into_descriptor_with_runtime_matchers(
+            provider,
+            matches_local_endpoint,
+            never_match_distributed_endpoint,
+            never_match_worker_runtime,
+        )
+    }
+
+    pub fn into_descriptor_with_runtime_matchers(
+        self,
+        provider: Arc<dyn InferenceProvider>,
+        matches_local_endpoint: fn(&InferenceEndpointRequest) -> bool,
+        matches_distributed_endpoint: fn(&InferenceEndpointRequest) -> bool,
+        matches_worker_runtime: fn(&InferenceWorkerRequest) -> bool,
+    ) -> InferenceProviderDescriptor {
         InferenceProviderDescriptor::new(
             InferenceProviderSelection::new(
                 self.provider_id,
@@ -585,8 +614,8 @@ impl PluginInferenceProviderRegistration {
                 provider,
             ),
             matches_local_endpoint,
-            never_match_distributed_endpoint,
-            never_match_worker_runtime,
+            matches_distributed_endpoint,
+            matches_worker_runtime,
         )
     }
 }
@@ -1297,12 +1326,17 @@ mod tests {
                 "mlx",
                 InferenceProviderCapabilities {
                     supports_local_runtime: true,
-                    supports_distributed_host_runtime: false,
-                    requires_worker_runtime: false,
+                    supports_distributed_host_runtime: true,
+                    requires_worker_runtime: true,
                     supports_moe_shard_runtime: false,
                 },
             )
-            .into_descriptor_with_local_match(Arc::new(TestLocalProvider), matches_mlx_model_dir),
+            .into_descriptor_with_runtime_matchers(
+                Arc::new(TestLocalProvider),
+                matches_mlx_model_dir,
+                matches_mlx_model_dir,
+                matches_mlx_worker_runtime,
+            ),
         );
 
         let request = InferenceEndpointRequest::local(&root, 8080, 1, 1);
@@ -1310,6 +1344,15 @@ mod tests {
 
         assert_eq!(selection.provider_id(), "plugin.mlx.local-mlx");
         assert_eq!(selection.backend_label(), "mlx");
+
+        let distributed = select_distributed_endpoint_provider(
+            &InferenceEndpointRequest::distributed_host(&root, 8123, vec![7001], 1, 1),
+        );
+        assert_eq!(distributed.provider_id(), "plugin.mlx.local-mlx");
+
+        let worker =
+            select_worker_provider(&InferenceWorkerRequest::default().with_model_path(Some(&root)));
+        assert_eq!(worker.provider_id(), "plugin.mlx.local-mlx");
 
         clear_registered_providers_for_tests();
         let _ = std::fs::remove_dir_all(&root);
