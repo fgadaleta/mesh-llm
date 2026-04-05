@@ -390,7 +390,7 @@ fn descriptor_from_identity(
     let catalog = crate::models::find_catalog_model_exact(model_name);
     let mut topology = crate::models::infer_local_model_topology(&path, catalog);
     if topology.is_none() {
-        if let Some(info) = moe::detect_moe(&path) {
+        if let Some(info) = provider::detect_moe_for_model(&path, None) {
             topology = Some(crate::models::ModelTopology {
                 moe: Some(crate::models::ModelMoeInfo {
                     expert_count: info.expert_count,
