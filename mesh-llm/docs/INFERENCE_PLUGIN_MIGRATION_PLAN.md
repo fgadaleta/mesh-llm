@@ -160,10 +160,10 @@ Move toward provider ownership for:
 
 The next concrete tasks are:
 
-1. Add a built-in MLX provider adapter on the same endpoint-provider contract.
-2. Start separating distributed worker launch from llama-specific orchestration details.
-3. Begin threading plugin-registered inference providers into the registry seam.
-4. Mirror neutral contract refactors onto the sync branches as they land.
+1. Mirror the newest shared contract work onto the sync branches without dragging along plugin-host assumptions they do not carry yet.
+2. Start replacing built-in backend wiring with plugin-managed provider registrations where the branch is ready, beginning with MLX.
+3. Continue splitting MoE ranking generation from host policy on the MoE sync branch.
+4. Keep the provider registry and plugin-managed endpoint seam aligned with the pure plugin model on `codex/plugin-manifest-proto-slice`.
 
 ## Current Status
 
@@ -183,6 +183,12 @@ The following no-behavior-change groundwork is already in place on this branch:
 - the provider contract now advertises explicit capabilities so orchestration can ask what a backend supports instead of inferring it indirectly
 - worker-runtime startup is now gated by provider capabilities instead of being assumed unconditionally in the shared runtime path
 - MoE GGUF detection and cached-ranking lookup now route through a backend-facing `MoeRankingProvider` on the provider seam, so ranking generation can move out of core without rewriting election policy
+- plugin-managed inference endpoints can now be surfaced from plugin manifests and synced into the provider registry as managed provider descriptors
+- plugin-managed endpoint launch now goes through a real host/plugin handshake (`inference/ensure_endpoint`) instead of stopping at registration-only descriptors
+- plugin-managed worker launch now goes through a matching host/plugin handshake (`inference/ensure_worker`)
+- plugin-managed MoE shard preparation now has a host/plugin handshake (`inference/prepare_moe_shard`) and the provider contract uses it instead of calling split logic directly
+- managed provider manifests can now declare selection metadata and provider capabilities, so host registration no longer hard-codes those properties
+- managed-provider model-path matchers now apply across local runtime, distributed-host runtime, and worker-runtime selection, not just local runtime
 
 ## Sync Branches
 
