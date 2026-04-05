@@ -181,7 +181,7 @@ The following no-behavior-change groundwork is already in place on this branch:
 - the shared inference layer now has a host-side plugin registration adapter that turns a plugin-style inference registration into a preferred-only provider descriptor
 - the provider contract now advertises explicit capabilities so orchestration can ask what a backend supports instead of inferring it indirectly
 - worker-runtime startup is now gated by provider capabilities instead of being assumed unconditionally in the shared runtime path
-- MoE GGUF detection and cached-ranking lookup now route through a backend-facing `MoeRankingProvider` on the provider seam, so ranking generation can move out of core without rewriting election policy
+- MoE GGUF detection, cached-ranking lookup, shared-artifact lookup/import, and ranking generation now route through a backend-facing `MoeRankingProvider` on the provider seam, so ranking generation can move out of core without rewriting election policy
 - on the MoE sync branch, full-analyze and micro-analyze ranking generation now also route through the builtin ranking provider, so `election.rs` keeps only ranking policy and plan selection
 - on the MoE sync branch, heuristic ranking and shard preparation now also route through the provider seam, so backend-specific MoE tooling keeps shrinking inside `election.rs`
 - plugin-managed inference endpoints can now be surfaced from plugin manifests and synced into the provider registry as managed provider descriptors
@@ -191,6 +191,7 @@ The following no-behavior-change groundwork is already in place on this branch:
 - managed provider manifests can now declare selection metadata and provider capabilities, so host registration no longer hard-codes those properties
 - managed-provider model-path matchers now apply across local runtime, distributed-host runtime, and worker-runtime selection, not just local runtime
 - MoE ranking operations now use provider-owned request shapes instead of loose parameter lists, which gives the future plugin transport a clean contract for full-analyze, micro-analyze, and heuristic ranking work
+- the remaining backend-facing MoE actions now also use provider-owned request shapes instead of raw path/artifact arguments, so the provider contract is now uniform across detection, cache lookup, shared-artifact import, and ranking generation
 - built-in llama ranking behavior now delegates to reusable backend-specific helper functions, so a future llama plugin can reuse the same GGUF/analyze implementation instead of copying logic out of the provider trait impl
 
 ## Sync Branches

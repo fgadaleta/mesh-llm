@@ -282,20 +282,77 @@ impl HeuristicRankingRequest {
     }
 }
 
-pub trait MoeRankingProvider: Send + Sync {
-    fn detect_moe(&self, model_path: &Path) -> Option<crate::models::gguf::GgufMoeInfo>;
+#[derive(Clone, Debug)]
+pub struct MoeDetectionRequest {
+    pub model_path: PathBuf,
+}
 
-    fn load_cached_ranking(&self, model_path: &Path) -> Option<Vec<u32>>;
+impl MoeDetectionRequest {
+    pub fn new(model_path: impl Into<PathBuf>) -> Self {
+        Self {
+            model_path: model_path.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedRankingRequest {
+    pub model_path: PathBuf,
+}
+
+impl CachedRankingRequest {
+    pub fn new(model_path: impl Into<PathBuf>) -> Self {
+        Self {
+            model_path: model_path.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedRankingArtifactLookupRequest {
+    pub model_path: PathBuf,
+}
+
+impl SharedRankingArtifactLookupRequest {
+    pub fn new(model_path: impl Into<PathBuf>) -> Self {
+        Self {
+            model_path: model_path.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedRankingArtifactImportRequest {
+    pub model_path: PathBuf,
+    pub artifact: crate::inference::moe::SharedRankingArtifact,
+}
+
+impl SharedRankingArtifactImportRequest {
+    pub fn new(
+        model_path: impl Into<PathBuf>,
+        artifact: crate::inference::moe::SharedRankingArtifact,
+    ) -> Self {
+        Self {
+            model_path: model_path.into(),
+            artifact,
+        }
+    }
+}
+
+pub trait MoeRankingProvider: Send + Sync {
+    fn detect_moe(&self, request: &MoeDetectionRequest)
+        -> Option<crate::models::gguf::GgufMoeInfo>;
+
+    fn load_cached_ranking(&self, request: &CachedRankingRequest) -> Option<Vec<u32>>;
 
     fn best_shared_ranking_artifact(
         &self,
-        model_path: &Path,
+        request: &SharedRankingArtifactLookupRequest,
     ) -> Option<crate::inference::moe::SharedRankingArtifact>;
 
     fn import_shared_ranking_artifact(
         &self,
-        model_path: &Path,
-        artifact: &crate::inference::moe::SharedRankingArtifact,
+        request: &SharedRankingArtifactImportRequest,
     ) -> Result<bool>;
 
     fn ensure_full_analyze_ranking(
@@ -578,27 +635,29 @@ pub struct BuiltinLlamaProvider;
 pub struct BuiltinLlamaMoeRankingProvider;
 
 impl MoeRankingProvider for BuiltinLlamaMoeRankingProvider {
-    fn detect_moe(&self, model_path: &Path) -> Option<crate::models::gguf::GgufMoeInfo> {
-        builtin_llama_detect_moe(model_path)
+    fn detect_moe(
+        &self,
+        request: &MoeDetectionRequest,
+    ) -> Option<crate::models::gguf::GgufMoeInfo> {
+        builtin_llama_detect_moe(request)
     }
 
-    fn load_cached_ranking(&self, model_path: &Path) -> Option<Vec<u32>> {
-        builtin_llama_load_cached_ranking(model_path)
+    fn load_cached_ranking(&self, request: &CachedRankingRequest) -> Option<Vec<u32>> {
+        builtin_llama_load_cached_ranking(request)
     }
 
     fn best_shared_ranking_artifact(
         &self,
-        model_path: &Path,
+        request: &SharedRankingArtifactLookupRequest,
     ) -> Option<crate::inference::moe::SharedRankingArtifact> {
-        builtin_llama_best_shared_ranking_artifact(model_path)
+        builtin_llama_best_shared_ranking_artifact(request)
     }
 
     fn import_shared_ranking_artifact(
         &self,
-        model_path: &Path,
-        artifact: &crate::inference::moe::SharedRankingArtifact,
+        request: &SharedRankingArtifactImportRequest,
     ) -> Result<bool> {
-        builtin_llama_import_shared_ranking_artifact(model_path, artifact)
+        builtin_llama_import_shared_ranking_artifact(request)
     }
 
     fn ensure_full_analyze_ranking(
@@ -623,26 +682,27 @@ impl MoeRankingProvider for BuiltinLlamaMoeRankingProvider {
     }
 }
 
-fn builtin_llama_detect_moe(model_path: &Path) -> Option<crate::models::gguf::GgufMoeInfo> {
-    crate::models::gguf::detect_moe(model_path)
+fn builtin_llama_detect_moe(
+    request: &MoeDetectionRequest,
+) -> Option<crate::models::gguf::GgufMoeInfo> {
+    crate::models::gguf::detect_moe(&request.model_path)
 }
 
-fn builtin_llama_load_cached_ranking(model_path: &Path) -> Option<Vec<u32>> {
-    let ranking_path = crate::inference::moe::ranking_cache_path(model_path);
+fn builtin_llama_load_cached_ranking(request: &CachedRankingRequest) -> Option<Vec<u32>> {
+    let ranking_path = crate::inference::moe::ranking_cache_path(&request.model_path);
     crate::inference::moe::load_cached_ranking(&ranking_path)
 }
 
 fn builtin_llama_best_shared_ranking_artifact(
-    model_path: &Path,
+    request: &SharedRankingArtifactLookupRequest,
 ) -> Option<crate::inference::moe::SharedRankingArtifact> {
-    crate::inference::moe::best_shared_ranking_artifact(model_path)
+    crate::inference::moe::best_shared_ranking_artifact(&request.model_path)
 }
 
 fn builtin_llama_import_shared_ranking_artifact(
-    model_path: &Path,
-    artifact: &crate::inference::moe::SharedRankingArtifact,
+    request: &SharedRankingArtifactImportRequest,
 ) -> Result<bool> {
-    crate::inference::moe::cache_shared_ranking_if_stronger(model_path, artifact)
+    crate::inference::moe::cache_shared_ranking_if_stronger(&request.model_path, &request.artifact)
 }
 
 fn builtin_llama_ensure_full_analyze_ranking(
@@ -1344,7 +1404,8 @@ pub fn detect_moe_for_model(
     preferred_provider_id: Option<&str>,
 ) -> Option<crate::models::gguf::GgufMoeInfo> {
     let selection = select_moe_ranking_provider(model_path, preferred_provider_id)?;
-    selection.moe_ranking_provider()?.detect_moe(model_path)
+    let request = MoeDetectionRequest::new(model_path);
+    selection.moe_ranking_provider()?.detect_moe(&request)
 }
 
 pub fn load_cached_moe_ranking_for_model(
@@ -1352,9 +1413,10 @@ pub fn load_cached_moe_ranking_for_model(
     preferred_provider_id: Option<&str>,
 ) -> Option<Vec<u32>> {
     let selection = select_moe_ranking_provider(model_path, preferred_provider_id)?;
+    let request = CachedRankingRequest::new(model_path);
     selection
         .moe_ranking_provider()?
-        .load_cached_ranking(model_path)
+        .load_cached_ranking(&request)
 }
 
 pub fn best_shared_moe_ranking_artifact_for_model(
@@ -1364,7 +1426,7 @@ pub fn best_shared_moe_ranking_artifact_for_model(
     let selection = select_moe_ranking_provider(model_path, preferred_provider_id)?;
     selection
         .moe_ranking_provider()?
-        .best_shared_ranking_artifact(model_path)
+        .best_shared_ranking_artifact(&SharedRankingArtifactLookupRequest::new(model_path))
 }
 
 pub fn import_shared_moe_ranking_artifact_for_model(
@@ -1382,7 +1444,10 @@ pub fn import_shared_moe_ranking_artifact_for_model(
     selection
         .moe_ranking_provider()
         .expect("selection should include a MoE ranking provider")
-        .import_shared_ranking_artifact(model_path, artifact)
+        .import_shared_ranking_artifact(&SharedRankingArtifactImportRequest::new(
+            model_path,
+            artifact.clone(),
+        ))
 }
 
 pub fn ensure_full_analyze_ranking_for_model(
