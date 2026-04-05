@@ -560,10 +560,26 @@ impl PluginManager {
         &self,
         plugin_name: &str,
         endpoint_id: &str,
-        model_path: &std::path::Path,
-        requested_port: Option<u16>,
-        ctx_size_override: Option<u32>,
+        request: &crate::inference::provider::InferenceEndpointRequest,
     ) -> Result<mesh_llm_plugin::EnsureInferenceEndpointResponse> {
+        let payload = mesh_llm_plugin::EnsureInferenceEndpointRequest {
+            endpoint_id: endpoint_id.to_string(),
+            model_path: request.model_path.display().to_string(),
+            requested_port: Some(request.listen_port),
+            ctx_size_override: request.ctx_size_override,
+            worker_tunnel_ports: request.worker_tunnel_ports.clone(),
+            tensor_split: request.tensor_split.clone(),
+            draft_model_path: request
+                .draft_model_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            draft_max: Some(request.draft_max),
+            mmproj_path: request
+                .mmproj_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            total_group_vram_bytes: request.total_group_vram_bytes,
+        };
         #[cfg(test)]
         if self.inner.plugins.is_empty() && self.inner.bridged_plugins.contains(plugin_name) {
             let bridge = self
@@ -573,13 +589,7 @@ impl PluginManager {
                 .await
                 .clone()
                 .context("No active test RPC bridge")?;
-            let params_json =
-                serde_json::to_string(&mesh_llm_plugin::EnsureInferenceEndpointRequest {
-                    endpoint_id: endpoint_id.to_string(),
-                    model_path: model_path.display().to_string(),
-                    requested_port,
-                    ctx_size_override,
-                })?;
+            let params_json = serde_json::to_string(&payload)?;
             let result = bridge
                 .handle_request(
                     plugin_name.to_string(),
@@ -608,15 +618,7 @@ impl PluginManager {
             .get(plugin_name)
             .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
         plugin
-            .mcp_request(
-                "inference/ensure_endpoint",
-                mesh_llm_plugin::EnsureInferenceEndpointRequest {
-                    endpoint_id: endpoint_id.to_string(),
-                    model_path: model_path.display().to_string(),
-                    requested_port,
-                    ctx_size_override,
-                },
-            )
+            .mcp_request("inference/ensure_endpoint", payload)
             .await
     }
 
@@ -1645,6 +1647,17 @@ mod tests {
                     "inference/ensure_endpoint" => {
                         let request: mesh_llm_plugin::EnsureInferenceEndpointRequest =
                             serde_json::from_str(&params_json).unwrap();
+                        if !request.worker_tunnel_ports.is_empty() {
+                            assert_eq!(request.worker_tunnel_ports, vec![7001, 7002]);
+                            assert_eq!(request.tensor_split.as_deref(), Some("3,5"));
+                            assert_eq!(
+                                request.draft_model_path.as_deref(),
+                                Some("/tmp/draft.gguf")
+                            );
+                            assert_eq!(request.draft_max, Some(8));
+                            assert_eq!(request.mmproj_path.as_deref(), Some("/tmp/mmproj.gguf"));
+                            assert_eq!(request.total_group_vram_bytes, Some(48_000_000_000));
+                        }
                         Ok(RpcResult {
                             result_json: serde_json::to_string(
                                 &mesh_llm_plugin::EnsureInferenceEndpointResponse {
@@ -2225,6 +2238,40 @@ mod tests {
 
         assert_eq!(process.listen_port, 8123);
         assert_eq!(process.context_length, 32768);
+    }
+
+    #[tokio::test]
+    async fn plugin_managed_provider_forwards_distributed_endpoint_shape_via_plugin_rpc() {
+        let plugin_manager =
+            PluginManager::for_test_bridge(&["mlx"], Arc::new(EnsureEndpointTestBridge));
+        let provider = provider::PluginManagedEndpointProvider::new(
+            "plugin.mlx.local-mlx",
+            "mlx",
+            "local-mlx",
+            plugin_manager,
+        );
+
+        let process = provider
+            .start_endpoint(
+                std::path::Path::new("."),
+                None,
+                &provider::InferenceEndpointRequest::distributed_host(
+                    "/tmp/model.gguf",
+                    8124,
+                    vec![7001, 7002],
+                    1,
+                    1,
+                )
+                .with_tensor_split(Some("3,5"))
+                .with_draft_model_path(Some("/tmp/draft.gguf"))
+                .with_draft_max(8)
+                .with_mmproj_path(Some("/tmp/mmproj.gguf"))
+                .with_total_group_vram_bytes(Some(48_000_000_000)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(process.listen_port, 8124);
     }
 
     #[tokio::test]
