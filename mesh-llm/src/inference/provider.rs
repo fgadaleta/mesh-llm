@@ -50,6 +50,26 @@ pub(crate) fn matches_mlx_worker_runtime(_request: &InferenceWorkerRequest) -> b
     false
 }
 
+fn is_gguf_model_file(model_path: &Path) -> bool {
+    model_path.is_file()
+        && model_path
+            .extension()
+            .map(|ext| ext == "gguf")
+            .unwrap_or(false)
+}
+
+pub(crate) fn matches_gguf_model_file(request: &InferenceEndpointRequest) -> bool {
+    is_gguf_model_file(request.model_path.as_path())
+}
+
+pub(crate) fn matches_gguf_worker_runtime(request: &InferenceWorkerRequest) -> bool {
+    request
+        .model_path
+        .as_deref()
+        .map(is_gguf_model_file)
+        .unwrap_or(false)
+}
+
 /// Backend-neutral runtime handle for a serving instance.
 ///
 /// This sits above any concrete backend implementation:
@@ -1269,6 +1289,56 @@ mod tests {
         assert_eq!(worker.provider_id(), "plugin.mlx.local-mlx");
 
         let _ = std::fs::remove_dir_all(&root);
+        clear_registered_providers_for_tests();
+    }
+
+    #[test]
+    fn gguf_runtime_matchers_select_plugin_provider_across_runtime_types() {
+        let _guard = provider_registry_test_lock()
+            .lock()
+            .expect("provider registry test lock poisoned");
+        clear_registered_providers_for_tests();
+
+        let root = std::env::temp_dir().join(format!(
+            "mesh-llm-provider-gguf-{}.gguf",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&root);
+        std::fs::write(&root, b"gguf").expect("write gguf placeholder");
+
+        register_provider(
+            PluginInferenceProviderRegistration::new(
+                "plugin.llama.local",
+                "llama",
+                InferenceProviderCapabilities {
+                    supports_local_runtime: true,
+                    supports_distributed_host_runtime: true,
+                    requires_worker_runtime: true,
+                    supports_moe_shard_runtime: true,
+                },
+            )
+            .into_descriptor_with_runtime_matchers(
+                Arc::new(TestLocalProvider),
+                matches_gguf_model_file,
+                matches_gguf_model_file,
+                matches_gguf_worker_runtime,
+            ),
+        );
+
+        let local =
+            select_local_endpoint_provider(&InferenceEndpointRequest::local(&root, 8080, 1, 1));
+        assert_eq!(local.provider_id(), "plugin.llama.local");
+
+        let distributed = select_distributed_endpoint_provider(
+            &InferenceEndpointRequest::distributed_host(&root, 8123, vec![7001], 1, 1),
+        );
+        assert_eq!(distributed.provider_id(), "plugin.llama.local");
+
+        let worker =
+            select_worker_provider(&InferenceWorkerRequest::default().with_model_path(Some(&root)));
+        assert_eq!(worker.provider_id(), "plugin.llama.local");
+
+        let _ = std::fs::remove_file(&root);
         clear_registered_providers_for_tests();
     }
 
