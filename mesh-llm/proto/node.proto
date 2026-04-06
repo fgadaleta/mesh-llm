@@ -201,8 +201,14 @@ message NodeConfigSnapshot {
   repeated NodePluginEntry plugins = 4;
 }
 
+enum GpuAssignment {
+  GPU_ASSIGNMENT_UNSPECIFIED = 0;
+  GPU_ASSIGNMENT_AUTO = 1;
+  GPU_ASSIGNMENT_PINNED = 2;
+}
+
 message NodeGpuConfig {
-  string assignment = 1;                   // "auto" or "pinned"
+  GpuAssignment assignment = 1;
 }
 
 message NodeModelEntry {
@@ -232,6 +238,7 @@ message ConfigSnapshotResponse {
   bytes config_hash = 5;                  // SHA-256 of canonical proto bytes (32 bytes)
   NodeConfigSnapshot config = 6;
   optional string hostname = 7;           // convenience: node hostname for display
+  optional string error = 8;             // set when an error occurred; config/hash/node_id may be empty
 }
 
 message ConfigUpdateNotification {

@@ -23,31 +23,69 @@ pub(crate) struct ConfigState {
     config_hash: [u8; 32],
     config: MeshConfig,
     config_path: PathBuf,
+    last_write_hash: [u8; 32],
 }
 
 fn revision_sidecar_path(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("config-revision")
+    let parent = config_path.parent().unwrap_or(Path::new("."));
+    if let Some(file_name) = config_path.file_name() {
+        let mut sidecar_name = std::ffi::OsString::from(file_name);
+        sidecar_name.push(".revision");
+        parent.join(sidecar_name)
+    } else {
+        parent.join("config-revision")
+    }
 }
 
 fn read_revision(sidecar: &Path) -> u64 {
-    std::fs::read_to_string(sidecar)
+    let rev = std::fs::read_to_string(sidecar)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    if rev.is_some() {
+        return rev.unwrap();
+    }
+    let legacy = sidecar
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("config-revision");
+    std::fs::read_to_string(&legacy)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(0)
 }
 
 fn atomic_write(target: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut tmp_name = target.as_os_str().to_os_string();
-    tmp_name.push(".tmp");
-    let tmp = PathBuf::from(tmp_name);
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, target)?;
+    let file_name = target
+        .file_name()
+        .unwrap_or(target.as_os_str())
+        .to_string_lossy();
+    let parent = target.parent().unwrap_or(Path::new("."));
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let tmp = parent.join(format!(".{}.{}.{}.tmp", file_name, pid, nanos));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(windows)]
+    if target.exists() {
+        std::fs::remove_file(target)?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -61,21 +99,28 @@ impl Default for ConfigState {
             config_hash,
             config,
             config_path: std::path::PathBuf::from("config.toml"),
+            last_write_hash: [0xFF; 32],
         }
     }
 }
 
 impl ConfigState {
     pub(crate) fn load(path: &Path) -> Result<Self> {
-        let config = load_config(Some(path)).unwrap_or_default();
+        let config = load_config(Some(path))?;
         let revision = read_revision(&revision_sidecar_path(path));
         let proto = mesh_config_to_proto(&config);
         let config_hash = canonical_config_hash(&proto);
+        let last_write_hash = if path.exists() {
+            config_hash
+        } else {
+            [0xFF; 32]
+        };
         Ok(Self {
             revision,
             config_hash,
             config,
             config_path: path.to_path_buf(),
+            last_write_hash,
         })
     }
 
@@ -105,6 +150,14 @@ impl ConfigState {
         let proto = mesh_config_to_proto(&new_config);
         let new_hash = canonical_config_hash(&proto);
 
+        if new_hash == self.last_write_hash {
+            return ApplyResult::Applied {
+                revision: self.revision,
+                hash: self.config_hash,
+                saved_to_disk: false,
+            };
+        }
+
         let toml_str = match toml::to_string(&new_config) {
             Ok(s) => s,
             Err(e) => return ApplyResult::PersistError(format!("toml serialization failed: {e}")),
@@ -117,11 +170,18 @@ impl ConfigState {
         let new_revision = self.revision + 1;
         let sidecar = revision_sidecar_path(&self.config_path);
         if let Err(e) = atomic_write(&sidecar, new_revision.to_string().as_bytes()) {
-            return ApplyResult::PersistError(format!("failed to write revision sidecar: {e}"));
+            self.config = new_config;
+            self.config_hash = new_hash;
+            self.last_write_hash = new_hash;
+            self.revision = read_revision(&sidecar);
+            return ApplyResult::PersistError(format!(
+                "failed to write revision sidecar: {e}; config persisted but revision tracking may be stale"
+            ));
         }
 
         self.config = new_config;
         self.config_hash = new_hash;
+        self.last_write_hash = new_hash;
         self.revision = new_revision;
 
         ApplyResult::Applied {
@@ -262,12 +322,25 @@ mod tests {
         let config_path = dir.join("config.toml");
         let mut state = ConfigState::load(&config_path).unwrap();
 
+        let make_config = |model: &str| MeshConfig {
+            version: Some(1),
+            gpu: GpuConfig {
+                assignment: GpuAssignment::Auto,
+            },
+            models: vec![crate::plugin::ModelConfigEntry {
+                model: model.to_string(),
+                mmproj: None,
+                ctx_size: None,
+            }],
+            plugins: vec![],
+        };
+
         assert_eq!(state.revision(), 0);
-        state.apply(minimal_valid_config(), 0);
+        state.apply(make_config("model-a.gguf"), 0);
         assert_eq!(state.revision(), 1);
-        state.apply(minimal_valid_config(), 1);
+        state.apply(make_config("model-b.gguf"), 1);
         assert_eq!(state.revision(), 2);
-        state.apply(minimal_valid_config(), 2);
+        state.apply(make_config("model-c.gguf"), 2);
         assert_eq!(state.revision(), 3);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -297,6 +370,102 @@ mod tests {
         assert_ne!(
             initial_hash, new_hash,
             "hash must change when config changes"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_sync_load_propagates_invalid_toml_error() {
+        let dir = test_dir();
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, "this is [not valid toml !!!\n").expect("write bad toml");
+        let result = ConfigState::load(&config_path);
+        assert!(result.is_err(), "load must return Err on malformed TOML");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_sync_noop_apply_skips_disk_write() {
+        let dir = test_dir();
+        let config_path = dir.join("config.toml");
+        let mut state = ConfigState::load(&config_path).expect("load");
+
+        let config_with_model = MeshConfig {
+            version: Some(1),
+            gpu: crate::plugin::GpuConfig {
+                assignment: GpuAssignment::Auto,
+            },
+            models: vec![crate::plugin::ModelConfigEntry {
+                model: "noop-test.gguf".to_string(),
+                mmproj: None,
+                ctx_size: None,
+            }],
+            plugins: vec![],
+        };
+
+        let r1 = state.apply(config_with_model.clone(), 0);
+        let rev_after_first = match r1 {
+            ApplyResult::Applied {
+                revision,
+                saved_to_disk,
+                ..
+            } => {
+                assert!(saved_to_disk, "first apply must save to disk");
+                revision
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        };
+
+        let r2 = state.apply(config_with_model.clone(), rev_after_first);
+        match r2 {
+            ApplyResult::Applied {
+                revision,
+                saved_to_disk,
+                ..
+            } => {
+                assert!(!saved_to_disk, "no-op apply must not save to disk");
+                assert_eq!(
+                    revision, rev_after_first,
+                    "revision must not change on no-op"
+                );
+            }
+            other => panic!("expected Applied with saved_to_disk=false, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_sync_sidecar_path_derived_from_filename() {
+        let dir = test_dir();
+        let config_path = dir.join("config.toml");
+        let sidecar = revision_sidecar_path(&config_path);
+        let expected = dir.join("config.toml.revision");
+        assert_eq!(
+            sidecar, expected,
+            "sidecar path must be config filename + .revision suffix"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_sync_sidecar_migration_fallback() {
+        let dir = test_dir();
+        let legacy_path = dir.join("config-revision");
+        std::fs::write(&legacy_path, "42\n").expect("write legacy revision");
+
+        let config_path = dir.join("config.toml");
+        let new_sidecar = revision_sidecar_path(&config_path);
+        assert_ne!(
+            new_sidecar, legacy_path,
+            "new sidecar must differ from legacy"
+        );
+
+        let revision = read_revision(&new_sidecar);
+        assert_eq!(
+            revision, 42,
+            "must fall back to legacy config-revision file"
         );
 
         std::fs::remove_dir_all(&dir).ok();

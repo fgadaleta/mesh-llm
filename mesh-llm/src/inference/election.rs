@@ -49,7 +49,7 @@ fn should_use_row_split(flavor: Option<BinaryFlavor>, gpu_count: usize) -> bool 
 /// supported.
 pub(crate) fn local_multi_gpu_split_mode(flavor: Option<BinaryFlavor>) -> Option<SplitMode> {
     let hw = hardware::query(&[hardware::Metric::GpuCount]);
-    let gpu_count = hw.gpus.len();
+    let gpu_count = usize::from(hw.gpu_count);
     if should_use_row_split(flavor, gpu_count) {
         tracing::info!(
             "Local multi-GPU detected ({} GPUs) — using row split for tensor parallelism",

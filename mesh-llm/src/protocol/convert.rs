@@ -422,8 +422,8 @@ pub(crate) fn mesh_config_to_proto(
 ) -> crate::proto::node::NodeConfigSnapshot {
     use crate::plugin::GpuAssignment;
     let assignment = match config.gpu.assignment {
-        GpuAssignment::Auto => "auto".to_string(),
-        GpuAssignment::Pinned => "pinned".to_string(),
+        GpuAssignment::Auto => crate::proto::node::GpuAssignment::Auto as i32,
+        GpuAssignment::Pinned => crate::proto::node::GpuAssignment::Pinned as i32,
     };
     let models = config
         .models
@@ -458,13 +458,8 @@ pub(crate) fn proto_config_to_mesh(
     use crate::plugin::{
         GpuAssignment, GpuConfig, MeshConfig, ModelConfigEntry, PluginConfigEntry,
     };
-    let assignment = match snapshot
-        .gpu
-        .as_ref()
-        .map(|g| g.assignment.as_str())
-        .unwrap_or("auto")
-    {
-        "pinned" => GpuAssignment::Pinned,
+    let assignment = match snapshot.gpu.as_ref().map(|g| g.assignment) {
+        Some(v) if v == crate::proto::node::GpuAssignment::Pinned as i32 => GpuAssignment::Pinned,
         _ => GpuAssignment::Auto,
     };
     let models = snapshot

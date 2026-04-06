@@ -77,6 +77,10 @@ pub(crate) enum ControlFrameError {
         got: usize,
     },
     MissingSignature,
+    InvalidSignatureLength {
+        got: usize,
+    },
+    MissingConfig,
     #[cfg(test)]
     DecodeError(String),
     #[cfg(test)]
@@ -118,6 +122,12 @@ impl std::fmt::Display for ControlFrameError {
                 write!(f, "invalid public key length: expected 32, got {}", got)
             }
             ControlFrameError::MissingSignature => write!(f, "config push missing signature"),
+            ControlFrameError::InvalidSignatureLength { got } => {
+                write!(f, "invalid signature length: expected 64, got {got}")
+            }
+            ControlFrameError::MissingConfig => {
+                write!(f, "config field is required but missing")
+            }
             #[cfg(test)]
             ControlFrameError::DecodeError(msg) => write!(f, "protobuf decode error: {}", msg),
             #[cfg(test)]
@@ -250,6 +260,9 @@ impl ValidateControlFrame for crate::proto::node::ConfigSnapshotResponse {
         }
         validate_endpoint_id_length(self.node_id.len())?;
         validate_config_hash_length(self.config_hash.len())?;
+        if self.config.is_none() {
+            return Err(ControlFrameError::MissingConfig);
+        }
         Ok(())
     }
 }
@@ -261,6 +274,9 @@ impl ValidateControlFrame for crate::proto::node::ConfigUpdateNotification {
         }
         validate_endpoint_id_length(self.node_id.len())?;
         validate_config_hash_length(self.config_hash.len())?;
+        if self.config.is_none() {
+            return Err(ControlFrameError::MissingConfig);
+        }
         Ok(())
     }
 }
@@ -278,6 +294,11 @@ impl ValidateControlFrame for crate::proto::node::ConfigPush {
         validate_public_key_length(self.owner_signing_public_key.len())?;
         if self.signature.is_empty() {
             return Err(ControlFrameError::MissingSignature);
+        }
+        if self.signature.len() != 64 {
+            return Err(ControlFrameError::InvalidSignatureLength {
+                got: self.signature.len(),
+            });
         }
         Ok(())
     }
@@ -508,7 +529,7 @@ mod tests {
         NodeConfigSnapshot {
             version: 1,
             gpu: Some(NodeGpuConfig {
-                assignment: "auto".to_string(),
+                assignment: crate::proto::node::GpuAssignment::Auto as i32,
             }),
             models: vec![NodeModelEntry {
                 model: "Qwen3-8B".to_string(),
@@ -676,6 +697,7 @@ mod tests {
             config_hash: config_hash.clone(),
             config: Some(snapshot.clone()),
             hostname: Some("node-01".to_string()),
+            error: None,
         };
         let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &snapshot_response);
         let decoded: ConfigSnapshotResponse =
@@ -707,7 +729,7 @@ mod tests {
             expected_revision: 8,
             config: Some(snapshot.clone()),
             owner_signing_public_key: vec![0x02; 32],
-            signature: vec![0x03],
+            signature: vec![0x03; 64],
         };
         let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
         let decoded: ConfigPush = decode_control_frame(STREAM_CONFIG_PUSH, &encoded)
@@ -761,6 +783,7 @@ mod tests {
             config_hash: vec![0x02; 32],
             config: Some(make_config_snapshot()),
             hostname: None,
+            error: None,
         };
         let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &snapshot_response);
         let err = decode_control_frame::<ConfigSnapshotResponse>(STREAM_CONFIG_SUBSCRIBE, &encoded)
@@ -775,6 +798,7 @@ mod tests {
             config_hash: vec![0x02; 16],
             config: Some(make_config_snapshot()),
             hostname: None,
+            error: None,
         };
         let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &snapshot_response);
         let err = decode_control_frame::<ConfigSnapshotResponse>(STREAM_CONFIG_SUBSCRIBE, &encoded)
@@ -1327,8 +1351,8 @@ mod tests {
         let roundtripped = mesh_config_to_proto(&config);
         assert_eq!(roundtripped.version, snapshot.version);
         assert_eq!(
-            roundtripped.gpu.as_ref().map(|g| g.assignment.as_str()),
-            Some("auto")
+            roundtripped.gpu.as_ref().map(|g| g.assignment),
+            Some(crate::proto::node::GpuAssignment::Auto as i32)
         );
         assert_eq!(roundtripped.models.len(), snapshot.models.len());
         assert_eq!(roundtripped.models[0].model, snapshot.models[0].model);
@@ -1807,5 +1831,96 @@ mod tests {
         let internal = v0_deserialized[0].clone().into_internal();
 
         assert_eq!(internal.owner_id, None, "v0 peer has no owner_id");
+    }
+
+    #[test]
+    fn config_sync_push_validates_signature_length_too_short() {
+        use crate::proto::node::ConfigPush;
+        let push = ConfigPush {
+            gen: NODE_PROTOCOL_GENERATION,
+            requester_id: vec![0x01; 32],
+            target_node_id: vec![0x02; 32],
+            owner_id: "owner-1".to_string(),
+            expected_revision: 0,
+            config: Some(make_config_snapshot()),
+            owner_signing_public_key: vec![0x03; 32],
+            signature: vec![0x04; 10],
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
+        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
+            .expect_err("short signature must be rejected");
+        assert!(
+            matches!(err, ControlFrameError::InvalidSignatureLength { got: 10 }),
+            "expected InvalidSignatureLength{{got:10}}, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn config_sync_push_validates_signature_length_empty() {
+        use crate::proto::node::ConfigPush;
+        let push = ConfigPush {
+            gen: NODE_PROTOCOL_GENERATION,
+            requester_id: vec![0x01; 32],
+            target_node_id: vec![0x02; 32],
+            owner_id: "owner-1".to_string(),
+            expected_revision: 0,
+            config: Some(make_config_snapshot()),
+            owner_signing_public_key: vec![0x03; 32],
+            signature: vec![],
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
+        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
+            .expect_err("empty signature must be rejected");
+        assert!(
+            matches!(err, ControlFrameError::MissingSignature),
+            "expected MissingSignature, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn config_sync_snapshot_response_validates_config_present() {
+        use crate::proto::node::ConfigSnapshotResponse;
+        let response = ConfigSnapshotResponse {
+            gen: NODE_PROTOCOL_GENERATION,
+            node_id: vec![0x01; 32],
+            owner_id: "owner-1".to_string(),
+            revision: 1,
+            config_hash: vec![0x02; 32],
+            config: None,
+            hostname: None,
+            error: None,
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &response);
+        let err = decode_control_frame::<ConfigSnapshotResponse>(STREAM_CONFIG_SUBSCRIBE, &encoded)
+            .expect_err("snapshot response with config=None must be rejected");
+        assert!(
+            matches!(err, ControlFrameError::MissingConfig),
+            "expected MissingConfig, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn config_sync_update_notification_validates_config_present() {
+        use crate::proto::node::ConfigUpdateNotification;
+        let notification = ConfigUpdateNotification {
+            gen: NODE_PROTOCOL_GENERATION,
+            node_id: vec![0x01; 32],
+            owner_id: "owner-1".to_string(),
+            revision: 1,
+            config_hash: vec![0x02; 32],
+            config: None,
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &notification);
+        let err =
+            decode_control_frame::<ConfigUpdateNotification>(STREAM_CONFIG_SUBSCRIBE, &encoded)
+                .expect_err("update notification with config=None must be rejected");
+        assert!(
+            matches!(err, ControlFrameError::MissingConfig),
+            "expected MissingConfig, got {:?}",
+            err
+        );
     }
 }
