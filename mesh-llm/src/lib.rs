@@ -23,7 +23,7 @@ pub use plugins::blackboard::mcp as blackboard_mcp;
 
 use anyhow::Result;
 
-pub const VERSION: &str = "0.55.1";
+pub const VERSION: &str = "0.55.1-gemma3fix";
 
 pub async fn run() -> Result<()> {
     runtime::run().await

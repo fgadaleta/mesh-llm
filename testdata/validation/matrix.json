@@ -148,11 +148,11 @@
       "id": "gemma3",
       "label": "gemma-3-1b",
       "expectation_class": "strict",
-      "notes": "Gemma3 parity baseline.",
+      "notes": "Gemma3 parity baseline using a tighter QAT low-bit pair.",
       "gguf": {
         "exact_case_id": "gemma3-gguf-exact",
         "behavior_case_id": "gemma3-gguf-behavior",
-        "model_ref": "ggml-org/gemma-3-1b-it-GGUF/gemma-3-1b-it-Q4_K_M.gguf"
+        "model_ref": "tetf/gemma-3-1b-it-qat-q4_0-GGUF/gemma-3-1b-it-q4_0.gguf"
       },
       "mlx": {
         "exact_case_id": "gemma3-mlx-exact",

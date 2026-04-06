@@ -102,6 +102,10 @@ pub struct ModelConfig {
     #[allow(dead_code)]
     pub sliding_window: Option<i32>,
     #[serde(default)]
+    pub sliding_window_pattern: Option<i32>,
+    #[serde(default)]
+    pub rope_local_base_freq: Option<f32>,
+    #[serde(default)]
     #[allow(dead_code)]
     pub cache_implementation: Option<String>,
     #[serde(default)]
@@ -298,6 +302,13 @@ fn cpu_dense_weight_t(
     let dense = Array::from_slice(dense_cpu.as_slice::<f32>(), dense_cpu.shape());
 
     Ok(dense.transpose_axes(&[1, 0])?)
+}
+
+fn force_dense_quantized_linear() -> bool {
+    matches!(
+        std::env::var("MESH_MLX_FORCE_DENSE_QUANTIZED_LINEAR").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }
 
 pub struct RMSNorm {
@@ -1921,7 +1932,9 @@ impl MlxModel {
                     .with_context(|| format!("missing {prefix}.biases"))?;
                 // Some Gemma4 MLX checkpoints use 5-bit weights for a subset of MLP
                 // blocks, and current Metal qmm kernels are missing for that shape.
-                if bits == 5 {
+                // Allow forcing the dense path for diagnostics when comparing qmm
+                // behavior against dequantized matmul on the same artifact.
+                if bits == 5 || force_dense_quantized_linear() {
                     Some(cpu_dense_weight_t(
                         &weight, &scales, &biases, group_size, bits,
                     )?)
@@ -2659,9 +2672,18 @@ impl MlxModel {
             } else {
                 layer_head_dim
             };
-            let rope_theta = rope_parameters
-                .and_then(|params| params.rope_theta)
-                .unwrap_or(config.rope_theta);
+            let gemma3_global_layer = arch.is_gemma3()
+                && config
+                    .sliding_window_pattern
+                    .map(|pattern| pattern > 0 && ((i + 1) % pattern == 0))
+                    .unwrap_or(false);
+            let rope_theta = if arch.is_gemma3() && !gemma3_global_layer {
+                config.rope_local_base_freq.unwrap_or(10_000.0)
+            } else {
+                rope_parameters
+                    .and_then(|params| params.rope_theta)
+                    .unwrap_or(config.rope_theta)
+            };
             let kv_shared_source = if arch.is_gemma4() && (i as usize) >= first_kv_shared_layer_idx
             {
                 non_shared_layer_types.as_ref().and_then(|types| {
@@ -2726,7 +2748,11 @@ impl MlxModel {
                         .then_some(config.attn_logit_softcapping.unwrap_or(50.0)),
                     rope_dim,
                     rope_theta,
-                    window_size: None,
+                    window_size: if arch.is_gemma3() && !gemma3_global_layer {
+                        config.sliding_window
+                    } else {
+                        None
+                    },
                     kv_shared_source,
                 }),
                 mlp: MlpKind::Dense(MLP {
@@ -3964,6 +3990,35 @@ mod tests {
         assert_eq!(config.final_logit_softcapping, Some(30.0));
         assert_eq!(config.sliding_window, Some(4096));
         assert_eq!(config.cache_implementation.as_deref(), Some("hybrid"));
+    }
+
+    #[test]
+    fn gemma3_config_parses_sliding_window_fields() {
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": 1152,
+            "num_hidden_layers": 26,
+            "intermediate_size": 6912,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 256,
+            "query_pre_attn_scalar": 256,
+            "vocab_size": 262144,
+            "rms_norm_eps": 0.000001,
+            "max_position_embeddings": 32768,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "sliding_window": 512,
+            "sliding_window_pattern": 6,
+            "rope_local_base_freq": 10000.0,
+            "rope_theta": 1000000.0,
+            "cache_implementation": "hybrid",
+            "eos_token_id": [1, 106]
+        }))
+        .unwrap();
+
+        assert_eq!(config.sliding_window, Some(512));
+        assert_eq!(config.sliding_window_pattern, Some(6));
+        assert_eq!(config.rope_local_base_freq, Some(10000.0));
+        assert_eq!(config.query_pre_attn_scalar, Some(256.0));
     }
 
     #[test]

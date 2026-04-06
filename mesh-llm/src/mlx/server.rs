@@ -64,6 +64,7 @@ struct GenerationConfig {
     max_tokens: usize,
     sampling: SamplingParams,
     stop_sequences: Vec<String>,
+    stop_token_ids: Vec<u32>,
     response_policy: ResponsePolicy,
 }
 
@@ -830,7 +831,7 @@ fn run_inference(
 
     // Decode
     for _ in 0..generation.max_tokens {
-        if is_eos(next_token, &state.model.config) {
+        if is_eos(next_token, &state.model.config) || is_stop_token(next_token, generation) {
             finish_reason = "stop";
             break;
         }
@@ -924,7 +925,7 @@ fn run_inference_streaming(
 
     // Decode + stream
     for _ in 0..generation.max_tokens {
-        if is_eos(next_token, &state.model.config) {
+        if is_eos(next_token, &state.model.config) || is_stop_token(next_token, generation) {
             finish_reason = "stop";
             break;
         }
@@ -1000,7 +1001,7 @@ fn run_inference_cacheless(
         let input = Array::from_slice(&tokens, &[1, tokens.len() as i32]);
         let logits = state.model.forward_no_cache(&input)?;
         let next_token = sampler.sample_next_token(&logits)?;
-        if is_eos(next_token, &state.model.config) {
+        if is_eos(next_token, &state.model.config) || is_stop_token(next_token, generation) {
             finish_reason = "stop";
             break;
         }
@@ -1060,7 +1061,7 @@ fn run_inference_streaming_cacheless(
         let input = Array::from_slice(&tokens, &[1, tokens.len() as i32]);
         let logits = state.model.forward_no_cache(&input)?;
         let next_token = sampler.sample_next_token(&logits)?;
-        if is_eos(next_token, &state.model.config) {
+        if is_eos(next_token, &state.model.config) || is_stop_token(next_token, generation) {
             finish_reason = "stop";
             break;
         }
@@ -1099,6 +1100,7 @@ fn parse_generation_config(req: &serde_json::Value, model: &MlxModel) -> Generat
     stop_sequences.extend(parse_stop_sequences(req.get("stop")));
     stop_sequences.sort();
     stop_sequences.dedup();
+    let stop_token_ids = stop_token_ids_for(&model.tokenizer, &stop_sequences);
     GenerationConfig {
         max_tokens: req["max_tokens"].as_u64().unwrap_or(2048) as usize,
         sampling: SamplingParams {
@@ -1111,8 +1113,32 @@ fn parse_generation_config(req: &serde_json::Value, model: &MlxModel) -> Generat
             seed: req["seed"].as_u64(),
         },
         stop_sequences,
+        stop_token_ids,
         response_policy: response_policy(req, model),
     }
+}
+
+fn stop_token_ids_for(tokenizer: &tokenizers::Tokenizer, stop_sequences: &[String]) -> Vec<u32> {
+    let mut ids = stop_sequences
+        .iter()
+        .filter_map(|sequence| {
+            let encoding = tokenizer.encode(sequence.as_str(), false).ok()?;
+            let ids = encoding.get_ids();
+            if ids.len() != 1 {
+                return None;
+            }
+            let token_id = ids[0];
+            let decoded = tokenizer.decode(&[token_id], false).ok()?;
+            (decoded == *sequence).then_some(token_id)
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn is_stop_token(token: u32, generation: &GenerationConfig) -> bool {
+    generation.stop_token_ids.binary_search(&token).is_ok()
 }
 
 fn parse_stop_sequences(stop: Option<&serde_json::Value>) -> Vec<String> {
