@@ -326,7 +326,7 @@ jobs:
         include:
           - name: qwen2.5-0.5b
             id: qwen25
-            cache_slug: mlx-community--Qwen2.5-0.5B-Instruct-8bit
+            cache_slug: meshllm--qwen2.5-0.5b-instruct-parity-8bit-mlx
           - name: qwen3-0.6b
             id: qwen3
             cache_slug: mlx-community--Qwen3-0.6B-bf16
@@ -407,7 +407,7 @@ jobs:
         include:
           - name: qwen2.5-0.5b
             id: qwen25
-            cache_slug: Qwen--Qwen2.5-0.5B-Instruct-GGUF
+            cache_slug: meshllm--qwen2.5-0.5b-instruct-parity-q8_0-gguf
           - name: qwen3-0.6b
             id: qwen3
             cache_slug: Qwen--Qwen3-0.6B-GGUF

@@ -84,13 +84,13 @@
       "gguf": {
         "exact_case_id": "qwen25-gguf-exact",
         "behavior_case_id": "qwen25-gguf-behavior",
-        "model_ref": "Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q8_0.gguf"
+        "model_ref": "meshllm/qwen2.5-0.5b-instruct-parity-q8_0-gguf/qwen2.5-0.5b-instruct-q8_0.gguf"
       },
       "mlx": {
         "exact_case_id": "qwen25-mlx-exact",
         "behavior_case_id": "qwen25-mlx-behavior",
-        "model_ref": "mlx-community/Qwen2.5-0.5B-Instruct-8bit",
-        "template_source": "tokenizer_config.json"
+        "model_ref": "meshllm/qwen2.5-0.5b-instruct-parity-8bit-mlx",
+        "template_source": "chat_template.jinja"
       }
     },
     {
