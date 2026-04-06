@@ -54,7 +54,7 @@ pub(super) fn hf_endpoint() -> String {
 fn hf_endpoint_override() -> Option<String> {
     std::env::var("HF_ENDPOINT")
         .ok()
-        .map(|value| value.trim().to_string())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
 }
 
