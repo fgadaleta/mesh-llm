@@ -148,16 +148,16 @@
       "id": "gemma3",
       "label": "gemma-3-1b",
       "expectation_class": "strict",
-      "notes": "Gemma3 parity baseline using a tighter QAT low-bit pair.",
+      "notes": "Gemma3 parity baseline using same-origin high-fidelity artifacts published by meshllm.",
       "gguf": {
         "exact_case_id": "gemma3-gguf-exact",
         "behavior_case_id": "gemma3-gguf-behavior",
-        "model_ref": "tetf/gemma-3-1b-it-qat-q4_0-GGUF/gemma-3-1b-it-q4_0.gguf"
+        "model_ref": "meshllm/gemma-3-1b-it-parity-f16-gguf/gemma-3-1b-it-f16.gguf"
       },
       "mlx": {
         "exact_case_id": "gemma3-mlx-exact",
         "behavior_case_id": "gemma3-mlx-behavior",
-        "model_ref": "mlx-community/gemma-3-1b-it-qat-4bit",
+        "model_ref": "meshllm/gemma-3-1b-it-parity-bf16-mlx",
         "template_source": "tokenizer_config.json"
       }
     },
