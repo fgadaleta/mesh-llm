@@ -28,11 +28,8 @@ pub use topology::{infer_local_model_topology, ModelMoeInfo, ModelTopology};
 
 fn build_hf_api(progress: bool) -> Result<Api> {
     let mut builder = ApiBuilder::from_cache(huggingface_hub_cache()).with_progress(progress);
-    if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
-        let endpoint = endpoint.trim();
-        if !endpoint.is_empty() {
-            builder = builder.with_endpoint(endpoint.to_string());
-        }
+    if let Some(endpoint) = hf_endpoint_override() {
+        builder = builder.with_endpoint(endpoint);
     }
     builder = builder.with_token(hf_token_override());
     builder.build().context("Build Hugging Face API client")
@@ -40,11 +37,8 @@ fn build_hf_api(progress: bool) -> Result<Api> {
 
 fn build_hf_tokio_api(progress: bool) -> Result<TokioApi> {
     let mut builder = TokioApiBuilder::from_cache(huggingface_hub_cache()).with_progress(progress);
-    if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
-        let endpoint = endpoint.trim();
-        if !endpoint.is_empty() {
-            builder = builder.with_endpoint(endpoint.to_string());
-        }
+    if let Some(endpoint) = hf_endpoint_override() {
+        builder = builder.with_endpoint(endpoint);
     }
     builder = builder.with_token(hf_token_override());
     builder
@@ -52,7 +46,19 @@ fn build_hf_tokio_api(progress: bool) -> Result<TokioApi> {
         .context("Build Hugging Face async API client")
 }
 
-fn hf_token_override() -> Option<String> {
+/// Returns the HF endpoint URL, falling back to the default if `HF_ENDPOINT` is not set.
+pub(super) fn hf_endpoint() -> String {
+    hf_endpoint_override().unwrap_or_else(|| "https://huggingface.co".to_string())
+}
+
+fn hf_endpoint_override() -> Option<String> {
+    std::env::var("HF_ENDPOINT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub(super) fn hf_token_override() -> Option<String> {
     for key in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
         if let Ok(token) = std::env::var(key) {
             let token = token.trim();

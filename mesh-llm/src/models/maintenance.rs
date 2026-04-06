@@ -2,8 +2,8 @@ use super::catalog;
 use super::local::legacy_models_dir;
 use super::resolve::{catalog_hf_asset_ref, catalog_hf_match, catalog_match, parse_hf_resolve_url};
 use super::{
-    build_hf_api, format_size_bytes, huggingface_hub_cache, huggingface_hub_cache_dir,
-    short_revision,
+    build_hf_api, format_size_bytes, hf_endpoint, hf_token_override, huggingface_hub_cache,
+    huggingface_hub_cache_dir, short_revision,
 };
 use anyhow::{Context, Result};
 use hf_hub::api::sync::Api;
@@ -468,7 +468,7 @@ fn migrate_catalog_model(
     let mut split_downloads = Vec::new();
     let legacy_root = legacy_models_dir();
     let legacy_files = collect_legacy_candidates(entries, &legacy_root);
-    let duplicate_legacy_files = duplicate_legacy_files(&legacy_files);
+    let duplicate_basenames = duplicate_legacy_files(&legacy_files);
     let expected_split_files = expected_split_gguf_files(model);
     let present_split_files: Vec<String> = expected_split_files
         .iter()
@@ -486,11 +486,11 @@ fn migrate_catalog_model(
             "   ⚠️ mixed legacy layout detected; both flat ~/.models files and nested subdirectories exist for this model"
         );
     }
-    if !duplicate_legacy_files.is_empty() {
+    if !duplicate_basenames.is_empty() {
         eprintln!(
             "   ⚠️ duplicate legacy basenames detected; automatic adoption will be skipped for ambiguous files"
         );
-        for (file, paths) in &duplicate_legacy_files {
+        for (file, paths) in &duplicate_basenames {
             eprintln!("      {file}:");
             for path in paths {
                 eprintln!("         {}", path.display());
@@ -960,60 +960,24 @@ fn fetch_recent_repo_commits(
 ) -> Result<Vec<RepoCommit>> {
     let endpoint = hf_endpoint();
     let token = hf_token_override();
-    let repo_id = repo_id.to_string();
-    let revision = revision.to_string();
-
-    let join = std::thread::spawn(move || -> Result<Vec<RepoCommit>> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("Build Tokio runtime for Hugging Face commit lookup")?;
-        runtime.block_on(async move {
-            let client = reqwest::Client::new();
-            let url = format!(
-                "{}/api/models/{}/commits/{}?limit={limit}",
-                endpoint,
-                urlencoding::encode(&repo_id),
-                urlencoding::encode(&revision)
-            );
-            let mut request = client.get(url);
-            if let Some(token) = token {
-                request = request.bearer_auth(token);
-            }
-            request
-                .send()
-                .await
-                .context("Fetch Hugging Face commit history")?
-                .error_for_status()
-                .context("Hugging Face commit history request failed")?
-                .json::<Vec<RepoCommit>>()
-                .await
-                .context("Parse Hugging Face commit history")
-        })
-    });
-
-    join.join()
-        .map_err(|_| anyhow::anyhow!("Hugging Face commit lookup thread panicked"))?
-}
-
-fn hf_endpoint() -> String {
-    std::env::var("HF_ENDPOINT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "https://huggingface.co".to_string())
-}
-
-fn hf_token_override() -> Option<String> {
-    for key in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"] {
-        if let Ok(token) = std::env::var(key) {
-            let token = token.trim();
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
-        }
+    let url = format!(
+        "{}/api/models/{}/commits/{}?limit={limit}",
+        endpoint,
+        urlencoding::encode(repo_id),
+        urlencoding::encode(revision)
+    );
+    let client = reqwest::blocking::Client::new();
+    let mut request = client.get(url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
     }
-    None
+    request
+        .send()
+        .context("Fetch Hugging Face commit history")?
+        .error_for_status()
+        .context("Hugging Face commit history request failed")?
+        .json::<Vec<RepoCommit>>()
+        .context("Parse Hugging Face commit history")
 }
 
 fn materialize_cached_snapshot_pointer(
@@ -1461,11 +1425,31 @@ mod tests {
 
     #[test]
     fn expected_split_gguf_files_includes_all_catalog_parts() {
-        let model = catalog::MODEL_CATALOG
-            .iter()
-            .find(|model| model.name == "MiniMax-M2.5-Q4_K_M")
-            .unwrap();
-        let files = expected_split_gguf_files(model);
+        let model = catalog::CatalogModel {
+            name: String::new(),
+            url: String::new(),
+            size: String::new(),
+            description: String::new(),
+            draft: None,
+            moe: None,
+            mmproj: None,
+            file: "MiniMax-M2.5-Q4_K_M-00001-of-00004.gguf".into(),
+            extra_files: vec![
+                catalog::CatalogAsset {
+                    file: "MiniMax-M2.5-Q4_K_M-00002-of-00004.gguf".into(),
+                    url: String::new(),
+                },
+                catalog::CatalogAsset {
+                    file: "MiniMax-M2.5-Q4_K_M-00003-of-00004.gguf".into(),
+                    url: String::new(),
+                },
+                catalog::CatalogAsset {
+                    file: "MiniMax-M2.5-Q4_K_M-00004-of-00004.gguf".into(),
+                    url: String::new(),
+                },
+            ],
+        };
+        let files = expected_split_gguf_files(&model);
 
         assert_eq!(files.len(), 4);
         assert!(files.contains(&"MiniMax-M2.5-Q4_K_M-00001-of-00004.gguf".to_string()));
