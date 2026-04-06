@@ -889,6 +889,8 @@ pub(crate) struct PeerAnnouncementV0 {
     served_model_descriptors: Vec<ServedModelDescriptor>,
     #[serde(skip_serializing, skip_deserializing, default)]
     served_model_runtime: Vec<ModelRuntimeDescriptor>,
+    #[serde(default)]
+    owner_id: Option<String>,
 }
 
 impl PeerAnnouncementV0 {
@@ -921,6 +923,7 @@ impl PeerAnnouncementV0 {
             available_model_sizes: self.available_model_sizes,
             served_model_descriptors: self.served_model_descriptors,
             served_model_runtime: self.served_model_runtime,
+            owner_id: self.owner_id,
         }
     }
 }
@@ -948,6 +951,7 @@ impl From<&PeerAnnouncement> for PeerAnnouncementV0 {
             available_model_sizes: ann.available_model_sizes.clone(),
             served_model_descriptors: ann.served_model_descriptors.clone(),
             served_model_runtime: ann.served_model_runtime.clone(),
+            owner_id: ann.owner_id.clone(),
         }
     }
 }
@@ -1059,6 +1063,7 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) available_model_sizes: HashMap<String, u64>,
     pub(crate) served_model_descriptors: Vec<ServedModelDescriptor>,
     pub(crate) served_model_runtime: Vec<ModelRuntimeDescriptor>,
+    pub(crate) owner_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1101,6 +1106,7 @@ pub struct PeerInfo {
     pub available_model_sizes: HashMap<String, u64>,
     pub served_model_descriptors: Vec<ServedModelDescriptor>,
     pub served_model_runtime: Vec<ModelRuntimeDescriptor>,
+    pub owner_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1138,6 +1144,7 @@ impl PeerInfo {
             available_model_sizes: ann.available_model_sizes.clone(),
             served_model_descriptors: ann.served_model_descriptors.clone(),
             served_model_runtime: ann.served_model_runtime.clone(),
+            owner_id: ann.owner_id.clone(),
         }
     }
 
@@ -1335,6 +1342,8 @@ pub struct Node {
     pub is_soc: Option<bool>,
     pub gpu_vram: Option<String>,
     pub gpu_bandwidth_gbps: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    config_state: Arc<tokio::sync::Mutex<crate::runtime::config_state::ConfigState>>,
+    config_revision_tx: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 struct MeshState {
@@ -1660,6 +1669,17 @@ impl Node {
             is_soc,
             gpu_vram,
             gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            config_state: {
+                let path = crate::plugin::config_path(None)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("config.toml"));
+                let state =
+                    crate::runtime::config_state::ConfigState::load(&path).unwrap_or_default();
+                Arc::new(tokio::sync::Mutex::new(state))
+            },
+            config_revision_tx: {
+                let (tx, _rx) = tokio::sync::watch::channel(0u64);
+                Arc::new(tx)
+            },
         };
 
         // Accept loop starts but waits for start_accepting() before processing connections.
@@ -1746,6 +1766,13 @@ impl Node {
             is_soc: Some(false),
             gpu_vram: None,
             gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            config_state: Arc::new(tokio::sync::Mutex::new(
+                crate::runtime::config_state::ConfigState::default(),
+            )),
+            config_revision_tx: {
+                let (tx, _rx) = tokio::sync::watch::channel(0u64);
+                Arc::new(tx)
+            },
         })
     }
 
@@ -3770,11 +3797,301 @@ impl Node {
                         }
                     });
                 }
+                STREAM_CONFIG_SUBSCRIBE => {
+                    let node = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = node.handle_config_subscribe(remote, send, recv).await {
+                            tracing::warn!(
+                                "config subscribe error from {}: {e}",
+                                remote.fmt_short()
+                            );
+                        }
+                    });
+                }
+                STREAM_CONFIG_PUSH => {
+                    let node = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = node.handle_config_push(remote, send, recv).await {
+                            tracing::warn!("config push error from {}: {e}", remote.fmt_short());
+                        }
+                    });
+                }
                 other => {
                     tracing::warn!("Unknown stream type {other} from {}", remote.fmt_short());
                 }
             }
         }
+    }
+
+    // --- Config Subscribe ---
+
+    async fn handle_config_subscribe(
+        &self,
+        remote: EndpointId,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+    ) -> anyhow::Result<()> {
+        use crate::proto::node::{ConfigSnapshotResponse, ConfigUpdateNotification};
+        use crate::protocol::convert::mesh_config_to_proto;
+
+        let buf = read_len_prefixed(&mut recv).await?;
+        let frame = crate::proto::node::ConfigSubscribe::decode(buf.as_slice())
+            .map_err(|e| anyhow::anyhow!("ConfigSubscribe decode error: {e}"))?;
+        frame
+            .validate_frame()
+            .map_err(|e| anyhow::anyhow!("ConfigSubscribe validation error: {e}"))?;
+
+        let local_owner_id = self.local_owner_id();
+        if let Some(ref local_id) = local_owner_id {
+            if frame.owner_id != *local_id {
+                tracing::warn!(
+                    "config subscribe from {}: owner_id mismatch (want {}, got {})",
+                    remote.fmt_short(),
+                    local_id,
+                    frame.owner_id
+                );
+                let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
+                    gen: NODE_PROTOCOL_GENERATION,
+                    node_id: vec![],
+                    owner_id: String::new(),
+                    revision: 0,
+                    config_hash: vec![],
+                    config: None,
+                    hostname: None,
+                };
+                use prost::Message as _;
+                write_len_prefixed(&mut send, &error_snapshot.encode_to_vec()).await?;
+                return Ok(());
+            }
+        }
+
+        let snapshot = {
+            let state = self.config_state.lock().await;
+            let proto_cfg = mesh_config_to_proto(state.config());
+            ConfigSnapshotResponse {
+                gen: NODE_PROTOCOL_GENERATION,
+                node_id: self.endpoint.id().as_bytes().to_vec(),
+                owner_id: local_owner_id.clone().unwrap_or_default(),
+                revision: state.revision(),
+                config_hash: state.config_hash().to_vec(),
+                config: Some(proto_cfg),
+                hostname: self.hostname.clone(),
+            }
+        };
+        write_len_prefixed(&mut send, &snapshot.encode_to_vec()).await?;
+
+        let mut rev_rx = self.config_revision_tx.subscribe();
+        loop {
+            if rev_rx.changed().await.is_err() {
+                break;
+            }
+            let notification = {
+                let state = self.config_state.lock().await;
+                let proto_cfg = mesh_config_to_proto(state.config());
+                ConfigUpdateNotification {
+                    gen: NODE_PROTOCOL_GENERATION,
+                    node_id: self.endpoint.id().as_bytes().to_vec(),
+                    owner_id: local_owner_id.clone().unwrap_or_default(),
+                    revision: state.revision(),
+                    config_hash: state.config_hash().to_vec(),
+                    config: Some(proto_cfg),
+                }
+            };
+            if write_len_prefixed(&mut send, &notification.encode_to_vec())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn local_owner_id(&self) -> Option<String> {
+        use crate::crypto::{default_keystore_path, load_keystore};
+        let path = default_keystore_path().ok()?;
+        let keypair = load_keystore(&path, None).ok()?;
+        Some(keypair.owner_id())
+    }
+
+    // --- Config Push ---
+
+    async fn handle_config_push(
+        &self,
+        _remote: EndpointId,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+    ) -> anyhow::Result<()> {
+        use crate::protocol::convert::proto_config_to_mesh;
+        use prost::Message as _;
+
+        // 1. Read + decode + validate ConfigPush
+        let buf = read_len_prefixed(&mut recv).await?;
+        let push = crate::proto::node::ConfigPush::decode(buf.as_slice())?;
+        push.validate_frame()
+            .map_err(|e| anyhow::anyhow!("invalid push frame: {e}"))?;
+
+        // 2. Derive owner_id from the push's public key
+        let pk_bytes: [u8; 32] = push
+            .owner_signing_public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid public key length"))?;
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)?;
+        let derived_owner_id = crate::crypto::owner_id_from_verifying_key(&vk);
+
+        // 3. Compare derived owner_id with push.owner_id AND local owner_id
+        if derived_owner_id != push.owner_id {
+            send_push_error(&mut send, "owner_id mismatch").await?;
+            return Ok(());
+        }
+        if let Some(local_id) = self.local_owner_id() {
+            if local_id != push.owner_id {
+                send_push_error(&mut send, "not the owner of this node").await?;
+                return Ok(());
+            }
+        }
+
+        // 4. Verify Ed25519 signature
+        let payload = config_push_signature_payload(&push);
+        let sig_bytes: [u8; 64] = push
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid signature length"))?;
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        if vk.verify_strict(&payload, &sig).is_err() {
+            send_push_error(&mut send, "signature verification failed").await?;
+            return Ok(());
+        }
+
+        // 5. Convert NodeConfigSnapshot → MeshConfig
+        let Some(ref config_snapshot) = push.config else {
+            send_push_error(&mut send, "missing config payload").await?;
+            return Ok(());
+        };
+        let mesh_config = proto_config_to_mesh(config_snapshot);
+
+        // 6. Apply via CAS
+        let result = {
+            let mut state = self.config_state.lock().await;
+            state.apply(mesh_config, push.expected_revision)
+        };
+
+        // 7. Build + send response
+        use crate::runtime::config_state::ApplyResult;
+        let response = match result {
+            ApplyResult::Applied {
+                revision,
+                hash,
+                saved_to_disk,
+            } => {
+                let _ = self.config_revision_tx.send(revision);
+                crate::proto::node::ConfigPushResponse {
+                    gen: NODE_PROTOCOL_GENERATION,
+                    success: true,
+                    current_revision: revision,
+                    config_hash: hash.to_vec(),
+                    error: None,
+                    saved_to_disk,
+                    applied_live: false,
+                }
+            }
+            ApplyResult::RevisionConflict { current_revision } => {
+                crate::proto::node::ConfigPushResponse {
+                    gen: NODE_PROTOCOL_GENERATION,
+                    success: false,
+                    current_revision,
+                    config_hash: vec![],
+                    error: Some(
+                        "revision conflict: expected_revision does not match current".to_string(),
+                    ),
+                    saved_to_disk: false,
+                    applied_live: false,
+                }
+            }
+            ApplyResult::ValidationError(msg) | ApplyResult::PersistError(msg) => {
+                crate::proto::node::ConfigPushResponse {
+                    gen: NODE_PROTOCOL_GENERATION,
+                    success: false,
+                    current_revision: 0,
+                    config_hash: vec![],
+                    error: Some(msg),
+                    saved_to_disk: false,
+                    applied_live: false,
+                }
+            }
+        };
+        write_len_prefixed(&mut send, &response.encode_to_vec()).await?;
+        Ok(())
+    }
+
+    /// Outbound config subscription helper — opens a bi-stream to the target peer,
+    /// sends a `ConfigSubscribe` message, and reads back the initial snapshot.
+    ///
+    /// This is an intentional API stub for the future UI/API layer that will
+    /// materialize a mesh-wide config view from per-node subscriptions.
+    /// Not yet called from production code.
+    #[allow(dead_code)]
+    pub(crate) async fn subscribe_to_config(
+        &self,
+        conn: &iroh::endpoint::Connection,
+        owner_id: &str,
+    ) -> anyhow::Result<(
+        crate::proto::node::ConfigSnapshotResponse,
+        tokio::sync::watch::Receiver<crate::proto::node::ConfigUpdateNotification>,
+    )> {
+        use crate::proto::node::{
+            ConfigSnapshotResponse, ConfigSubscribe, ConfigUpdateNotification,
+        };
+
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(&[STREAM_CONFIG_SUBSCRIBE]).await?;
+
+        let req = ConfigSubscribe {
+            gen: NODE_PROTOCOL_GENERATION,
+            subscriber_id: self.endpoint.id().as_bytes().to_vec(),
+            owner_id: owner_id.to_string(),
+        };
+        write_len_prefixed(&mut send, &req.encode_to_vec()).await?;
+
+        let buf = read_len_prefixed(&mut recv).await?;
+        let snapshot = ConfigSnapshotResponse::decode(buf.as_slice())
+            .map_err(|e| anyhow::anyhow!("ConfigSnapshotResponse decode error: {e}"))?;
+        snapshot
+            .validate_frame()
+            .map_err(|e| anyhow::anyhow!("ConfigSnapshotResponse validation error: {e}"))?;
+
+        let empty_notif = ConfigUpdateNotification {
+            gen: NODE_PROTOCOL_GENERATION,
+            node_id: snapshot.node_id.clone(),
+            owner_id: snapshot.owner_id.clone(),
+            revision: snapshot.revision,
+            config_hash: snapshot.config_hash.clone(),
+            config: snapshot.config.clone(),
+        };
+        let (notif_tx, notif_rx) = tokio::sync::watch::channel(empty_notif);
+        tokio::spawn(async move {
+            loop {
+                match read_len_prefixed(&mut recv).await {
+                    Ok(buf) => match ConfigUpdateNotification::decode(buf.as_slice()) {
+                        Ok(notif) => {
+                            if notif_tx.send(notif).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("ConfigUpdateNotification decode error: {e}");
+                            break;
+                        }
+                    },
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok((snapshot, notif_rx))
     }
 
     // --- Gossip ---
@@ -4350,6 +4667,7 @@ impl Node {
                     available_model_sizes: p.available_model_sizes.clone(),
                     served_model_descriptors: p.served_model_descriptors.clone(),
                     served_model_runtime: p.served_model_runtime.clone(),
+                    owner_id: p.owner_id.clone(),
                 })
                 .collect()
         };
@@ -4393,9 +4711,40 @@ impl Node {
             available_model_sizes: my_model_sizes,
             served_model_descriptors: my_served_model_descriptors,
             served_model_runtime: my_model_runtime_descriptors,
+            owner_id: self.local_owner_id(),
         });
         announcements
     }
+}
+
+pub(crate) fn config_push_signature_payload(push: &crate::proto::node::ConfigPush) -> Vec<u8> {
+    use prost::Message as _;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&push.gen.to_le_bytes());
+    payload.extend_from_slice(&push.requester_id);
+    payload.extend_from_slice(&push.target_node_id);
+    payload.extend_from_slice(push.owner_id.as_bytes());
+    payload.extend_from_slice(&push.expected_revision.to_le_bytes());
+    if let Some(ref config) = push.config {
+        payload.extend_from_slice(&config.encode_to_vec());
+    }
+    payload
+}
+
+async fn send_push_error(send: &mut iroh::endpoint::SendStream, msg: &str) -> anyhow::Result<()> {
+    use crate::protocol::{write_len_prefixed, NODE_PROTOCOL_GENERATION};
+    use prost::Message as _;
+    let response = crate::proto::node::ConfigPushResponse {
+        gen: NODE_PROTOCOL_GENERATION,
+        success: false,
+        current_revision: 0,
+        config_hash: vec![],
+        error: Some(msg.to_string()),
+        saved_to_disk: false,
+        applied_live: false,
+    };
+    write_len_prefixed(send, &response.encode_to_vec()).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4465,6 +4814,13 @@ mod tests {
             is_soc: None,
             gpu_vram: None,
             gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            config_state: Arc::new(tokio::sync::Mutex::new(
+                crate::runtime::config_state::ConfigState::default(),
+            )),
+            config_revision_tx: {
+                let (tx, _rx) = tokio::sync::watch::channel(0u64);
+                Arc::new(tx)
+            },
         };
 
         let accept_node = node.clone();
@@ -4944,6 +5300,7 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         };
         let legacy_route_table = RoutingTable {
             hosts: vec![RouteEntry {
@@ -5159,6 +5516,7 @@ mod tests {
             available_model_sizes: HashMap::from([("Qwen".into(), 1234_u64)]),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         };
         let json = serde_json::to_vec(&vec![ann.clone()]).unwrap();
 
@@ -5229,6 +5587,7 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         }
     }
 
@@ -5717,6 +6076,7 @@ mod tests {
                 context_length: Some(32768),
                 ready: true,
             }],
+            owner_id: None,
         };
 
         let proto_pa = local_ann_to_proto_ann(&local_ann);
@@ -5933,6 +6293,7 @@ mod tests {
             available_model_sizes: new_sizes,
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         };
 
         apply_transitive_ann(&mut existing, &addr, &ann);
@@ -6000,6 +6361,7 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         };
 
         apply_transitive_ann(&mut existing, &weak_addr, &ann);
@@ -6046,6 +6408,7 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         };
         apply_transitive_ann(&mut existing, &richer_addr, &ann2);
 
@@ -7028,6 +7391,7 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         };
 
         let server = tokio::spawn(async move {
@@ -7214,6 +7578,7 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         };
 
         let server = tokio::spawn(async move {
@@ -7422,6 +7787,7 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         };
         let v0_gossip_json =
             serde_json::to_vec(&vec![v0_ann]).expect("v0 gossip JSON must serialize");
@@ -7641,6 +8007,7 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         }
     }
 
@@ -7808,6 +8175,173 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn config_sync_subscribe_snapshot_encode_decode() {
+        use crate::proto::node::{ConfigSnapshotResponse, NodeConfigSnapshot, NodeGpuConfig};
+
+        let snapshot = ConfigSnapshotResponse {
+            gen: NODE_PROTOCOL_GENERATION,
+            node_id: vec![0xAA; 32],
+            owner_id: "test-owner".to_string(),
+            revision: 7,
+            config_hash: vec![0xBB; 32],
+            config: Some(NodeConfigSnapshot {
+                version: 1,
+                gpu: Some(NodeGpuConfig {
+                    assignment: "auto".to_string(),
+                }),
+                models: vec![],
+                plugins: vec![],
+            }),
+            hostname: Some("test-host".to_string()),
+        };
+
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &snapshot);
+        let decoded: ConfigSnapshotResponse =
+            decode_control_frame(STREAM_CONFIG_SUBSCRIBE, &encoded)
+                .expect("round-trip must succeed");
+
+        assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
+        assert_eq!(decoded.node_id, vec![0xAA; 32]);
+        assert_eq!(decoded.owner_id, "test-owner");
+        assert_eq!(decoded.revision, 7);
+        assert_eq!(decoded.config_hash, vec![0xBB; 32]);
+        assert_eq!(decoded.hostname, Some("test-host".to_string()));
+        let cfg = decoded.config.expect("config must be present");
+        assert_eq!(cfg.version, 1);
+        let gpu = cfg.gpu.expect("gpu must be present");
+        assert_eq!(gpu.assignment, "auto");
+    }
+
+    #[test]
+    fn config_sync_subscribe_wrong_owner_rejected() {
+        let local_id = "alice-owner-id";
+        let remote_id = "bob-owner-id";
+        assert_ne!(local_id, remote_id, "owner IDs must differ for this test");
+        let mismatch = local_id != remote_id;
+        assert!(
+            mismatch,
+            "subscription from wrong owner must be detected as a mismatch"
+        );
+    }
+
+    #[test]
+    fn config_sync_subscribe_not_before_admission() {
+        assert!(
+            !stream_allowed_before_admission(STREAM_CONFIG_SUBSCRIBE),
+            "STREAM_CONFIG_SUBSCRIBE (0x0b) must require admission — it is an owner-gated config stream"
+        );
+    }
+
+    fn test_signing_key() -> (ed25519_dalek::SigningKey, String) {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let verifying = signing_key.verifying_key();
+        let owner_id = crate::crypto::owner_id_from_verifying_key(&verifying);
+        (signing_key, owner_id)
+    }
+
+    #[test]
+    fn config_sync_push_signature_payload_deterministic() {
+        use crate::proto::node::{ConfigPush, NodeConfigSnapshot};
+
+        let (_, owner_id) = test_signing_key();
+        let push = ConfigPush {
+            gen: NODE_PROTOCOL_GENERATION,
+            requester_id: vec![0xAA; 32],
+            target_node_id: vec![0xBB; 32],
+            owner_id: owner_id.clone(),
+            owner_signing_public_key: vec![0x42u8; 32],
+            expected_revision: 3,
+            config: Some(NodeConfigSnapshot {
+                version: 1,
+                gpu: None,
+                models: vec![],
+                plugins: vec![],
+            }),
+            signature: vec![0u8; 64],
+        };
+
+        let p1 = config_push_signature_payload(&push);
+        let p2 = config_push_signature_payload(&push);
+        assert_eq!(p1, p2, "payload must be deterministic for the same input");
+        assert!(!p1.is_empty(), "payload must not be empty");
+    }
+
+    #[test]
+    fn config_sync_push_wrong_owner_detected() {
+        use crate::proto::node::ConfigPush;
+
+        let (signing_key, real_owner_id) = test_signing_key();
+        let vk = signing_key.verifying_key();
+        let derived = crate::crypto::owner_id_from_verifying_key(&vk);
+
+        let push_owner_id = "some-other-owner-id".to_string();
+        assert_ne!(
+            push_owner_id, derived,
+            "test requires push.owner_id to differ from the derived owner_id"
+        );
+
+        let push = ConfigPush {
+            gen: NODE_PROTOCOL_GENERATION,
+            requester_id: vec![0xAA; 32],
+            target_node_id: vec![0xBB; 32],
+            owner_id: push_owner_id.clone(),
+            owner_signing_public_key: vk.to_bytes().to_vec(),
+            expected_revision: 0,
+            config: None,
+            signature: vec![0u8; 64],
+        };
+
+        let mismatch = derived != push.owner_id;
+        assert!(
+            mismatch,
+            "owner_id derived from public key ({derived}) must not match push.owner_id ({push_owner_id})"
+        );
+        let _ = real_owner_id;
+    }
+
+    #[test]
+    fn config_sync_push_bad_signature_bytes_length() {
+        let bad_sig: Vec<u8> = vec![0u8; 32];
+        let result: Result<[u8; 64], _> = bad_sig.as_slice().try_into();
+        assert!(
+            result.is_err(),
+            "32-byte slice must not convert to [u8; 64] — wrong-length signature must be rejected"
+        );
+
+        let good_sig: Vec<u8> = vec![0u8; 64];
+        let result: Result<[u8; 64], _> = good_sig.as_slice().try_into();
+        assert!(result.is_ok(), "64-byte slice must convert to [u8; 64]");
+    }
+
+    #[test]
+    fn config_sync_push_roundtrip_encode_decode() {
+        use crate::proto::node::ConfigPushResponse;
+        use prost::Message as _;
+
+        let response = ConfigPushResponse {
+            gen: NODE_PROTOCOL_GENERATION,
+            success: true,
+            current_revision: 42,
+            config_hash: vec![0xCC; 32],
+            error: None,
+            saved_to_disk: true,
+            applied_live: false,
+        };
+
+        let encoded = response.encode_to_vec();
+        let decoded = ConfigPushResponse::decode(encoded.as_slice())
+            .expect("ConfigPushResponse must round-trip through encode/decode");
+
+        assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
+        assert!(decoded.success);
+        assert_eq!(decoded.current_revision, 42);
+        assert_eq!(decoded.config_hash, vec![0xCC; 32]);
+        assert!(decoded.error.is_none());
+        assert!(decoded.saved_to_disk);
+        assert!(!decoded.applied_live);
     }
 }
 

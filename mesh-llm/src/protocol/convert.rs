@@ -258,6 +258,7 @@ pub(crate) fn local_ann_to_proto_ann(
         served_model_identities,
         served_model_descriptors,
         served_model_runtime,
+        owner_id: ann.owner_id.clone(),
     }
 }
 
@@ -335,6 +336,7 @@ pub(crate) fn proto_ann_to_local(
             .iter()
             .map(proto_runtime_descriptor_to_local)
             .collect(),
+        owner_id: pa.owner_id.clone(),
         served_model_descriptors: if !pa.served_model_descriptors.is_empty() {
             let descriptors: Vec<_> = pa
                 .served_model_descriptors
@@ -413,6 +415,91 @@ pub(crate) fn routing_table_to_proto(table: &RoutingTable) -> crate::proto::node
         mesh_id: table.mesh_id.clone(),
         gen: NODE_PROTOCOL_GENERATION,
     }
+}
+
+pub(crate) fn mesh_config_to_proto(
+    config: &crate::plugin::MeshConfig,
+) -> crate::proto::node::NodeConfigSnapshot {
+    use crate::plugin::GpuAssignment;
+    let assignment = match config.gpu.assignment {
+        GpuAssignment::Auto => "auto".to_string(),
+        GpuAssignment::Pinned => "pinned".to_string(),
+    };
+    let models = config
+        .models
+        .iter()
+        .map(|m| crate::proto::node::NodeModelEntry {
+            model: m.model.clone(),
+            mmproj: m.mmproj.clone(),
+            ctx_size: m.ctx_size,
+        })
+        .collect();
+    let plugins = config
+        .plugins
+        .iter()
+        .map(|p| crate::proto::node::NodePluginEntry {
+            name: p.name.clone(),
+            enabled: p.enabled,
+            command: p.command.clone(),
+            args: p.args.clone(),
+        })
+        .collect();
+    crate::proto::node::NodeConfigSnapshot {
+        version: config.version.unwrap_or(1),
+        gpu: Some(crate::proto::node::NodeGpuConfig { assignment }),
+        models,
+        plugins,
+    }
+}
+
+pub(crate) fn proto_config_to_mesh(
+    snapshot: &crate::proto::node::NodeConfigSnapshot,
+) -> crate::plugin::MeshConfig {
+    use crate::plugin::{
+        GpuAssignment, GpuConfig, MeshConfig, ModelConfigEntry, PluginConfigEntry,
+    };
+    let assignment = match snapshot
+        .gpu
+        .as_ref()
+        .map(|g| g.assignment.as_str())
+        .unwrap_or("auto")
+    {
+        "pinned" => GpuAssignment::Pinned,
+        _ => GpuAssignment::Auto,
+    };
+    let models = snapshot
+        .models
+        .iter()
+        .map(|m| ModelConfigEntry {
+            model: m.model.clone(),
+            mmproj: m.mmproj.clone(),
+            ctx_size: m.ctx_size,
+        })
+        .collect();
+    let plugins = snapshot
+        .plugins
+        .iter()
+        .map(|p| PluginConfigEntry {
+            name: p.name.clone(),
+            enabled: p.enabled,
+            command: p.command.clone(),
+            args: p.args.clone(),
+        })
+        .collect();
+    MeshConfig {
+        version: Some(snapshot.version),
+        gpu: GpuConfig { assignment },
+        models,
+        plugins,
+    }
+}
+
+pub(crate) fn canonical_config_hash(snapshot: &crate::proto::node::NodeConfigSnapshot) -> [u8; 32] {
+    use prost::Message as _;
+    use sha2::{Digest, Sha256};
+    let bytes = snapshot.encode_to_vec();
+    let hash = Sha256::digest(&bytes);
+    hash.into()
 }
 
 #[cfg(test)]

@@ -40,6 +40,12 @@ pub(crate) const STREAM_PEER_DOWN: u8 = 0x06;
 pub(crate) const STREAM_PEER_LEAVING: u8 = 0x07;
 pub(crate) const STREAM_PLUGIN_CHANNEL: u8 = 0x08;
 pub(crate) const STREAM_PLUGIN_BULK_TRANSFER: u8 = 0x09;
+pub(crate) const STREAM_CONFIG_SUBSCRIBE: u8 = 0x0b;
+pub(crate) const STREAM_CONFIG_PUSH: u8 = 0x0c;
+const _: () = {
+    let _ = STREAM_CONFIG_SUBSCRIBE;
+    let _ = STREAM_CONFIG_PUSH;
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControlProtocol {
@@ -63,6 +69,14 @@ pub(crate) enum ControlFrameError {
         got: usize,
     },
     MissingHttpPort,
+    MissingOwnerId,
+    InvalidConfigHashLength {
+        got: usize,
+    },
+    InvalidPublicKeyLength {
+        got: usize,
+    },
+    MissingSignature,
     #[cfg(test)]
     DecodeError(String),
     #[cfg(test)]
@@ -96,6 +110,14 @@ impl std::fmt::Display for ControlFrameError {
             ControlFrameError::MissingHttpPort => {
                 write!(f, "HOST-role peer annotation missing http_port")
             }
+            ControlFrameError::MissingOwnerId => write!(f, "config frame missing owner_id"),
+            ControlFrameError::InvalidConfigHashLength { got } => {
+                write!(f, "invalid config_hash length: expected 32, got {}", got)
+            }
+            ControlFrameError::InvalidPublicKeyLength { got } => {
+                write!(f, "invalid public key length: expected 32, got {}", got)
+            }
+            ControlFrameError::MissingSignature => write!(f, "config push missing signature"),
             #[cfg(test)]
             ControlFrameError::DecodeError(msg) => write!(f, "protobuf decode error: {}", msg),
             #[cfg(test)]
@@ -208,6 +230,69 @@ impl ValidateControlFrame for crate::proto::node::PeerLeaving {
     }
 }
 
+impl ValidateControlFrame for crate::proto::node::ConfigSubscribe {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if self.gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        }
+        validate_endpoint_id_length(self.subscriber_id.len())?;
+        if self.owner_id.is_empty() {
+            return Err(ControlFrameError::MissingOwnerId);
+        }
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::ConfigSnapshotResponse {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if self.gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        }
+        validate_endpoint_id_length(self.node_id.len())?;
+        validate_config_hash_length(self.config_hash.len())?;
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::ConfigUpdateNotification {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if self.gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        }
+        validate_endpoint_id_length(self.node_id.len())?;
+        validate_config_hash_length(self.config_hash.len())?;
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::ConfigPush {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if self.gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        }
+        validate_endpoint_id_length(self.requester_id.len())?;
+        validate_endpoint_id_length(self.target_node_id.len())?;
+        if self.owner_id.is_empty() {
+            return Err(ControlFrameError::MissingOwnerId);
+        }
+        validate_public_key_length(self.owner_signing_public_key.len())?;
+        if self.signature.is_empty() {
+            return Err(ControlFrameError::MissingSignature);
+        }
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::ConfigPushResponse {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if self.gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        }
+        validate_config_hash_length(self.config_hash.len())?;
+        Ok(())
+    }
+}
+
 pub(crate) fn validate_peer_announcement(
     pa: &crate::proto::node::PeerAnnouncement,
 ) -> Result<(), ControlFrameError> {
@@ -218,6 +303,27 @@ pub(crate) fn validate_peer_announcement(
     }
     if pa.role == crate::proto::node::NodeRole::Host as i32 && pa.http_port.is_none() {
         return Err(ControlFrameError::MissingHttpPort);
+    }
+    Ok(())
+}
+
+fn validate_endpoint_id_length(len: usize) -> Result<(), ControlFrameError> {
+    if len != 32 {
+        return Err(ControlFrameError::InvalidEndpointId { got: len });
+    }
+    Ok(())
+}
+
+fn validate_config_hash_length(len: usize) -> Result<(), ControlFrameError> {
+    if len != 32 {
+        return Err(ControlFrameError::InvalidConfigHashLength { got: len });
+    }
+    Ok(())
+}
+
+fn validate_public_key_length(len: usize) -> Result<(), ControlFrameError> {
+    if len != 32 {
+        return Err(ControlFrameError::InvalidPublicKeyLength { got: len });
     }
     Ok(())
 }
@@ -378,7 +484,11 @@ pub(crate) fn decode_control_frame<T: ValidateControlFrame>(
 mod tests {
     use super::*;
     use crate::mesh::{resolve_peer_down, resolve_peer_leaving, ModelDemand, PeerInfo};
-    use crate::proto::node::{GossipFrame, NodeRole, PeerAnnouncement, RouteTableRequest};
+    use crate::proto::node::{
+        ConfigPush, ConfigPushResponse, ConfigSnapshotResponse, ConfigSubscribe,
+        ConfigUpdateNotification, GossipFrame, NodeConfigSnapshot, NodeGpuConfig, NodeModelEntry,
+        NodePluginEntry, NodeRole, PeerAnnouncement, RouteTableRequest,
+    };
     use iroh::{EndpointAddr, EndpointId, SecretKey};
     use std::collections::{HashMap, HashSet};
 
@@ -391,6 +501,34 @@ mod tests {
                 role: NodeRole::Worker as i32,
                 ..Default::default()
             }],
+        }
+    }
+
+    fn make_config_snapshot() -> NodeConfigSnapshot {
+        NodeConfigSnapshot {
+            version: 1,
+            gpu: Some(NodeGpuConfig {
+                assignment: "auto".to_string(),
+            }),
+            models: vec![NodeModelEntry {
+                model: "Qwen3-8B".to_string(),
+                mmproj: Some("mmproj-cut".to_string()),
+                ctx_size: Some(8192),
+            }],
+            plugins: vec![NodePluginEntry {
+                name: "blackboard".to_string(),
+                enabled: Some(true),
+                command: Some("mesh-llm".to_string()),
+                args: vec!["--plugin".to_string(), "blackboard".to_string()],
+            }],
+        }
+    }
+
+    fn make_valid_config_subscribe() -> ConfigSubscribe {
+        ConfigSubscribe {
+            gen: NODE_PROTOCOL_GENERATION,
+            subscriber_id: vec![0xAA; 32],
+            owner_id: "owner-1".to_string(),
         }
     }
 
@@ -425,6 +563,7 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         }
     }
 
@@ -473,6 +612,7 @@ mod tests {
             available_model_sizes: HashMap::from([("Qwen".into(), 1234_u64)]),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         };
         let json = serde_json::to_vec(&vec![PeerAnnouncementV0::from(&ann)]).unwrap();
 
@@ -514,6 +654,198 @@ mod tests {
         assert_eq!(decoded.peers.len(), 1);
         assert_eq!(decoded.peers[0].endpoint_id, vec![0u8; 32]);
         assert_eq!(decoded.peers[0].role, NodeRole::Worker as i32);
+    }
+
+    #[test]
+    fn config_frames_roundtrip_and_validation() {
+        let snapshot = make_config_snapshot();
+        let config_hash = vec![0xA5; 32];
+        let node_id = vec![0x42; 32];
+
+        let subscribe = make_valid_config_subscribe();
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &subscribe);
+        let decoded: ConfigSubscribe = decode_control_frame(STREAM_CONFIG_SUBSCRIBE, &encoded)
+            .expect("valid config subscribe must decode");
+        assert_eq!(decoded.owner_id, "owner-1");
+
+        let snapshot_response = ConfigSnapshotResponse {
+            gen: NODE_PROTOCOL_GENERATION,
+            node_id: node_id.clone(),
+            owner_id: "owner-1".to_string(),
+            revision: 7,
+            config_hash: config_hash.clone(),
+            config: Some(snapshot.clone()),
+            hostname: Some("node-01".to_string()),
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &snapshot_response);
+        let decoded: ConfigSnapshotResponse =
+            decode_control_frame(STREAM_CONFIG_SUBSCRIBE, &encoded)
+                .expect("valid snapshot response must decode");
+        assert_eq!(decoded.revision, 7);
+        assert_eq!(decoded.config_hash, config_hash);
+        assert_eq!(decoded.hostname.as_deref(), Some("node-01"));
+
+        let update = ConfigUpdateNotification {
+            gen: NODE_PROTOCOL_GENERATION,
+            node_id: node_id.clone(),
+            owner_id: "owner-1".to_string(),
+            revision: 8,
+            config_hash: config_hash.clone(),
+            config: Some(snapshot.clone()),
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &update);
+        let decoded: ConfigUpdateNotification =
+            decode_control_frame(STREAM_CONFIG_SUBSCRIBE, &encoded)
+                .expect("valid update notification must decode");
+        assert_eq!(decoded.revision, 8);
+
+        let push = ConfigPush {
+            gen: NODE_PROTOCOL_GENERATION,
+            requester_id: vec![0x10; 32],
+            target_node_id: node_id.clone(),
+            owner_id: "owner-1".to_string(),
+            expected_revision: 8,
+            config: Some(snapshot.clone()),
+            owner_signing_public_key: vec![0x02; 32],
+            signature: vec![0x03],
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
+        let decoded: ConfigPush = decode_control_frame(STREAM_CONFIG_PUSH, &encoded)
+            .expect("valid config push must decode");
+        assert_eq!(decoded.expected_revision, 8);
+
+        let push_response = ConfigPushResponse {
+            gen: NODE_PROTOCOL_GENERATION,
+            success: true,
+            current_revision: 9,
+            config_hash: config_hash.clone(),
+            error: None,
+            saved_to_disk: true,
+            applied_live: true,
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push_response);
+        let decoded: ConfigPushResponse = decode_control_frame(STREAM_CONFIG_PUSH, &encoded)
+            .expect("valid push response must decode");
+        assert!(decoded.success);
+        assert_eq!(decoded.current_revision, 9);
+    }
+
+    #[test]
+    fn config_frames_validation_rejects_bad_data() {
+        let mut subscribe = make_valid_config_subscribe();
+        subscribe.gen = 0;
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &subscribe);
+        let err = decode_control_frame::<ConfigSubscribe>(STREAM_CONFIG_SUBSCRIBE, &encoded)
+            .expect_err("bad generation must be rejected");
+        assert!(matches!(err, ControlFrameError::BadGeneration { got: 0 }));
+
+        let mut subscribe = make_valid_config_subscribe();
+        subscribe.subscriber_id = vec![0x01; 16];
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &subscribe);
+        let err = decode_control_frame::<ConfigSubscribe>(STREAM_CONFIG_SUBSCRIBE, &encoded)
+            .expect_err("invalid subscriber id length must be rejected");
+        assert!(matches!(err, ControlFrameError::InvalidEndpointId { .. }));
+
+        let mut subscribe = make_valid_config_subscribe();
+        subscribe.owner_id = String::new();
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &subscribe);
+        let err = decode_control_frame::<ConfigSubscribe>(STREAM_CONFIG_SUBSCRIBE, &encoded)
+            .expect_err("missing owner id must be rejected");
+        assert!(matches!(err, ControlFrameError::MissingOwnerId));
+
+        let snapshot_response = ConfigSnapshotResponse {
+            gen: NODE_PROTOCOL_GENERATION,
+            node_id: vec![0x01; 16],
+            owner_id: "owner-1".to_string(),
+            revision: 1,
+            config_hash: vec![0x02; 32],
+            config: Some(make_config_snapshot()),
+            hostname: None,
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &snapshot_response);
+        let err = decode_control_frame::<ConfigSnapshotResponse>(STREAM_CONFIG_SUBSCRIBE, &encoded)
+            .expect_err("invalid node id must be rejected");
+        assert!(matches!(err, ControlFrameError::InvalidEndpointId { .. }));
+
+        let snapshot_response = ConfigSnapshotResponse {
+            gen: NODE_PROTOCOL_GENERATION,
+            node_id: vec![0xAA; 32],
+            owner_id: "owner-1".to_string(),
+            revision: 1,
+            config_hash: vec![0x02; 16],
+            config: Some(make_config_snapshot()),
+            hostname: None,
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &snapshot_response);
+        let err = decode_control_frame::<ConfigSnapshotResponse>(STREAM_CONFIG_SUBSCRIBE, &encoded)
+            .expect_err("invalid config hash length must be rejected");
+        assert!(matches!(
+            err,
+            ControlFrameError::InvalidConfigHashLength { .. }
+        ));
+
+        let update = ConfigUpdateNotification {
+            gen: NODE_PROTOCOL_GENERATION,
+            node_id: vec![0xBB; 32],
+            owner_id: "owner-1".to_string(),
+            revision: 2,
+            config_hash: vec![0xCC; 16],
+            config: Some(make_config_snapshot()),
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &update);
+        let err =
+            decode_control_frame::<ConfigUpdateNotification>(STREAM_CONFIG_SUBSCRIBE, &encoded)
+                .expect_err("invalid config hash for update must be rejected");
+        assert!(matches!(
+            err,
+            ControlFrameError::InvalidConfigHashLength { .. }
+        ));
+
+        let mut push = ConfigPush {
+            gen: NODE_PROTOCOL_GENERATION,
+            requester_id: vec![0x01; 32],
+            target_node_id: vec![0x02; 32],
+            owner_id: String::new(),
+            expected_revision: 2,
+            config: Some(make_config_snapshot()),
+            owner_signing_public_key: vec![0x03; 32],
+            signature: vec![0x04],
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
+        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
+            .expect_err("empty owner id must be rejected");
+        assert!(matches!(err, ControlFrameError::MissingOwnerId));
+
+        push.owner_id = "owner-1".to_string();
+        push.owner_signing_public_key = vec![0x05; 16];
+        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
+        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
+            .expect_err("short public key must be rejected");
+        assert!(matches!(
+            err,
+            ControlFrameError::InvalidPublicKeyLength { .. }
+        ));
+
+        push.owner_signing_public_key = vec![0x06; 32];
+        push.signature = vec![];
+        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
+        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
+            .expect_err("empty signature must be rejected");
+        assert!(matches!(err, ControlFrameError::MissingSignature));
+
+        let push_response = ConfigPushResponse {
+            gen: 0,
+            success: false,
+            current_revision: 2,
+            config_hash: vec![0x07; 32],
+            error: Some("fail".to_string()),
+            saved_to_disk: false,
+            applied_live: false,
+        };
+        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push_response);
+        let err = decode_control_frame::<ConfigPushResponse>(STREAM_CONFIG_PUSH, &encoded)
+            .expect_err("bad gen must be rejected");
+        assert!(matches!(err, ControlFrameError::BadGeneration { got: 0 }));
     }
 
     #[test]
@@ -880,6 +1212,7 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
+            owner_id: None,
         };
         let json = serde_json::to_vec(&vec![PeerAnnouncementV0::from(&ann)])
             .expect("JSON serialization must succeed");
@@ -936,5 +1269,543 @@ mod tests {
             bad_result.is_err(),
             "ProtoV1 gossip with gen=99 must be rejected by the generation gate"
         );
+    }
+
+    #[test]
+    fn owner_fields_roundtrip_through_proto_announcement() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0xAB; 32]).public());
+        let config_hash_bytes = vec![0xDE_u8; 32];
+        let ann = super::PeerAnnouncement {
+            addr: iroh::EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving_models: vec![],
+            hosted_models: None,
+            available_models: vec![],
+            requested_models: vec![],
+            version: None,
+            model_demand: HashMap::new(),
+            mesh_id: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+            owner_id: Some("owner-abc".to_string()),
+        };
+        let proto_pa = local_ann_to_proto_ann(&ann);
+        assert_eq!(proto_pa.owner_id.as_deref(), Some("owner-abc"));
+
+        let (_, roundtripped) =
+            proto_ann_to_local(&proto_pa).expect("proto_ann_to_local must succeed");
+        assert_eq!(roundtripped.owner_id.as_deref(), Some("owner-abc"));
+    }
+
+    #[test]
+    fn mesh_config_proto_roundtrip() {
+        let snapshot = make_config_snapshot();
+        let config = proto_config_to_mesh(&snapshot);
+        assert_eq!(config.version, Some(1));
+        assert_eq!(config.gpu.assignment, crate::plugin::GpuAssignment::Auto);
+        assert_eq!(config.models.len(), 1);
+        assert_eq!(config.models[0].model, "Qwen3-8B");
+        assert_eq!(config.models[0].mmproj.as_deref(), Some("mmproj-cut"));
+        assert_eq!(config.models[0].ctx_size, Some(8192));
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(config.plugins[0].name, "blackboard");
+
+        let roundtripped = mesh_config_to_proto(&config);
+        assert_eq!(roundtripped.version, snapshot.version);
+        assert_eq!(
+            roundtripped.gpu.as_ref().map(|g| g.assignment.as_str()),
+            Some("auto")
+        );
+        assert_eq!(roundtripped.models.len(), snapshot.models.len());
+        assert_eq!(roundtripped.models[0].model, snapshot.models[0].model);
+        assert_eq!(roundtripped.models[0].mmproj, snapshot.models[0].mmproj);
+        assert_eq!(roundtripped.models[0].ctx_size, snapshot.models[0].ctx_size);
+        assert_eq!(roundtripped.plugins.len(), snapshot.plugins.len());
+        assert_eq!(roundtripped.plugins[0].name, snapshot.plugins[0].name);
+    }
+
+    #[test]
+    fn canonical_config_hash_is_stable() {
+        let snapshot = make_config_snapshot();
+        let hash1 = canonical_config_hash(&snapshot);
+        let hash2 = canonical_config_hash(&snapshot);
+        assert_eq!(hash1, hash2, "same config must produce the same hash");
+        assert_eq!(hash1.len(), 32);
+
+        let mut different = snapshot.clone();
+        different.version = 2;
+        let hash3 = canonical_config_hash(&different);
+        assert_ne!(hash1, hash3, "different config must produce different hash");
+    }
+
+    #[test]
+    fn config_sync_v0_gossip_accepted() {
+        // Prove that a V0 JSON gossip frame (PeerAnnouncementV0 without owner fields)
+        // is accepted by the v1 gossip decoder and produces a PeerAnnouncement with owner_id: None.
+        let remote_id = EndpointId::from(SecretKey::from_bytes(&[0x33; 32]).public());
+        let ann = super::PeerAnnouncement {
+            addr: EndpointAddr {
+                id: remote_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            models: vec!["test-model".to_string()],
+            vram_bytes: 16 * 1024 * 1024 * 1024,
+            model_source: None,
+            serving_models: vec!["test-model".to_string()],
+            hosted_models: Some(vec!["test-model".to_string()]),
+            available_models: vec![],
+            requested_models: vec![],
+            version: Some("0.50.0".to_string()),
+            model_demand: HashMap::new(),
+            mesh_id: Some("v0-compat-test".to_string()),
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+            owner_id: None,
+        };
+        let json = serde_json::to_vec(&vec![PeerAnnouncementV0::from(&ann)])
+            .expect("JSON serialization must succeed");
+
+        let decoded = decode_gossip_payload(ControlProtocol::JsonV0, remote_id, &json)
+            .expect("v0 JSON gossip must be accepted");
+
+        assert_eq!(
+            decoded.len(),
+            1,
+            "must decode exactly one peer announcement"
+        );
+        assert_eq!(
+            decoded[0].0.id, remote_id,
+            "decoded addr id must match remote_id"
+        );
+        assert_eq!(
+            decoded[0].1.owner_id, None,
+            "v0 gossip without owner_id must decode to None"
+        );
+        assert_eq!(
+            decoded[0].1.serving_models.first().map(String::as_str),
+            Some("test-model"),
+            "serving model must round-trip correctly"
+        );
+    }
+
+    #[test]
+    fn config_sync_v0_announcement_roundtrip() {
+        // Prove PeerAnnouncementV0 serde handles new fields gracefully:
+        // - owner_id and config_revision ARE serialized (use #[serde(default)])
+        // - config_hash is NOT serialized (uses #[serde(skip_serializing, default)])
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x44; 32]).public());
+        let ann = super::PeerAnnouncement {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving_models: vec![],
+            hosted_models: None,
+            available_models: vec![],
+            requested_models: vec![],
+            version: None,
+            model_demand: HashMap::new(),
+            mesh_id: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+            owner_id: Some("test-owner".to_string()),
+        };
+
+        let v0 = PeerAnnouncementV0::from(&ann);
+        let json_str = serde_json::to_string(&v0).expect("JSON serialization must succeed");
+
+        // Assert owner_id and config_revision ARE in the JSON
+        assert!(
+            json_str.contains("\"owner_id\""),
+            "owner_id must be serialized in JSON"
+        );
+        assert!(
+            json_str.contains("\"test-owner\""),
+            "owner_id value must be in JSON"
+        );
+
+        // Deserialize an OLD-format JSON string (without owner_id field)
+        // Create a minimal valid old-format JSON by serializing a v0 without those fields
+        let old_ann = super::PeerAnnouncement {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving_models: vec![],
+            hosted_models: None,
+            available_models: vec![],
+            requested_models: vec![],
+            version: None,
+            model_demand: HashMap::new(),
+            mesh_id: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+            owner_id: None,
+        };
+        let old_v0 = PeerAnnouncementV0::from(&old_ann);
+        let old_json = serde_json::to_string(&old_v0).expect("JSON serialization must succeed");
+        let deserialized: PeerAnnouncementV0 =
+            serde_json::from_str(&old_json).expect("old JSON format must deserialize");
+        let restored = deserialized.into_internal();
+        assert_eq!(
+            restored.owner_id, None,
+            "missing owner_id field must default to None"
+        );
+    }
+
+    #[test]
+    fn config_sync_mixed_version_proto_compat() {
+        // Prove proto3 unknown-field compatibility:
+        // Build a proto PeerAnnouncement WITH owner_id,
+        // encode to bytes, decode back, and verify fields are preserved.
+        use prost::Message as _;
+
+        let owner_id = "owner-x".to_string();
+        let endpoint_id = vec![0x55_u8; 32];
+
+        let proto_ann = crate::proto::node::PeerAnnouncement {
+            endpoint_id: endpoint_id.clone(),
+            owner_id: Some(owner_id.clone()),
+            ..Default::default()
+        };
+
+        let encoded = proto_ann.encode_to_vec();
+        let decoded = crate::proto::node::PeerAnnouncement::decode(encoded.as_slice())
+            .expect("proto decode must succeed");
+
+        assert_eq!(
+            decoded.owner_id.as_deref(),
+            Some("owner-x"),
+            "owner_id must round-trip through proto"
+        );
+
+        // Now test with a proto PeerAnnouncement WITHOUT owner_id
+        let proto_ann_empty = crate::proto::node::PeerAnnouncement {
+            endpoint_id: endpoint_id.clone(),
+            ..Default::default()
+        };
+
+        let encoded_empty = proto_ann_empty.encode_to_vec();
+        let decoded_empty = crate::proto::node::PeerAnnouncement::decode(encoded_empty.as_slice())
+            .expect("proto decode must succeed");
+
+        assert_eq!(
+            decoded_empty.owner_id, None,
+            "missing owner_id must default to None"
+        );
+    }
+
+    #[test]
+    fn config_sync_full_config_roundtrip() {
+        use crate::plugin::{GpuAssignment, GpuConfig, ModelConfigEntry, PluginConfigEntry};
+        let config = crate::plugin::MeshConfig {
+            version: Some(1),
+            gpu: GpuConfig {
+                assignment: GpuAssignment::Auto,
+            },
+            models: vec![ModelConfigEntry {
+                model: "Qwen3-8B.gguf".to_string(),
+                mmproj: Some("mm.gguf".to_string()),
+                ctx_size: Some(8192),
+            }],
+            plugins: vec![PluginConfigEntry {
+                name: "blackboard".to_string(),
+                enabled: Some(true),
+                command: Some("mesh-llm".to_string()),
+                args: vec!["--plugin".to_string()],
+            }],
+        };
+        let snapshot = mesh_config_to_proto(&config);
+        let restored = proto_config_to_mesh(&snapshot);
+        assert_eq!(restored.version, config.version);
+        assert_eq!(restored.models.len(), 1);
+        assert_eq!(restored.models[0].model, "Qwen3-8B.gguf");
+        assert_eq!(restored.models[0].mmproj.as_deref(), Some("mm.gguf"));
+        assert_eq!(restored.models[0].ctx_size, Some(8192));
+        assert_eq!(restored.plugins.len(), 1);
+        assert_eq!(restored.plugins[0].name, "blackboard");
+        assert_eq!(restored.plugins[0].enabled, Some(true));
+        assert_eq!(restored.plugins[0].command.as_deref(), Some("mesh-llm"));
+        assert_eq!(restored.plugins[0].args, vec!["--plugin"]);
+    }
+
+    #[test]
+    fn config_sync_empty_config_roundtrip() {
+        let config = crate::plugin::MeshConfig::default();
+        let snapshot = mesh_config_to_proto(&config);
+        let restored = proto_config_to_mesh(&snapshot);
+        assert!(restored.models.is_empty());
+        assert!(restored.plugins.is_empty());
+    }
+
+    #[test]
+    fn config_sync_config_hash_determinism() {
+        use crate::plugin::{GpuAssignment, GpuConfig, ModelConfigEntry};
+        let config = crate::plugin::MeshConfig {
+            version: Some(1),
+            gpu: GpuConfig {
+                assignment: GpuAssignment::Auto,
+            },
+            models: vec![ModelConfigEntry {
+                model: "test.gguf".to_string(),
+                mmproj: None,
+                ctx_size: None,
+            }],
+            plugins: vec![],
+        };
+        let snap1 = mesh_config_to_proto(&config);
+        let snap2 = mesh_config_to_proto(&config);
+        let h1 = canonical_config_hash(&snap1);
+        let h2 = canonical_config_hash(&snap2);
+        assert_eq!(h1, h2, "same config must produce same hash");
+
+        let config2 = crate::plugin::MeshConfig {
+            version: Some(1),
+            gpu: GpuConfig {
+                assignment: GpuAssignment::Auto,
+            },
+            models: vec![ModelConfigEntry {
+                model: "other.gguf".to_string(),
+                mmproj: None,
+                ctx_size: None,
+            }],
+            plugins: vec![],
+        };
+        let snap3 = mesh_config_to_proto(&config2);
+        let h3 = canonical_config_hash(&snap3);
+        assert_ne!(h1, h3, "different config must produce different hash");
+    }
+
+    #[test]
+    fn config_sync_push_signature_roundtrip() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let owner_id = crate::crypto::owner_id_from_verifying_key(&verifying_key);
+
+        let push = ConfigPush {
+            gen: NODE_PROTOCOL_GENERATION,
+            requester_id: vec![0x01; 32],
+            target_node_id: vec![0x02; 32],
+            owner_id: owner_id.clone(),
+            expected_revision: 0,
+            config: Some(NodeConfigSnapshot {
+                version: 1,
+                ..Default::default()
+            }),
+            owner_signing_public_key: verifying_key.to_bytes().to_vec(),
+            signature: vec![0u8; 64],
+        };
+
+        let payload = crate::mesh::config_push_signature_payload(&push);
+        let sig = signing_key.sign(&payload);
+        let mut push_signed = push.clone();
+        push_signed.signature = sig.to_bytes().to_vec();
+
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(
+            &push_signed
+                .owner_signing_public_key
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let payload2 = crate::mesh::config_push_signature_payload(&push_signed);
+        let sig2 = ed25519_dalek::Signature::from_bytes(
+            &push_signed.signature.as_slice().try_into().unwrap(),
+        );
+        assert!(
+            vk.verify_strict(&payload2, &sig2).is_ok(),
+            "valid signature must verify"
+        );
+    }
+
+    #[test]
+    fn config_sync_push_tampered_payload_rejected() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(&[0x43u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let owner_id = crate::crypto::owner_id_from_verifying_key(&verifying_key);
+
+        let push = ConfigPush {
+            gen: NODE_PROTOCOL_GENERATION,
+            requester_id: vec![0x01; 32],
+            target_node_id: vec![0x02; 32],
+            owner_id: owner_id.clone(),
+            expected_revision: 0,
+            config: Some(NodeConfigSnapshot {
+                version: 1,
+                ..Default::default()
+            }),
+            owner_signing_public_key: verifying_key.to_bytes().to_vec(),
+            signature: vec![0u8; 64],
+        };
+
+        let payload = crate::mesh::config_push_signature_payload(&push);
+        let sig = signing_key.sign(&payload);
+        let mut push_signed = push.clone();
+        push_signed.signature = sig.to_bytes().to_vec();
+
+        let mut push_tampered = push_signed.clone();
+        push_tampered.expected_revision += 1;
+
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(
+            &push_tampered
+                .owner_signing_public_key
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let payload_tampered = crate::mesh::config_push_signature_payload(&push_tampered);
+        let sig2 = ed25519_dalek::Signature::from_bytes(
+            &push_signed.signature.as_slice().try_into().unwrap(),
+        );
+        assert!(
+            vk.verify_strict(&payload_tampered, &sig2).is_err(),
+            "tampered payload must fail verification"
+        );
+    }
+
+    #[test]
+    fn config_sync_v0_mesh_coexistence() {
+        // Prove round-trip through the V0 conversion path correctly handles config metadata.
+        // This documents the intentional behavior: config_hash is ephemeral in v0 gossip
+        // (lost in JSON round-trip due to skip_serializing).
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x66; 32]).public());
+        let config_hash_bytes = vec![0xFF_u8; 32];
+
+        let ann = super::PeerAnnouncement {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving_models: vec![],
+            hosted_models: None,
+            available_models: vec![],
+            requested_models: vec![],
+            version: None,
+            model_demand: HashMap::new(),
+            mesh_id: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+            owner_id: Some("mesh-owner".to_string()),
+        };
+
+        // Convert to V0, serialize to JSON, deserialize back, then convert to internal
+        let v0 = PeerAnnouncementV0::from(&ann);
+        let json = serde_json::to_vec(&vec![v0]).expect("JSON serialization must succeed");
+        let v0_deserialized: Vec<PeerAnnouncementV0> =
+            serde_json::from_slice(&json).expect("JSON deserialization must succeed");
+        let restored = v0_deserialized[0].clone().into_internal();
+
+        // owner_id and config_revision survive the round-trip
+        assert_eq!(
+            restored.owner_id.as_deref(),
+            Some("mesh-owner"),
+            "owner_id must survive v0 JSON round-trip"
+        );
+    }
+
+    #[test]
+    fn config_sync_v0_peer_no_config_metadata() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x77; 32]).public());
+        let ann = super::PeerAnnouncement {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            models: vec!["v0-model".to_string()],
+            vram_bytes: 0,
+            model_source: None,
+            serving_models: vec!["v0-model".to_string()],
+            hosted_models: None,
+            available_models: vec![],
+            requested_models: vec![],
+            version: Some("0.49.0".to_string()),
+            model_demand: HashMap::new(),
+            mesh_id: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+            owner_id: None,
+        };
+
+        let v0 = PeerAnnouncementV0::from(&ann);
+        let json = serde_json::to_vec(&vec![v0]).expect("JSON serialization must succeed");
+        let v0_deserialized: Vec<PeerAnnouncementV0> =
+            serde_json::from_slice(&json).expect("JSON deserialization must succeed");
+        let internal = v0_deserialized[0].clone().into_internal();
+
+        assert_eq!(internal.owner_id, None, "v0 peer has no owner_id");
     }
 }
