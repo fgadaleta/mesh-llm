@@ -953,6 +953,23 @@ fn remote_metadata_matches_checksum(
             .unwrap_or(false)
 }
 
+fn commits_api_url(endpoint: &str, repo_id: &str, revision: &str, limit: usize) -> String {
+    // The slash in `owner/model-name` is a path separator and must NOT be percent-encoded.
+    // Encode each segment individually (matching huggingface_hub Python behaviour) and
+    // rejoin with a literal slash.
+    let encoded_repo: String = repo_id
+        .split('/')
+        .map(|s| urlencoding::encode(s).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    format!(
+        "{}/api/models/{}/commits/{}?limit={limit}",
+        endpoint,
+        encoded_repo,
+        urlencoding::encode(revision)
+    )
+}
+
 fn fetch_recent_repo_commits(
     repo_id: &str,
     revision: &str,
@@ -960,12 +977,7 @@ fn fetch_recent_repo_commits(
 ) -> Result<Vec<RepoCommit>> {
     let endpoint = hf_endpoint();
     let token = hf_token_override();
-    let url = format!(
-        "{}/api/models/{}/commits/{}?limit={limit}",
-        endpoint,
-        urlencoding::encode(repo_id),
-        urlencoding::encode(revision)
-    );
+    let url = commits_api_url(&endpoint, repo_id, revision, limit);
     let client = reqwest::blocking::Client::new();
     let mut request = client.get(url);
     if let Some(token) = token {
@@ -1421,6 +1433,40 @@ mod tests {
             42,
             "ffffffffffffffff"
         ));
+    }
+
+    #[test]
+    fn commits_api_url_preserves_repo_id_slash() {
+        // The slash between owner and model name is a path separator and must NOT be
+        // percent-encoded to %2F. This matches huggingface_hub Python behaviour.
+        let url = commits_api_url("https://huggingface.co", "Qwen/Qwen3-8B-GGUF", "main", 20);
+        assert!(
+            !url.contains("%2F"),
+            "URL must not encode the repo_id slash: {url}"
+        );
+        assert_eq!(
+            url,
+            "https://huggingface.co/api/models/Qwen/Qwen3-8B-GGUF/commits/main?limit=20"
+        );
+    }
+
+    #[test]
+    fn commits_api_url_encodes_special_chars_in_revision() {
+        // Special characters in a branch name should still be encoded.
+        let url = commits_api_url(
+            "https://huggingface.co",
+            "org/model",
+            "branch with spaces",
+            5,
+        );
+        assert!(
+            url.contains("branch%20with%20spaces"),
+            "revision special chars should be encoded: {url}"
+        );
+        assert!(
+            !url.contains("%2F"),
+            "repo_id slash should not be encoded: {url}"
+        );
     }
 
     #[test]
