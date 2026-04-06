@@ -6027,37 +6027,30 @@ function NodeSidebar({
               <Shield className="h-4 w-4 text-muted-foreground" />
               <span>Ownership</span>
             </CardTitle>
+            <p className="text-sm leading-6 text-muted-foreground">
+              Shows whether this node identity is cryptographically bound to a stable owner.
+            </p>
           </CardHeader>
           <CardContent className="grid gap-3 pt-0 sm:grid-cols-2">
             <ModelMetaItem
-              label="Status"
+              label="Ownership"
               value={ownershipStatusLabel(node.owner.status)}
             />
             <ModelMetaItem
-              label="Verified"
-              value={node.owner.verified ? "Yes" : "No"}
+              label="Node"
+              value={node.id}
+              copyValue={node.id}
             />
             <ModelMetaItem
-              label="Owner ID"
+              label="Owner"
               value={node.owner.owner_id ?? "Unsigned"}
               copyValue={node.owner.owner_id}
-            />
-            <ModelMetaItem
-              label="Cert ID"
-              value={node.owner.cert_id ?? "n/a"}
-              copyValue={node.owner.cert_id}
             />
             {node.owner.node_label ? (
               <ModelMetaItem label="Node Label" value={node.owner.node_label} />
             ) : null}
             {node.owner.hostname_hint ? (
               <ModelMetaItem label="Hostname Hint" value={node.owner.hostname_hint} />
-            ) : null}
-            {node.owner.expires_at_unix_ms ? (
-              <ModelMetaItem
-                label="Expires"
-                value={formatOwnershipExpiry(node.owner.expires_at_unix_ms) ?? "n/a"}
-              />
             ) : null}
           </CardContent>
         </Card>
