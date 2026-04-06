@@ -71,7 +71,6 @@ pub(super) struct StatusPayload {
     pub(super) peers: Vec<PeerPayload>,
     pub(super) launch_pi: Option<String>,
     pub(super) launch_goose: Option<String>,
-    pub(super) mesh_models: Vec<MeshModelPayload>,
     pub(super) inflight_requests: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mesh_id: Option<String>,
@@ -137,6 +136,16 @@ pub(super) struct MeshModelPayload {
     pub(super) expert_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) used_expert_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ranking_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ranking_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ranking_prompt_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ranking_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ranking_layer_scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) draft_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

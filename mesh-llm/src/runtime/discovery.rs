@@ -130,13 +130,22 @@ pub(super) async fn nostr_rediscovery(
 }
 
 /// Helper for StartNew path — configure CLI to start a new mesh.
-pub(super) fn start_new_mesh(cli: &mut Cli, _models: &[String], my_vram_gb: f64) {
+pub(super) fn start_new_mesh(
+    cli: &mut Cli,
+    _models: &[String],
+    my_vram_gb: f64,
+    has_startup_models: bool,
+) {
     let pack = nostr::auto_model_pack(my_vram_gb);
     let primary = pack.first().cloned().unwrap_or_default();
     eprintln!("🆕 Starting a new mesh");
-    eprintln!("   Serving: {primary}");
+    if has_startup_models {
+        eprintln!("   Using configured startup models");
+    } else {
+        eprintln!("   Serving: {primary}");
+    }
     eprintln!("   VRAM: {:.0}GB", my_vram_gb);
-    if cli.model.is_empty() {
+    if !has_startup_models && cli.model.is_empty() {
         cli.model.push(primary.into());
     }
     if !cli.publish {
@@ -158,7 +167,7 @@ pub(crate) fn nostr_relays(cli_relays: &[String]) -> Vec<String> {
 
 /// Ensure mesh-llm is running on `port`, then return (available_models, chosen_model, spawned_child).
 ///
-/// Launcher behavior: if nothing is listening yet, auto-start `mesh-llm --client --auto`
+/// Launcher behavior: if nothing is listening yet, auto-start `mesh-llm client --auto`
 /// (client node — tunnels to mesh peers without publishing to Nostr).
 /// Returns the child process handle if we spawned one, so callers can clean up on exit.
 pub(crate) async fn check_mesh(
@@ -174,7 +183,7 @@ pub(crate) async fn check_mesh(
         let exe = std::env::current_exe().unwrap_or_else(|_| "mesh-llm".into());
         child = Some(
             std::process::Command::new(&exe)
-                .args(["--client", "--auto", "--port", &port.to_string()])
+                .args(["client", "--auto", "--port", &port.to_string()])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()

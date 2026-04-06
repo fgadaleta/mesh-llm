@@ -10,6 +10,30 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::process::Command;
 
+/// llama.cpp split mode for distributing tensors across devices.
+///
+/// - `Layer` (default): each device gets a contiguous range of layers.
+///   Works over RPC (network) and local multi-GPU.
+/// - `Row`: weight matrices are sharded across devices (true tensor parallelism).
+///   Only works for local multi-GPU (CUDA, ROCm) — NOT over RPC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Layer is available for explicit CLI override
+pub enum SplitMode {
+    /// Pipeline parallelism — split by layers (default, works everywhere).
+    Layer,
+    /// Tensor parallelism — split weight rows across local GPUs.
+    Row,
+}
+
+impl SplitMode {
+    fn as_arg(self) -> &'static str {
+        match self {
+            SplitMode::Layer => "layer",
+            SplitMode::Row => "row",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum BinaryFlavor {
     Cpu,
@@ -188,7 +212,8 @@ fn resolve_binary_path(
 }
 
 fn temp_log_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(name)
+    let mesh_pid = std::process::id();
+    std::env::temp_dir().join(format!("mesh-llm-{mesh_pid}-{name}"))
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +267,7 @@ pub struct ModelLaunchSpec<'a> {
     pub http_port: u16,
     pub tunnel_ports: &'a [u16],
     pub tensor_split: Option<&'a str>,
+    pub split_mode: Option<SplitMode>,
     pub draft: Option<&'a Path>,
     pub draft_max: u16,
     pub model_bytes: u64,
@@ -292,6 +318,15 @@ fn log_tail(path: &Path, max_lines: usize) -> String {
     let lines: Vec<&str> = contents.lines().collect();
     let start = lines.len().saturating_sub(max_lines);
     lines[start..].join("\n")
+}
+
+fn log_tail_message(path: &Path, max_lines: usize) -> String {
+    let tail = log_tail(path, max_lines);
+    if tail.is_empty() {
+        format!("See {}", path.display())
+    } else {
+        format!("See {}:\n{}", path.display(), tail)
+    }
 }
 
 fn parse_available_devices(output: &str) -> Vec<String> {
@@ -413,7 +448,7 @@ pub async fn start_rpc_server(
 
     tracing::info!("Starting rpc-server on :{port} (device: {device})");
 
-    let rpc_log = temp_log_path(&format!("mesh-llm-rpc-{port}.log"));
+    let rpc_log = temp_log_path(&format!("rpc-server-{port}.log"));
     let rpc_log_file = std::fs::File::create(&rpc_log)
         .with_context(|| format!("Failed to create rpc-server log file {}", rpc_log.display()))?;
     let rpc_log_file2 = rpc_log_file.try_clone()?;
@@ -613,6 +648,7 @@ pub async fn start_llama_server(
     let http_port = spec.http_port;
     let tunnel_ports = spec.tunnel_ports;
     let tensor_split = spec.tensor_split;
+    let split_mode = spec.split_mode;
     let draft = spec.draft;
     let draft_max = spec.draft_max;
     let model_bytes = spec.model_bytes;
@@ -637,7 +673,7 @@ pub async fn start_llama_server(
         rpc_arg
     );
 
-    let llama_log = temp_log_path("mesh-llm-llama-server.log");
+    let llama_log = temp_log_path("llama-server.log");
     let log_file = std::fs::File::create(&llama_log).with_context(|| {
         format!(
             "Failed to create llama-server log file {}",
@@ -746,6 +782,24 @@ pub async fn start_llama_server(
         args.push("--tensor-split".to_string());
         args.push(ts.to_string());
     }
+    if let Some(mode) = split_mode {
+        args.push("--split-mode".to_string());
+        args.push(mode.as_arg().to_string());
+        match mode {
+            SplitMode::Layer => {
+                tracing::info!(
+                    "Split mode: {} (layer-based / pipeline parallelism)",
+                    mode.as_arg()
+                );
+            }
+            SplitMode::Row => {
+                tracing::info!(
+                    "Split mode: {} (tensor parallelism across local GPUs)",
+                    mode.as_arg()
+                );
+            }
+        }
+    }
     let local_device = resolve_device_for_binary(&llama_server.path, llama_server.flavor, None)?;
     if let Some(draft_path) = draft {
         if draft_path.exists() {
@@ -802,7 +856,7 @@ pub async fn start_llama_server(
         })?;
 
     // Wait for health check
-    let url = format!("http://localhost:{http_port}/health");
+    let url = format!("http://127.0.0.1:{http_port}/health");
     for i in 0..600 {
         if i > 0 && i % 10 == 0 {
             let bytes = crate::network::tunnel::bytes_transferred();
@@ -818,6 +872,17 @@ pub async fn start_llama_server(
             };
             tracing::info!(
                 "Still waiting for llama-server to load model... ({i}s, {transferred} transferred)"
+            );
+        }
+        if let Some(status) = child.try_wait().with_context(|| {
+            format!(
+                "Failed to poll llama-server status for {}",
+                llama_server.path.display()
+            )
+        })? {
+            anyhow::bail!(
+                "llama-server exited before becoming healthy on port {http_port} (status: {status}). {}",
+                log_tail_message(&llama_log, 80)
             );
         }
         if reqwest_health_check(&url).await {
@@ -843,7 +908,10 @@ pub async fn start_llama_server(
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 
-    anyhow::bail!("llama-server failed to become healthy within 600s");
+    anyhow::bail!(
+        "llama-server failed to become healthy within 600s. {}",
+        log_tail_message(&llama_log, 80)
+    );
 }
 
 /// Find an available TCP port
@@ -1014,7 +1082,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_context_size, parse_available_devices, preferred_device, BinaryFlavor};
+    use super::{
+        compute_context_size, parse_available_devices, preferred_device, temp_log_path,
+        BinaryFlavor, SplitMode,
+    };
     use std::path::Path;
 
     #[test]
@@ -1095,5 +1166,37 @@ No devices found
             compute_context_size(None, model_bytes, my_vram, total_group_vram),
             16384
         );
+    }
+
+    #[test]
+    fn temp_log_path_includes_pid_and_suffix() {
+        let suffix = "rpc-server.log";
+        let path = temp_log_path(suffix);
+        let file_name = path
+            .file_name()
+            .expect("temp_log_path should produce a filename")
+            .to_string_lossy();
+        let pid = std::process::id().to_string();
+
+        assert!(
+            file_name.contains(&pid),
+            "expected filename '{file_name}' to contain current pid '{pid}'"
+        );
+        assert!(
+            file_name.contains(suffix),
+            "expected filename '{file_name}' to contain suffix '{suffix}'"
+        );
+    }
+
+    // ── SplitMode ──
+
+    #[test]
+    fn split_mode_layer_arg() {
+        assert_eq!(SplitMode::Layer.as_arg(), "layer");
+    }
+
+    #[test]
+    fn split_mode_row_arg() {
+        assert_eq!(SplitMode::Row.as_arg(), "row");
     }
 }

@@ -1,6 +1,9 @@
+mod auth;
+mod benchmark;
 mod blackboard;
 mod discover;
 mod download;
+mod gpus;
 mod integrations;
 mod models;
 mod plugin;
@@ -9,15 +12,17 @@ mod update;
 
 use anyhow::Result;
 
+use crate::cli::commands::benchmark::dispatch_benchmark_command;
 use crate::cli::commands::blackboard::{install_skill, run_blackboard};
 use crate::cli::commands::discover::{run_discover, run_stop};
 use crate::cli::commands::download::dispatch_download_command;
+use crate::cli::commands::gpus::run_gpus;
 use crate::cli::commands::integrations::{run_claude, run_goose};
 use crate::cli::commands::models::dispatch_models_command;
 use crate::cli::commands::plugin::run_plugin_command;
 use crate::cli::commands::runtime::{dispatch_runtime_command, run_drop, run_load, run_status};
 use crate::cli::commands::update::run_update;
-use crate::cli::{Cli, Command};
+use crate::cli::{AuthCommand, Cli, Command};
 use crate::network::nostr;
 
 pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
@@ -33,6 +38,10 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
             dispatch_download_command(name.as_deref(), *draft).await
         }
         Command::Update => run_update(cli).await,
+        Command::Gpus => {
+            run_gpus()?;
+            Ok(())
+        }
         Command::Runtime { command } => dispatch_runtime_command(command.as_ref()).await,
         Command::Load { name, port } => run_load(name, *port).await,
         Command::Unload { name, port } => run_drop(name, *port).await,
@@ -83,6 +92,16 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
             }
         }
         Command::Plugin { command } => run_plugin_command(command, cli).await,
+        Command::Benchmark { command } => dispatch_benchmark_command(command).await,
+        Command::Auth { command } => match command {
+            AuthCommand::Init {
+                owner_key,
+                force,
+                no_passphrase,
+                keychain,
+            } => auth::run_init(owner_key.clone(), *force, *no_passphrase, *keychain),
+            AuthCommand::Status { owner_key } => auth::run_status(owner_key.clone()),
+        },
     }?;
     Ok(true)
 }

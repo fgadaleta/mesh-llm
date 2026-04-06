@@ -151,21 +151,11 @@ pub fn run_model_installed() {
     if installed.is_empty() {
         println!("📦 No installed models found");
         println!("   HF cache: {}", huggingface_hub_cache_dir().display());
-        let legacy = legacy_models_dir();
-        if legacy.exists() {
-            println!("   legacy: {}", legacy.display());
-        }
         return;
     }
 
     println!("💾 Installed models");
     println!("📁 HF cache: {}", huggingface_hub_cache_dir().display());
-    if legacy_models_present() {
-        println!(
-            "⚠️ Legacy storage detected: {}",
-            legacy_models_dir().display()
-        );
-    }
     println!();
     for (index, entry) in installed.iter().enumerate() {
         let display_name = installed_entry_display_name(entry);

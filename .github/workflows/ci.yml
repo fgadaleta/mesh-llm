@@ -16,6 +16,9 @@ env:
   # Tiny model for integration tests (~138MB Q8_0, has chat template)
   MODEL_URL: https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q8_0.gguf
   MODEL_FILE: SmolLM2-135M-Instruct-Q8_0.gguf
+  # Small MoE model for MoE split tests (~598MB Q2_K, qwen35moe architecture)
+  MOE_MODEL_URL: https://huggingface.co/Flexan/kshitijthakkar-qwen3.5-moe-0.87B-d0.8B-GGUF/resolve/main/qwen3.5-moe-0.87B-d0.8B.Q2_K.gguf
+  MOE_MODEL_FILE: qwen3.5-moe-0.87B-d0.8B-Q2_K.gguf
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
@@ -83,6 +86,10 @@ jobs:
       - name: Install Python SDKs
         run: python -m pip install --upgrade pip -r ci/requirements-ci-python.txt
 
+      # ── System dependencies ──
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+
       # ── Rust ──
       - uses: dtolnay/rust-toolchain@stable
 
@@ -127,7 +134,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_OPENSSL=OFF \
             "${CACHE_FLAGS[@]}"
-          cmake --build llama.cpp/build --config Release -j$(nproc) --target rpc-server llama-server
+          cmake --build llama.cpp/build --config Release -j$(nproc) --target rpc-server llama-server llama-moe-split
 
       - name: Package Linux binaries
         run: |
@@ -181,6 +188,34 @@ jobs:
             target/release/mesh-llm \
             llama.cpp/build/bin \
             ~/.models/$MODEL_FILE
+
+      # ── MoE split test ──
+      - name: Cache MoE model
+        id: cache-moe-model
+        uses: actions/cache@v5
+        with:
+          path: ~/.models/${{ env.MOE_MODEL_FILE }}
+          key: ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-model-${{ env.MOE_MODEL_FILE }}-${{ hashFiles('.github/cache-version.txt', '.github/workflows/ci.yml') }}
+
+      - name: Download MoE model
+        if: steps.cache-moe-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.models
+          curl -fSL "$MOE_MODEL_URL" -o ~/.models/$MOE_MODEL_FILE
+          ls -lh ~/.models/$MOE_MODEL_FILE
+
+      - name: MoE split test (expert sharding)
+        run: |
+          scripts/ci-moe-split-test.sh \
+            llama.cpp/build/bin \
+            ~/.models/$MOE_MODEL_FILE
+
+      - name: MoE mesh test (expert sharding end-to-end)
+        run: |
+          scripts/ci-moe-mesh-test.sh \
+            target/release/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/$MOE_MODEL_FILE
 
       - name: CLI smoke test
         run: |
@@ -249,7 +284,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_OPENSSL=OFF \
             "${CACHE_FLAGS[@]}"
-          cmake --build llama.cpp/build --config Release -j$(sysctl -n hw.ncpu) --target rpc-server llama-server
+          cmake --build llama.cpp/build --config Release -j$(sysctl -n hw.ncpu) --target rpc-server llama-server llama-moe-split
 
       - name: Package macOS binaries
         run: |
@@ -302,6 +337,34 @@ jobs:
             target/release/mesh-llm \
             llama.cpp/build/bin \
             ~/.models/$MODEL_FILE
+
+      # ── MoE split test ──
+      - name: Cache MoE model
+        id: cache-moe-model
+        uses: actions/cache@v5
+        with:
+          path: ~/.models/${{ env.MOE_MODEL_FILE }}
+          key: ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-model-${{ env.MOE_MODEL_FILE }}-${{ hashFiles('.github/cache-version.txt', '.github/workflows/ci.yml') }}
+
+      - name: Download MoE model
+        if: steps.cache-moe-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.models
+          curl -fSL "$MOE_MODEL_URL" -o ~/.models/$MOE_MODEL_FILE
+          ls -lh ~/.models/$MOE_MODEL_FILE
+
+      - name: MoE split test (expert sharding)
+        run: |
+          scripts/ci-moe-split-test.sh \
+            llama.cpp/build/bin \
+            ~/.models/$MOE_MODEL_FILE
+
+      - name: MoE mesh test (expert sharding end-to-end)
+        run: |
+          scripts/ci-moe-mesh-test.sh \
+            target/release/mesh-llm \
+            llama.cpp/build/bin \
+            ~/.models/$MOE_MODEL_FILE
 
       - name: CLI smoke test
         run: |
@@ -496,6 +559,7 @@ jobs:
             ninja-build \
             pkg-config \
             libssl-dev \
+            libdbus-1-dev \
             python3
           rm -rf /var/lib/apt/lists/*
 
@@ -581,6 +645,7 @@ jobs:
             ninja-build \
             pkg-config \
             libssl-dev \
+            libdbus-1-dev \
             python3
           rm -rf /var/lib/apt/lists/*
 
@@ -664,6 +729,7 @@ jobs:
             ninja-build \
             pkg-config \
             libssl-dev \
+            libdbus-1-dev \
             libvulkan-dev \
             glslc \
             python3

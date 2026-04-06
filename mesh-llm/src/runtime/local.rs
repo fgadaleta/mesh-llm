@@ -172,6 +172,7 @@ pub(super) async fn start_runtime_local_model(
     binary_flavor: Option<launch::BinaryFlavor>,
     node: &mesh::Node,
     model_path: &Path,
+    mmproj_override: Option<&Path>,
     ctx_size_override: Option<u32>,
 ) -> Result<(
     String,
@@ -187,7 +188,9 @@ pub(super) async fn start_runtime_local_model(
     );
 
     let port = alloc_local_port().await?;
-    let mmproj_path = mmproj_path_for_model(&model_name);
+    let mmproj_path = mmproj_override
+        .map(Path::to_path_buf)
+        .or_else(|| mmproj_path_for_model(&model_name));
     #[cfg(target_os = "macos")]
     let mlx_process = if crate::mlx::is_mlx_model_dir(model_path) {
         let dir = crate::mlx::mlx_model_dir(model_path)
@@ -212,6 +215,7 @@ pub(super) async fn start_runtime_local_model(
                     http_port: port,
                     tunnel_ports: &[],
                     tensor_split: None,
+                    split_mode: election::local_multi_gpu_split_mode(binary_flavor),
                     draft: None,
                     draft_max: 0,
                     model_bytes,

@@ -3,6 +3,7 @@
 //! Endpoints:
 //!   GET  /api/status    — live mesh state (JSON)
 //!   GET  /api/runtime   — local model state (JSON)
+//!   GET  /api/runtime/endpoints — registered plugin endpoint state (JSON)
 //!   GET  /api/runtime/processes — local inference process state (JSON)
 //!   POST /api/runtime/models — load a local model
 //!   DELETE /api/runtime/models/{model} — unload a local model
@@ -564,6 +565,17 @@ impl MeshApi {
                             .and_then(|m| m.moe.as_ref())
                             .map(|m| m.n_expert_used)
                     });
+                let ranking_source = topology_moe
+                    .and_then(|moe| moe.ranking_source.as_ref())
+                    .cloned();
+                let ranking_origin = topology_moe
+                    .and_then(|moe| moe.ranking_origin.as_ref())
+                    .cloned();
+                let ranking_prompt_count = topology_moe.and_then(|moe| moe.ranking_prompt_count);
+                let ranking_tokens = topology_moe.and_then(|moe| moe.ranking_tokens);
+                let ranking_layer_scope = topology_moe
+                    .and_then(|moe| moe.ranking_layer_scope.as_ref())
+                    .cloned();
                 let draft_model = catalog_entry.and_then(|m| m.draft.clone());
                 let source_page_url =
                     identity
@@ -639,6 +651,11 @@ impl MeshApi {
                     moe,
                     expert_count,
                     used_expert_count,
+                    ranking_source,
+                    ranking_origin,
+                    ranking_prompt_count,
+                    ranking_tokens,
+                    ranking_layer_scope,
                     draft_model,
                     request_count,
                     last_active_secs_ago,
@@ -650,11 +667,37 @@ impl MeshApi {
                     fit_label,
                     fit_detail,
                     download_command: format!("mesh-llm models download {}", command_ref),
-                    run_command: format!("mesh-llm --model {}", command_ref),
-                    auto_command: format!("mesh-llm --auto --model {}", command_ref),
+                    run_command: format!("mesh-llm serve --model {}", command_ref),
+                    auto_command: format!("mesh-llm serve --auto --model {}", command_ref),
                 }
             })
             .collect()
+    }
+
+    fn derive_node_status(
+        is_client: bool,
+        effective_is_host: bool,
+        effective_llama_ready: bool,
+        has_local_worker_activity: bool,
+        has_split_workers: bool,
+        display_model_name: &str,
+        peer_count: usize,
+    ) -> String {
+        if is_client {
+            "Client".to_string()
+        } else if effective_is_host && effective_llama_ready {
+            if has_split_workers {
+                "Serving (split)".to_string()
+            } else {
+                "Serving".to_string()
+            }
+        } else if has_local_worker_activity {
+            "Worker (split)".to_string()
+        } else if display_model_name.is_empty() && peer_count == 0 {
+            "Idle".to_string()
+        } else {
+            "Standby".to_string()
+        }
     }
 
     async fn status(&self) -> StatusPayload {
@@ -744,7 +787,6 @@ impl MeshApi {
             .or_else(|| my_hosted_models.first().cloned())
             .or_else(|| my_serving_models.first().cloned())
             .unwrap_or_else(|| model_name.clone());
-        let mesh_models = self.mesh_models().await;
 
         let (launch_pi, launch_goose) = if effective_llama_ready {
             (
@@ -757,30 +799,20 @@ impl MeshApi {
 
         let mesh_id = node.mesh_id().await;
 
-        // Derive node status for display
-        let node_status = if is_client {
-            "Client".to_string()
-        } else if effective_is_host && effective_llama_ready {
-            let has_split_workers = all_peers.iter().any(|p| {
-                matches!(p.role, mesh::NodeRole::Worker)
-                    && p.is_assigned_model(display_model_name.as_str())
-            });
-            if has_split_workers {
-                "Serving (split)".to_string()
-            } else {
-                "Serving".to_string()
-            }
-        } else if !effective_is_host && !display_model_name.is_empty() {
-            "Worker (split)".to_string()
-        } else if display_model_name.is_empty() {
-            if all_peers.is_empty() {
-                "Idle".to_string()
-            } else {
-                "Standby".to_string()
-            }
-        } else {
-            "Standby".to_string()
-        };
+        let has_local_worker_activity = has_local_processes || !my_hosted_models.is_empty();
+        let has_split_workers = all_peers.iter().any(|p| {
+            matches!(p.role, mesh::NodeRole::Worker)
+                && p.is_assigned_model(display_model_name.as_str())
+        });
+        let node_status = Self::derive_node_status(
+            is_client,
+            effective_is_host,
+            effective_llama_ready,
+            has_local_worker_activity,
+            has_split_workers,
+            display_model_name.as_str(),
+            all_peers.len(),
+        );
 
         StatusPayload {
             version: MESH_LLM_VERSION.to_string(),
@@ -804,7 +836,6 @@ impl MeshApi {
             peers,
             launch_pi,
             launch_goose,
-            mesh_models,
             inflight_requests,
             mesh_id,
             mesh_name,
@@ -1005,6 +1036,7 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
                 path_only,
                 body,
                 req.as_ref(),
+                &request.raw,
             )
             .await?
             {
@@ -1019,7 +1051,13 @@ async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> anyhow::Resul
 mod tests {
     use super::*;
     use crate::api::status::decode_runtime_model_path;
+    use crate::plugin;
+    use crate::plugins::{blackboard, blobstore};
     use mesh_llm_plugin::MeshVisibility;
+    use rmcp::model::ErrorCode;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -1221,6 +1259,36 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_node_status_prefers_client_role() {
+        let status = MeshApi::derive_node_status(true, true, true, true, true, "Qwen", 2);
+        assert_eq!(status, "Client");
+    }
+
+    #[test]
+    fn test_derive_node_status_standby_when_only_declaring_models() {
+        let status = MeshApi::derive_node_status(false, false, false, false, false, "Qwen", 1);
+        assert_eq!(status, "Standby");
+    }
+
+    #[test]
+    fn test_derive_node_status_worker_requires_local_runtime_activity() {
+        let status = MeshApi::derive_node_status(false, false, false, true, false, "Qwen", 1);
+        assert_eq!(status, "Worker (split)");
+    }
+
+    #[test]
+    fn test_derive_node_status_marks_split_host() {
+        let status = MeshApi::derive_node_status(false, true, true, true, true, "Qwen", 1);
+        assert_eq!(status, "Serving (split)");
+    }
+
+    #[test]
+    fn test_derive_node_status_idle_without_model_or_peers() {
+        let status = MeshApi::derive_node_status(false, false, false, false, false, "", 0);
+        assert_eq!(status, "Idle");
+    }
+
+    #[test]
     fn test_decode_runtime_model_path_decodes_percent_not_plus() {
         // %20 is a space; + is a literal plus in URL paths (not a space)
         assert_eq!(
@@ -1272,6 +1340,23 @@ mod tests {
         build_test_mesh_api_with_api_port(3131).await
     }
 
+    async fn build_test_mesh_api_with_plugin_manager(
+        api_port: u16,
+        plugin_manager: plugin::PluginManager,
+    ) -> MeshApi {
+        let node = mesh::Node::new_for_tests(mesh::NodeRole::Worker)
+            .await
+            .unwrap();
+        MeshApi::new(
+            node,
+            "test-model".to_string(),
+            api_port,
+            0,
+            plugin_manager,
+            affinity::AffinityRouter::default(),
+        )
+    }
+
     async fn spawn_management_test_server(
         state: MeshApi,
     ) -> (
@@ -1285,6 +1370,273 @@ mod tests {
             handle_request(stream, &state).await
         });
         (addr, handle)
+    }
+
+    async fn send_management_request(addr: std::net::SocketAddr, raw_request: String) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(raw_request.as_bytes()).await.unwrap();
+        let _ = stream.shutdown().await;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    fn json_body(response: &str) -> serde_json::Value {
+        let body = response.split("\r\n\r\n").nth(1).unwrap_or_default();
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null)
+    }
+
+    #[derive(Clone)]
+    struct BlobstoreApiTestBridge {
+        plugin_name: String,
+        store: blobstore::BlobStore,
+    }
+
+    #[derive(Clone)]
+    struct BlackboardApiTestBridge {
+        plugin_name: String,
+        store: blackboard::BlackboardStore,
+    }
+
+    impl BlobstoreApiTestBridge {
+        fn error_response(message: impl Into<String>) -> plugin::proto::ErrorResponse {
+            plugin::proto::ErrorResponse {
+                code: ErrorCode::INTERNAL_ERROR.0,
+                message: message.into(),
+                data_json: String::new(),
+            }
+        }
+    }
+
+    impl BlackboardApiTestBridge {
+        fn error_response(message: impl Into<String>) -> plugin::proto::ErrorResponse {
+            plugin::proto::ErrorResponse {
+                code: ErrorCode::INTERNAL_ERROR.0,
+                message: message.into(),
+                data_json: String::new(),
+            }
+        }
+    }
+
+    impl plugin::PluginRpcBridge for BlobstoreApiTestBridge {
+        fn handle_request(
+            &self,
+            plugin_name: String,
+            method: String,
+            params_json: String,
+        ) -> plugin::BridgeFuture<Result<plugin::RpcResult, plugin::proto::ErrorResponse>> {
+            let expected_plugin_name = self.plugin_name.clone();
+            let store = self.store.clone();
+            Box::pin(async move {
+                if plugin_name != expected_plugin_name {
+                    return Err(Self::error_response(format!(
+                        "Unsupported test plugin '{}'",
+                        plugin_name
+                    )));
+                }
+                if method != "tools/call" {
+                    return Err(Self::error_response(format!(
+                        "Unsupported method '{}'",
+                        method
+                    )));
+                }
+
+                let request: mesh_llm_plugin::OperationRequest = serde_json::from_str(&params_json)
+                    .map_err(|err| Self::error_response(err.to_string()))?;
+                let result_json = match request.name.as_str() {
+                    blobstore::PUT_REQUEST_OBJECT_TOOL => {
+                        let request: blobstore::PutRequestObjectRequest =
+                            serde_json::from_value(request.arguments)
+                                .map_err(|err| Self::error_response(err.to_string()))?;
+                        let response = store
+                            .put_request_object(request)
+                            .map_err(|err| Self::error_response(err.to_string()))?;
+                        serde_json::to_string(&rmcp::model::CallToolResult::structured(
+                            serde_json::to_value(response)
+                                .map_err(|err| Self::error_response(err.to_string()))?,
+                        ))
+                        .map_err(|err| Self::error_response(err.to_string()))?
+                    }
+                    blobstore::COMPLETE_REQUEST_TOOL | blobstore::ABORT_REQUEST_TOOL => {
+                        let request: blobstore::FinishRequestRequest =
+                            serde_json::from_value(request.arguments)
+                                .map_err(|err| Self::error_response(err.to_string()))?;
+                        let response = store
+                            .finish_request(&request.request_id)
+                            .map_err(|err| Self::error_response(err.to_string()))?;
+                        serde_json::to_string(&rmcp::model::CallToolResult::structured(
+                            serde_json::to_value(response)
+                                .map_err(|err| Self::error_response(err.to_string()))?,
+                        ))
+                        .map_err(|err| Self::error_response(err.to_string()))?
+                    }
+                    _ => {
+                        return Err(Self::error_response(format!(
+                            "Unsupported blobstore tool '{}'",
+                            request.name
+                        )));
+                    }
+                };
+
+                Ok(plugin::RpcResult { result_json })
+            })
+        }
+
+        fn handle_notification(
+            &self,
+            _plugin_name: String,
+            _method: String,
+            _params_json: String,
+        ) -> plugin::BridgeFuture<()> {
+            Box::pin(async {})
+        }
+    }
+
+    impl plugin::PluginRpcBridge for BlackboardApiTestBridge {
+        fn handle_request(
+            &self,
+            plugin_name: String,
+            method: String,
+            params_json: String,
+        ) -> plugin::BridgeFuture<Result<plugin::RpcResult, plugin::proto::ErrorResponse>> {
+            let expected_plugin_name = self.plugin_name.clone();
+            let store = self.store.clone();
+            Box::pin(async move {
+                if plugin_name != expected_plugin_name {
+                    return Err(Self::error_response(format!(
+                        "Unsupported test plugin '{}'",
+                        plugin_name
+                    )));
+                }
+                if method != "tools/call" {
+                    return Err(Self::error_response(format!(
+                        "Unsupported method '{}'",
+                        method
+                    )));
+                }
+
+                let request: mesh_llm_plugin::OperationRequest = serde_json::from_str(&params_json)
+                    .map_err(|err| Self::error_response(err.to_string()))?;
+                let result_json = match request.name.as_str() {
+                    "feed" => {
+                        let request: blackboard::FeedRequest =
+                            serde_json::from_value(request.arguments)
+                                .map_err(|err| Self::error_response(err.to_string()))?;
+                        let response = store
+                            .feed(request.since, request.from.as_deref(), request.limit)
+                            .await;
+                        serde_json::to_string(&rmcp::model::CallToolResult::structured(
+                            serde_json::to_value(response)
+                                .map_err(|err| Self::error_response(err.to_string()))?,
+                        ))
+                        .map_err(|err| Self::error_response(err.to_string()))?
+                    }
+                    "search" => {
+                        let request: blackboard::SearchRequest =
+                            serde_json::from_value(request.arguments)
+                                .map_err(|err| Self::error_response(err.to_string()))?;
+                        let mut response = store.search(&request.query, request.since).await;
+                        response.truncate(request.limit.max(1));
+                        serde_json::to_string(&rmcp::model::CallToolResult::structured(
+                            serde_json::to_value(response)
+                                .map_err(|err| Self::error_response(err.to_string()))?,
+                        ))
+                        .map_err(|err| Self::error_response(err.to_string()))?
+                    }
+                    "post" => {
+                        let request: blackboard::PostRequest =
+                            serde_json::from_value(request.arguments)
+                                .map_err(|err| Self::error_response(err.to_string()))?;
+                        let item = blackboard::BlackboardItem::new(
+                            if request.from.trim().is_empty() {
+                                "mcp".into()
+                            } else {
+                                request.from
+                            },
+                            if request.peer_id.trim().is_empty() {
+                                "mcp".into()
+                            } else {
+                                request.peer_id
+                            },
+                            request.text,
+                        );
+                        let response = store.post(item).await.map_err(Self::error_response)?;
+                        serde_json::to_string(&rmcp::model::CallToolResult::structured(
+                            serde_json::to_value(response)
+                                .map_err(|err| Self::error_response(err.to_string()))?,
+                        ))
+                        .map_err(|err| Self::error_response(err.to_string()))?
+                    }
+                    _ => {
+                        return Err(Self::error_response(format!(
+                            "Unsupported blackboard tool '{}'",
+                            request.name
+                        )));
+                    }
+                };
+
+                Ok(plugin::RpcResult { result_json })
+            })
+        }
+
+        fn handle_notification(
+            &self,
+            _plugin_name: String,
+            _method: String,
+            _params_json: String,
+        ) -> plugin::BridgeFuture<()> {
+            Box::pin(async {})
+        }
+    }
+
+    fn temp_blobstore_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("mesh-llm-api-{name}-{}", rand::random::<u64>()))
+    }
+
+    async fn build_blobstore_api_plugin_manager() -> (plugin::PluginManager, std::path::PathBuf) {
+        let plugin_name = "blobstore";
+        let root = temp_blobstore_root("blobstore");
+        let bridge = BlobstoreApiTestBridge {
+            plugin_name: plugin_name.into(),
+            store: blobstore::BlobStore::new(root.clone()),
+        };
+        let plugin_manager =
+            plugin::PluginManager::for_test_bridge(&[plugin_name], Arc::new(bridge));
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            plugin_name.to_string(),
+            mesh_llm_plugin::plugin_manifest![mesh_llm_plugin::capability(
+                blobstore::OBJECT_STORE_CAPABILITY
+            ),],
+        );
+        plugin_manager
+            .set_test_manifests(manifests.into_iter().collect())
+            .await;
+        (plugin_manager, root)
+    }
+
+    async fn build_blackboard_api_plugin_manager() -> plugin::PluginManager {
+        let plugin_name = "blackboard";
+        let bridge = BlackboardApiTestBridge {
+            plugin_name: plugin_name.into(),
+            store: blackboard::BlackboardStore::new(true),
+        };
+        let plugin_manager =
+            plugin::PluginManager::for_test_bridge(&[plugin_name], Arc::new(bridge));
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            plugin_name.to_string(),
+            mesh_llm_plugin::plugin_manifest![
+                mesh_llm_plugin::capability(plugin::BLACKBOARD_CAPABILITY),
+                mesh_llm_plugin::http_get("/feed", "feed"),
+                mesh_llm_plugin::http_get("/search", "search"),
+                mesh_llm_plugin::http_post("/post", "post"),
+            ],
+        );
+        plugin_manager
+            .set_test_manifests(manifests.into_iter().collect())
+            .await;
+        plugin_manager
     }
 
     async fn spawn_capturing_upstream(
@@ -1448,6 +1800,116 @@ mod tests {
 
         drop(stream);
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_api_status_excludes_mesh_models_and_models_endpoint_serves_them() {
+        let state = build_test_mesh_api().await;
+        let (status_addr, status_handle) = spawn_management_test_server(state.clone()).await;
+
+        let status_response = send_management_request(
+            status_addr,
+            "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+        )
+        .await;
+        assert!(status_response.starts_with("HTTP/1.1 200"));
+        let status_body = json_body(&status_response);
+        assert!(status_body.get("mesh_models").is_none());
+        status_handle.abort();
+
+        let (models_addr, models_handle) = spawn_management_test_server(state).await;
+        let models_response = send_management_request(
+            models_addr,
+            "GET /api/models HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+        )
+        .await;
+        assert!(models_response.starts_with("HTTP/1.1 200"));
+        let models_body = json_body(&models_response);
+        assert!(models_body.get("mesh_models").is_some());
+
+        models_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_api_objects_routes_through_object_store_capability() {
+        let (plugin_manager, blobstore_root) = build_blobstore_api_plugin_manager().await;
+        let state = build_test_mesh_api_with_plugin_manager(3131, plugin_manager).await;
+        let (addr, handle) = spawn_management_test_server(state).await;
+
+        let body = json!({
+            "request_id": "req-api-object",
+            "mime_type": "text/plain",
+            "file_name": "note.txt",
+            "bytes_base64": "aGVsbG8=",
+            "expires_in_secs": 60,
+            "uses_remaining": 1,
+        })
+        .to_string();
+        let request = format!(
+            "POST /api/objects HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = send_management_request(addr, request).await;
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        let payload = json_body(&response);
+        assert_eq!(payload["request_id"], "req-api-object");
+        assert_eq!(payload["mime_type"], "text/plain");
+        assert!(payload["token"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("obj_"));
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(blobstore_root);
+    }
+
+    #[tokio::test]
+    async fn test_api_blackboard_routes_through_blackboard_capability() {
+        let plugin_manager = build_blackboard_api_plugin_manager().await;
+        let state = build_test_mesh_api_with_plugin_manager(3131, plugin_manager).await;
+
+        let (post_addr, post_handle) = spawn_management_test_server(state.clone()).await;
+        let post_body = json!({ "text": "hello integration blackboard" }).to_string();
+        let post_request = format!(
+            "POST /api/blackboard/post HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            post_body.len(),
+            post_body
+        );
+        let post_response = send_management_request(post_addr, post_request).await;
+        assert!(post_response.starts_with("HTTP/1.1 200"));
+        let posted = json_body(&post_response);
+        assert_eq!(posted["text"], "hello integration blackboard");
+        post_handle.abort();
+
+        let (feed_addr, feed_handle) = spawn_management_test_server(state.clone()).await;
+        let feed_response = send_management_request(
+            feed_addr,
+            "GET /api/blackboard/feed?limit=5 HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+        )
+        .await;
+        assert!(feed_response.starts_with("HTTP/1.1 200"));
+        let feed = json_body(&feed_response);
+        let feed_items = feed.as_array().cloned().unwrap_or_default();
+        assert!(feed_items
+            .iter()
+            .any(|item| item["text"] == "hello integration blackboard"));
+        feed_handle.abort();
+
+        let (search_addr, search_handle) = spawn_management_test_server(state).await;
+        let search_response = send_management_request(
+            search_addr,
+            "GET /api/blackboard/search?q=integration HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+        )
+        .await;
+        assert!(search_response.starts_with("HTTP/1.1 200"));
+        let search = json_body(&search_response);
+        let search_items = search.as_array().cloned().unwrap_or_default();
+        assert!(search_items
+            .iter()
+            .any(|item| item["text"] == "hello integration blackboard"));
+        search_handle.abort();
     }
 
     #[tokio::test]

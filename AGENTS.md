@@ -183,6 +183,13 @@ Do not run Rust build, test, or format commands in parallel in the same worktree
 
 Before committing Rust changes, format only the changed Rust files from the repo root, for example with `cargo fmt --all -- path/to/file.rs`, and include those formatting changes in the commit.
 
+## Warnings
+
+Do not leave Rust compiler warnings behind in code you touched.
+
+- Fix or remove unused code, dead code, and other warnings introduced or surfaced by your change before committing.
+- Do not silence warnings with `#[allow(...)]` unless there is a clear reason and the developer has asked for that tradeoff.
+
 ## Pull Requests
 
 Pull request titles and descriptions should be user-focused by default.
@@ -229,6 +236,16 @@ pkill -f mesh-llm; pkill -f rpc-server; pkill -f llama-server
 11. Verify expected peer count.
 12. Test inference through every model in `/v1/models`.
 13. Test `/v1/` passthrough on port 3131.
+
+### Debugging llama-server startup
+
+If llama-server fails to start (stuck at "⏳ Starting llama-server..."), check its log file. Rust's `std::env::temp_dir()` on macOS points to the per-user temp dir, **not** `/tmp`:
+
+```bash
+cat "$(python3 -c 'import tempfile; print(tempfile.gettempdir())')/mesh-llm-llama-server.log"
+```
+
+Typical path: `/var/folders/XX/.../T/mesh-llm-llama-server.log`. rpc-server logs are in the same directory as `mesh-llm-rpc-{port}.log`.
 
 ### Common failures
 - **Use `tmux` for any long-running remote process** — downloads, deploy steps, validation runs, server startup, and similar remote work should be launched inside `tmux`, not as a plain foreground SSH command and not via `nohup`. This keeps the login environment intact, survives disconnects more reliably, and makes progress/log inspection easier.

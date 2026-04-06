@@ -8,7 +8,6 @@ pub mod prompt;
 mod resolve;
 pub mod search;
 pub mod topology;
-mod warnings;
 
 use anyhow::{Context, Result};
 use hf_hub::api::sync::{Api, ApiBuilder};
@@ -19,19 +18,18 @@ pub use inventory::{scan_local_inventory_snapshot_with_progress, LocalModelInven
 pub use local::{
     find_mmproj_path, find_model_path, huggingface_hub_cache, huggingface_hub_cache_dir,
     huggingface_identity_for_path, legacy_models_dir, legacy_models_present, model_dirs,
-    path_is_in_legacy_models_dir, scan_installed_model_entries, scan_local_models,
-    InstalledModelEntry, InstalledModelKind,
+    path_is_in_legacy_models_dir, resolve_mmproj_path, scan_installed_model_entries,
+    scan_installed_models, scan_local_models, InstalledModelEntry, InstalledModelKind,
 };
 pub use maintenance::{run_migrate, run_update, warn_about_updates_for_paths};
 pub use prompt::{infer_prompt_behavior_for_dir, ModelPromptBehavior};
 pub use resolve::{
     catalog_model_kind_label, download_exact_ref, find_catalog_model_exact,
-    installed_model_capabilities, installed_model_display_name, show_exact_model,
-    MlxSelectionPolicy, ResolveFormatPreference,
+    installed_model_capabilities, installed_model_display_name, resolve_model_spec,
+    show_exact_model, MlxSelectionPolicy, ResolveFormatPreference,
 };
 pub use search::{search_catalog_models, search_huggingface, SearchProgress};
 pub use topology::{infer_local_model_topology, ModelMoeInfo, ModelTopology};
-pub use warnings::warn_about_legacy_model_usage;
 
 fn build_hf_api(progress: bool) -> Result<Api> {
     let mut builder = ApiBuilder::from_cache(huggingface_hub_cache()).with_progress(progress);

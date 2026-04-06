@@ -1,5 +1,6 @@
 mod api;
 mod cli;
+pub mod crypto;
 mod inference;
 mod mesh;
 #[cfg(target_os = "macos")]
@@ -18,12 +19,11 @@ pub mod proto {
     }
 }
 
-pub use plugins::blackboard;
-pub use plugins::blackboard::mcp as blackboard_mcp;
+pub(crate) use plugins::blackboard;
 
 use anyhow::Result;
 
-pub const VERSION: &str = "0.55.1-gemma3fix";
+pub const VERSION: &str = "0.55.4";
 
 pub async fn run() -> Result<()> {
     runtime::run().await

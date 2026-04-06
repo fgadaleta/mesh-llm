@@ -1,6 +1,6 @@
 use super::ModelCapabilities;
 use super::{build_hf_tokio_api, capabilities, catalog, find_model_path, format_size_bytes};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use hf_hub::{Repo, RepoType};
 use std::path::{Path, PathBuf};
 
@@ -109,10 +109,41 @@ pub async fn download_exact_ref(
                 return Ok(dest);
             }
             eprintln!("📥 Downloading {}...", dest.display());
-            catalog::download_url(&url, &dest).await?;
-            Ok(dest)
+            catalog::download_hf_split_gguf(&url, &filename).await
         }
     }
+}
+
+pub async fn resolve_model_spec(input: &Path) -> Result<PathBuf> {
+    let raw = input.to_string_lossy();
+
+    if input.exists() {
+        return Ok(input.to_path_buf());
+    }
+
+    if !raw.contains('/') {
+        let installed_name = raw.strip_suffix(".gguf").unwrap_or(&raw);
+        let installed_path = find_model_path(installed_name);
+        if installed_path.exists() {
+            return Ok(installed_path);
+        }
+        if let Some(entry) = catalog::find_model(&raw) {
+            return catalog::download_model(entry).await;
+        }
+        bail!(
+            "Model not found: {raw}\nNot a local file, not in the Hugging Face cache, not in catalog.\n\
+             Use a path, a catalog name (run `mesh-llm download` to list), or a Hugging Face exact ref/URL."
+        );
+    }
+
+    download_exact_ref(
+        &raw,
+        ResolveFormatPreference::Auto,
+        "mesh-llm models download",
+        MlxSelectionPolicy::AllowImplicit,
+    )
+    .await
+    .with_context(|| format!("Resolve model spec {raw}"))
 }
 
 pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {

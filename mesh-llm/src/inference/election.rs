@@ -9,12 +9,56 @@ use crate::inference::{launch, moe};
 use crate::mesh;
 use crate::models;
 use crate::network::tunnel;
+use crate::system::hardware;
+use launch::{BinaryFlavor, SplitMode};
 use mesh::NodeRole;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use tokio::sync::watch;
+
+/// Returns `true` when `flavor` and `gpu_count` together call for row-split
+/// tensor parallelism.
+///
+/// Row split requires a backend that implements `ggml_backend_split_buffer_type`
+/// (CUDA and ROCm).  When no flavor is specified the binary may still be a CUDA
+/// or ROCm build discovered automatically, so `None` is treated as potentially
+/// supported; if the binary turns out to be CPU/Metal/Vulkan, llama.cpp falls
+/// back safely.
+fn should_use_row_split(flavor: Option<BinaryFlavor>, gpu_count: u8) -> bool {
+    let backend_supported = matches!(
+        flavor,
+        Some(BinaryFlavor::Cuda) | Some(BinaryFlavor::Rocm) | None
+    );
+    backend_supported && gpu_count > 1
+}
+
+/// Returns `Some(SplitMode::Row)` when the local machine has multiple GPUs and
+/// the llama.cpp backend supports row-level tensor parallelism (CUDA, ROCm).
+///
+/// Row split shards weight matrices across local GPUs so all GPUs are active on
+/// every token — faster than layer (pipeline) split where GPUs take turns.
+/// This does NOT work over RPC (network) — only for GPUs on the same machine.
+///
+/// When no explicit flavor is provided the resolved binary may still be CUDA/ROCm
+/// (auto-detected from the binary name), so `None` is treated as potentially
+/// supported.
+pub(crate) fn local_multi_gpu_split_mode(flavor: Option<BinaryFlavor>) -> Option<SplitMode> {
+    let hw = hardware::query(&[hardware::Metric::GpuCount]);
+    if should_use_row_split(flavor, hw.gpu_count) {
+        tracing::info!(
+            "Local multi-GPU detected ({} GPUs) — using row split for tensor parallelism",
+            hw.gpu_count
+        );
+        Some(SplitMode::Row)
+    } else {
+        None
+    }
+}
 
 /// Calculate total model size, summing all split files if present.
 /// Split files follow the pattern: name-00001-of-00004.gguf
@@ -84,6 +128,8 @@ pub enum InferenceTarget {
 pub struct MoeState {
     /// All MoE node targets (local + remote), in stable order.
     pub nodes: Vec<InferenceTarget>,
+    /// Full-coverage targets that can serve the whole model if the active shard set fails.
+    pub fallbacks: Vec<InferenceTarget>,
 }
 
 /// Per-model routing table. The API proxy uses this to route by model name.
@@ -109,6 +155,57 @@ pub struct LocalProcessInfo {
 
 fn stop_requested(stop_rx: &watch::Receiver<bool>) -> bool {
     *stop_rx.borrow()
+}
+
+async fn wait_for_peer_moe_ranking(
+    model_name: &str,
+    model_path: &Path,
+    peer_rx: &mut watch::Receiver<usize>,
+    stop_rx: &mut watch::Receiver<bool>,
+    timeout: std::time::Duration,
+) {
+    if moe::best_shared_ranking_artifact(model_path).is_some() {
+        return;
+    }
+
+    eprintln!(
+        "🧩 [{model_name}] Waiting up to {:.0}s for peer MoE ranking before local analysis",
+        timeout.as_secs_f64()
+    );
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            eprintln!("  No peer MoE ranking arrived in time — continuing with local analysis");
+            return;
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(remaining) => {
+                eprintln!("  No peer MoE ranking arrived in time — continuing with local analysis");
+                return;
+            }
+            res = peer_rx.changed() => {
+                if res.is_err() {
+                    return;
+                }
+                if let Some(artifact) = moe::best_shared_ranking_artifact(model_path) {
+                    eprintln!(
+                        "  Using imported peer MoE ranking mode={} origin={}",
+                        artifact.kind.label(),
+                        artifact.origin.label()
+                    );
+                    return;
+                }
+            }
+            res = stop_rx.changed() => {
+                if res.is_err() || stop_requested(stop_rx) {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 impl ModelTargets {
@@ -162,11 +259,27 @@ impl ModelTargets {
         let idx = (hash as usize) % moe.nodes.len();
         Some(moe.nodes[idx].clone())
     }
+
+    pub fn get_moe_failover_targets(&self, session_hint: &str) -> Vec<InferenceTarget> {
+        let Some(primary) = self.get_moe_target(session_hint) else {
+            return Vec::new();
+        };
+        let mut ordered = vec![primary.clone()];
+        if let Some(moe) = self.moe.as_ref() {
+            for fallback in &moe.fallbacks {
+                if fallback != &primary {
+                    ordered.push(fallback.clone());
+                }
+            }
+        }
+        ordered
+    }
 }
 
 /// Compute shard index for a node given all node IDs in the MoE group.
 /// Nodes are sorted by ID to ensure all nodes agree on the ordering.
 /// Returns (sorted_ids, my_index).
+#[cfg(test)]
 pub fn moe_shard_index(
     my_id: iroh::EndpointId,
     peer_ids: &[iroh::EndpointId],
@@ -184,35 +297,213 @@ pub fn moe_shard_index(
 /// The caller's own node gets MoeLocal(port), others get MoeRemote(id).
 pub fn build_moe_targets(
     sorted_ids: &[iroh::EndpointId],
+    fallback_ids: &[iroh::EndpointId],
     my_id: iroh::EndpointId,
-    my_port: u16,
+    active_local_port: Option<u16>,
+    fallback_local_port: Option<u16>,
     model_name: &str,
 ) -> ModelTargets {
     let mut moe_state = MoeState::default();
     for &id in sorted_ids {
         if id == my_id {
-            moe_state.nodes.push(InferenceTarget::MoeLocal(my_port));
+            if let Some(port) = active_local_port {
+                moe_state.nodes.push(InferenceTarget::MoeLocal(port));
+            }
         } else {
             moe_state.nodes.push(InferenceTarget::MoeRemote(id));
         }
     }
+    for &id in fallback_ids {
+        if id == my_id {
+            if let Some(port) = fallback_local_port {
+                moe_state.fallbacks.push(InferenceTarget::Local(port));
+            }
+        } else {
+            moe_state.fallbacks.push(InferenceTarget::Remote(id));
+        }
+    }
     let mut targets = ModelTargets::default();
-    targets.targets.insert(
-        model_name.to_string(),
-        vec![InferenceTarget::MoeLocal(my_port)],
-    );
+    let primary_targets = if let Some(port) = active_local_port {
+        vec![InferenceTarget::MoeLocal(port)]
+    } else if let Some(port) = fallback_local_port {
+        vec![InferenceTarget::Local(port)]
+    } else {
+        Vec::new()
+    };
+    if !primary_targets.is_empty() {
+        targets
+            .targets
+            .insert(model_name.to_string(), primary_targets);
+    }
     targets.moe = Some(moe_state);
     targets
 }
 
-/// Look up MoE config for a model. Two tiers:
-/// 1. Catalog (has pre-computed ranking) — instant, optimal
-/// 2. GGUF header detection (no ranking) — uses conservative defaults
+#[derive(Clone, Debug)]
+struct ResolvedMoeConfig {
+    config: crate::models::catalog::MoeConfig,
+    ranking_strategy: moe::MoeRankingStrategy,
+    ranking_source: String,
+    ranking_origin: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MoePlacementRole {
+    SplitShard,
+    FullFallback,
+    Standby,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MoePlacementPlan {
+    leader_id: iroh::EndpointId,
+    active_ids: Vec<iroh::EndpointId>,
+    fallback_ids: Vec<iroh::EndpointId>,
+    overlap: usize,
+}
+
+const MOE_SCALE_UP_QUIET_SECS: u64 = 45;
+
+#[derive(Clone, Copy, Debug)]
+struct MoePlacementCandidate {
+    id: iroh::EndpointId,
+    vram_bytes: u64,
+    full_coverage: bool,
+}
+
+impl MoePlacementPlan {
+    fn role_for(&self, my_id: iroh::EndpointId) -> MoePlacementRole {
+        if self.active_ids.contains(&my_id) {
+            MoePlacementRole::SplitShard
+        } else if self.fallback_ids.contains(&my_id) {
+            MoePlacementRole::FullFallback
+        } else {
+            MoePlacementRole::Standby
+        }
+    }
+
+    fn shard_index_for(&self, my_id: iroh::EndpointId) -> Option<usize> {
+        self.active_ids.iter().position(|id| *id == my_id)
+    }
+
+    fn materially_improves_upon(&self, current: &Self) -> bool {
+        let improves_fallback = self.fallback_ids.len() > current.fallback_ids.len()
+            && self.active_ids.len() >= current.active_ids.len();
+        let improves_active_count = self.active_ids.len() > current.active_ids.len()
+            && self.fallback_ids.len() >= current.fallback_ids.len();
+        let improves_overlap = self.overlap > current.overlap
+            && self.active_ids.len() >= current.active_ids.len()
+            && self.fallback_ids.len() >= current.fallback_ids.len();
+
+        improves_fallback || improves_active_count || improves_overlap
+    }
+}
+
+fn running_plan_state<'a>(
+    last_plan: Option<&'a MoePlacementPlan>,
+    currently_running: bool,
+) -> (&'a [iroh::EndpointId], &'a [iroh::EndpointId]) {
+    if currently_running {
+        let active_ids = last_plan
+            .map(|plan| plan.active_ids.as_slice())
+            .unwrap_or(&[]);
+        let fallback_ids = last_plan
+            .map(|plan| plan.fallback_ids.as_slice())
+            .unwrap_or(&[]);
+        (active_ids, fallback_ids)
+    } else {
+        (&[], &[])
+    }
+}
+
+fn compute_best_moe_placement(
+    mut candidates: Vec<MoePlacementCandidate>,
+) -> Option<MoePlacementPlan> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates.sort_by(|a, b| {
+        b.vram_bytes
+            .cmp(&a.vram_bytes)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let leader_id = candidates[0].id;
+    let mut active_ids: Vec<iroh::EndpointId> =
+        candidates.iter().map(|candidate| candidate.id).collect();
+    active_ids.sort();
+    active_ids.dedup();
+
+    let mut fallback_ids = Vec::new();
+    if active_ids.len() >= 3 {
+        if let Some(fallback_candidate) =
+            candidates.iter().find(|candidate| candidate.full_coverage)
+        {
+            active_ids.retain(|id| *id != fallback_candidate.id);
+            fallback_ids.push(fallback_candidate.id);
+        }
+    }
+
+    fallback_ids.sort();
+    fallback_ids.dedup();
+
+    let overlap = if active_ids.len() >= 3 { 2 } else { 1 };
+
+    Some(MoePlacementPlan {
+        leader_id,
+        active_ids,
+        fallback_ids,
+        overlap,
+    })
+}
+
+fn plan_moe_placement(
+    candidates: Vec<MoePlacementCandidate>,
+    current_active_ids: &[iroh::EndpointId],
+    current_fallback_ids: &[iroh::EndpointId],
+    allow_scale_up: bool,
+) -> Option<MoePlacementPlan> {
+    let candidate_ids: HashSet<_> = candidates.iter().map(|candidate| candidate.id).collect();
+    let keep_current_active = !current_active_ids.is_empty()
+        && current_active_ids
+            .iter()
+            .all(|id| candidate_ids.contains(id));
+
+    let best = compute_best_moe_placement(candidates.clone())?;
+    if !keep_current_active {
+        return Some(best);
+    }
+
+    let mut stable = MoePlacementPlan {
+        leader_id: best.leader_id,
+        active_ids: current_active_ids.to_vec(),
+        fallback_ids: current_fallback_ids
+            .iter()
+            .copied()
+            .filter(|id| candidate_ids.contains(id) && !current_active_ids.contains(id))
+            .collect(),
+        overlap: if current_active_ids.len() >= 3 { 2 } else { 1 },
+    };
+    stable.active_ids.sort();
+    stable.active_ids.dedup();
+    stable.fallback_ids.sort();
+    stable.fallback_ids.dedup();
+
+    if allow_scale_up && best.materially_improves_upon(&stable) {
+        Some(best)
+    } else {
+        Some(stable)
+    }
+}
+
+/// Look up base MoE config for a model.
+/// 1. Catalog provides MoE shape hints when available.
+/// 2. GGUF header detection fills in the rest with conservative defaults.
 fn lookup_moe_config(
     model_name: &str,
     model_path: &Path,
 ) -> Option<crate::models::catalog::MoeConfig> {
-    // Tier 1: catalog lookup (has ranking)
+    // Tier 1: catalog lookup (shape hints only; runtime ranking is resolved later)
     let q = model_name.to_lowercase();
     if let Some(cfg) = crate::models::catalog::MODEL_CATALOG
         .iter()
@@ -260,6 +551,600 @@ fn lookup_moe_config(
     })
 }
 
+fn should_attempt_local_micro_analyze(
+    model_path: &Path,
+    model_name: &str,
+    local_vram_budget: u64,
+) -> bool {
+    let model_bytes = total_model_bytes(model_path);
+    // Require roughly the same headroom we already use for "fits locally" checks.
+    let fits_with_headroom = local_vram_budget >= (model_bytes as f64 * 1.1) as u64;
+    if !fits_with_headroom {
+        eprintln!(
+            "🧩 [{model_name}] Skipping local micro-analyze: model needs about {:.1}GB with headroom, local VRAM is {:.1}GB",
+            model_bytes as f64 * 1.1 / 1e9,
+            local_vram_budget as f64 / 1e9
+        );
+    }
+    fits_with_headroom
+}
+
+fn resolve_runtime_moe_config(
+    model_name: &str,
+    model_path: &Path,
+    bin_dir: &Path,
+    local_vram_budget: u64,
+    options: &moe::MoeRuntimeOptions,
+) -> anyhow::Result<Option<ResolvedMoeConfig>> {
+    let base = match lookup_moe_config(model_name, model_path) {
+        Some(cfg) => cfg,
+        None => return Ok(None),
+    };
+
+    let started = std::time::Instant::now();
+    let (ranking, ranking_source, ranking_origin) = match options.ranking_strategy {
+        moe::MoeRankingStrategy::Auto => {
+            if let Some(artifact) = moe::best_shared_ranking_artifact(model_path) {
+                let cached = moe::shared_ranking_cache_path(model_path, &artifact);
+                eprintln!(
+                    "🧩 [{model_name}] Using cached MoE ranking mode={} origin={} cache={}",
+                    artifact.kind.label(),
+                    artifact.origin.label(),
+                    cached.display()
+                );
+                (
+                    artifact.ranking,
+                    artifact.kind.label().to_string(),
+                    artifact.origin.label().to_string(),
+                )
+            } else {
+                if should_attempt_local_micro_analyze(model_path, model_name, local_vram_budget) {
+                    match ensure_micro_analyze_ranking(bin_dir, model_name, model_path, options) {
+                        Ok(artifact) => (
+                            artifact.ranking,
+                            artifact.kind.label().to_string(),
+                            artifact.origin.label().to_string(),
+                        ),
+                        Err(err) => {
+                            eprintln!(
+                                "⚠ [{model_name}] micro-analyze failed ({err}); falling back to sequential expert order"
+                            );
+                            (
+                                (0..base.n_expert).collect(),
+                                "sequential-fallback".to_string(),
+                                "fallback".to_string(),
+                            )
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "🧩 [{model_name}] Waiting for peer MoE ranking or using sequential fallback on this node"
+                    );
+                    (
+                        (0..base.n_expert).collect(),
+                        "sequential-fallback".to_string(),
+                        "fallback".to_string(),
+                    )
+                }
+            }
+        }
+        moe::MoeRankingStrategy::Analyze => {
+            let cached = moe::ranking_cache_path(model_path);
+            let artifact = ensure_full_analyze_ranking(bin_dir, model_name, model_path, &cached)?;
+            (
+                artifact.ranking,
+                artifact.kind.label().to_string(),
+                artifact.origin.label().to_string(),
+            )
+        }
+        moe::MoeRankingStrategy::MicroAnalyze => {
+            let artifact = ensure_micro_analyze_ranking(bin_dir, model_name, model_path, options)?;
+            (
+                artifact.ranking,
+                artifact.kind.label().to_string(),
+                artifact.origin.label().to_string(),
+            )
+        }
+    };
+
+    eprintln!(
+        "🧩 [{}] MoE ranking={} resolved in {:.1}s",
+        model_name,
+        format!("{ranking_source} origin={ranking_origin}"),
+        started.elapsed().as_secs_f64()
+    );
+
+    Ok(Some(ResolvedMoeConfig {
+        config: crate::models::catalog::MoeConfig { ranking, ..base },
+        ranking_strategy: options.ranking_strategy,
+        ranking_source,
+        ranking_origin,
+    }))
+}
+
+fn refresh_auto_moe_config_from_cache(
+    model_name: &str,
+    model_path: &Path,
+    cfg: &mut ResolvedMoeConfig,
+) -> bool {
+    if !matches!(cfg.ranking_strategy, moe::MoeRankingStrategy::Auto) {
+        return false;
+    }
+    let Some(artifact) = moe::best_shared_ranking_artifact(model_path) else {
+        return false;
+    };
+    if cfg.config.ranking == artifact.ranking
+        && cfg.ranking_source == artifact.kind.label()
+        && cfg.ranking_origin == artifact.origin.label()
+    {
+        return false;
+    }
+
+    eprintln!(
+        "🧩 [{model_name}] Switching to better cached MoE ranking mode={} origin={}",
+        artifact.kind.label(),
+        artifact.origin.label()
+    );
+    cfg.config.ranking = artifact.ranking;
+    cfg.ranking_source = artifact.kind.label().to_string();
+    cfg.ranking_origin = artifact.origin.label().to_string();
+    true
+}
+
+fn resolve_analyze_binary(bin_dir: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let candidates = [
+        bin_dir.join("llama-moe-analyze"),
+        bin_dir.join("../llama.cpp/build/bin/llama-moe-analyze"),
+        bin_dir.join("../../llama.cpp/build/bin/llama-moe-analyze"),
+        bin_dir.join("../../../llama.cpp/build/bin/llama-moe-analyze"),
+    ];
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate.canonicalize().unwrap_or(candidate));
+        }
+    }
+    anyhow::bail!(
+        "llama-moe-analyze not found in {} or nearby llama.cpp/build/bin directories",
+        bin_dir.display()
+    )
+}
+
+fn should_suppress_moe_analyze_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty() || trimmed.starts_with("print_info:")
+}
+
+fn should_relay_moe_analyze_warning(line: &str) -> bool {
+    let trimmed = line.trim();
+    if should_suppress_moe_analyze_line(trimmed) {
+        return false;
+    }
+
+    trimmed.starts_with("W ")
+        || trimmed.starts_with("E ")
+        || trimmed.to_ascii_lowercase().contains("failed")
+        || trimmed.to_ascii_lowercase().contains("error")
+}
+
+#[derive(Default)]
+struct MoeAnalyzeProgressState {
+    current_prompt: usize,
+    total_prompts: Option<usize>,
+    done: bool,
+}
+
+fn format_moe_analysis_progress_line(
+    model_name: &str,
+    mode: &str,
+    spinner: &str,
+    current: usize,
+    total: Option<usize>,
+    elapsed: std::time::Duration,
+) -> String {
+    let progress = match total {
+        Some(total) if total > 0 => format!(
+            "{:>5.1}%  {}/{}",
+            (current as f64 / total as f64) * 100.0,
+            current,
+            total
+        ),
+        Some(total) => format!("       0/{}", total),
+        None => "starting".to_string(),
+    };
+    format!(
+        "🧩 [{}] {:<17} {}  {:>3}s",
+        model_name,
+        format!("MoE {mode}"),
+        format!("{spinner} {progress}"),
+        elapsed.as_secs()
+    )
+}
+
+fn spawn_moe_analysis_spinner(
+    model_name: String,
+    mode: &'static str,
+    progress: Arc<Mutex<MoeAnalyzeProgressState>>,
+    started: std::time::Instant,
+) -> thread::JoinHandle<()> {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    thread::spawn(move || {
+        let mut frame_idx = 0usize;
+        loop {
+            let (current, total, done) = progress
+                .lock()
+                .map(|state| (state.current_prompt, state.total_prompts, state.done))
+                .unwrap_or((0, None, true));
+            let spinner = if done {
+                "✓"
+            } else {
+                FRAMES[frame_idx % FRAMES.len()]
+            };
+            let line = format_moe_analysis_progress_line(
+                &model_name,
+                mode,
+                spinner,
+                current,
+                total,
+                started.elapsed(),
+            );
+            eprint!("\r\x1b[2K{line}");
+            let _ = std::io::stderr().flush();
+            if done {
+                eprintln!();
+                break;
+            }
+            frame_idx += 1;
+            thread::sleep(std::time::Duration::from_millis(125));
+        }
+    })
+}
+
+fn parse_moe_analyze_prompt_total(line: &str) -> Option<usize> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("Running ")?;
+    let prompt_count = rest.split_whitespace().next()?;
+    prompt_count.parse::<usize>().ok()
+}
+
+fn parse_moe_analyze_prompt_progress(line: &str) -> Option<(usize, usize)> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("Prompt ")?;
+    let progress = rest.split(':').next()?.trim();
+    let (current, total) = progress.split_once('/')?;
+    Some((current.parse::<usize>().ok()?, total.parse::<usize>().ok()?))
+}
+
+fn spawn_moe_analyze_log_relay<R: std::io::Read + Send + 'static>(
+    reader: R,
+    model_name: String,
+    progress: Arc<Mutex<MoeAnalyzeProgressState>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let reader = BufReader::new(reader);
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(total) = parse_moe_analyze_prompt_total(&line) {
+                if let Ok(mut state) = progress.lock() {
+                    state.total_prompts = Some(total);
+                }
+                continue;
+            }
+            if let Some((current, total)) = parse_moe_analyze_prompt_progress(&line) {
+                if let Ok(mut state) = progress.lock() {
+                    state.total_prompts = Some(total);
+                    state.current_prompt = current.saturating_sub(1);
+                }
+                continue;
+            }
+            if should_relay_moe_analyze_warning(&line) {
+                eprint!("\r\x1b[2K");
+                eprintln!("  [{model_name}] {line}");
+            }
+        }
+    })
+}
+
+fn ensure_full_analyze_ranking(
+    bin_dir: &Path,
+    model_name: &str,
+    model_path: &Path,
+    cached_path: &Path,
+) -> anyhow::Result<moe::SharedRankingArtifact> {
+    if let Some(artifact) = moe::load_shared_ranking_artifact(
+        cached_path,
+        moe::SharedRankingKind::Analyze,
+        moe::SharedRankingOrigin::LegacyCache,
+        None,
+        None,
+        None,
+    ) {
+        eprintln!(
+            "🧩 [{model_name}] Using cached MoE ranking mode=full-analyze origin={} cache={}",
+            artifact.origin.label(),
+            cached_path.display()
+        );
+        return Ok(artifact);
+    }
+    if let Some(parent) = cached_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let analyze_bin = resolve_analyze_binary(bin_dir)?;
+    let started = std::time::Instant::now();
+    eprintln!(
+        "🧩 [{model_name}] MoE analysis mode=full-analyze cache={}",
+        cached_path.display()
+    );
+    let progress = Arc::new(Mutex::new(MoeAnalyzeProgressState::default()));
+    let spinner = spawn_moe_analysis_spinner(
+        model_name.to_string(),
+        "full-analyze",
+        Arc::clone(&progress),
+        started,
+    );
+    let mut child = Command::new(&analyze_bin)
+        .args([
+            "-m",
+            &model_path.to_string_lossy(),
+            "--all-layers",
+            "--export-ranking",
+            &cached_path.to_string_lossy(),
+            "-n",
+            "32",
+            "-c",
+            "4096",
+            "-ngl",
+            "99",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout_relay = child.stdout.take().map(|stdout| {
+        spawn_moe_analyze_log_relay(stdout, model_name.to_string(), Arc::clone(&progress))
+    });
+    let stderr_relay = child.stderr.take().map(|stderr| {
+        spawn_moe_analyze_log_relay(stderr, model_name.to_string(), Arc::clone(&progress))
+    });
+    let status = child.wait()?;
+    if let Some(handle) = stdout_relay {
+        let _ = handle.join();
+    }
+    if let Some(handle) = stderr_relay {
+        let _ = handle.join();
+    }
+    if let Ok(mut state) = progress.lock() {
+        if let Some(total) = state.total_prompts {
+            state.current_prompt = total;
+        }
+        state.done = true;
+    }
+    let _ = spinner.join();
+    anyhow::ensure!(status.success(), "llama-moe-analyze exited with {status}");
+    let ranking = moe::load_cached_ranking(cached_path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No ranking produced by full analyze at {}",
+            cached_path.display()
+        )
+    })?;
+    let artifact = moe::SharedRankingArtifact {
+        kind: moe::SharedRankingKind::Analyze,
+        origin: moe::SharedRankingOrigin::LocalFullAnalyze,
+        ranking,
+        micro_prompt_count: None,
+        micro_tokens: None,
+        micro_layer_scope: None,
+    };
+    moe::cache_shared_ranking_if_stronger(model_path, &artifact)?;
+    eprintln!(
+        "  Full moe-analyze cached at {} in {:.1}s (origin={})",
+        cached_path.display(),
+        started.elapsed().as_secs_f64(),
+        artifact.origin.label()
+    );
+    Ok(artifact)
+}
+
+fn ensure_micro_analyze_ranking(
+    bin_dir: &Path,
+    model_name: &str,
+    model_path: &Path,
+    options: &moe::MoeRuntimeOptions,
+) -> anyhow::Result<moe::SharedRankingArtifact> {
+    let cached_path = moe::micro_ranking_cache_path(
+        model_path,
+        options.micro_prompt_count,
+        options.micro_tokens,
+        options.micro_layer_scope,
+    );
+    if let Some(artifact) = moe::load_shared_ranking_artifact(
+        &cached_path,
+        moe::SharedRankingKind::MicroAnalyze,
+        moe::SharedRankingOrigin::LegacyCache,
+        Some(options.micro_prompt_count),
+        Some(options.micro_tokens),
+        Some(options.micro_layer_scope),
+    ) {
+        eprintln!(
+            "🧩 [{model_name}] Using cached MoE ranking mode=micro-analyze origin={} cache={}",
+            artifact.origin.label(),
+            cached_path.display()
+        );
+        return Ok(artifact);
+    }
+    let ranking = run_micro_analyze_ranking(bin_dir, model_name, model_path, options)?;
+    let artifact = moe::SharedRankingArtifact {
+        kind: moe::SharedRankingKind::MicroAnalyze,
+        origin: moe::SharedRankingOrigin::LocalMicroAnalyze,
+        ranking,
+        micro_prompt_count: Some(options.micro_prompt_count),
+        micro_tokens: Some(options.micro_tokens),
+        micro_layer_scope: Some(options.micro_layer_scope),
+    };
+    moe::cache_shared_ranking_if_stronger(model_path, &artifact)?;
+    eprintln!(
+        "  Micro moe-analyze cached at {} (origin={})",
+        cached_path.display(),
+        artifact.origin.label()
+    );
+    Ok(artifact)
+}
+
+#[derive(Clone, Copy)]
+struct AnalyzeMassRow {
+    expert_id: u32,
+    gate_mass: f64,
+}
+
+fn run_micro_analyze_ranking(
+    bin_dir: &Path,
+    model_name: &str,
+    model_path: &Path,
+    options: &moe::MoeRuntimeOptions,
+) -> anyhow::Result<Vec<u32>> {
+    let prompts = default_micro_prompts();
+    let prompt_count = options.micro_prompt_count.max(1).min(prompts.len());
+    let analyze_bin = resolve_analyze_binary(bin_dir)?;
+    let timestamp_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "mesh-llm-micro-live-{}-{}",
+        std::process::id(),
+        timestamp_nanos
+    ));
+    std::fs::create_dir_all(&tmp_dir)?;
+    let started = std::time::Instant::now();
+    let mut mass_by_expert: HashMap<u32, f64> = HashMap::new();
+    eprintln!(
+        "🧩 [{model_name}] MoE analysis mode=micro-analyze prompts={} tokens={} layers={} cache=pending",
+        prompt_count,
+        options.micro_tokens,
+        match options.micro_layer_scope {
+            moe::MoeMicroLayerScope::All => "all",
+            moe::MoeMicroLayerScope::First => "first",
+        }
+    );
+    let progress = Arc::new(Mutex::new(MoeAnalyzeProgressState {
+        current_prompt: 0,
+        total_prompts: Some(prompt_count),
+        done: false,
+    }));
+    let spinner = spawn_moe_analysis_spinner(
+        model_name.to_string(),
+        "micro-analyze",
+        Arc::clone(&progress),
+        started,
+    );
+
+    for (idx, prompt) in prompts.iter().take(prompt_count).enumerate() {
+        let output_path = tmp_dir.join(format!("prompt-{idx}.csv"));
+        let mut command = Command::new(&analyze_bin);
+        command.args([
+            "-m",
+            &model_path.to_string_lossy(),
+            "--export-ranking",
+            &output_path.to_string_lossy(),
+            "-n",
+            &options.micro_tokens.to_string(),
+            "-c",
+            "4096",
+            "-ngl",
+            "99",
+            "-p",
+            prompt,
+        ]);
+        if matches!(options.micro_layer_scope, moe::MoeMicroLayerScope::All) {
+            command.arg("--all-layers");
+        }
+        let output = command.output()?;
+        if !output.status.success() {
+            if let Ok(mut state) = progress.lock() {
+                state.done = true;
+            }
+            let _ = spinner.join();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut details = stderr
+                .lines()
+                .chain(stdout.lines())
+                .filter(|line| !should_suppress_moe_analyze_line(line))
+                .collect::<Vec<_>>();
+            if details.len() > 20 {
+                details.truncate(20);
+            }
+            let detail_text = if details.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", details.join(" | "))
+            };
+            anyhow::bail!(
+                "llama-moe-analyze exited with {}{}",
+                output.status,
+                detail_text
+            );
+        }
+        for row in load_analyze_mass_rows(&output_path)? {
+            *mass_by_expert.entry(row.expert_id).or_insert(0.0) += row.gate_mass;
+        }
+        if let Ok(mut state) = progress.lock() {
+            state.current_prompt = idx + 1;
+        }
+    }
+    if let Ok(mut state) = progress.lock() {
+        state.current_prompt = prompt_count;
+        state.done = true;
+    }
+    let _ = spinner.join();
+
+    let mut rows = mass_by_expert.into_iter().collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let ranking = rows.into_iter().map(|(expert_id, _)| expert_id).collect();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    eprintln!(
+        "  Micro moe-analyze used {} prompt(s), {} token(s), {} in {:.1}s",
+        prompt_count,
+        options.micro_tokens,
+        match options.micro_layer_scope {
+            moe::MoeMicroLayerScope::All => "all layers",
+            moe::MoeMicroLayerScope::First => "first layer",
+        },
+        started.elapsed().as_secs_f64()
+    );
+    Ok(ranking)
+}
+
+fn load_analyze_mass_rows(path: &Path) -> anyhow::Result<Vec<AnalyzeMassRow>> {
+    let content = std::fs::read_to_string(path)?;
+    let mut rows = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("expert") {
+            continue;
+        }
+        let parts = trimmed.split(',').map(str::trim).collect::<Vec<_>>();
+        if parts.len() < 2 {
+            continue;
+        }
+        rows.push(AnalyzeMassRow {
+            expert_id: parts[0].parse()?,
+            gate_mass: parts[1].parse()?,
+        });
+    }
+    Ok(rows)
+}
+
+fn default_micro_prompts() -> &'static [&'static str] {
+    &[
+        "User: Explain how mixture-of-experts routing works in a language model.\nAssistant:",
+        "User: Write a short professional email asking for feedback on a technical design.\nAssistant:",
+        "User: Outline a debugging plan for a flaky distributed systems test.\nAssistant:",
+        "User: Summarize the tradeoffs between latency and quality in MoE inference.\nAssistant:",
+    ]
+}
+
 /// Background election loop for a single model.
 /// This node serves `model` — it only cares about peers also serving `model`.
 ///
@@ -278,11 +1163,13 @@ pub async fn election_loop(
     bin_dir: std::path::PathBuf,
     model: std::path::PathBuf,
     model_name: String,
+    explicit_mmproj: Option<std::path::PathBuf>,
     draft: Option<std::path::PathBuf>,
     draft_max: u16,
     force_split: bool,
     binary_flavor: Option<launch::BinaryFlavor>,
     ctx_size_override: Option<u32>,
+    moe_runtime_options: moe::MoeRuntimeOptions,
     target_tx: Arc<watch::Sender<ModelTargets>>,
     mut stop_rx: watch::Receiver<bool>,
     mut on_change: impl FnMut(bool, bool) + Send,
@@ -303,7 +1190,7 @@ pub async fn election_loop(
     let my_vram = node.vram_bytes();
     let model_fits_locally = my_vram >= (model_bytes as f64 * 1.1) as u64;
 
-    // Check if this is a MoE model with pre-computed expert routing
+    // Check if this is a MoE model with enough metadata to plan expert routing.
     let moe_config = lookup_moe_config(&model_name, &model);
     if moe_config.is_some() {
         eprintln!(
@@ -317,9 +1204,43 @@ pub async fn election_loop(
     // MoE mode: each node runs its own llama-server with its expert shard.
     // Only enter MoE split mode if the model doesn't fit locally or --split is forced.
     // Otherwise, just run the full model — every node is independent.
-    if let Some(ref moe_cfg) = moe_config {
+    if moe_config.is_some() {
         let need_moe_split = force_split || !model_fits_locally;
         if need_moe_split {
+            if matches!(
+                moe_runtime_options.ranking_strategy,
+                moe::MoeRankingStrategy::Auto
+            ) && moe::best_shared_ranking_artifact(&model).is_none()
+            {
+                wait_for_peer_moe_ranking(
+                    &model_name,
+                    &model,
+                    &mut peer_rx,
+                    &mut stop_rx,
+                    std::time::Duration::from_secs(8),
+                )
+                .await;
+            }
+            let resolved_moe_cfg = match resolve_runtime_moe_config(
+                &model_name,
+                &model,
+                &bin_dir,
+                my_vram,
+                &moe_runtime_options,
+            ) {
+                Ok(Some(cfg)) => cfg,
+                Ok(None) => {
+                    eprintln!("⚠️  [{}] Failed to resolve MoE split config", model_name);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "⚠️  [{}] Failed to resolve MoE ranking/grouping: {e}",
+                        model_name
+                    );
+                    return;
+                }
+            };
             moe_election_loop(
                 node,
                 tunnel_mgr,
@@ -327,7 +1248,7 @@ pub async fn election_loop(
                 bin_dir,
                 model,
                 model_name,
-                moe_cfg.clone(),
+                resolved_moe_cfg,
                 my_vram,
                 model_bytes as u64,
                 binary_flavor,
@@ -547,6 +1468,7 @@ pub async fn election_loop(
                 &model,
                 &model_name,
                 peers_for_launch,
+                explicit_mmproj.as_deref(),
                 draft.as_deref(),
                 draft_max,
                 force_split,
@@ -687,7 +1609,7 @@ async fn moe_election_loop(
     bin_dir: std::path::PathBuf,
     model: std::path::PathBuf,
     model_name: String,
-    moe_cfg: crate::models::catalog::MoeConfig,
+    mut moe_cfg: ResolvedMoeConfig,
     my_vram: u64,
     model_bytes: u64,
     binary_flavor: Option<launch::BinaryFlavor>,
@@ -699,30 +1621,139 @@ async fn moe_election_loop(
 ) {
     let mut peer_rx = node.peer_change_rx.clone();
     let mut currently_running = false;
-    let mut last_n_nodes: usize = 0;
+    let mut last_plan: Option<MoePlacementPlan> = None;
     let mut llama_process: Option<launch::InferenceServerProcess> = None;
+    let mut current_local_port: Option<u16> = None;
+    let mut last_plan_change_at = tokio::time::Instant::now();
 
     loop {
         if stop_requested(&stop_rx) {
             break;
         }
-        // Count how many nodes (including us) are serving this model
+
+        if !currently_running {
+            let _ = refresh_auto_moe_config_from_cache(&model_name, &model, &mut moe_cfg);
+        }
+
         let peers = node.peers().await;
-        let model_peers: Vec<mesh::PeerInfo> = peers
+        let local_descriptors = node.served_model_descriptors().await;
+        let declared_model_peers: Vec<mesh::PeerInfo> = peers
+            .iter()
+            .filter(|p| !matches!(p.role, NodeRole::Client))
+            .filter(|peer| {
+                peer.is_assigned_model(&model_name)
+                    || peer
+                        .requested_models
+                        .iter()
+                        .any(|requested| requested == &model_name)
+                    || peer.models.iter().any(|model| model == &model_name)
+            })
+            .cloned()
+            .collect();
+        let eligible_model_peers: Vec<mesh::PeerInfo> = declared_model_peers
+            .iter()
+            .filter_map(|peer| {
+                mesh::peer_is_eligible_for_active_moe(&local_descriptors, peer, &model_name)
+                    .then_some(peer.clone())
+            })
+            .collect();
+        let model_fits = my_vram >= (model_bytes as f64 * 1.1) as u64;
+        let placement_peers: Vec<mesh::PeerInfo> = if !currently_running
+            && !model_fits
+            && eligible_model_peers.is_empty()
+        {
+            if !declared_model_peers.is_empty() {
+                eprintln!(
+                        "🧩 [{model_name}] Bootstrapping MoE placement with {} declared peer(s) while active eligibility catches up",
+                        declared_model_peers.len()
+                    );
+            }
+            declared_model_peers.clone()
+        } else {
+            eligible_model_peers.clone()
+        };
+        let recovering_peer_count = peers
             .iter()
             .filter(|p| p.is_assigned_model(&model_name))
             .filter(|p| !matches!(p.role, NodeRole::Client))
-            .cloned()
-            .collect();
-        let n_nodes = model_peers.len() + 1; // +1 for us
+            .filter(|peer| !peer.moe_recovery_ready())
+            .count();
+        if recovering_peer_count > 0 {
+            eprintln!(
+                "🧩 [{model_name}] Holding {} recovered peer(s) out of active MoE placement until stable",
+                recovering_peer_count
+            );
+        }
 
-        // Determine our shard index: sort all node IDs, find our position
         let my_id = node.id();
-        let peer_ids: Vec<iroh::EndpointId> = model_peers.iter().map(|p| p.id).collect();
-        let (all_ids, my_shard_index) = moe_shard_index(my_id, &peer_ids);
+        let mut candidates = vec![MoePlacementCandidate {
+            id: my_id,
+            vram_bytes: my_vram,
+            full_coverage: model_fits,
+        }];
+        candidates.extend(placement_peers.iter().map(|peer| MoePlacementCandidate {
+            id: peer.id,
+            vram_bytes: peer.vram_bytes,
+            full_coverage: peer.vram_bytes >= (model_bytes as f64 * 1.1) as u64,
+        }));
+        let (current_active_ids, current_fallback_ids) =
+            running_plan_state(last_plan.as_ref(), currently_running);
+        let provisional_best = compute_best_moe_placement(candidates.clone());
+        let allow_scale_up = currently_running
+            && last_plan_change_at.elapsed()
+                >= std::time::Duration::from_secs(MOE_SCALE_UP_QUIET_SECS);
+        let Some(plan) = plan_moe_placement(
+            candidates,
+            current_active_ids,
+            current_fallback_ids,
+            allow_scale_up,
+        ) else {
+            tokio::select! {
+                res = peer_rx.changed() => {
+                    if res.is_err() { break; }
+                }
+                res = stop_rx.changed() => {
+                    if res.is_err() || stop_requested(&stop_rx) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        };
+        let role = plan.role_for(my_id);
+        let healthy_reserve_count = placement_peers
+            .iter()
+            .filter(|peer| {
+                !plan.active_ids.contains(&peer.id) && !plan.fallback_ids.contains(&peer.id)
+            })
+            .count();
+        if healthy_reserve_count > 0 && currently_running {
+            if !allow_scale_up {
+                let remaining = std::time::Duration::from_secs(MOE_SCALE_UP_QUIET_SECS)
+                    .saturating_sub(last_plan_change_at.elapsed())
+                    .as_secs();
+                eprintln!(
+                    "🧩 [{model_name}] Keeping {} healthy peer(s) in reserve for {}s before considering MoE scale-up",
+                    healthy_reserve_count,
+                    remaining
+                );
+            } else if provisional_best
+                .as_ref()
+                .filter(|best| {
+                    last_plan
+                        .as_ref()
+                        .is_some_and(|current| best.materially_improves_upon(current))
+                })
+                .is_none()
+            {
+                eprintln!(
+                    "🧩 [{model_name}] Keeping {} healthy peer(s) in reserve; the current MoE plan is still preferred",
+                    healthy_reserve_count
+                );
+            }
+        }
 
-        // If nothing changed, skip
-        if currently_running && n_nodes == last_n_nodes {
+        if currently_running && last_plan.as_ref() == Some(&plan) {
             tokio::select! {
                 res = peer_rx.changed() => {
                     if res.is_err() { break; }
@@ -740,6 +1771,34 @@ async fn moe_election_loop(
             continue;
         }
 
+        if currently_running {
+            if let Some(previous_plan) = last_plan.as_ref() {
+                let previous_role = previous_plan.role_for(my_id);
+                let same_local_deployment = previous_role == role
+                    && previous_plan.active_ids == plan.active_ids
+                    && previous_plan.overlap == plan.overlap;
+                if same_local_deployment && previous_plan.fallback_ids != plan.fallback_ids {
+                    let targets = build_moe_targets(
+                        &plan.active_ids,
+                        &plan.fallback_ids,
+                        my_id,
+                        matches!(role, MoePlacementRole::SplitShard).then_some(
+                            current_local_port.expect("running MoE shard should have a local port"),
+                        ),
+                        matches!(role, MoePlacementRole::FullFallback).then_some(
+                            current_local_port
+                                .expect("running MoE fallback should have a local port"),
+                        ),
+                        &model_name,
+                    );
+                    target_tx.send_replace(targets);
+                    last_plan = Some(plan);
+                    last_plan_change_at = tokio::time::Instant::now();
+                    continue;
+                }
+            }
+        }
+
         // Something changed — kill existing llama-server
         if currently_running {
             if let Some(process) = llama_process.take() {
@@ -747,16 +1806,112 @@ async fn moe_election_loop(
             }
             tunnel_mgr.set_http_port(0);
             currently_running = false;
+            current_local_port = None;
             on_process(None);
             on_change(false, false);
         }
 
-        last_n_nodes = n_nodes;
+        last_plan = Some(plan.clone());
+        last_plan_change_at = tokio::time::Instant::now();
 
-        if n_nodes == 1 {
-            // Solo: check if the full model fits in VRAM
-            let model_fits = my_vram >= (model_bytes as f64 * 1.1) as u64;
+        if matches!(role, MoePlacementRole::Standby) {
+            node.set_model_runtime_context_length(&model_name, None, None)
+                .await;
+            node.regossip().await;
+            eprintln!(
+                "🧩 [{}] Standing by outside active MoE placement (leader={} active={} fallback={})",
+                model_name,
+                plan.leader_id.fmt_short(),
+                plan.active_ids.len(),
+                plan.fallback_ids.len()
+            );
+            node.set_role(NodeRole::Worker).await;
+            update_targets(&node, &model_name, InferenceTarget::None, &target_tx).await;
+            on_change(false, false);
+        } else if matches!(role, MoePlacementRole::FullFallback) {
+            eprintln!(
+                "🧩 [{}] MoE full-coverage fallback — leader={} active-shards={} fallback-nodes={}",
+                model_name,
+                plan.leader_id.fmt_short(),
+                plan.active_ids.len(),
+                plan.fallback_ids.len()
+            );
+            on_change(true, false);
+
+            let llama_port = match find_free_port().await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("  Failed to find free port: {e}");
+                    if peer_rx.changed().await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
+            };
+
+            match launch::start_llama_server(
+                &bin_dir,
+                binary_flavor,
+                launch::ModelLaunchSpec {
+                    model: &model,
+                    http_port: llama_port,
+                    tunnel_ports: &[],
+                    tensor_split: None,
+                    split_mode: None,
+                    draft: None,
+                    draft_max: 0,
+                    model_bytes,
+                    my_vram,
+                    mmproj: None,
+                    ctx_size_override,
+                    total_group_vram: None,
+                },
+            )
+            .await
+            {
+                Ok(process) => {
+                    node.set_role(NodeRole::Host {
+                        http_port: ingress_http_port,
+                    })
+                    .await;
+                    tunnel_mgr.set_http_port(ingress_http_port);
+                    currently_running = true;
+                    current_local_port = Some(llama_port);
+                    llama_process = Some(process);
+                    if let Some(ref process) = llama_process {
+                        on_process(Some(LocalProcessInfo {
+                            backend: "llama".into(),
+                            pid: process.handle.pid(),
+                            port: llama_port,
+                            context_length: process.context_length,
+                        }));
+                    }
+                    node.regossip().await;
+                    let targets = build_moe_targets(
+                        &plan.active_ids,
+                        &plan.fallback_ids,
+                        my_id,
+                        None,
+                        Some(llama_port),
+                        &model_name,
+                    );
+                    target_tx.send_replace(targets);
+                    on_change(true, true);
+                    eprintln!(
+                        "✅ [{}] MoE fallback replica ready on port {llama_port}",
+                        model_name
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  Failed to start fallback llama-server: {e}");
+                }
+            }
+        } else if plan.active_ids.len() == 1 {
             if model_fits {
+                node.set_model_runtime_context_length(&model_name, None, None)
+                    .await;
+                node.regossip().await;
                 eprintln!(
                     "🧩 [{}] MoE model — serving entirely ({:.1}GB fits in {:.1}GB VRAM)",
                     model_name,
@@ -786,6 +1941,7 @@ async fn moe_election_loop(
                         http_port: llama_port,
                         tunnel_ports: &[],
                         tensor_split: None,
+                        split_mode: local_multi_gpu_split_mode(binary_flavor),
                         draft: None,
                         draft_max: 0,
                         model_bytes: mb,
@@ -804,6 +1960,7 @@ async fn moe_election_loop(
                         .await;
                         tunnel_mgr.set_http_port(ingress_http_port);
                         currently_running = true;
+                        current_local_port = Some(llama_port);
                         llama_process = Some(process);
                         if let Some(ref process) = llama_process {
                             on_process(Some(LocalProcessInfo {
@@ -831,22 +1988,35 @@ async fn moe_election_loop(
                     }
                 }
             } else {
-                // Model too large even for solo — wait for peers to join so we can split
+                node.set_model_runtime_context_length(&model_name, None, None)
+                    .await;
+                node.regossip().await;
                 eprintln!("⚠️  [{}] MoE model too large to serve entirely ({:.1}GB model, {:.1}GB VRAM) — waiting for peers",
                     model_name, model_bytes as f64 / 1e9, my_vram as f64 / 1e9);
                 on_change(false, false);
             }
         } else {
-            // Multi-node MoE: split and load our shard
+            let my_shard_index = plan.shard_index_for(my_id).unwrap_or(0);
             eprintln!(
-                "🧩 [{}] MoE split mode — {} nodes, I am shard {}/{}",
-                model_name, n_nodes, my_shard_index, n_nodes
+                "🧩 [{}] MoE split mode — leader={} active={} fallback={} I am shard {}/{} (ranking={} origin={}, overlap={})",
+                model_name,
+                plan.leader_id.fmt_short(),
+                plan.active_ids.len(),
+                plan.fallback_ids.len(),
+                my_shard_index,
+                plan.active_ids.len(),
+                moe_cfg.ranking_source,
+                moe_cfg.ranking_origin,
+                plan.overlap
             );
             on_change(true, false);
 
-            // Compute assignments and get our shard
-            let assignments =
-                moe::compute_assignments(&moe_cfg.ranking, n_nodes, moe_cfg.min_experts_per_node);
+            let assignments = moe::compute_assignments_with_overlap(
+                &moe_cfg.config.ranking,
+                plan.active_ids.len(),
+                moe_cfg.config.min_experts_per_node,
+                plan.overlap,
+            );
             let my_assignment = &assignments[my_shard_index];
             eprintln!(
                 "  My experts: {} ({} shared + {} unique)",
@@ -855,8 +2025,12 @@ async fn moe_election_loop(
                 my_assignment.n_unique
             );
 
-            // Get or create the shard GGUF via local split
-            let shard_path = moe::split_path(&model, n_nodes, my_shard_index);
+            // Advertise a non-ready local runtime before split generation / load so
+            // peer liveness stays conservative during MoE convergence.
+            node.set_model_runtime_starting(&model_name).await;
+            node.regossip().await;
+
+            let shard_path = moe::split_path(&model, plan.active_ids.len(), my_shard_index);
 
             if !shard_path.exists() {
                 eprintln!("  Splitting GGUF → {} ...", shard_path.display());
@@ -867,6 +2041,9 @@ async fn moe_election_loop(
                     }
                     Err(e) => {
                         eprintln!("  ❌ moe-split failed: {e}");
+                        node.set_model_runtime_context_length(&model_name, None, None)
+                            .await;
+                        node.regossip().await;
                         if peer_rx.changed().await.is_err() {
                             break;
                         }
@@ -905,6 +2082,7 @@ async fn moe_election_loop(
                     http_port: llama_port,
                     tunnel_ports: &[],
                     tensor_split: None,
+                    split_mode: local_multi_gpu_split_mode(binary_flavor),
                     draft: None,
                     draft_max: 0,
                     model_bytes: shard_bytes,
@@ -923,6 +2101,7 @@ async fn moe_election_loop(
                     .await;
                     tunnel_mgr.set_http_port(ingress_http_port);
                     currently_running = true;
+                    current_local_port = Some(llama_port);
                     llama_process = Some(process);
                     if let Some(ref process) = llama_process {
                         on_process(Some(LocalProcessInfo {
@@ -934,8 +2113,14 @@ async fn moe_election_loop(
                     }
                     node.regossip().await;
 
-                    // Build and publish MoE target map
-                    let targets = build_moe_targets(&all_ids, my_id, llama_port, &model_name);
+                    let targets = build_moe_targets(
+                        &plan.active_ids,
+                        &plan.fallback_ids,
+                        my_id,
+                        Some(llama_port),
+                        None,
+                        &model_name,
+                    );
                     target_tx.send_replace(targets);
 
                     on_change(true, true);
@@ -947,7 +2132,17 @@ async fn moe_election_loop(
                     );
                 }
                 Err(e) => {
-                    eprintln!("  ❌ Failed to start llama-server: {e}");
+                    eprintln!(
+                        "  ❌ MoE split validation failed for shard {}: {e}",
+                        shard_path.display()
+                    );
+                    eprintln!(
+                        "  ⚠️  [{}] Refusing to enter MoE split mode on this node until the shard validates",
+                        model_name
+                    );
+                    node.set_model_runtime_context_length(&model_name, None, None)
+                        .await;
+                    node.regossip().await;
                 }
             }
         }
@@ -1083,6 +2278,7 @@ async fn start_llama(
     model: &Path,
     model_name: &str,
     model_peers: &[mesh::PeerInfo],
+    explicit_mmproj: Option<&Path>,
     draft: Option<&Path>,
     draft_max: u16,
     force_split: bool,
@@ -1264,7 +2460,8 @@ async fn start_llama(
     };
 
     // Look up mmproj for vision models
-    let mmproj_path = crate::models::find_mmproj_path(model_name, model);
+    let mmproj_path =
+        crate::models::resolve_mmproj_path(model_name, model, explicit_mmproj.as_deref());
 
     // In split mode (pipeline parallel), pass total group VRAM so context size
     // accounts for the host only holding its share of layers. KV cache is also
@@ -1283,6 +2480,13 @@ async fn start_llama(
             http_port: llama_port,
             tunnel_ports: &rpc_ports,
             tensor_split: split.as_deref(),
+            // Row split only works for local multi-GPU — not over RPC.
+            // When we have RPC workers, llama.cpp uses layer (pipeline) split.
+            split_mode: if rpc_ports.is_empty() {
+                local_multi_gpu_split_mode(binary_flavor)
+            } else {
+                None
+            },
             draft,
             draft_max,
             model_bytes,
@@ -1396,7 +2600,7 @@ mod tests {
         let id_b = make_id(2);
         let (sorted, _) = moe_shard_index(id_a, &[id_b]);
 
-        let targets = build_moe_targets(&sorted, id_a, 8080, "test-model");
+        let targets = build_moe_targets(&sorted, &[], id_a, Some(8080), None, "test-model");
 
         // Should have MoE state
         let moe = targets.moe.as_ref().unwrap();
@@ -1429,7 +2633,7 @@ mod tests {
         let id_b = make_id(2);
         let (sorted, idx_a) = moe_shard_index(id_a, &[id_b]);
 
-        let targets = build_moe_targets(&sorted, id_a, 9999, "m");
+        let targets = build_moe_targets(&sorted, &[], id_a, Some(9999), None, "m");
         let moe = targets.moe.as_ref().unwrap();
 
         // Our index in the MoE state should have our port
@@ -1437,6 +2641,208 @@ mod tests {
             InferenceTarget::MoeLocal(port) => assert_eq!(*port, 9999),
             other => panic!("Expected MoeLocal(9999), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_build_moe_targets_reconfigures_when_third_node_drops() {
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+        let id_c = make_id(3);
+
+        let (sorted_three, _) = moe_shard_index(id_a, &[id_b, id_c]);
+        let targets_three = build_moe_targets(&sorted_three, &[], id_a, Some(8080), None, "m");
+        let moe_three = targets_three.moe.as_ref().unwrap();
+        assert_eq!(moe_three.nodes.len(), 3);
+        assert!(moe_three
+            .nodes
+            .iter()
+            .any(|target| matches!(target, InferenceTarget::MoeRemote(id) if *id == id_c)));
+
+        let (sorted_two, _) = moe_shard_index(id_a, &[id_b]);
+        let targets_two = build_moe_targets(&sorted_two, &[], id_a, Some(8080), None, "m");
+        let moe_two = targets_two.moe.as_ref().unwrap();
+        assert_eq!(moe_two.nodes.len(), 2);
+        assert!(!moe_two
+            .nodes
+            .iter()
+            .any(|target| matches!(target, InferenceTarget::MoeRemote(id) if *id == id_c)));
+
+        // The survivor should still route locally, but only across the 2 remaining shards.
+        assert!(matches!(
+            targets_two.get("m"),
+            InferenceTarget::MoeLocal(8080)
+        ));
+    }
+
+    #[test]
+    fn test_build_moe_targets_collapse_to_single_node_after_peer_loss() {
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+
+        let (sorted_two, _) = moe_shard_index(id_a, &[id_b]);
+        let targets_two = build_moe_targets(&sorted_two, &[], id_a, Some(8080), None, "m");
+        let moe_two = targets_two.moe.as_ref().unwrap();
+        assert_eq!(moe_two.nodes.len(), 2);
+
+        let targets_one = build_moe_targets(&[id_a], &[], id_a, Some(8080), None, "m");
+        let moe_one = targets_one.moe.as_ref().unwrap();
+        assert_eq!(moe_one.nodes.len(), 1);
+        assert!(matches!(moe_one.nodes[0], InferenceTarget::MoeLocal(8080)));
+
+        for i in 0..20 {
+            match targets_one.get_moe_target(&format!("after-drop-{i}")) {
+                Some(InferenceTarget::MoeLocal(8080)) => {}
+                other => panic!("Expected MoeLocal(8080) after collapse, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_moe_targets_include_full_fallback_candidates() {
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+        let id_c = make_id(3);
+        let targets = build_moe_targets(&[id_a, id_b], &[id_c], id_a, Some(8080), None, "m");
+        let moe = targets.moe.as_ref().unwrap();
+        assert_eq!(moe.nodes.len(), 2);
+        assert_eq!(moe.fallbacks.len(), 1);
+        assert!(matches!(moe.fallbacks[0], InferenceTarget::Remote(id) if id == id_c));
+
+        let candidates = targets.get_moe_failover_targets("session");
+        assert_eq!(candidates.len(), 2);
+        assert!(matches!(candidates[1], InferenceTarget::Remote(id) if id == id_c));
+    }
+
+    #[test]
+    fn test_plan_moe_placement_reserves_full_fallback_when_spare_node_exists() {
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+        let id_c = make_id(3);
+        let id_d = make_id(4);
+
+        let plan = plan_moe_placement(
+            vec![
+                MoePlacementCandidate {
+                    id: id_a,
+                    vram_bytes: 40,
+                    full_coverage: true,
+                },
+                MoePlacementCandidate {
+                    id: id_b,
+                    vram_bytes: 24,
+                    full_coverage: false,
+                },
+                MoePlacementCandidate {
+                    id: id_c,
+                    vram_bytes: 24,
+                    full_coverage: false,
+                },
+                MoePlacementCandidate {
+                    id: id_d,
+                    vram_bytes: 24,
+                    full_coverage: false,
+                },
+            ],
+            &[],
+            &[],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(plan.leader_id, id_a);
+        assert_eq!(plan.active_ids.len(), 3);
+        assert_eq!(plan.fallback_ids, vec![id_a]);
+        assert_eq!(plan.overlap, 2);
+    }
+
+    #[test]
+    fn test_plan_moe_placement_keeps_current_active_set_during_recovery() {
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+        let id_c = make_id(3);
+
+        let plan = plan_moe_placement(
+            vec![
+                MoePlacementCandidate {
+                    id: id_a,
+                    vram_bytes: 48,
+                    full_coverage: true,
+                },
+                MoePlacementCandidate {
+                    id: id_b,
+                    vram_bytes: 24,
+                    full_coverage: false,
+                },
+                MoePlacementCandidate {
+                    id: id_c,
+                    vram_bytes: 24,
+                    full_coverage: false,
+                },
+            ],
+            &[id_b, id_c],
+            &[],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.active_ids, vec![id_b, id_c]);
+        assert_eq!(plan.fallback_ids, Vec::<iroh::EndpointId>::new());
+        assert_eq!(plan.overlap, 1);
+    }
+
+    #[test]
+    fn test_plan_moe_placement_scales_up_after_quiet_window_when_materially_better() {
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+        let id_c = make_id(3);
+
+        let plan = plan_moe_placement(
+            vec![
+                MoePlacementCandidate {
+                    id: id_a,
+                    vram_bytes: 48,
+                    full_coverage: true,
+                },
+                MoePlacementCandidate {
+                    id: id_b,
+                    vram_bytes: 24,
+                    full_coverage: false,
+                },
+                MoePlacementCandidate {
+                    id: id_c,
+                    vram_bytes: 24,
+                    full_coverage: false,
+                },
+            ],
+            &[id_b, id_c],
+            &[],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(plan.active_ids, vec![id_b, id_c]);
+        assert_eq!(plan.fallback_ids, vec![id_a]);
+        assert_eq!(plan.overlap, 1);
+    }
+
+    #[test]
+    fn test_running_plan_state_ignores_stale_plan_when_not_running() {
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+        let stale = MoePlacementPlan {
+            leader_id: id_a,
+            active_ids: vec![id_a],
+            fallback_ids: vec![id_b],
+            overlap: 1,
+        };
+
+        let (active_ids, fallback_ids) = running_plan_state(Some(&stale), false);
+        assert!(active_ids.is_empty());
+        assert!(fallback_ids.is_empty());
+
+        let (active_ids, fallback_ids) = running_plan_state(Some(&stale), true);
+        assert_eq!(active_ids, &[id_a]);
+        assert_eq!(fallback_ids, &[id_b]);
     }
 
     #[test]
@@ -1536,7 +2942,7 @@ mod tests {
         let id_a = make_id(1);
         let id_b = make_id(2);
         let (sorted, _) = moe_shard_index(id_a, &[id_b]);
-        let targets = build_moe_targets(&sorted, id_a, 8080, "m");
+        let targets = build_moe_targets(&sorted, &[], id_a, Some(8080), None, "m");
 
         // Same session hint should always route to same node
         let t1 = targets.get_moe_target("user-123");
@@ -1549,7 +2955,7 @@ mod tests {
         let id_a = make_id(1);
         let id_b = make_id(2);
         let (sorted, _) = moe_shard_index(id_a, &[id_b]);
-        let targets = build_moe_targets(&sorted, id_a, 8080, "m");
+        let targets = build_moe_targets(&sorted, &[], id_a, Some(8080), None, "m");
 
         // With enough different sessions, both nodes should get traffic
         let mut hit_local = false;
@@ -1575,7 +2981,7 @@ mod tests {
     #[test]
     fn test_session_routing_single_node() {
         let id_a = make_id(1);
-        let targets = build_moe_targets(&[id_a], id_a, 8080, "m");
+        let targets = build_moe_targets(&[id_a], &[], id_a, Some(8080), None, "m");
 
         // All sessions should go to the single node
         for i in 0..20 {
@@ -1651,5 +3057,46 @@ mod tests {
         let targets = ModelTargets::default();
         let result = targets.pick_from(&[]);
         assert_eq!(result, InferenceTarget::None);
+    }
+
+    // ── Row-split / tensor-parallelism selection ──
+
+    #[test]
+    fn row_split_enabled_for_cuda_multi_gpu() {
+        assert!(should_use_row_split(Some(BinaryFlavor::Cuda), 2));
+        assert!(should_use_row_split(Some(BinaryFlavor::Cuda), 8));
+    }
+
+    #[test]
+    fn row_split_enabled_for_rocm_multi_gpu() {
+        assert!(should_use_row_split(Some(BinaryFlavor::Rocm), 2));
+    }
+
+    #[test]
+    fn row_split_enabled_for_unknown_flavor_multi_gpu() {
+        // None means auto-detected; the resolved binary may still be CUDA/ROCm.
+        assert!(should_use_row_split(None, 2));
+        assert!(should_use_row_split(None, 4));
+    }
+
+    #[test]
+    fn row_split_disabled_for_single_gpu() {
+        assert!(!should_use_row_split(Some(BinaryFlavor::Cuda), 1));
+        assert!(!should_use_row_split(Some(BinaryFlavor::Rocm), 1));
+        assert!(!should_use_row_split(None, 1));
+    }
+
+    #[test]
+    fn row_split_disabled_for_zero_gpus() {
+        assert!(!should_use_row_split(Some(BinaryFlavor::Cuda), 0));
+        assert!(!should_use_row_split(None, 0));
+    }
+
+    #[test]
+    fn row_split_disabled_for_non_cuda_backends() {
+        // Metal, Vulkan, CPU don't support ggml_backend_split_buffer_type.
+        assert!(!should_use_row_split(Some(BinaryFlavor::Metal), 8));
+        assert!(!should_use_row_split(Some(BinaryFlavor::Vulkan), 4));
+        assert!(!should_use_row_split(Some(BinaryFlavor::Cpu), 4));
     }
 }

@@ -44,6 +44,8 @@ configure_compiler_cache() {
     fi
 }
 
+LLAMA_BRANCH="${LLAMA_BRANCH:-upstream-latest}"
+
 clone_or_update_llama() {
     if [[ ! -d "$LLAMA_DIR" ]]; then
         echo "Cloning michaelneale/llama.cpp ($LLAMA_BRANCH branch)..."

@@ -6,13 +6,75 @@ This documents how MoE expert sharding is implemented in mesh-llm. Originally a 
 
 ```bash
 # MoE auto-detected — splits if needed, runs solo if it fits
-mesh-llm --model Qwen3-30B-A3B-Q4_K_M
+mesh-llm serve --model Qwen3-30B-A3B-Q4_K_M
 
-# Force splitting even if model fits locally
-mesh-llm --model Qwen3-30B-A3B-Q4_K_M --split
+# Hidden test/debug override: force splitting even if the model fits locally
+mesh-llm serve --model Qwen3-30B-A3B-Q4_K_M --split
 ```
 
 The system detects MoE from the GGUF header, computes expert assignments, splits the GGUF per node, and each node runs its own llama-server. Sessions are hash-routed. No manual steps.
+
+Normal operators should use plain `mesh-llm --model ...` or `--auto`.
+
+- `--split` remains a hidden test/debug override for forcing the MoE path.
+- `--max-vram` is a supported resource-budget knob when you want the planner to behave as if less VRAM is available.
+
+## Planned Deployment Policy
+
+The current runtime uses **leader-planned automatic MoE deployment**.
+
+That means:
+
+- the leader computes one deployment plan for the exact model identity currently being served
+- nodes advertise resources and health, not their own preferred MoE strategy
+- `auto` is the normal path; the mesh decides whether to run solo, split, or split with extra redundancy
+- nodes either participate in the chosen plan or do not join that split
+
+The deployment plan should choose:
+
+- participating nodes
+- shard count
+- ranking source
+- overlap / redundancy level
+- whether a full-coverage fallback replica is feasible
+
+## Failure Handling
+
+The goal is graceful degradation, not perfect steadiness on a broken topology.
+
+- **Active shard failure should fail down quickly.**
+  If a request to an active shard fails, the deployment should be treated as invalid and reconfigured across survivors.
+- **Heartbeat is supporting evidence, not the main signal.**
+  Heartbeats are useful for liveness, but request-path failure matters more because it directly affects serving.
+- **Do not retry to another partial shard by default.**
+  Partial shards are not interchangeable.
+- **Retry directly only to a full-coverage target.**
+  If a node can serve the full expert set for the same exact model identity, it is a safe failover target.
+
+## Recovery Handling
+
+- **Recover up cautiously.**
+  When a lost node comes back, it should rejoin the mesh first but remain out of active MoE placement until it has stayed healthy for a short probation window.
+- **Use a quiet window before scale-up.**
+  After probation, the leader should still wait for a short quiet period before reconsidering a larger topology.
+- **Only expand when the plan is materially better.**
+  A recovered node being reachable again is not enough by itself. The larger plan should improve fallback coverage, active capacity, or redundancy enough to justify a rebuild.
+- **Avoid topology flapping.**
+  The system should fail down faster than it scales back up.
+- **Recompute when membership changes.**
+  As nodes join or leave, the leader should re-plan the deployment based on the current healthy set and the available resource budget.
+
+## Redundancy Handling
+
+If the cluster has spare capacity, the leader should use it to improve resilience automatically rather than exposing manual runtime knobs.
+
+Possible outcomes:
+
+- extra overlap
+- replicated hot experts
+- a full-coverage fallback replica
+
+The choice should come from the observed cluster resources and health, not conflicting per-node flags.
 
 ## Implementation
 
@@ -31,9 +93,11 @@ else:
     → normal election — solo or tensor split
 ```
 
-`lookup_moe_config()` checks two tiers:
-1. **Catalog** — pre-computed rankings (instant, optimal)
-2. **GGUF header** — auto-detected, uses cached ranking if available, otherwise 50% shared core fallback
+`lookup_moe_config()` checks the current ranking sources in descending quality:
+1. **cached full analyze**
+2. **cached/imported micro-analyze**
+3. **peer-first micro-analyze on cold start**
+4. **sequential fallback**
 
 ### Step 3: Compute assignments (`moe.rs`)
 
@@ -41,6 +105,9 @@ else:
 - Shared core = top `min_experts` by gate mass (replicated to every node)
 - Remaining experts distributed round-robin across nodes
 - Returns `Vec<NodeAssignment>` — each has `experts`, `n_shared`, `n_unique`
+
+The leader now chooses placement automatically from cluster resources instead of exposing MoE split-planning knobs at runtime. The current planner keeps a healthy active shard set stable, uses overlap-based redundancy in the active split, and reserves a full-coverage fallback replica when there is enough spare capacity.
+Recover-up is intentionally conservative: a recovered node must pass probation, then a quiet window, and then the leader only scales back up if the candidate plan is materially better than the current healthy one.
 
 ### Step 4: Split GGUF (`moe.rs` → `llama-moe-split`)
 
@@ -62,7 +129,8 @@ Each node runs `llama-server` with its split GGUF. No `--rpc`, no tensor splitti
 
 - **Shard distribution over QUIC** — the design proposed pushing shards from host to workers. Instead, every node splits locally from its own copy of the full GGUF. Simpler, but requires every node to have the full model on disk.
 - **Probe-based placement** — hash routing is used instead. Both nodes are equivalent with sufficient overlap.
-- **Lazy `moe-analyze`** — not run automatically. Users can run it manually; cached rankings are picked up.
+- **Global redundancy optimization** — the current leader plan is intentionally conservative and deterministic. It does not yet search all possible shard/fallback layouts.
+- **Probe-based placement** — hash routing plus full-coverage failover is still used instead of prompt probing.
 
 ## Open Questions (from original design, still open)
 

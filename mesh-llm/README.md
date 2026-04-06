@@ -30,7 +30,7 @@ Notable built-ins under `src/plugins/` today:
 ```text
 plugins/
 ├── blackboard/            shared mesh message feed + MCP surface
-└── example/               standalone example plugin crate
+└── lemonade/              external OpenAI-compatible inference endpoint bridge
 ```
 
 ## Runtime model
@@ -50,7 +50,7 @@ The management API exposes the state the UI uses directly:
 
 - `GET /api/status` for node, peer, and routing state
 - `GET /api/events` for live updates
-- `GET /api/models` and runtime endpoints for loaded model/process state
+- `GET /api/models` for mesh model inventory and `GET /api/runtime*` for loaded model/process state
 - `GET /api/discover` for mesh discovery results
 - `GET /api/plugins` plus per-plugin tool endpoints
 - `GET /api/blackboard/feed`, `GET /api/blackboard/search`, `POST /api/blackboard/post`
@@ -65,39 +65,62 @@ Plugin hosting now lives in `src/plugin/` rather than a crate-root module. mesh-
 - external executable plugins declared in `~/.mesh-llm/config.toml`
 - MCP exposure through the plugin bridge
 
-The blackboard plugin is auto-registered unless explicitly disabled in config. Useful entry points:
+`mesh-llm serve` also loads startup model config from the same file. The blackboard plugin is auto-registered unless explicitly disabled in config. Useful entry points:
 
 ```bash
 mesh-llm plugin list
 mesh-llm blackboard
 mesh-llm blackboard --search "routing"
-mesh-llm --client --join <token> blackboard --mcp
+mesh-llm client --join <token> blackboard --mcp
 ```
 
-External plugins are configured as executables, for example:
+Unified local config example:
 
 ```toml
+version = 1
+
+[gpu]
+assignment = "auto"
+
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+
+[[models]]
+model = "bartowski/Qwen2.5-VL-7B-Instruct-GGUF/qwen2.5-vl-7b-instruct-q4_k_m.gguf"
+mmproj = "bartowski/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-f16.gguf"
+ctx_size = 8192
+
+[[plugin]]
+name = "blackboard"
+enabled = true
+
 [[plugin]]
 name = "my-plugin"
 command = "/absolute/path/to/plugin-binary"
 args = ["--stdio"]
 ```
 
+`mesh-llm serve` uses `~/.mesh-llm/config.toml` by default, or `--config /path/to/config.toml`.
+Explicit `--model` or `--gguf` ignores configured `[[models]]`, and explicit `--ctx-size`
+overrides configured `ctx_size` for the selected startup models.
+Bare `mesh-llm serve` warns, shows help, and exits if `[[models]]` is empty.
+
 ## Discovery and mesh modes
 
 Opt-in Nostr discovery:
 
 ```bash
-mesh-llm --model Qwen2.5-3B --publish --mesh-name "Sydney Lab" --region AU
+mesh-llm serve --model Qwen2.5-3B --publish --mesh-name "Sydney Lab" --region AU
 mesh-llm discover
 mesh-llm discover --model GLM --region AU
-mesh-llm --auto
+mesh-llm serve --auto
+mesh-llm gpus
 ```
 
 Named meshes still work as a strict discovery filter:
 
 ```bash
-mesh-llm --auto --model GLM-4.7-Flash-Q4_K_M --mesh-name "poker-night"
+mesh-llm serve --auto --model GLM-4.7-Flash-Q4_K_M --mesh-name "poker-night"
 ```
 
 No-arg behavior remains intentionally simple:

@@ -13,8 +13,8 @@ All core phases are complete and integrated into mesh-llm.
 - Auto-detected in `election.rs` at model load time.
 
 ### Ranking
-- **Catalog models**: pre-computed expert gate mass rankings baked into `download.rs` (e.g. `QWEN3_30B_A3B_RANKING`).
-- **Cached rankings**: `moe::load_cached_ranking()` loads from a sibling `moe-rankings/` directory next to the source model file.
+- **Cached rankings**: `moe::load_cached_ranking()` loads from the mesh-llm cache under `~/.cache/mesh-llm/moe-rankings/`.
+- **Dynamic analysis**: runtime can materialize cached rankings via `micro-analyze` or full `moe-analyze`.
 - **Fallback**: no ranking → conservative 50% shared core with sequential expert IDs.
 - **Tool**: `llama-moe-analyze` (in `llama.cpp/tools/moe-analyze/`) runs inference on sample prompts and exports per-expert gate mass CSV.
 
@@ -38,15 +38,148 @@ All core phases are complete and integrated into mesh-llm.
 ### Tested
 - OLMoE-1B-7B: 2 nodes over WAN (225ms RTT Sydney↔Sydney), both shards coherent.
 - Qwen3-30B-A3B: local quality validation, 87/128 experts per node = excellent.
-- GLM-4.7-Flash-Q4_K_M: MoE auto-detected (64 experts, top-4), fits locally → solo mode, no split. No pre-baked ranking in catalog yet — would use 50% fallback if split.
+- GLM-4.7-Flash-Q4_K_M: MoE auto-detected (64 experts, top-4), fits locally → solo mode, no split. If split, mesh-llm now prefers cached or freshly computed analysis over the sequential fallback.
+
+### Direct `moe-split` Smoke Matrix
+
+The splitter needs its own direct smoke coverage before any full mesh experiment. The minimum family matrix should track the MoE layouts we already use:
+
+| Family | Preferred model | Coverage reason |
+|---|---|---|
+| Qwen A3B | `Qwen3-30B-A3B-Q4_K_M` | Main 128-expert A3B split path we actively deploy |
+| Qwen Next | `Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf` | Multi-part GGUF frontier Qwen MoE layout |
+| DeepSeek2 / GLM | `GLM-4.7-Flash-Q4_K_M` | Exercises `exp_probs_b` plus shared-expert tensors |
+| OLMoE | `OLMoE-1B-7B-0924-Instruct-Q4_K_M` or `OLMoE-1B-7B-0125-Instruct-Q4_K_M` | Small MoE family used for fast split validation |
+
+For each family, the smoke should:
+
+1. Generate a `2`-way split for both `group 0` and `group 1`.
+2. Validate each shard by loading it with `llama-server`.
+3. Fail immediately on loader shape mismatches or file-bounds corruption.
+4. Run before remote mesh deploys so splitter regressions are caught locally.
+
+## Leader-Planned Auto MoE
+
+Current behavior:
+
+- **Leader computes one plan per exact model identity.**
+  - participating nodes
+  - shard count
+  - ranking source
+  - overlap and redundancy
+  - whether a full-coverage fallback replica is feasible
+- **Followers advertise facts, not policies.**
+  - model identity present or not
+  - available VRAM / RAM
+  - health and stability
+  - bandwidth / RTT when available
+- **No mixed per-node MoE strategies.**
+  One deployment gets one plan. Nodes either participate in that plan or sit out.
+- **`auto` is the default runtime behavior.**
+  The system should pick solo, split, or split-with-redundancy based on current resources without requiring flags such as grouping or overlap mode.
+- **Keep the public surface small.**
+  `--split` stays a hidden test/debug override. `--max-vram` is the supported budget knob when an operator wants to constrain planning without changing hardware.
+
+### Failure and Recovery Policy
+
+The deployment objective is to keep serving as much as possible while avoiding topology flapping.
+
+- **Fail down quickly when an active shard is unusable.**
+  A shard request failure is stronger evidence than a heartbeat miss and should trigger prompt reconfiguration across survivors.
+- **Do not blindly retry on another partial shard.**
+  Partial shards do not generally contain interchangeable expert sets.
+- **Retry directly only to full-coverage targets.**
+  If another node has the full expert set for the same exact model identity, it is a valid failover target.
+- **Recover up cautiously.**
+  When a lost node reappears, re-admit it to mesh membership first, then keep it out of active MoE placement until it has stayed healthy for a short stability window.
+- **Use extra capacity for resilience when available.**
+  If the cluster has spare memory, the leader may choose extra overlap, replicated hot experts, or a full-coverage fallback replica instead of maximizing packing efficiency.
+
+### Current Result
+
+This should give mesh-llm the following MoE behavior:
+
+- `A + B -> A` quickly when `B` disappears
+- `A + B + C -> A + B` quickly when `C` disappears
+- stable serving on the reduced topology instead of waiting for manual restart
+- cautious expansion back to larger splits only after the recovered node proves healthy
+- optional direct failover to a full-coverage replica when one exists
+
+Current recover-up policy is intentionally simple:
+- a recovered node must first pass probation
+- then the cluster must remain quiet for a short scale-up window
+- only after that does the leader reconsider a larger plan
+- the leader only expands if the candidate plan is materially better than the current healthy one
 
 ## What's NOT Implemented
 
 ### No probe-based session placement (planned)
 The current design uses hash routing — sessions are assigned to nodes deterministically. The original plan proposed fan-out probes where each node scores "how well does my shard match this prompt" and the best node gets the session. This was unnecessary for the 2-node case with sufficient overlap (68%+) — both nodes produce equivalent quality. Probing becomes important with more nodes, less overlap, or sharper expert specialization. With scale testing on larger models coming soon, this is next on the list.
 
-### No lazy `moe-analyze` for unknown models
-Phase 4 in TODO. Unknown MoE models use the 50% shared core fallback with sequential expert IDs. Running `moe-analyze` automatically on first deploy (2-5 min of sample inference to compute proper rankings) is planned but not implemented. You can run it manually and the cached ranking will be picked up.
+### Remaining limits
+- The leader currently prefers a conservative automatic plan:
+  - keep the existing active shard set when it is still healthy
+  - reserve a dedicated full-coverage fallback when spare nodes exist
+  - otherwise use overlap-based redundancy in the active split
+- This is intentionally simpler than a full global packing solver. It does not yet optimize across all possible redundancy layouts or cost models.
+
+### Future: full global redundancy optimizer
+
+The long-term planner should treat MoE placement as an optimization problem, not just a deterministic rule set.
+
+Instead of only deciding:
+- active shard set
+- simple overlap level
+- whether one fallback replica fits
+
+it should evaluate a larger plan space such as:
+- how many active shards to run
+- which exact nodes should be active shards
+- whether spare capacity is better spent on:
+  - extra overlap
+  - replicated hot experts
+  - one full-coverage fallback replica
+  - multiple partial backup replicas
+- whether a larger split is worth the rebuild cost at all
+
+Inputs the optimizer should consider:
+- exact model identity and MoE shape
+- expert ranking quality and confidence
+- VRAM / RAM per node
+- node stability and recent failure history
+- RTT / bandwidth where relevant
+- whether nodes can host the full model
+- current demand and recent request volume
+
+The objective should be biased toward availability first:
+1. keep serving through a node loss
+2. preserve correctness
+3. minimize topology churn
+4. maximize fallback coverage
+5. only then optimize packing efficiency or latency
+
+That means the optimizer may choose plans like:
+- 3 active shards + 1 full fallback
+- 2 active shards + higher overlap instead of 3 thin shards
+- 4 active shards with duplicated hottest experts
+- stay on the current smaller split because the recovered node does not improve resilience enough to justify a rebuild
+
+The implementation should be phased:
+- Phase 1: score a small number of explicit candidate plans
+- Phase 2: add failure-cost and churn-cost terms
+- Phase 3: use live cluster signals to adapt the scoring
+
+The important constraint is explainability. The leader should be able to log why a plan won, for example:
+- `kept 2 active shards because recovered node did not improve fallback coverage`
+- `reserved node C as full fallback because it is the only node that can host the full model`
+- `preferred 2x overlap over a 3-way split because it gives better single-node failure tolerance`
+
+The advanced version of recover-up should live inside this optimizer rather than as a separate rule.
+That means the optimizer should eventually score:
+- whether to stay on the current reduced topology
+- whether to scale back up now
+- whether to wait longer because the recovered node is still too unstable
+- whether the larger plan improves fallback coverage enough to justify churn
 
 ### No scale testing on large models
 Phase 5 in TODO. Mixtral 8×22B (~80GB) and Qwen3-235B-A22B (~130GB) are the real targets where expert sharding provides value (models that don't fit on one machine). Not tested yet.
@@ -62,7 +195,7 @@ Planned direction:
   - capabilities (`vision`, `reasoning`, `tool_use`, `moe`)
   - optional `topology.moe`
 - **Initial MoE topology sources**:
-  1. precomputed MoE data already baked into this repo
+  1. cached `moe-analyze` or `micro-analyze` results
   2. Hugging Face metadata such as `num_experts` and `num_experts_per_tok`
   3. GGUF header fallback when no stronger source exists
 - **What goes into `ModelMoeInfo` first**:

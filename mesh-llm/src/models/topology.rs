@@ -19,6 +19,18 @@ pub struct ModelMoeInfo {
     pub min_experts_per_node: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranking_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranking_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranking: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranking_prompt_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranking_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranking_layer_scope: Option<String>,
 }
 
 pub fn infer_catalog_topology(model: &catalog::CatalogModel) -> Option<ModelTopology> {
@@ -28,6 +40,12 @@ pub fn infer_catalog_topology(model: &catalog::CatalogModel) -> Option<ModelTopo
             used_expert_count: moe.n_expert_used as u32,
             min_experts_per_node: Some(moe.min_experts_per_node as u32),
             source: Some("catalog".to_string()),
+            ranking_source: None,
+            ranking_origin: None,
+            ranking: Vec::new(),
+            ranking_prompt_count: None,
+            ranking_tokens: None,
+            ranking_layer_scope: None,
         }),
     })
 }
@@ -60,6 +78,12 @@ fn infer_hf_metadata_topology(config: &Value) -> Option<ModelTopology> {
             used_expert_count,
             min_experts_per_node: None,
             source: Some("hf_metadata".to_string()),
+            ranking_source: None,
+            ranking_origin: None,
+            ranking: Vec::new(),
+            ranking_prompt_count: None,
+            ranking_tokens: None,
+            ranking_layer_scope: None,
         }),
     })
 }

@@ -1,8 +1,39 @@
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::cli::benchmark::BenchmarkCommand;
 use crate::cli::runtime::RuntimeCommand;
 
+#[derive(Subcommand, Debug)]
+pub(crate) enum AuthCommand {
+    /// Generate a new owner keypair and save to keystore.
+    Init {
+        /// Path to the keystore file (default: ~/.mesh-llm/owner-keystore.json).
+        #[arg(long)]
+        owner_key: Option<PathBuf>,
+        /// Overwrite an existing keystore.
+        #[arg(long)]
+        force: bool,
+        /// Skip passphrase prompt (store keys unencrypted).
+        #[arg(long, conflicts_with = "keychain")]
+        no_passphrase: bool,
+        /// Store a random unlock passphrase in the OS keychain (macOS Keychain,
+        /// Windows Credential Manager, Linux Secret Service). New keystores
+        /// already default to this when a backend is available; use this flag
+        /// to force it when overwriting an existing keystore.
+        #[arg(long)]
+        keychain: bool,
+    },
+    /// Show current owner identity status.
+    Status {
+        /// Path to the keystore file.
+        #[arg(long)]
+        owner_key: Option<PathBuf>,
+    },
+}
+
+pub(crate) mod benchmark;
 pub(crate) mod commands;
 pub mod models;
 pub(crate) mod runtime;
@@ -12,7 +43,7 @@ pub(crate) mod runtime;
     name = "mesh-llm",
     version = crate::VERSION,
     about = "Pool GPUs over the internet for LLM inference",
-    after_help = "Run with --help-advanced for all options."
+    after_help = "Preferred runtime entrypoints:\n  mesh-llm serve\n  mesh-llm serve --model Qwen3-8B-Q4_K_M\n  mesh-llm client --auto\n  mesh-llm gpus\n\n`mesh-llm serve` loads startup models from ~/.mesh-llm/config.toml.\nRun with --help-advanced for all options."
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -56,6 +87,10 @@ pub(crate) struct Cli {
     /// `config.json`, `tokenizer.json`, or `model.safetensors`.
     #[arg(long = "mlx-file")]
     pub(crate) mlx_file: Vec<PathBuf>,
+
+    /// Explicit mmproj sidecar to pass to llama-server for the primary served model.
+    #[arg(long, hide = true)]
+    pub(crate) mmproj: Option<PathBuf>,
 
     /// API port (default: 9337).
     #[arg(long, default_value = "9337")]
@@ -118,8 +153,8 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     pub(crate) ctx_size: Option<u32>,
 
-    /// Limit VRAM advertised to the mesh (GB).
-    #[arg(long, hide = true)]
+    /// Cap VRAM used for planning, local-fit decisions, and mesh advertisement (GB).
+    #[arg(long)]
     pub(crate) max_vram: Option<f64>,
 
     /// Enumerate host hardware (GPU name, hostname) at startup.
@@ -167,7 +202,7 @@ pub(crate) struct Cli {
     pub(crate) no_console: bool,
 
     /// Optional path to the mesh-llm config file.
-    #[arg(long, hide = true)]
+    #[arg(long)]
     pub(crate) config: Option<PathBuf>,
 
     /// Internal: set when this node joined via Nostr discovery (not --join).
@@ -192,6 +227,9 @@ pub(crate) enum Command {
     },
     /// Update mesh-llm to the latest bundled release and exit.
     Update,
+    /// Inspect local GPUs, stable IDs, and cached bandwidth.
+    #[command(alias = "gpu")]
+    Gpus,
     /// Inspect and manage local runtime-served models.
     #[command(hide = true)]
     Runtime {
@@ -274,7 +312,7 @@ pub(crate) enum Command {
     /// Show feed:        mesh-llm blackboard
     /// Search:           mesh-llm blackboard --search "query"
     /// From a peer:      mesh-llm blackboard --from tyler
-    /// MCP server:       mesh-llm --client --join <token> blackboard --mcp
+    /// MCP server:       mesh-llm client --join <token> blackboard --mcp
     /// Install skill:    mesh-llm blackboard install-skill
     ///
     /// Conventions: prefix messages with QUESTION:, STATUS:, FINDING:, TIP: etc.
@@ -307,6 +345,17 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: PluginCommand,
     },
+    /// Benchmark and compare model/runtime strategies.
+    #[command(hide = true)]
+    Benchmark {
+        #[command(subcommand)]
+        command: BenchmarkCommand,
+    },
+    /// Manage owner identity and keystore.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -318,4 +367,242 @@ pub(crate) enum PluginCommand {
     },
     /// List auto-registered and configured plugins.
     List,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeSurface {
+    Serve,
+    Client,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NormalizedRuntimeArgs {
+    pub(crate) original: Vec<OsString>,
+    pub(crate) normalized: Vec<OsString>,
+    pub(crate) explicit_surface: Option<RuntimeSurface>,
+}
+
+pub(crate) fn normalize_runtime_surface_args<I, S>(args: I) -> NormalizedRuntimeArgs
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let original: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let mut normalized = original.clone();
+    let mut explicit_surface = None;
+
+    match original.get(1).and_then(|arg| arg.to_str()) {
+        Some("serve") => match original.get(2).and_then(|arg| arg.to_str()) {
+            Some(arg) if arg.starts_with('-') => {
+                normalized.remove(1);
+                explicit_surface = Some(RuntimeSurface::Serve);
+            }
+            None => {
+                normalized[1] = OsString::from("--help");
+                explicit_surface = Some(RuntimeSurface::Serve);
+            }
+            _ => {}
+        },
+        Some("client") => {
+            normalized.remove(1);
+            normalized.insert(1, OsString::from("--client"));
+            explicit_surface = Some(RuntimeSurface::Client);
+        }
+        _ => {}
+    }
+
+    NormalizedRuntimeArgs {
+        original,
+        normalized,
+        explicit_surface,
+    }
+}
+
+pub(crate) fn legacy_runtime_surface_warning(
+    cli: &Cli,
+    original_args: &[OsString],
+    explicit_surface: Option<RuntimeSurface>,
+) -> Option<String> {
+    if explicit_surface.is_some() || cli.command.is_some() {
+        return None;
+    }
+
+    if cli.client {
+        return Some(format!(
+            "⚠️ top-level `--client` now maps to `mesh-llm client`.\n  Please use: {}",
+            suggested_client_command(original_args)
+        ));
+    }
+
+    if !cli.model.is_empty()
+        || !cli.gguf_file.is_empty()
+        || !cli.mlx_file.is_empty()
+        || cli.mmproj.is_some()
+    {
+        return Some(format!(
+            "⚠️ top-level serving flags now map to `mesh-llm serve`.\n  Please use: {}",
+            suggested_serve_command(original_args)
+        ));
+    }
+
+    None
+}
+
+fn suggested_serve_command(original_args: &[OsString]) -> String {
+    let mut args = Vec::with_capacity(original_args.len() + 1);
+    if let Some(program) = original_args.first() {
+        args.push(program.clone());
+    } else {
+        args.push(OsString::from("mesh-llm"));
+    }
+    args.push(OsString::from("serve"));
+    args.extend(original_args.iter().skip(1).cloned());
+    shell_join(&args)
+}
+
+fn suggested_client_command(original_args: &[OsString]) -> String {
+    let mut args = Vec::with_capacity(original_args.len());
+    if let Some(program) = original_args.first() {
+        args.push(program.clone());
+    } else {
+        args.push(OsString::from("mesh-llm"));
+    }
+    args.push(OsString::from("client"));
+    let mut skipped_client = false;
+    for arg in original_args.iter().skip(1) {
+        if !skipped_client && arg.to_string_lossy() == "--client" {
+            skipped_client = true;
+            continue;
+        }
+        args.push(arg.clone());
+    }
+    shell_join(&args)
+}
+
+fn shell_join(args: &[OsString]) -> String {
+    args.iter()
+        .map(|arg| shell_display(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_display(arg: &OsString) -> String {
+    let text = arg.to_string_lossy();
+    if text.is_empty() {
+        "\"\"".into()
+    } else if text
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '\\'))
+    {
+        format!("{text:?}")
+    } else {
+        text.into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn normalize_runtime_surface_args_rewrites_serve_invocation() {
+        let normalized = normalize_runtime_surface_args([
+            "mesh-llm",
+            "serve",
+            "--auto",
+            "--model",
+            "Qwen3-8B-Q4_K_M",
+        ]);
+
+        assert_eq!(normalized.explicit_surface, Some(RuntimeSurface::Serve));
+        assert_eq!(
+            normalized.normalized,
+            vec!["mesh-llm", "--auto", "--model", "Qwen3-8B-Q4_K_M"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn normalize_runtime_surface_args_bare_serve_rewrites_to_help() {
+        let normalized = normalize_runtime_surface_args(["mesh-llm", "serve"]);
+
+        assert_eq!(normalized.explicit_surface, Some(RuntimeSurface::Serve));
+        assert_eq!(
+            normalized.normalized,
+            vec!["mesh-llm", "--help"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn normalize_runtime_surface_args_rewrites_client_invocation() {
+        let normalized =
+            normalize_runtime_surface_args(["mesh-llm", "client", "--auto", "--port", "9337"]);
+
+        assert_eq!(normalized.explicit_surface, Some(RuntimeSurface::Client));
+        assert_eq!(
+            normalized.normalized,
+            vec!["mesh-llm", "--client", "--auto", "--port", "9337"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn normalize_runtime_surface_args_keeps_non_runtime_subcommands() {
+        let normalized = normalize_runtime_surface_args(["mesh-llm", "download", "foo"]);
+
+        assert_eq!(normalized.explicit_surface, None);
+        assert_eq!(
+            normalized.normalized,
+            vec!["mesh-llm", "download", "foo"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn legacy_runtime_surface_warning_for_top_level_serve_flags() {
+        let normalized =
+            normalize_runtime_surface_args(["mesh-llm", "--auto", "--model", "Qwen3-8B-Q4_K_M"]);
+        let cli = Cli::parse_from(normalized.normalized.clone());
+
+        let warning =
+            legacy_runtime_surface_warning(&cli, &normalized.original, normalized.explicit_surface)
+                .expect("warning should be present");
+
+        assert!(warning.contains("mesh-llm serve --auto --model Qwen3-8B-Q4_K_M"));
+    }
+
+    #[test]
+    fn legacy_runtime_surface_warning_for_top_level_client_flag() {
+        let normalized = normalize_runtime_surface_args(["mesh-llm", "--auto", "--client"]);
+        let cli = Cli::parse_from(normalized.normalized.clone());
+
+        let warning =
+            legacy_runtime_surface_warning(&cli, &normalized.original, normalized.explicit_surface)
+                .expect("warning should be present");
+
+        assert!(warning.contains("mesh-llm client --auto"));
+    }
+
+    #[test]
+    fn explicit_runtime_surface_suppresses_legacy_warning() {
+        let normalized = normalize_runtime_surface_args(["mesh-llm", "client", "--auto"]);
+        let cli = Cli::parse_from(normalized.normalized.clone());
+
+        assert!(legacy_runtime_surface_warning(
+            &cli,
+            &normalized.original,
+            normalized.explicit_surface
+        )
+        .is_none());
+    }
 }

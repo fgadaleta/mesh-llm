@@ -89,6 +89,12 @@ message ModelMoeInfo {
   uint32 used_expert_count = 2;
   optional uint32 min_experts_per_node = 3;
   optional string source = 4;
+  optional string ranking_source = 5;
+  repeated uint32 ranking = 6;
+  optional uint32 ranking_prompt_count = 7;
+  optional uint32 ranking_tokens = 8;
+  optional string ranking_layer_scope = 9;
+  optional string ranking_origin = 10;
 }
 
 message CompactModelMetadata {

@@ -176,6 +176,11 @@ type MeshModel = {
   moe?: boolean;
   expert_count?: number;
   used_expert_count?: number;
+  ranking_source?: string;
+  ranking_origin?: string;
+  ranking_prompt_count?: number;
+  ranking_tokens?: number;
+  ranking_layer_scope?: string;
   draft_model?: string;
   source_page_url?: string;
   fit_label?: string;
@@ -230,6 +235,39 @@ type NodeSidebarRecord = {
 function modelDisplayName(model?: MeshModel | null) {
   if (!model) return "";
   return model.display_name || model.name;
+}
+
+function formatMoeRanking(model?: MeshModel | null) {
+  if (!model?.ranking_source) return null;
+  if (model.ranking_source === "analyze") return "Full analyze";
+  if (model.ranking_source !== "micro-analyze") return model.ranking_source;
+
+  const parts = ["Micro-analyze"];
+  if (model.ranking_prompt_count) {
+    parts.push(`${model.ranking_prompt_count} prompt${model.ranking_prompt_count === 1 ? "" : "s"}`);
+  }
+  if (model.ranking_tokens) {
+    parts.push(`${model.ranking_tokens} tokens`);
+  }
+  if (model.ranking_layer_scope) {
+    parts.push(model.ranking_layer_scope === "all" ? "all layers" : "first layer");
+  }
+  return parts.join(" · ");
+}
+
+function formatMoeRankingOrigin(model?: MeshModel | null) {
+  switch (model?.ranking_origin) {
+    case "local-full-analyze":
+      return "Local full analyze";
+    case "local-micro-analyze":
+      return "Local micro-analyze";
+    case "peer-import":
+      return "Peer import";
+    case "legacy-cache":
+      return "Legacy cache";
+    default:
+      return null;
+  }
 }
 
 function visionBadge(model?: MeshModel | null) {
@@ -6160,14 +6198,16 @@ function ModelSidebar({
           </CardContent>
         </Card>
 
-        {model.description ||
-        model.architecture ||
-        model.quantization ||
-        model.draft_model ||
-        model.source_ref ||
-        model.source_revision ||
-        model.expert_count ||
-        model.used_expert_count ? (
+        {(model.description ||
+          model.architecture ||
+          model.quantization ||
+          model.draft_model ||
+          model.source_ref ||
+          model.source_revision ||
+          model.expert_count ||
+          model.used_expert_count ||
+          model.ranking_source ||
+          model.ranking_origin) ? (
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="flex items-center gap-2 text-sm">
@@ -6208,6 +6248,20 @@ function ModelSidebar({
                     label="MoE Topology"
                     value={`${model.expert_count} experts · top-${model.used_expert_count}`}
                     icon={<Boxes className="h-3.5 w-3.5" />}
+                  />
+                ) : null}
+                {formatMoeRanking(model) ? (
+                  <ModelMetaItem
+                    label="MoE Ranking"
+                    value={formatMoeRanking(model)!}
+                    icon={<Boxes className="h-3.5 w-3.5" />}
+                  />
+                ) : null}
+                {formatMoeRankingOrigin(model) ? (
+                  <ModelMetaItem
+                    label="Ranking Origin"
+                    value={formatMoeRankingOrigin(model)!}
+                    icon={<Sparkles className="h-3.5 w-3.5" />}
                   />
                 ) : null}
                 {model.source_page_url ? (
@@ -6357,12 +6411,14 @@ function CapabilityBadge({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <button
-          type="button"
+        {/* eslint-disable-next-line jsx-a11y/prefer-tag-over-role -- span avoids nested <button> when used inside StatCard */}
+        <span
+          role="button"
+          tabIndex={0}
           className="inline-flex rounded-full bg-transparent p-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           {badge}
-        </button>
+        </span>
       </TooltipTrigger>
       <TooltipContent side="bottom" align="center" sideOffset={8}>
         {tooltip}
@@ -6532,12 +6588,14 @@ function StatusPill({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <button
-          type="button"
+        {/* eslint-disable-next-line jsx-a11y/prefer-tag-over-role -- span avoids nested <button> when used inside StatCard */}
+        <span
+          role="button"
+          tabIndex={0}
           className="inline-flex rounded-full bg-transparent p-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           {badge}
-        </button>
+        </span>
       </TooltipTrigger>
       <TooltipContent side="bottom" align="center" sideOffset={8}>
         {tooltip}

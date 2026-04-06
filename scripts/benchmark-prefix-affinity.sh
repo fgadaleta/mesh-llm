@@ -12,7 +12,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MESH_BIN="${MESH_BIN:-$ROOT/target/release/mesh-llm}"
 BIN_DIR="${BIN_DIR:-$ROOT/llama.cpp/build/bin}"
-MODEL_PATH="${MODEL_PATH:-$HOME/.models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf}"
+HF_CACHE_DIR="${HF_HUB_CACHE:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/hub}"
+MODEL_PATH="${MODEL_PATH:-$HF_CACHE_DIR/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf}"
 MODEL_NAME="${MODEL_NAME:-$(basename "$MODEL_PATH" .gguf)}"
 NODE1_API_PORT="${NODE1_API_PORT:-9337}"
 NODE2_API_PORT="${NODE2_API_PORT:-9338}"
@@ -171,6 +172,7 @@ EOF
 
   env "${launch_env[@]}" \
     "$MESH_BIN" \
+    serve \
     --config "$CONFIG_PATH" \
     "${extra_args[@]}" \
     --model "$MODEL_PATH" \
@@ -187,6 +189,7 @@ EOF
   env "${launch_env[@]}" \
     MESH_LLM_EPHEMERAL_KEY=1 \
     "$MESH_BIN" \
+    serve \
     --config "$CONFIG_PATH" \
     "${extra_args[@]}" \
     --model "$MODEL_PATH" \
@@ -202,9 +205,9 @@ EOF
 
   env "${launch_env[@]}" \
     "$MESH_BIN" \
+    client \
     --config "$CONFIG_PATH" \
     "${extra_args[@]}" \
-    --client \
     --join "$token" \
     --port "$CLIENT1_API_PORT" \
     --console "$CLIENT1_CONSOLE_PORT" \

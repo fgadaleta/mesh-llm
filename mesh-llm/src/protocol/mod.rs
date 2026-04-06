@@ -38,9 +38,8 @@ pub const STREAM_TUNNEL_HTTP: u8 = 0x04;
 pub(crate) const STREAM_ROUTE_REQUEST: u8 = 0x05;
 pub(crate) const STREAM_PEER_DOWN: u8 = 0x06;
 pub(crate) const STREAM_PEER_LEAVING: u8 = 0x07;
-pub(crate) const STREAM_BLACKBOARD: u8 = 0x08;
-pub(crate) const STREAM_PLUGIN_CHANNEL: u8 = 0x09;
-pub(crate) const STREAM_PLUGIN_BULK_TRANSFER: u8 = 0x0a;
+pub(crate) const STREAM_PLUGIN_CHANNEL: u8 = 0x08;
+pub(crate) const STREAM_PLUGIN_BULK_TRANSFER: u8 = 0x09;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControlProtocol {
@@ -414,6 +413,7 @@ mod tests {
             available_models: vec![],
             requested_models: vec![],
             last_seen: std::time::Instant::now(),
+            moe_recovered_at: None,
             version: None,
             gpu_name: None,
             hostname: None,

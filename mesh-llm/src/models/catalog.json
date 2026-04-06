@@ -152,8 +152,7 @@
     "moe": {
       "n_expert": 64,
       "n_expert_used": 4,
-      "min_experts_per_node": 24,
-      "ranking_key": null
+      "min_experts_per_node": 24
     },
     "extra_files": [],
     "mmproj": null
@@ -168,8 +167,7 @@
     "moe": {
       "n_expert": 128,
       "n_expert_used": 8,
-      "min_experts_per_node": 46,
-      "ranking_key": "QWEN3_30B_A3B_RANKING"
+      "min_experts_per_node": 46
     },
     "extra_files": [],
     "mmproj": null
@@ -184,8 +182,7 @@
     "moe": {
       "n_expert": 128,
       "n_expert_used": 8,
-      "min_experts_per_node": 46,
-      "ranking_key": "QWEN3_30B_A3B_RANKING"
+      "min_experts_per_node": 46
     },
     "extra_files": [],
     "mmproj": null
@@ -255,8 +252,7 @@
     "moe": {
       "n_expert": 16,
       "n_expert_used": 1,
-      "min_experts_per_node": 6,
-      "ranking_key": null
+      "min_experts_per_node": 6
     },
     "extra_files": [],
     "mmproj": null
@@ -353,8 +349,7 @@
     "moe": {
       "n_expert": 8,
       "n_expert_used": 2,
-      "min_experts_per_node": 4,
-      "ranking_key": null
+      "min_experts_per_node": 4
     },
     "extra_files": [],
     "mmproj": null
@@ -369,8 +364,7 @@
     "moe": {
       "n_expert": 128,
       "n_expert_used": 8,
-      "min_experts_per_node": 46,
-      "ranking_key": null
+      "min_experts_per_node": 46
     },
     "extra_files": [],
     "mmproj": null
@@ -396,8 +390,7 @@
     "moe": {
       "n_expert": 256,
       "n_expert_used": 8,
-      "min_experts_per_node": 96,
-      "ranking_key": null
+      "min_experts_per_node": 96
     },
     "extra_files": [
       {

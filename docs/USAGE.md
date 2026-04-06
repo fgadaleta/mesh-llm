@@ -29,7 +29,7 @@ Release bundles install flavor-specific llama.cpp binaries:
 If you keep more than one flavor in the same `bin` directory, choose one explicitly:
 
 ```bash
-mesh-llm --llama-flavor vulkan --model Qwen2.5-32B
+mesh-llm serve --llama-flavor vulkan --model Qwen2.5-32B
 ```
 
 Source builds must use `just`:
@@ -59,14 +59,16 @@ For full build details, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 ## Common commands
 
 ```bash
-mesh-llm --auto
-mesh-llm --model Qwen2.5-32B
-mesh-llm --join <token>
-mesh-llm --client --auto
+mesh-llm serve --auto
+mesh-llm serve --model Qwen2.5-32B
+mesh-llm serve --join <token>
+mesh-llm client --auto
+mesh-llm gpus
 mesh-llm discover
 ```
 
 If you run `mesh-llm` with no arguments, it prints `--help` and exits. It does not start the console or bind ports until you choose a mode.
+Bare `mesh-llm serve` loads startup models from `[[models]]` in `~/.mesh-llm/config.toml`.
 
 ## Background service
 
@@ -76,22 +78,19 @@ To install Mesh LLM as a per-user background service:
 curl -fsSL https://raw.githubusercontent.com/michaelneale/mesh-llm/main/install.sh | bash -s -- --service
 ```
 
-To seed the service with a custom startup command on first install:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/michaelneale/mesh-llm/main/install.sh | bash -s -- --service --service-args '--model Qwen2.5-3B'
-```
-
 Service installs are user-scoped:
 
 - macOS installs a `launchd` agent at `~/Library/LaunchAgents/com.mesh-llm.mesh-llm.plist`
 - Linux installs a `systemd --user` unit at `~/.config/systemd/user/mesh-llm.service`
 - Shared environment config lives in `~/.config/mesh-llm/service.env`
+- Startup models live in `~/.mesh-llm/config.toml`
 
 Platform behavior:
 
-- macOS reads startup args from `~/.config/mesh-llm/service.args`
-- Linux writes the `mesh-llm` argv directly into `ExecStart=`
+- macOS loads `service.env` and then executes `mesh-llm serve`
+- Linux writes `mesh-llm serve` directly into `ExecStart=`
+
+The background service no longer stores custom startup args. Configure startup models in `~/.mesh-llm/config.toml` instead.
 
 Optional shared environment file example:
 
@@ -133,15 +132,116 @@ Draft pairings for speculative decoding:
 
 ## Specifying models
 
-`--model` accepts several formats. Hugging Face-backed models are cached in the standard Hugging Face cache on first use.
+`mesh-llm serve --model` accepts several formats. Hugging Face-backed models are cached in the standard Hugging Face cache on first use.
 
 ```bash
-mesh-llm --model Qwen3-8B
-mesh-llm --model Qwen3-8B-Q4_K_M
-mesh-llm --model https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf
-mesh-llm --model bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf
-mesh-llm --gguf ~/my-models/custom-model.gguf
+mesh-llm serve --model Qwen3-8B
+mesh-llm serve --model Qwen3-8B-Q4_K_M
+mesh-llm serve --model https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf
+mesh-llm serve --model bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf
+mesh-llm serve --gguf ~/my-models/custom-model.gguf
+mesh-llm serve --gguf ~/my-models/qwen3.5-4b.gguf --mmproj ~/my-models/mmproj-BF16.gguf
 ```
+
+## Startup config
+
+`mesh-llm serve` also loads startup models from `~/.mesh-llm/config.toml` by default.
+
+```toml
+version = 1
+
+[gpu]
+assignment = "auto"
+
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+
+[[models]]
+model = "bartowski/Qwen2.5-VL-7B-Instruct-GGUF/qwen2.5-vl-7b-instruct-q4_k_m.gguf"
+mmproj = "bartowski/Qwen2.5-VL-7B-Instruct-GGUF/mmproj-f16.gguf"
+ctx_size = 8192
+
+[[plugin]]
+name = "blackboard"
+enabled = true
+```
+
+Use the default config:
+
+```bash
+mesh-llm serve
+```
+
+If no startup models are configured, `mesh-llm serve` prints a `⚠️` warning, shows help, and exits.
+
+Or an explicit path:
+
+```bash
+mesh-llm serve --config /path/to/config.toml
+```
+
+Config precedence:
+
+- Explicit `--model` or `--gguf` ignores configured `[[models]]`.
+- Explicit `--ctx-size` overrides configured `ctx_size` for the selected startup models.
+- `mmproj` is optional and only used when that startup model needs a projector sidecar.
+- Plugin entries stay in the same file.
+
+## Lemonade integration
+
+mesh-llm includes a built-in `lemonade` plugin for routing requests to a local [Lemonade Server](https://lemonade-server.ai) through the same `http://localhost:9337/v1` API that mesh-llm already exposes.
+
+Start Lemonade first, either with the Lemonade Desktop app or with the CLI:
+
+```bash
+lemonade-server serve
+curl -s http://localhost:8000/api/v1/models | jq '.data[].id'
+```
+
+The plugin uses `http://localhost:8000/api/v1` by default. To point at a different Lemonade endpoint, set:
+
+```bash
+export MESH_LLM_LEMONADE_BASE_URL=http://127.0.0.1:8000/api/v1
+```
+
+Then enable the plugin in `~/.mesh-llm/config.toml`:
+
+```toml
+[[plugin]]
+name = "lemonade"
+enabled = true
+```
+
+Start mesh-llm normally:
+
+```bash
+mesh-llm serve --model Qwen3-8B-Q4_K_M
+```
+
+After startup, mesh-llm should include Lemonade-hosted models in its own model list:
+
+```bash
+curl -s http://localhost:9337/v1/models | jq '.data[].id'
+```
+
+Requests sent to mesh-llm with a Lemonade model ID are forwarded to Lemonade:
+
+```bash
+curl http://localhost:9337/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-0.6B-GGUF",
+    "messages": [
+      {"role": "user", "content": "hello"}
+    ]
+  }'
+```
+
+Notes:
+
+- mesh-llm does not start or supervise Lemonade; run it separately with the Desktop app or CLI.
+- Use the exact model ID returned by Lemonade's `/api/v1/models`.
+- If you use the mesh-llm background service, add `MESH_LLM_LEMONADE_BASE_URL=...` to `~/.config/mesh-llm/service.env`.
 
 Useful model commands:
 
@@ -162,9 +262,18 @@ mesh-llm models updates Qwen/Qwen3-8B-GGUF
 ## Model storage
 
 - Hugging Face repo snapshots are the canonical managed model store.
-- `~/.models/` is deprecated and will be removed in a future release.
-- Arbitrary local GGUF files still work through `--gguf`.
+- Flat `~/.models/` storage is no longer scanned for managed models.
+- If you still have legacy files there, use `mesh-llm models migrate --apply`.
+- Arbitrary local GGUF files still work through `mesh-llm serve --gguf`.
 - MoE split artifacts are cached under `~/.cache/mesh-llm/splits/`.
+
+## Inspect local GPUs
+
+```bash
+mesh-llm gpus
+```
+
+This prints the local GPU inventory with stable IDs, backend device names, VRAM, unified-memory status, and cached bandwidth if a benchmark fingerprint is already present.
 
 ## Local runtime control
 

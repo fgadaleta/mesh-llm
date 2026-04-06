@@ -111,12 +111,52 @@ Execution order matters:
 That grouped order is the expected orchestration for local and remote matrix
 runs.
 
+## Local inspection
+
+### 0. Inspect local GPUs
+
+```bash
+mesh-llm gpus
+```
+
+- Prints local GPU entries with stable IDs, backend devices, VRAM, unified-memory status, and cached bandwidth when a fingerprint is available
+
+### 0a. Startup config smoke
+
+Create `~/.mesh-llm/config.toml`:
+
+```toml
+version = 1
+
+[gpu]
+assignment = "auto"
+
+[[models]]
+model = "Qwen2.5-3B"
+
+[[models]]
+model = "/absolute/path/to/qwen2.5-vl.gguf"
+mmproj = "/absolute/path/to/mmproj.gguf"
+ctx_size = 8192
+```
+
+Then start:
+
+```bash
+mesh-llm serve
+```
+
+- Both configured startup models should be considered for launch
+- If `[[models]]` is empty, `mesh-llm serve` should print a `⚠️` warning, show help, and exit cleanly
+- Explicit `--model` or `--gguf` should ignore configured `[[models]]`
+- Explicit `--ctx-size` should override configured `ctx_size`
+
 ## Single-model permutations
 
 ### 1. Solo (single node)
 
 ```bash
-mesh-llm --model Qwen2.5-3B --console
+mesh-llm serve --model Qwen2.5-3B --console
 ```
 
 - API on `:9337`, console on `:3131`
@@ -127,9 +167,9 @@ mesh-llm --model Qwen2.5-3B --console
 
 ```bash
 # node A (more VRAM, becomes host)
-mesh-llm --model Qwen2.5-32B --bind-port 7842
+mesh-llm serve --model Qwen2.5-32B --bind-port 7842
 # node B (joins)
-mesh-llm --model Qwen2.5-32B --join <TOKEN>
+mesh-llm serve --model Qwen2.5-32B --join <TOKEN>
 ```
 
 - Both nodes run solo (no split) — each is its own host
@@ -139,9 +179,9 @@ mesh-llm --model Qwen2.5-32B --join <TOKEN>
 
 ```bash
 # host with --split
-mesh-llm --model Qwen2.5-32B --bind-port 7842 --split
+mesh-llm serve --model Qwen2.5-32B --bind-port 7842 --split
 # worker joins
-mesh-llm --model Qwen2.5-32B --join <TOKEN>
+mesh-llm serve --model Qwen2.5-32B --join <TOKEN>
 ```
 
 - `--split` forces tensor split even when model fits on host
@@ -156,7 +196,7 @@ When the model exceeds host VRAM, split happens automatically without `--split`.
 ### 5. Lite client (no GPU)
 
 ```bash
-mesh-llm --client --join <TOKEN> --port 9555
+mesh-llm client --join <TOKEN> --port 9555
 ```
 
 - Uses ephemeral key (unique identity, works on same machine as GPU node)
@@ -170,9 +210,9 @@ mesh-llm --client --join <TOKEN> --port 9555
 
 ```bash
 # node A: seeds mesh with two models, serves 3B
-mesh-llm --model Qwen2.5-3B --model GLM-4.7-Flash --console
+mesh-llm serve --model Qwen2.5-3B --model GLM-4.7-Flash --console
 # node B: joins, auto-assigned to GLM (needed, on disk)
-mesh-llm --join <TOKEN>
+mesh-llm serve --join <TOKEN>
 ```
 
 - `/v1/models` on either node lists both models
@@ -184,26 +224,26 @@ mesh-llm --join <TOKEN>
 Compatibility result:
 - Verified on 2026-04-02 with the current `codex/model-identity-design` branch on node 1 and the latest GitHub release `v0.54.0` on node 2.
 - Node 1 served `Llama-3.2-1B-Instruct-Q4_K_M`; node 2 served `Qwen3-4B-Q4_K_M`.
-- `/api/status` and `/v1/models` agreed on the same warm model list from both nodes.
+- `/api/models` and `/v1/models` agreed on the same warm model list from both nodes.
 - Chat from node 1 to node 2's model succeeded, and chat from node 2 to node 1's model succeeded.
 
 ### 7. Auto-assignment
 
 ```bash
 # seeder declares two models
-mesh-llm --model Qwen2.5-3B --model GLM-4.7-Flash
+mesh-llm serve --model Qwen2.5-3B --model GLM-4.7-Flash
 # joiner with no --model
-mesh-llm --join <TOKEN>
+mesh-llm serve --join <TOKEN>
 ```
 
-- Joiner scans the Hugging Face cache first (with deprecated `~/.models/` as legacy fallback), picks an unserved model already on disk
+- Joiner scans the Hugging Face cache and picks an unserved model already on disk
 - Log: "Assigned to serve GLM-4.7-Flash (needed by mesh, already on disk)"
 
 ### 8. Lite client with multi-model
 
 ```bash
 # GPU nodes running as above
-mesh-llm --client --join <TOKEN> --port 9555
+mesh-llm client --join <TOKEN> --port 9555
 ```
 
 - Client sees all models via gossip (ephemeral key = unique identity)
@@ -225,7 +265,7 @@ mesh-llm unload GLM-4.7-Flash-Q4_K_M
 
 ```bash
 # Running node
-mesh-llm --model Qwen2.5-0.5B-Instruct-Q4_K_M --console
+mesh-llm serve --model Qwen2.5-0.5B-Instruct-Q4_K_M --console
 
 # Operator surface
 mesh-llm load Llama-3.2-1B-Instruct-Q4_K_M
@@ -258,7 +298,7 @@ curl -X DELETE localhost:3131/api/runtime/models/Llama-3.2-1B-Instruct-Q4_K_M
 
 ```bash
 # With --mesh-name (deterministic ID)
-mesh-llm --model Qwen2.5-3B --mesh-name "test-mesh"
+mesh-llm serve --model Qwen2.5-3B --mesh-name "test-mesh"
 ```
 
 - Log: `📌 Mesh ID: <hex>`
@@ -270,9 +310,9 @@ mesh-llm --model Qwen2.5-3B --mesh-name "test-mesh"
 
 ```bash
 # Originator
-mesh-llm --model Qwen2.5-3B --mesh-name "test-mesh"
+mesh-llm serve --model Qwen2.5-3B --mesh-name "test-mesh"
 # Joiner
-mesh-llm --model Qwen2.5-3B --join <TOKEN>
+mesh-llm serve --model Qwen2.5-3B --join <TOKEN>
 ```
 
 - Joiner log: `📌 Mesh ID: <same hex as originator>`
@@ -291,9 +331,9 @@ mesh-llm --model Qwen2.5-3B --join <TOKEN>
 
 ```bash
 # Originator (already running)
-mesh-llm --model Qwen2.5-3B --port 8090
+mesh-llm serve --model Qwen2.5-3B --port 8090
 # Joiner
-mesh-llm --model Qwen2.5-3B --join <TOKEN> --port 8091
+mesh-llm serve --model Qwen2.5-3B --join <TOKEN> --port 8091
 ```
 
 - Joiner log: `⚡ API ready (bootstrap): http://localhost:8091`
@@ -306,7 +346,7 @@ mesh-llm --model Qwen2.5-3B --join <TOKEN> --port 8091
 ### 20. Bootstrap proxy not started for originator
 
 ```bash
-mesh-llm --model Qwen2.5-3B
+mesh-llm serve --model Qwen2.5-3B
 ```
 
 - No `⚡ API ready (bootstrap)` message (only joiners get bootstrap proxy)
@@ -328,7 +368,7 @@ mesh-llm
 ### 22. Join via console
 
 ```bash
-mesh-llm --client --auto
+mesh-llm client --auto
 # In browser: http://localhost:3131 → Discover → Join
 # Or via API:
 curl -X POST localhost:3131/api/join -H 'Content-Type: application/json' -d '{"token":"..."}'
@@ -341,9 +381,9 @@ curl -X POST localhost:3131/api/join -H 'Content-Type: application/json' -d '{"t
 ### 23. Management API while serving
 
 ```bash
-mesh-llm --auto
+mesh-llm serve --auto
 # After serving:
-curl localhost:3131/api/status   # JSON: node, peers, models, mesh_id, mesh_name
+curl localhost:3131/api/status   # JSON: node, peers, routing, mesh_id, mesh_name
 curl localhost:3131/api/events   # SSE stream
 curl localhost:3131/api/discover # Nostr meshes (current mesh marked by mesh_id)
 ```
@@ -374,6 +414,129 @@ curl localhost:3131/api/discover # Nostr meshes (current mesh marked by mesh_id)
 - Dead model goes cold, peer removed from list, death broadcast to mesh
 - Dead peer won't be re-added by gossip (dead_peers set)
 - Console updates automatically
+
+## MoE Smoke Tests
+
+These are the minimum smoke tests for leader-planned MoE recovery. They should be kept green as the runtime changes.
+
+### 10z. Direct `moe-split` family smoke
+
+Run the direct splitter smoke before remote mesh experiments:
+
+```bash
+just moe-split-smoke
+```
+
+Or target specific families:
+
+```bash
+scripts/moe-split-smoke.sh llama.cpp/build/bin glm-deepseek2 qwen3-a3b
+```
+
+Current preferred family matrix:
+
+| Family | Preferred model |
+|---|---|
+| `qwen3-a3b` | `Qwen3-30B-A3B-Q4_K_M` |
+| `qwen3-next` | `Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf` |
+| `glm-deepseek2` | `GLM-4.7-Flash-Q4_K_M` |
+| `olmoe` | `OLMoE-1B-7B-0924-Instruct-Q4_K_M` or `OLMoE-1B-7B-0125-Instruct-Q4_K_M` |
+
+What it validates:
+
+- `llama-moe-split` can generate both sides of a `2`-way split.
+- Each shard can be loaded by `llama-server`.
+- Splitter regressions fail early with a direct tool-level repro, before the mesh runtime is involved.
+
+### 10zz. Live MoE inference smoke
+
+Use this once a real split is already up for a family that passes direct `moe-split` validation.
+
+```bash
+just moe-live-smoke \
+  model=Qwen3-30B-A3B-Q4_K_M \
+  api_url=http://studio54.local:9337 \
+  console_url=http://studio54.local:3131
+```
+
+To validate more than one console view of the same deployment, call the script directly:
+
+```bash
+scripts/moe-live-smoke.sh \
+  --expected-nodes 2 \
+  Qwen3-30B-A3B-Q4_K_M \
+  http://studio54.local:9337 \
+  http://studio54.local:3131 \
+  http://build.local:3131
+```
+
+What it validates:
+
+- `/api/status` reports the model as `warm`
+- `node_count` and `active_nodes` agree with the expected MoE topology
+- `/v1/models` exposes the model through the chosen API
+- `/v1/chat/completions` succeeds through the mesh
+
+Current preferred live-inference families on `studio54.local + build.local`:
+
+| Family | Preferred model | Notes |
+|---|---|---|
+| `qwen3-a3b` | `Qwen3-30B-A3B-Q4_K_M` | Main live control case |
+| `glm-deepseek2` | `GLM-4.7-Flash-Q4_K_M` | Expect slower shard-1 startup on `build.local` |
+| `olmoe` | `OLMoE-1B-7B-0924-Instruct-Q4_K_M` | Use `--split --max-vram 4.0` on this pair to force the live MoE path |
+
+Coverage note:
+
+- `just moe-split-smoke` is the CI-safe family gate.
+- `scripts/moe-live-smoke.sh` is the manual or remote-runner integration check after actual mesh nodes are up.
+
+### 11a. Two-node MoE split collapses to one survivor
+
+```bash
+# node A
+mesh-llm --model Qwen3-Coder-Next-Q4_K_M --auto --no-self-update
+
+# node B
+mesh-llm --model Qwen3-Coder-Next-Q4_K_M --auto --no-self-update --split --join <TOKEN>
+```
+
+- Verify the two-node split comes up and `/v1/chat/completions` works.
+- Kill one node with `kill -9`.
+- The survivor should stop counting the dead shard in the active MoE set.
+- The survivor should reconfigure to a one-node topology and serving should recover without manual restart.
+
+### 11b. Three-node MoE split shrinks to two survivors
+
+- Start a three-node split on the same exact MoE model identity.
+- Kill one shard node.
+- The remaining two nodes should re-elect on `n_nodes = 2`.
+- The dead shard should disappear from the active MoE target map.
+- Serving should recover on the two-node topology without killing the survivors.
+
+### 11c. Recovered node does not cause immediate flap
+
+- Start a two-node or three-node MoE split.
+- Kill one shard node and wait for the deployment to fail down.
+- Restart the dead node.
+- Verify the node reappears in mesh membership.
+- Verify the deployment does **not** immediately expand back up on the first healthy signal.
+- Verify the deployment still does **not** expand during the quiet window after probation expires.
+- Verify the leader keeps the existing healthy shard set unless the larger topology is explicitly needed.
+- If the recovered node enables a materially better plan, verify scale-up happens only after the quiet window, not before.
+
+### 11d. Full-coverage fallback replica
+
+- Start a split deployment where one additional node can serve the full expert set for the same exact model identity.
+- Kill an active shard.
+- Verify request routing can fail over to the full-coverage target instead of blindly retrying a different partial shard.
+- Verify the surviving cluster keeps serving while the leader recomputes the split on the remaining active shard set.
+
+### 11e. Flaky network does not churn the MoE topology
+
+- Run a two-node or three-node MoE split.
+- Inject transient packet loss or briefly interrupt control traffic without killing the process.
+- Verify the deployment does not oscillate between `N` and `N-1` on a single blip.
+- Verify serving stays available when the shard remains reachable for inference.
 
 ### 12. Node rejoin
 
@@ -427,10 +590,10 @@ Without this, both processes share `~/.mesh-llm/key` and appear as the same node
 
 ```bash
 # Terminal 1: host with --split
-mesh-llm --model Qwen2.5-3B --port 9337 --split --console
+mesh-llm serve --model Qwen2.5-3B --port 9337 --split --console
 
 # Terminal 2: worker with ephemeral key
-MESH_LLM_EPHEMERAL_KEY=1 mesh-llm --model Qwen2.5-3B --join <TOKEN> --port 9338 --split --max-vram 1
+MESH_LLM_EPHEMERAL_KEY=1 mesh-llm serve --model Qwen2.5-3B --join <TOKEN> --port 9338 --split --max-vram 1
 ```
 
 - Host starts solo, then re-elects with split when worker joins
@@ -442,10 +605,10 @@ MESH_LLM_EPHEMERAL_KEY=1 mesh-llm --model Qwen2.5-3B --join <TOKEN> --port 9338 
 
 ```bash
 # Terminal 1: host
-mesh-llm --model Qwen2.5-3B --port 9337
+mesh-llm serve --model Qwen2.5-3B --port 9337
 
-# Terminal 2: passive client (--client uses ephemeral key automatically)
-mesh-llm --client --join <TOKEN> --port 9338
+# Terminal 2: client (the client surface uses an ephemeral key automatically)
+mesh-llm client --join <TOKEN> --port 9338
 ```
 
 - Client connects without gossip (no peer list entry on host)
