@@ -2276,6 +2276,7 @@ pub async fn route_moe_request(
 ) -> bool {
     let mut tcp_stream = tcp_stream;
     let Some(primary_target) = targets.get_moe_target(session_hint) else {
+        let _ = send_503(tcp_stream).await;
         return false;
     };
     let mut ordered = order_targets_by_context(
@@ -2286,6 +2287,7 @@ pub async fn route_moe_request(
     )
     .await;
     if ordered.is_empty() {
+        let _ = send_503(tcp_stream).await;
         return false;
     }
     move_target_first(&mut ordered, &primary_target);
