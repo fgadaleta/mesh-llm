@@ -186,7 +186,6 @@ impl MeshApi {
                 nostr_discovery: false,
                 runtime_control: None,
                 local_processes: Vec::new(),
-                cached_mesh_models: Vec::new(),
                 sse_clients: Vec::new(),
                 inventory_scan_running: false,
                 inventory_scan_waiters: Vec::new(),
@@ -672,16 +671,6 @@ impl MeshApi {
             .collect()
     }
 
-    async fn cached_mesh_models(&self) -> Vec<MeshModelPayload> {
-        self.inner.lock().await.cached_mesh_models.clone()
-    }
-
-    async fn refresh_mesh_models(&self) -> Vec<MeshModelPayload> {
-        let mesh_models = self.mesh_models().await;
-        self.inner.lock().await.cached_mesh_models = mesh_models.clone();
-        mesh_models
-    }
-
     fn derive_node_status(
         is_client: bool,
         effective_is_host: bool,
@@ -797,7 +786,6 @@ impl MeshApi {
             .or_else(|| my_hosted_models.first().cloned())
             .or_else(|| my_serving_models.first().cloned())
             .unwrap_or_else(|| model_name.clone());
-        let mesh_models = self.cached_mesh_models().await;
 
         let (launch_pi, launch_goose) = if effective_llama_ready {
             (
@@ -848,7 +836,6 @@ impl MeshApi {
             peers,
             launch_pi,
             launch_goose,
-            mesh_models,
             inflight_requests,
             mesh_id,
             mesh_name,
@@ -1813,6 +1800,34 @@ mod tests {
 
         drop(stream);
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_api_status_excludes_mesh_models_and_models_endpoint_serves_them() {
+        let state = build_test_mesh_api().await;
+        let (status_addr, status_handle) = spawn_management_test_server(state.clone()).await;
+
+        let status_response = send_management_request(
+            status_addr,
+            "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+        )
+        .await;
+        assert!(status_response.starts_with("HTTP/1.1 200"));
+        let status_body = json_body(&status_response);
+        assert!(status_body.get("mesh_models").is_none());
+        status_handle.abort();
+
+        let (models_addr, models_handle) = spawn_management_test_server(state).await;
+        let models_response = send_management_request(
+            models_addr,
+            "GET /api/models HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+        )
+        .await;
+        assert!(models_response.starts_with("HTTP/1.1 200"));
+        let models_body = json_body(&models_response);
+        assert!(models_body.get("mesh_models").is_some());
+
+        models_handle.abort();
     }
 
     #[tokio::test]

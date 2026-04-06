@@ -73,7 +73,6 @@ pub(super) struct StatusPayload {
     pub(super) peers: Vec<PeerPayload>,
     pub(super) launch_pi: Option<String>,
     pub(super) launch_goose: Option<String>,
-    pub(super) mesh_models: Vec<MeshModelPayload>,
     pub(super) inflight_requests: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mesh_id: Option<String>,
@@ -144,7 +143,7 @@ pub(super) fn build_ownership_payload(summary: &OwnershipSummary) -> OwnershipPa
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 pub(super) struct MeshModelPayload {
     pub(super) name: String,
     pub(super) display_name: String,
