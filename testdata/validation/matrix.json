@@ -118,13 +118,13 @@
       "gguf": {
         "exact_case_id": "llama32-gguf-exact",
         "behavior_case_id": "llama32-gguf-behavior",
-        "model_ref": "llmware/llama-3.2-1b-gguf/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+        "model_ref": "meshllm/llama-3.2-1b-instruct-parity-f16-gguf/llama-3.2-1b-instruct-f16.gguf"
       },
       "mlx": {
         "exact_case_id": "llama32-mlx-exact",
         "behavior_case_id": "llama32-mlx-behavior",
-        "model_ref": "mlx-community/Llama-3.2-1B-Instruct-4bit",
-        "template_source": "tokenizer_config.json"
+        "model_ref": "meshllm/llama-3.2-1b-instruct-parity-bf16-mlx",
+        "template_source": "chat_template.jinja"
       }
     },
     {
@@ -203,12 +203,12 @@
       "gguf": {
         "exact_case_id": "lfm2-gguf-exact",
         "behavior_case_id": "lfm2-gguf-behavior",
-        "model_ref": "LiquidAI/LFM2-350M-GGUF/LFM2-350M-Q4_K_M.gguf"
+        "model_ref": "meshllm/lfm2-350m-parity-q4_k_m-gguf/lfm2-350m-q4_k_m.gguf"
       },
       "mlx": {
         "exact_case_id": "lfm2-mlx-exact",
         "behavior_case_id": "lfm2-mlx-behavior",
-        "model_ref": "mlx-community/LFM2-350M-4bit",
+        "model_ref": "meshllm/lfm2-350m-parity-4bit-mlx",
         "template_source": "chat_template.jinja"
       }
     }
