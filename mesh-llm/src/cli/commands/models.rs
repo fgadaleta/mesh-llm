@@ -84,7 +84,7 @@ pub async fn run_model_search(
         let mut stats = Vec::new();
         if result.gguf_files > 0 {
             stats.push(format!(
-                "📦 {} GGUF files",
+                "📦 {} variants",
                 format_count(result.gguf_files as u64)
             ));
         }
