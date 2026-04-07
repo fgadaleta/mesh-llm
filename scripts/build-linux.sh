@@ -28,6 +28,13 @@ BACKEND=""
 CUDA_ARCH=""
 ROCM_ARCH=""
 
+trace_cmd() {
+    printf '+ '
+    printf '%q ' "$@"
+    printf '\n'
+    "$@"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --clean)
@@ -163,7 +170,7 @@ configure_compiler_cache() {
     elif command -v ccache >/dev/null 2>&1; then
         cache_bin="ccache"
     else
-        return
+        return 0
     fi
 
     echo "Using compiler cache: $cache_bin"
@@ -238,17 +245,17 @@ esac
 
 if [[ ! -d "$LLAMA_DIR" ]]; then
     echo "Cloning michaelneale/llama.cpp (upstream-latest)..."
-    git clone -b upstream-latest \
+    trace_cmd git clone -b upstream-latest \
         https://github.com/michaelneale/llama.cpp.git "$LLAMA_DIR"
 else
     cd "$LLAMA_DIR"
     CURRENT_BRANCH=$(git branch --show-current)
     if [[ "$CURRENT_BRANCH" != "upstream-latest" ]]; then
         echo "⚠️  llama.cpp is on branch '$CURRENT_BRANCH', switching to upstream-latest..."
-        git checkout upstream-latest
+        trace_cmd git checkout upstream-latest
     fi
     echo "Pulling latest upstream-latest from origin..."
-    git pull --ff-only origin upstream-latest
+    trace_cmd git pull --ff-only origin upstream-latest
     cd "$REPO_ROOT"
 fi
 
@@ -275,8 +282,16 @@ if [[ "$BACKEND" == "cpu" ]]; then
         -DGGML_METAL=OFF
     )
 elif [[ "$BACKEND" == "cuda" ]]; then
+    # GGML_CUDA_FA_ALL_QUANTS compiles the full matrix of FlashAttention
+    # kernels so mismatched K/V cache quantization types (e.g. K=q8_0, V=q4_0)
+    # don't hit BEST_FATTN_KERNEL_NONE and crash the rpc-server.
+    # Increases compile time but is required for any asymmetric KV cache.
+    # Tracking: https://github.com/ggml-org/llama.cpp/issues/20866
+    # Once that upstream issue is resolved and our fork is rebased past the
+    # fix, this flag can be dropped.
     cmake_flags+=(
         -DGGML_CUDA=ON
+        -DGGML_CUDA_FA_ALL_QUANTS=ON
         -DGGML_HIP=OFF
         -DGGML_VULKAN=OFF
         -DGGML_METAL=OFF
@@ -306,8 +321,23 @@ fi
 
 cmake_flags+=("${compiler_launcher_flags[@]}")
 
-cmake "${cmake_flags[@]}"
-cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
+trace_cmd cmake "${cmake_flags[@]}"
+
+# Post-configure assertion: guarantee GGML_CUDA_FA_ALL_QUANTS actually landed
+# in the CMake cache for CUDA builds. If someone deletes the flag above by
+# mistake, this trips before we burn 90s rebuilding llama.cpp. Tracking:
+# https://github.com/ggml-org/llama.cpp/issues/20866
+if [[ "$BACKEND" == "cuda" ]]; then
+    if ! grep -q "^GGML_CUDA_FA_ALL_QUANTS:BOOL=ON" "$BUILD_DIR/CMakeCache.txt"; then
+        echo "ERROR: GGML_CUDA_FA_ALL_QUANTS is not ON in $BUILD_DIR/CMakeCache.txt" >&2
+        echo "       This flag is required so asymmetric K/V cache quantization" >&2
+        echo "       does not crash rpc-server with BEST_FATTN_KERNEL_NONE." >&2
+        echo "       See scripts/build-linux.sh and ggml-org/llama.cpp#20866." >&2
+        exit 1
+    fi
+fi
+
+trace_cmd cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
 echo "llama.cpp build complete: $BUILD_DIR/bin/"
 
 if [[ -d "$MESH_DIR" ]]; then

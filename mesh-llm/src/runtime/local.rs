@@ -1,7 +1,6 @@
 use crate::api;
 use crate::inference::{election, launch};
 use crate::mesh;
-use crate::mlx;
 use crate::models;
 use crate::network::router;
 use anyhow::Result;
@@ -26,6 +25,20 @@ pub(super) struct ManagedModelController {
 }
 
 pub(super) fn resolved_model_name(path: &Path) -> String {
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = crate::mlx::mlx_model_dir(path) {
+        if let Some(identity) =
+            crate::models::huggingface_identity_for_path(&dir.join("config.json"))
+        {
+            if let Some(name) = identity.repo_id.rsplit('/').next() {
+                return name.to_string();
+            }
+        }
+        if let Some(name) = dir.file_name().and_then(|value| value.to_str()) {
+            return name.to_string();
+        }
+    }
+
     let stem = path
         .file_stem()
         .unwrap_or_default()
@@ -100,8 +113,9 @@ pub(super) async fn set_advertised_model_context(
     node: &mesh::Node,
     model_name: &str,
     context_length: Option<u32>,
+    backend: Option<&str>,
 ) {
-    node.set_model_runtime_context_length(model_name, context_length)
+    node.set_model_runtime_context_length(model_name, context_length, backend)
         .await;
     node.regossip().await;
 }
@@ -177,14 +191,22 @@ pub(super) async fn start_runtime_local_model(
     let mmproj_path = mmproj_override
         .map(Path::to_path_buf)
         .or_else(|| mmproj_path_for_model(&model_name));
-    let (backend, process) = if mlx::model::is_mlx_model_dir(model_path) {
-        (
-            "mlx".to_string(),
-            mlx::server::start_mlx_server(model_path, model_name.clone(), port).await?,
-        )
+    #[cfg(target_os = "macos")]
+    let mlx_process = if crate::mlx::is_mlx_model_dir(model_path) {
+        let dir = crate::mlx::mlx_model_dir(model_path)
+            .expect("mlx path should normalize after compatibility check");
+        Some(crate::mlx::start_mlx_server(dir, model_name.clone(), port).await?)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mlx_process: Option<launch::InferenceServerProcess> = None;
+
+    let (backend, process) = if let Some(process) = mlx_process {
+        ("mlx", process)
     } else {
         (
-            "llama".to_string(),
+            "llama",
             launch::start_llama_server(
                 bin_dir,
                 binary_flavor,
@@ -211,7 +233,7 @@ pub(super) async fn start_runtime_local_model(
         model_name,
         LocalRuntimeModelHandle {
             port,
-            backend,
+            backend: backend.into(),
             process: process.handle,
             context_length: process.context_length,
         },

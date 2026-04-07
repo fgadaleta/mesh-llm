@@ -3,8 +3,8 @@ pub mod catalog;
 pub mod gguf;
 pub mod inventory;
 pub mod local;
-pub mod prompt;
 mod maintenance;
+pub mod prompt;
 mod resolve;
 pub mod search;
 pub mod topology;
@@ -19,11 +19,12 @@ pub use local::{
     find_mmproj_path, find_model_path, huggingface_hub_cache, huggingface_hub_cache_dir,
     huggingface_identity_for_path, resolve_mmproj_path, scan_installed_models, scan_local_models,
 };
-pub use maintenance::{run_migrate, run_update, warn_about_updates_for_paths};
+pub use maintenance::{run_update, warn_about_updates_for_paths};
 pub use prompt::{infer_prompt_behavior_for_dir, ModelPromptBehavior};
 pub use resolve::{
     download_exact_ref, find_catalog_model_exact, installed_model_capabilities,
-    installed_model_display_name, resolve_model_spec, show_exact_model,
+    installed_model_display_name, resolve_model_spec, show_exact_model, MlxSelectionPolicy,
+    ResolveFormatPreference,
 };
 pub use search::{search_catalog_models, search_huggingface, SearchProgress};
 pub use topology::{infer_local_model_topology, ModelMoeInfo, ModelTopology};

@@ -3,7 +3,8 @@ mod cli;
 pub mod crypto;
 mod inference;
 mod mesh;
-pub(crate) mod mlx;
+#[cfg(target_os = "macos")]
+mod mlx;
 mod models;
 mod network;
 mod plugin;
@@ -22,7 +23,7 @@ pub(crate) use plugins::blackboard;
 
 use anyhow::Result;
 
-pub const VERSION: &str = "0.55.4";
+pub const VERSION: &str = "0.56.0";
 
 pub async fn run() -> Result<()> {
     runtime::run().await

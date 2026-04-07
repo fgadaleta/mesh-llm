@@ -2,7 +2,7 @@ use crate::cli::models::ModelsCommand;
 use crate::models::{
     capabilities, catalog, download_exact_ref, find_catalog_model_exact, huggingface_hub_cache_dir,
     installed_model_capabilities, scan_installed_models, search_catalog_models, search_huggingface,
-    show_exact_model, SearchProgress,
+    show_exact_model, MlxSelectionPolicy, ResolveFormatPreference, SearchProgress,
 };
 use crate::system::hardware;
 use anyhow::{anyhow, Result};
@@ -238,8 +238,27 @@ pub async fn run_model_show(model_ref: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_model_download(model_ref: &str, include_draft: bool) -> Result<()> {
-    let path = download_exact_ref(model_ref).await?;
+pub async fn run_model_download(
+    model_ref: &str,
+    prefer_gguf: bool,
+    prefer_mlx: bool,
+    include_draft: bool,
+) -> Result<()> {
+    let preference = if prefer_gguf {
+        ResolveFormatPreference::Gguf
+    } else if prefer_mlx {
+        ResolveFormatPreference::Mlx
+    } else {
+        ResolveFormatPreference::Auto
+    };
+
+    let path = download_exact_ref(
+        model_ref,
+        preference,
+        "mesh-llm models download",
+        MlxSelectionPolicy::AllowImplicit,
+    )
+    .await?;
     println!("✅ Downloaded model");
     println!("   {}", path.display());
 
@@ -331,8 +350,12 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
             limit,
         } => run_model_search(query, *catalog, *limit).await?,
         ModelsCommand::Show { model } => run_model_show(model).await?,
-        ModelsCommand::Download { model, draft } => run_model_download(model, *draft).await?,
-        ModelsCommand::Migrate { apply, prune } => crate::models::run_migrate(*apply, *prune)?,
+        ModelsCommand::Download {
+            model,
+            gguf,
+            mlx,
+            draft,
+        } => run_model_download(model, *gguf, *mlx, *draft).await?,
         ModelsCommand::Updates { repo, all, check } => {
             crate::models::run_update(repo.as_deref(), *all, *check)?
         }

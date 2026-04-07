@@ -1,6 +1,6 @@
 [package]
 name = "mesh-llm"
-version = "0.55.1"
+version = "0.56.0"
 edition = "2021"
 
 [dependencies]
@@ -47,6 +47,12 @@ hf-hub = { git = "https://github.com/i386/hf-hub.git", rev = "a123ed91f20317d117
 minijinja = { version = "2", features = ["loader"] }
 tokenizers = "0.22"
 mlx_rs = { package = "mlx-rs", path = "../../../mlx-rs/mlx-rs", features = ["safetensors"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+mlx-rs = { version = "0.25", features = ["safetensors"] }
+minijinja = { version = "2", features = ["json", "loop_controls"] }
+tokenizers = "0.21"
 
 [dev-dependencies]
 axum = "0.8"
