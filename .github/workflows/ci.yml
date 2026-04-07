@@ -408,26 +408,36 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Verify macOS runner memory (>= 64GB)
+      - name: Check macOS runner memory (>= 64GB)
+        id: mlx_mem_check
         run: |
           REQUIRED_BYTES=68719476736
           MEM_BYTES="$(sysctl -n hw.memsize)"
           echo "Detected runner memory bytes: ${MEM_BYTES}"
           if [ "${MEM_BYTES}" -lt "${REQUIRED_BYTES}" ]; then
-            echo "MLX smoke tests require at least 64GB RAM."
-            exit 1
+            echo "can_run=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping MLX smoke tests: requires >=64GB RAM."
+          else
+            echo "can_run=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Skip notice for insufficient memory
+        if: steps.mlx_mem_check.outputs.can_run != 'true'
+        run: echo "MLX smoke tests skipped on this runner (<64GB RAM)."
+
       - name: Download macOS binaries
+        if: steps.mlx_mem_check.outputs.can_run == 'true'
         uses: actions/download-artifact@v4
         with:
           name: macos-binaries
           path: ci-artifacts
 
       - name: Extract macOS binaries
+        if: steps.mlx_mem_check.outputs.can_run == 'true'
         run: tar -xzf ci-artifacts/macos-binaries.tgz
 
       - name: Stage binaries for validation runner
+        if: steps.mlx_mem_check.outputs.can_run == 'true'
         run: |
           mkdir -p target/release llama.cpp/build/bin
           cp macos-binaries/mesh-llm target/release/mesh-llm
@@ -441,12 +451,14 @@ jobs:
           fi
 
       - name: Cache MLX model repo
+        if: steps.mlx_mem_check.outputs.can_run == 'true'
         uses: actions/cache@v5
         with:
           path: ~/.cache/huggingface/hub/models--${{ matrix.cache_slug }}
           key: mlx-hub-${{ matrix.cache_slug }}
 
       - name: MLX exact matrix
+        if: steps.mlx_mem_check.outputs.can_run == 'true'
         run: |
           python3 scripts/run-validation-matrix.py \
             --suite exact \
@@ -456,7 +468,7 @@ jobs:
             --stamp "ci-macos-mlx-${{ matrix.id }}"
 
       - name: Upload MLX exact results
-        if: always()
+        if: always() && steps.mlx_mem_check.outputs.can_run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: mlx-exact-${{ matrix.id }}
