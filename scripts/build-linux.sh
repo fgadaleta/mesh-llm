@@ -28,6 +28,13 @@ BACKEND=""
 CUDA_ARCH=""
 ROCM_ARCH=""
 
+trace_cmd() {
+    printf '+ '
+    printf '%q ' "$@"
+    printf '\n'
+    "$@"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --clean)
@@ -238,17 +245,17 @@ esac
 
 if [[ ! -d "$LLAMA_DIR" ]]; then
     echo "Cloning michaelneale/llama.cpp (upstream-latest)..."
-    git clone -b upstream-latest \
+    trace_cmd git clone -b upstream-latest \
         https://github.com/michaelneale/llama.cpp.git "$LLAMA_DIR"
 else
     cd "$LLAMA_DIR"
     CURRENT_BRANCH=$(git branch --show-current)
     if [[ "$CURRENT_BRANCH" != "upstream-latest" ]]; then
         echo "⚠️  llama.cpp is on branch '$CURRENT_BRANCH', switching to upstream-latest..."
-        git checkout upstream-latest
+        trace_cmd git checkout upstream-latest
     fi
     echo "Pulling latest upstream-latest from origin..."
-    git pull --ff-only origin upstream-latest
+    trace_cmd git pull --ff-only origin upstream-latest
     cd "$REPO_ROOT"
 fi
 
@@ -306,8 +313,8 @@ fi
 
 cmake_flags+=("${compiler_launcher_flags[@]}")
 
-cmake "${cmake_flags[@]}"
-cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
+trace_cmd cmake "${cmake_flags[@]}"
+trace_cmd cmake --build "$BUILD_DIR" --config Release -j"$(nproc)"
 echo "llama.cpp build complete: $BUILD_DIR/bin/"
 
 if [[ -d "$MESH_DIR" ]]; then
