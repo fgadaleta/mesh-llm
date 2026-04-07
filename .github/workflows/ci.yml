@@ -372,9 +372,30 @@ jobs:
             llama.cpp/build/bin \
             ~/.models/$MOE_MODEL_FILE
 
-  mlx_smoke_tests:
+  mlx_runner_gate:
     needs: [changes, macos, inference_smoke_tests]
     if: ${{ needs.macos.result == 'success' && needs.inference_smoke_tests.result == 'success' && vars.ENABLE_MACOS_CI == 'true' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') && (github.event_name != 'workflow_dispatch' || github.event.inputs.run_mlx_smoke_tests != 'false') }}
+    name: MLX Runner Gate
+    runs-on: macos-latest
+    outputs:
+      can_run: ${{ steps.mlx_mem_check.outputs.can_run }}
+    steps:
+      - name: Check macOS runner memory (>= 64GB)
+        id: mlx_mem_check
+        run: |
+          REQUIRED_BYTES=68719476736
+          MEM_BYTES="$(sysctl -n hw.memsize)"
+          echo "Detected runner memory bytes: ${MEM_BYTES}"
+          if [ "${MEM_BYTES}" -lt "${REQUIRED_BYTES}" ]; then
+            echo "can_run=false" >> "$GITHUB_OUTPUT"
+            echo "MLX smoke tests will be skipped on this runner (<64GB RAM)."
+          else
+            echo "can_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  mlx_smoke_tests:
+    needs: [changes, macos, inference_smoke_tests, mlx_runner_gate]
+    if: ${{ needs.macos.result == 'success' && needs.inference_smoke_tests.result == 'success' && needs.mlx_runner_gate.outputs.can_run == 'true' && vars.ENABLE_MACOS_CI == 'true' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') && (github.event_name != 'workflow_dispatch' || github.event.inputs.run_mlx_smoke_tests != 'false') }}
     name: MLX Smoke Tests
     runs-on: macos-latest
     strategy:
@@ -408,36 +429,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Check macOS runner memory (>= 64GB)
-        id: mlx_mem_check
-        run: |
-          REQUIRED_BYTES=68719476736
-          MEM_BYTES="$(sysctl -n hw.memsize)"
-          echo "Detected runner memory bytes: ${MEM_BYTES}"
-          if [ "${MEM_BYTES}" -lt "${REQUIRED_BYTES}" ]; then
-            echo "can_run=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping MLX smoke tests: requires >=64GB RAM."
-          else
-            echo "can_run=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Skip notice for insufficient memory
-        if: steps.mlx_mem_check.outputs.can_run != 'true'
-        run: echo "MLX smoke tests skipped on this runner (<64GB RAM)."
-
       - name: Download macOS binaries
-        if: steps.mlx_mem_check.outputs.can_run == 'true'
         uses: actions/download-artifact@v4
         with:
           name: macos-binaries
           path: ci-artifacts
 
       - name: Extract macOS binaries
-        if: steps.mlx_mem_check.outputs.can_run == 'true'
         run: tar -xzf ci-artifacts/macos-binaries.tgz
 
       - name: Stage binaries for validation runner
-        if: steps.mlx_mem_check.outputs.can_run == 'true'
         run: |
           mkdir -p target/release llama.cpp/build/bin
           cp macos-binaries/mesh-llm target/release/mesh-llm
@@ -451,14 +452,12 @@ jobs:
           fi
 
       - name: Cache MLX model repo
-        if: steps.mlx_mem_check.outputs.can_run == 'true'
         uses: actions/cache@v5
         with:
           path: ~/.cache/huggingface/hub/models--${{ matrix.cache_slug }}
           key: mlx-hub-${{ matrix.cache_slug }}
 
       - name: MLX exact matrix
-        if: steps.mlx_mem_check.outputs.can_run == 'true'
         run: |
           python3 scripts/run-validation-matrix.py \
             --suite exact \
@@ -468,7 +467,7 @@ jobs:
             --stamp "ci-macos-mlx-${{ matrix.id }}"
 
       - name: Upload MLX exact results
-        if: always() && steps.mlx_mem_check.outputs.can_run == 'true'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mlx-exact-${{ matrix.id }}
