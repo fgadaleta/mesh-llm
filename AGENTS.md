@@ -4,24 +4,31 @@
 
 This repo (`mesh-llm`) contains mesh-llm — a Rust binary that pools GPUs over QUIC for distributed LLM inference using llama.cpp.
 
+## Principles
+
+These guide every design decision in this project:
+
+- **One command to run.** `mesh-llm serve --auto` should be all you need.
+- **Batteries included.** Models download automatically. Backends are bundled. The web console ships inside the binary.
+- **Sensible defaults.** Solo when the model fits. Split only when it has to. Draft models auto-paired. Context sized to VRAM.
+- **Always compatible in the mesh.** Older and newer nodes must coexist. Protocol negotiation keeps mixed meshes working. Rolling upgrades, not flag days.
+- **Public and private.** `--auto` for public meshes, `--join <token>` for private. Same binary, same API.
+- **Support as many platforms as possible.** macOS Metal, Linux CUDA/ROCm/Vulkan/CPU, Jetson/Tegra, Windows.
+
 ## Key Docs
 
 | Doc | What it covers |
 |---|---|
-| `README.md` | Usage, install, CLI flags, examples |
-| `CONTRIBUTING.md` | Build from source, dev workflow, UI dev |
-| `RELEASE.md` | Release process (build, bundle, tag, GitHub release) |
-| `ROADMAP.md` | Future directions |
-| `PLAN.md` | Historical design notes and benchmarks |
-| `mesh-llm/TODO.md` | Current work items and backlog |
-| `mesh-llm/README.md` | Rust crate overview and file map |
-| `mesh-llm/docs/DESIGN.md` | Architecture, protocols, features |
-| `mesh-llm/docs/TESTING.md` | Test playbook, scenarios, remote deploy |
+| `README.md` | User-facing: install, usage, CLI, examples, agents |
+| `HUMANS.md` | Developer-facing: architecture, testing, release, roadmap, plugins |
+| `PLUGINS.md` | Full plugin architecture spec |
+| `PLUGINS_PLAN.md` | Plugin implementation sequencing |
+| `mesh-llm/docs/message_protocol.md` | Wire protocol spec |
+| `mesh-llm/docs/MULTI_MODAL.md` | Multimodal capability details |
 | `mesh-llm/docs/MoE_PLAN.md` | MoE expert sharding design |
-| `mesh-llm/docs/MoE_DEPLOY_DESIGN.md` | MoE auto-deploy UX |
-| `mesh-llm/docs/MoE_SPLIT_REPORT.md` | MoE splitting validation results |
-| `fly/README.md` | Fly.io deployment (console + API apps) |
-| `relay/README.md` | Self-hosted iroh relay on Fly |
+| `mesh-llm/docs/MoE_DEPLOY_DESIGN.md` | MoE auto-deploy implementation |
+| `fly/README.md` | Fly.io deployment |
+| `relay/README.md` | Self-hosted iroh relay |
 
 ## Building
 
@@ -36,13 +43,13 @@ just auto     # build + stop + start with --auto
 just ui-dev   # vite dev server with HMR
 ```
 
-See `CONTRIBUTING.md` for full dev workflow.
+See `HUMANS.md` for full dev workflow.
 
 ## Project Structure
 
 - `mesh-llm/src/` — Rust source
 - `mesh-llm/ui/` — React web console (shadcn/ui patterns, see https://ui.shadcn.com/llms.txt)
-- `mesh-llm/docs/` — Design and testing docs
+- `mesh-llm/docs/` — Design and protocol docs
 - `fly/` — Fly.io deployment (console + API client apps)
 - `relay/` — Self-hosted iroh relay
 - `evals/` — Benchmarking and evaluation scripts
@@ -112,18 +119,6 @@ Current structure notes.
 - Plugin MCP support belongs inside `mesh-llm/src/plugin/`, not as a separate root module.
 - Model command handlers belong in `mesh-llm/src/cli/commands/`; `mesh-llm/src/models/` should stay domain-focused.
 
-## Key Source Files
-
-- `mesh-llm/src/main.rs` — CLI args, orchestration: `run_auto()`, `run_idle()`, `run_passive()`
-- `mesh-llm/src/mesh.rs` — `Node` struct, gossip, mesh_id, peer management
-- `mesh-llm/src/election.rs` — Host election, tensor split calculation
-- `mesh-llm/src/proxy.rs` — HTTP proxy: request parsing, model routing, response helpers
-- `mesh-llm/src/api.rs` — Management API (:3131): `/api/status`, `/api/events`, `/api/discover`, `/api/join`
-- `mesh-llm/src/nostr.rs` — Nostr discovery, `score_mesh()`, `smart_auto()`
-- `mesh-llm/src/download.rs` — Model catalog (`MODEL_CATALOG`), HuggingFace downloads
-- `mesh-llm/src/moe.rs` — MoE detection, expert rankings, split orchestration
-- `mesh-llm/src/launch.rs` — llama-server/rpc-server process management
-
 ## Plugin Protocol Compatibility
 
 When iterating on the plugin protocol, always consider protocol compatibility.
@@ -138,7 +133,7 @@ For changes in `mesh-llm/ui/`, use components and compose interfaces consistentl
 
 ## Testing
 
-Read `mesh-llm/docs/TESTING.md` before running tests. It has all test scenarios, remote deploy instructions, and cleanup commands.
+Read `HUMANS.md` (Testing section) before running tests. It has all test scenarios, remote deploy instructions, and cleanup commands.
 
 ## Formatting
 
@@ -164,19 +159,6 @@ Pull request titles and descriptions should be user-focused by default.
 - If the PR changes the UI, include at least one screenshot in the PR description.
 - Validation and screenshots should stay separate from the user-facing summary.
 
-### Deploy to Remote
-
-```bash
-just bundle
-# scp bundle to remote, tar xzf, codesign -s - the three binaries
-```
-
-### Cleanup
-
-```bash
-pkill -f mesh-llm; pkill -f rpc-server; pkill -f llama-server
-```
-
 ## Deploy Checklist — MANDATORY
 
 **Every deploy to test machines MUST follow this checklist.**
@@ -200,7 +182,7 @@ pkill -f mesh-llm; pkill -f rpc-server; pkill -f llama-server
 
 ### Debugging llama-server startup
 
-If llama-server fails to start (stuck at "⏳ Starting llama-server..."), check its log file. Rust's `std::env::temp_dir()` on macOS points to the per-user temp dir, **not** `/tmp`:
+If llama-server fails to start (stuck at "⏳ Starting llama-server..."), check its log file:
 
 ```bash
 cat "$(python3 -c 'import tempfile; print(tempfile.gettempdir())')/mesh-llm-llama-server.log"
@@ -215,21 +197,16 @@ Typical path: `/var/folders/XX/.../T/mesh-llm-llama-server.log`. rpc-server logs
 
 ## Releasing
 
-See `RELEASE.md` for the full process.
+See `HUMANS.md` (Release process section) for the full process.
 
-Current release flow:
+Quick version:
 
-1. Build and verify locally:
-   ```bash
-   just build
-   just bundle
-   ```
-2. Release from a clean local `main` branch:
-   ```bash
-   just release v0.X.Y
-   ```
-   This bumps the version, refreshes `Cargo.lock` without upgrading dependencies, commits as `v0.X.Y: release`, pushes `main`, and then pushes only the new release tag.
-3. Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the release artifacts on Linux CPU, Linux CUDA, and macOS and creates the GitHub release automatically.
+```bash
+just build && just bundle     # build and verify
+just release v0.X.Y           # bump, commit, tag, push
+```
+
+Pushing a `v*` tag triggers CI which builds all platform artifacts and creates the GitHub release.
 
 ## Credentials
 
