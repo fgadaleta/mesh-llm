@@ -127,7 +127,7 @@ import {
   getAttachmentSendIssue,
   validateAttachmentFile,
 } from "./lib/attachments";
-import { createRafBatcher } from "./lib/streaming";
+import { createRafBatcher, hasBlobContent, parseApiErrorBody } from "./lib/streaming";
 import { cn } from "./lib/utils";
 import {
   TOPOLOGY_LAYOUT_OPTIONS,
@@ -1541,20 +1541,7 @@ export function App() {
       // Detect multimodal requests — blob tokens are single-use so retrying
       // with the same tokens will always fail with "Unknown or expired blob
       // token".  Skip the retry loop for these requests.
-      const hasBlobContent = Array.isArray(requestInput) &&
-        requestInput.some(
-          (msg: Record<string, unknown>) =>
-            Array.isArray(msg.content) &&
-            (msg.content as Array<Record<string, unknown>>).some(
-              (block) =>
-                typeof block === "object" &&
-                block !== null &&
-                Object.values(block).some(
-                  (v) => typeof v === "string" && v.startsWith("mesh://blob/"),
-                ),
-            ),
-        );
-      const effectiveMaxRetries = hasBlobContent ? 1 : MAX_RETRIES;
+      const effectiveMaxRetries = hasBlobContent(requestInput) ? 1 : MAX_RETRIES;
       let response: Response | null = null;
 
       for (let attempt = 0; attempt < effectiveMaxRetries; attempt++) {
@@ -1581,30 +1568,9 @@ export function App() {
       if (!response?.ok || !response?.body) {
         // Try to extract the real error message from the response body
         // instead of discarding it and showing only the status code.
-        let errorMessage = `HTTP ${response?.status ?? "unknown"}`;
-        if (response) {
-          try {
-            const errorBody = await response.text();
-            if (errorBody.length > 0) {
-              try {
-                const parsed = JSON.parse(errorBody);
-                if (parsed?.error?.message) {
-                  errorMessage = parsed.error.message;
-                } else if (typeof parsed?.error === "string") {
-                  errorMessage = parsed.error;
-                } else if (errorBody.length < 500) {
-                  errorMessage = errorBody;
-                }
-              } catch {
-                if (errorBody.length < 500) {
-                  errorMessage = errorBody;
-                }
-              }
-            }
-          } catch {
-            // Body couldn't be read — keep the status code message.
-          }
-        }
+        const errorMessage = response
+          ? await parseApiErrorBody(response)
+          : "HTTP unknown";
         throw new Error(errorMessage);
       }
 
