@@ -3168,4 +3168,38 @@ mod tests {
         );
         assert_eq!(result.unwrap().status_code, 200);
     }
+
+    #[tokio::test]
+    async fn test_send_error_429_includes_retry_after() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            super::send_error(stream, 429, "model not available")
+                .await
+                .unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let mut total = 0;
+        loop {
+            let n = client.read(&mut buf[total..]).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        let response = String::from_utf8_lossy(&buf[..total]);
+
+        assert!(response.starts_with("HTTP/1.1 429 Too Many Requests\r\n"));
+        assert!(response.contains("Retry-After: 5\r\n"));
+        assert!(response.contains("model not available"));
+
+        server.await.unwrap();
+    }
 }
