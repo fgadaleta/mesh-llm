@@ -1582,19 +1582,27 @@ export function App() {
         // Try to extract the real error message from the response body
         // instead of discarding it and showing only the status code.
         let errorMessage = `HTTP ${response?.status ?? "unknown"}`;
-        if (response?.body) {
+        if (response) {
           try {
             const errorBody = await response.text();
-            const parsed = JSON.parse(errorBody);
-            if (parsed?.error?.message) {
-              errorMessage = parsed.error.message;
-            } else if (typeof parsed?.error === "string") {
-              errorMessage = parsed.error;
-            } else if (errorBody.length > 0 && errorBody.length < 500) {
-              errorMessage = errorBody;
+            if (errorBody.length > 0) {
+              try {
+                const parsed = JSON.parse(errorBody);
+                if (parsed?.error?.message) {
+                  errorMessage = parsed.error.message;
+                } else if (typeof parsed?.error === "string") {
+                  errorMessage = parsed.error;
+                } else if (errorBody.length < 500) {
+                  errorMessage = errorBody;
+                }
+              } catch {
+                if (errorBody.length < 500) {
+                  errorMessage = errorBody;
+                }
+              }
             }
           } catch {
-            // Body wasn't JSON or couldn't be read — keep the status code message.
+            // Body couldn't be read — keep the status code message.
           }
         }
         throw new Error(errorMessage);
