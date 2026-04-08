@@ -10,7 +10,8 @@ use crate::network::affinity::{
 };
 use crate::network::openai::adapter;
 use crate::network::openai::errors;
-use crate::network::openai::schema;
+use crate::network::openai::request_adapter;
+use crate::network::openai::response_adapter;
 use crate::network::router;
 use crate::plugin;
 use anyhow::{anyhow, bail, Context, Result};
@@ -432,327 +433,25 @@ fn extract_session_hint_from_json(body: &serde_json::Value) -> Option<String> {
     })
 }
 
-fn path_only(path: &str) -> &str {
-    path.split('?').next().unwrap_or(path)
-}
-
-fn rewrite_path_preserving_query(path: &str, new_path: &str) -> String {
-    match path.split_once('?') {
-        Some((_, query)) => format!("{new_path}?{query}"),
-        None => new_path.to_string(),
-    }
-}
-
-fn alias_max_tokens(object: &mut serde_json::Map<String, serde_json::Value>) -> bool {
-    let mut changed = false;
-    for alias in ["max_completion_tokens", "max_output_tokens"] {
-        let Some(value) = object.remove(alias) else {
-            continue;
-        };
-        changed = true;
-        object.entry("max_tokens".to_string()).or_insert(value);
-    }
-    changed
-}
-
 fn normalize_openai_compat_request(
     path: &str,
     body: &mut serde_json::Value,
 ) -> Result<RequestNormalization> {
-    // Typed edge parsing for known OpenAI-compatible request envelopes.
-    match path_only(path) {
-        "/v1/chat/completions" => {
-            let _ = adapter::parse_chat_request(body)?;
-        }
-        "/v1/responses" => {
-            let _ = adapter::parse_responses_request(body)?;
-        }
-        _ => {}
-    }
-
-    let Some(object) = body.as_object_mut() else {
-        return Ok(RequestNormalization {
-            changed: false,
-            rewritten_path: None,
-            response_adapter: ResponseAdapter::None,
-        });
-    };
-
-    let mut changed = alias_max_tokens(object);
-    let mut rewritten_path = None;
-    let mut response_adapter = ResponseAdapter::None;
-
-    if path_only(path) == "/v1/responses" {
-        let is_stream = object
-            .get("stream")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        changed |= translate_openai_responses_input(object)?;
-        rewritten_path = Some(rewrite_path_preserving_query(path, "/v1/chat/completions"));
-        response_adapter = if is_stream {
-            ResponseAdapter::OpenAiResponsesStream
-        } else {
+    let normalized = request_adapter::normalize_openai_compat_request(path, body)?;
+    let response_adapter = match normalized.response_adapter {
+        request_adapter::ResponseAdapterMode::None => ResponseAdapter::None,
+        request_adapter::ResponseAdapterMode::OpenAiResponsesJson => {
             ResponseAdapter::OpenAiResponsesJson
-        };
-    }
-
+        }
+        request_adapter::ResponseAdapterMode::OpenAiResponsesStream => {
+            ResponseAdapter::OpenAiResponsesStream
+        }
+    };
     Ok(RequestNormalization {
-        changed,
-        rewritten_path,
+        changed: normalized.changed,
+        rewritten_path: normalized.rewritten_path,
         response_adapter,
     })
-}
-
-fn map_response_role(role: &str) -> String {
-    match role {
-        "developer" => "system".to_string(),
-        other => other.to_string(),
-    }
-}
-
-fn object_or_url_container(
-    value: Option<&serde_json::Value>,
-    fallback_url: Option<&str>,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
-    match value {
-        Some(serde_json::Value::Object(map)) => Some(map.clone()),
-        Some(serde_json::Value::String(url)) => Some(serde_json::Map::from_iter([(
-            "url".to_string(),
-            serde_json::Value::String(url.clone()),
-        )])),
-        _ => fallback_url.map(|url| {
-            serde_json::Map::from_iter([(
-                "url".to_string(),
-                serde_json::Value::String(url.to_string()),
-            )])
-        }),
-    }
-}
-
-fn translate_responses_content_item(item: &serde_json::Value) -> Result<serde_json::Value> {
-    let Some(object) = item.as_object() else {
-        return Ok(serde_json::json!({
-            "type": "text",
-            "text": item.as_str().unwrap_or_default(),
-        }));
-    };
-    let item_type = object
-        .get("type")
-        .and_then(|value| value.as_str())
-        .unwrap_or("text");
-
-    match item_type {
-        "input_text" | "text" => {
-            let text = object
-                .get("text")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            Ok(serde_json::json!({"type": "text", "text": text}))
-        }
-        "input_image" | "image_url" | "image" => {
-            let container = object_or_url_container(
-                object.get("image_url").or_else(|| object.get("image")),
-                object.get("url").and_then(|value| value.as_str()),
-            )
-            .ok_or_else(|| anyhow!("responses input_image block is missing image_url/url"))?;
-            Ok(serde_json::json!({"type": "image_url", "image_url": container}))
-        }
-        "input_audio" | "audio" | "audio_url" => {
-            let mut container = object_or_url_container(
-                object
-                    .get("input_audio")
-                    .or_else(|| object.get("audio_url")),
-                object.get("url").and_then(|value| value.as_str()),
-            )
-            .unwrap_or_default();
-            for key in [
-                "data",
-                "format",
-                "mime_type",
-                "mesh_token",
-                "blob_token",
-                "token",
-            ] {
-                if let Some(value) = object.get(key) {
-                    container
-                        .entry(key.to_string())
-                        .or_insert_with(|| value.clone());
-                }
-            }
-            if container.is_empty() {
-                bail!("responses input_audio block is missing input_audio/audio_url/url");
-            }
-            Ok(serde_json::json!({"type": "input_audio", "input_audio": container}))
-        }
-        "input_file" | "file" => {
-            let mut container = object_or_url_container(
-                object.get("input_file").or_else(|| object.get("file")),
-                object.get("url").and_then(|value| value.as_str()),
-            )
-            .ok_or_else(|| anyhow!("responses input_file block is missing input_file/file/url"))?;
-            for key in [
-                "mime_type",
-                "file_name",
-                "filename",
-                "mesh_token",
-                "blob_token",
-                "token",
-            ] {
-                if let Some(value) = object.get(key) {
-                    container
-                        .entry(key.to_string())
-                        .or_insert_with(|| value.clone());
-                }
-            }
-            Ok(serde_json::json!({"type": "input_file", "input_file": container}))
-        }
-        other => bail!("unsupported /v1/responses content block type '{other}'"),
-    }
-}
-
-fn collapse_blocks_if_text_only(blocks: Vec<serde_json::Value>) -> serde_json::Value {
-    if blocks.len() == 1 {
-        if let Some(text) = blocks[0].get("text").and_then(|value| value.as_str()) {
-            return serde_json::Value::String(text.to_string());
-        }
-    }
-    serde_json::Value::Array(blocks)
-}
-
-fn translate_responses_message_content(content: &serde_json::Value) -> Result<serde_json::Value> {
-    match content {
-        serde_json::Value::String(text) => Ok(serde_json::Value::String(text.clone())),
-        serde_json::Value::Array(items) => {
-            let blocks = items
-                .iter()
-                .map(translate_responses_content_item)
-                .collect::<Result<Vec<_>>>()?;
-            Ok(collapse_blocks_if_text_only(blocks))
-        }
-        serde_json::Value::Object(_) => Ok(collapse_blocks_if_text_only(vec![
-            translate_responses_content_item(content)?,
-        ])),
-        _ => bail!("unsupported /v1/responses input content shape"),
-    }
-}
-
-fn translate_responses_input_message(
-    message: &serde_json::Value,
-) -> Result<serde_json::Map<String, serde_json::Value>> {
-    let Some(object) = message.as_object() else {
-        bail!("unsupported /v1/responses message shape");
-    };
-
-    let role = map_response_role(
-        object
-            .get("role")
-            .and_then(|value| value.as_str())
-            .unwrap_or("user"),
-    );
-    let content_value = object
-        .get("content")
-        .map(translate_responses_message_content)
-        .transpose()?
-        .unwrap_or_else(|| serde_json::Value::String(String::new()));
-
-    Ok(serde_json::Map::from_iter([
-        ("role".to_string(), serde_json::Value::String(role)),
-        ("content".to_string(), content_value),
-    ]))
-}
-
-fn translate_responses_input_to_messages(
-    input: &serde_json::Value,
-) -> Result<Vec<serde_json::Value>> {
-    match input {
-        serde_json::Value::String(text) => Ok(vec![serde_json::json!({
-            "role": "user",
-            "content": text,
-        })]),
-        serde_json::Value::Array(items) => {
-            let looks_like_messages = items.iter().all(|item| {
-                item.as_object()
-                    .map(|object| object.contains_key("role") || object.contains_key("content"))
-                    .unwrap_or(false)
-            });
-            if looks_like_messages {
-                items
-                    .iter()
-                    .map(translate_responses_input_message)
-                    .map(|result| result.map(serde_json::Value::Object))
-                    .collect()
-            } else {
-                let content = translate_responses_message_content(input)?;
-                Ok(vec![serde_json::json!({
-                    "role": "user",
-                    "content": content,
-                })])
-            }
-        }
-        serde_json::Value::Object(object) => {
-            if object.contains_key("role") || object.contains_key("content") {
-                Ok(vec![serde_json::Value::Object(
-                    translate_responses_input_message(input)?,
-                )])
-            } else {
-                let content = translate_responses_message_content(input)?;
-                Ok(vec![serde_json::json!({
-                    "role": "user",
-                    "content": content,
-                })])
-            }
-        }
-        _ => bail!("unsupported /v1/responses input shape"),
-    }
-}
-
-fn translate_openai_responses_input(
-    object: &mut serde_json::Map<String, serde_json::Value>,
-) -> Result<bool> {
-    let mut changed = false;
-    let mut messages = Vec::new();
-
-    if let Some(instructions_value) = object.remove("instructions") {
-        if let Some(instructions) = instructions_value.as_str().map(str::trim) {
-            if !instructions.is_empty() {
-                messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": instructions,
-                }));
-            }
-        }
-        changed = true;
-    }
-
-    if let Some(input) = object.remove("input") {
-        messages.extend(translate_responses_input_to_messages(&input)?);
-        changed = true;
-    } else if let Some(existing_messages) = object.remove("messages") {
-        messages.extend(translate_responses_input_to_messages(&existing_messages)?);
-        changed = true;
-    }
-
-    if !messages.is_empty() {
-        object.insert("messages".to_string(), serde_json::Value::Array(messages));
-    }
-
-    for key in [
-        "include",
-        "output",
-        "output_text",
-        "parallel_tool_calls",
-        "previous_response_id",
-        "reasoning",
-        "store",
-        "text",
-        "truncation",
-    ] {
-        if object.remove(key).is_some() {
-            changed = true;
-        }
-    }
-
-    Ok(changed)
 }
 
 fn request_id_from_body(body: &serde_json::Value) -> Option<String> {
@@ -1124,199 +823,6 @@ fn is_retryable_context_overflow_response(body: &[u8]) -> bool {
     mentions_context && mentions_limit
 }
 
-fn chat_completion_message_text(message: &serde_json::Value) -> String {
-    match message.get("content") {
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| {
-                item.get("text")
-                    .and_then(|value| value.as_str())
-                    .map(ToString::to_string)
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
-}
-
-fn translate_chat_completion_to_responses(body: &[u8]) -> Result<Vec<u8>> {
-    let value: serde_json::Value =
-        serde_json::from_slice(body).context("parse chat completion response body")?;
-    let id = value
-        .get("id")
-        .and_then(|field| field.as_str())
-        .unwrap_or("resp_mesh_llm")
-        .to_string();
-    let created_at = value
-        .get("created")
-        .and_then(|field| field.as_i64())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs() as i64)
-                .unwrap_or(0)
-        });
-    let model = value
-        .get("model")
-        .and_then(|field| field.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let assistant_message = value
-        .get("choices")
-        .and_then(|field| field.as_array())
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({"role": "assistant", "content": ""}));
-    let output_text = chat_completion_message_text(&assistant_message);
-
-    let usage = value.get("usage").map(|usage| {
-        serde_json::json!({
-            "input_tokens": usage.get("prompt_tokens").cloned().unwrap_or(serde_json::Value::Null),
-            "output_tokens": usage.get("completion_tokens").cloned().unwrap_or(serde_json::Value::Null),
-            "total_tokens": usage.get("total_tokens").cloned().unwrap_or(serde_json::Value::Null),
-        })
-    });
-
-    let response = serde_json::json!({
-        "id": id,
-        "object": "response",
-        "created_at": created_at,
-        "status": "completed",
-        "error": serde_json::Value::Null,
-        "incomplete_details": serde_json::Value::Null,
-        "model": model,
-        "output": [{
-            "id": format!("msg_{created_at}"),
-            "type": "message",
-            "status": "completed",
-            "role": assistant_message
-                .get("role")
-                .and_then(|field| field.as_str())
-                .unwrap_or("assistant"),
-            "content": [{
-                "type": "output_text",
-                "text": output_text.clone(),
-                "annotations": [],
-            }],
-        }],
-        "output_text": output_text,
-        "usage": usage.unwrap_or(serde_json::Value::Null),
-    });
-    serde_json::to_vec(&response).context("serialize translated /v1/responses body")
-}
-
-fn sse_frame(event: Option<&str>, data: &str) -> Vec<u8> {
-    let mut frame = Vec::new();
-    if let Some(event_name) = event {
-        frame.extend_from_slice(format!("event: {event_name}\n").as_bytes());
-    }
-    for line in data.lines() {
-        frame.extend_from_slice(b"data: ");
-        frame.extend_from_slice(line.as_bytes());
-        frame.extend_from_slice(b"\n");
-    }
-    if data.is_empty() {
-        frame.extend_from_slice(b"data: \n");
-    }
-    frame.extend_from_slice(b"\n");
-    frame
-}
-
-async fn write_chunked_bytes(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
-    let header = format!("{:x}\r\n", bytes.len());
-    stream.write_all(header.as_bytes()).await?;
-    stream.write_all(bytes).await?;
-    stream.write_all(b"\r\n").await
-}
-
-async fn write_chunked_sse_event(
-    stream: &mut TcpStream,
-    event: Option<&str>,
-    data: &str,
-) -> std::io::Result<()> {
-    let frame = sse_frame(event, data);
-    write_chunked_bytes(stream, &frame).await
-}
-
-fn responses_stream_created_event(model: &str, created_at: i64) -> serde_json::Value {
-    serde_json::json!({
-        "type": "response.created",
-        "response": {
-            "id": format!("resp_{created_at}"),
-            "object": "response",
-            "created_at": created_at,
-            "status": "in_progress",
-            "model": model,
-            "output": [],
-        }
-    })
-}
-
-fn responses_stream_delta_event(item_id: &str, delta: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "response.output_text.delta",
-        "item_id": item_id,
-        "output_index": 0,
-        "content_index": 0,
-        "delta": delta,
-    })
-}
-
-fn responses_stream_text_done_event(item_id: &str, text: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "response.output_text.done",
-        "item_id": item_id,
-        "output_index": 0,
-        "content_index": 0,
-        "text": text,
-    })
-}
-
-fn responses_stream_completed_event(
-    response_id: &str,
-    created_at: i64,
-    model: &str,
-    item_id: &str,
-    text: &str,
-    usage: Option<serde_json::Value>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type": "response.completed",
-        "response": {
-            "id": response_id,
-            "object": "response",
-            "created_at": created_at,
-            "status": "completed",
-            "error": serde_json::Value::Null,
-            "incomplete_details": serde_json::Value::Null,
-            "model": model,
-            "output": [{
-                "id": item_id,
-                "type": "message",
-                "status": "completed",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": text,
-                    "annotations": [],
-                }],
-            }],
-            "output_text": text,
-            "usage": usage.unwrap_or(serde_json::Value::Null),
-        }
-    })
-}
-
-fn stream_usage_to_responses_usage(usage: &schema::StreamUsage) -> serde_json::Value {
-    serde_json::json!({
-        "input_tokens": usage.prompt_tokens.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
-        "output_tokens": usage.completion_tokens.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
-        "total_tokens": usage.total_tokens.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
-    })
-}
-
 async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
     tcp_stream: &mut TcpStream,
     reader: &mut R,
@@ -1373,10 +879,16 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
             }
             // Emit response.created once we have the model from the first chunk.
             if !created_emitted && !model.is_empty() {
-                let created =
-                    serde_json::to_string(&responses_stream_created_event(&model, created_at))
-                        .context("serialize response.created stream event")?;
-                write_chunked_sse_event(tcp_stream, Some("response.created"), &created).await?;
+                let created = serde_json::to_string(
+                    &response_adapter::responses_stream_created_event(&model, created_at),
+                )
+                .context("serialize response.created stream event")?;
+                response_adapter::write_chunked_sse_event(
+                    tcp_stream,
+                    Some("response.created"),
+                    &created,
+                )
+                .await?;
                 created_emitted = true;
             }
             if let Some(delta) = chunk
@@ -1386,13 +898,22 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
                 .and_then(|delta| delta.content.as_deref())
             {
                 output_text.push_str(delta);
-                let event = serde_json::to_string(&responses_stream_delta_event(&item_id, delta))
-                    .context("serialize response.output_text.delta event")?;
-                write_chunked_sse_event(tcp_stream, Some("response.output_text.delta"), &event)
-                    .await?;
+                let event = serde_json::to_string(&response_adapter::responses_stream_delta_event(
+                    &item_id, delta,
+                ))
+                .context("serialize response.output_text.delta event")?;
+                response_adapter::write_chunked_sse_event(
+                    tcp_stream,
+                    Some("response.output_text.delta"),
+                    &event,
+                )
+                .await?;
             }
             if usage.is_none() {
-                usage = chunk.usage.as_ref().map(stream_usage_to_responses_usage);
+                usage = chunk
+                    .usage
+                    .as_ref()
+                    .map(response_adapter::stream_usage_to_responses_usage);
             }
         }
 
@@ -1415,16 +936,26 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
 
     // If upstream sent no model field at all (e.g. empty stream), still emit response.created.
     if !created_emitted {
-        let created = serde_json::to_string(&responses_stream_created_event(&model, created_at))
-            .context("serialize response.created stream event")?;
-        write_chunked_sse_event(tcp_stream, Some("response.created"), &created).await?;
+        let created = serde_json::to_string(&response_adapter::responses_stream_created_event(
+            &model, created_at,
+        ))
+        .context("serialize response.created stream event")?;
+        response_adapter::write_chunked_sse_event(tcp_stream, Some("response.created"), &created)
+            .await?;
     }
 
-    let text_done =
-        serde_json::to_string(&responses_stream_text_done_event(&item_id, &output_text))
-            .context("serialize response.output_text.done event")?;
-    write_chunked_sse_event(tcp_stream, Some("response.output_text.done"), &text_done).await?;
-    let completed = serde_json::to_string(&responses_stream_completed_event(
+    let text_done = serde_json::to_string(&response_adapter::responses_stream_text_done_event(
+        &item_id,
+        &output_text,
+    ))
+    .context("serialize response.output_text.done event")?;
+    response_adapter::write_chunked_sse_event(
+        tcp_stream,
+        Some("response.output_text.done"),
+        &text_done,
+    )
+    .await?;
+    let completed = serde_json::to_string(&response_adapter::responses_stream_completed_event(
         &response_id,
         created_at,
         &model,
@@ -1433,8 +964,9 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
         usage,
     ))
     .context("serialize response.completed event")?;
-    write_chunked_sse_event(tcp_stream, Some("response.completed"), &completed).await?;
-    write_chunked_sse_event(tcp_stream, Some("done"), "[DONE]").await?;
+    response_adapter::write_chunked_sse_event(tcp_stream, Some("response.completed"), &completed)
+        .await?;
+    response_adapter::write_chunked_sse_event(tcp_stream, Some("done"), "[DONE]").await?;
     let _ = tcp_stream.write_all(b"0\r\n\r\n").await;
     let _ = tcp_stream.shutdown().await;
     Ok(RouteAttemptResult::Delivered {
@@ -1460,7 +992,8 @@ async fn relay_translated_responses_json<R: AsyncRead + Unpin>(
 
     let parsed = try_parse_response_headers(&buffered)?
         .ok_or_else(|| anyhow!("incomplete HTTP response"))?;
-    let translated_body = translate_chat_completion_to_responses(&buffered[parsed.header_end..])?;
+    let translated_body =
+        response_adapter::translate_chat_completion_to_responses(&buffered[parsed.header_end..])?;
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         translated_body.len()
@@ -2938,7 +2471,7 @@ mod tests {
 
     #[test]
     fn test_translate_chat_completion_to_responses_json() {
-        let translated = translate_chat_completion_to_responses(
+        let translated = response_adapter::translate_chat_completion_to_responses(
             serde_json::json!({
                 "id": "chatcmpl_123",
                 "object": "chat.completion",
