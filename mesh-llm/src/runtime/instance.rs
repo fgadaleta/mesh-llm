@@ -491,8 +491,12 @@ pub mod validate {
         }
 
         pub fn process_started_at_unix(pid: u32) -> anyhow::Result<Option<i64>> {
+            // Force C locale so `ps -o lstart=` always emits English month
+            // abbreviations (Jan/Feb/…) regardless of the system locale.
             let output = std::process::Command::new("ps")
                 .args(["-p", &pid.to_string(), "-o", "lstart="])
+                .env("LANG", "C")
+                .env("LC_ALL", "C")
                 .output()?;
             let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if s.is_empty() {

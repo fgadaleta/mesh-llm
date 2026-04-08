@@ -139,7 +139,8 @@ pub(crate) async fn run() -> Result<()> {
     // Acquire the per-instance runtime directory and flock (skip for --client — no local servers).
     // Wrap in Arc so it can be cheaply shared with election/spawn tasks that
     // need to write pidfiles for child processes (rpc-server, llama-server).
-    let runtime: Option<std::sync::Arc<crate::runtime::instance::InstanceRuntime>> = if !cli.client {
+    let runtime: Option<std::sync::Arc<crate::runtime::instance::InstanceRuntime>> = if !cli.client
+    {
         match crate::runtime::instance::InstanceRuntime::acquire(std::process::id()) {
             Ok(rt) => Some(std::sync::Arc::new(rt)),
             Err(e) => {
