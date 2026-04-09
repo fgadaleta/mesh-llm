@@ -210,7 +210,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
 }
 
 fn artifact_kind_for_file(file: &str) -> &'static str {
-    if file.ends_with("model.safetensors") || file.ends_with("model.safetensors.index.json") {
+    if file.ends_with(".safetensors") || file.ends_with(".safetensors.index.json") {
         "🍎 MLX"
     } else {
         "🦙 GGUF"
@@ -488,7 +488,7 @@ fn parse_exact_model_ref(input: &str) -> Result<ExactModelRef> {
         });
     }
     bail!(
-        "Expected an exact model ref. Use a catalog id, a Hugging Face ref like org/repo/file.gguf (or org/repo/file-stem for split GGUFs), or a direct URL."
+        "Expected an exact model ref. Use a catalog id, a Hugging Face ref like org/repo/file.gguf, org/repo/file-stem for split GGUFs, org/repo/model.safetensors, or org/repo/model-00001-of-00048.safetensors, or a direct URL."
     )
 }
 
@@ -526,7 +526,10 @@ async fn resolve_huggingface_file(
     revision: Option<&str>,
     file: &str,
 ) -> Result<String> {
-    if file.ends_with(".gguf") {
+    if file.ends_with(".gguf")
+        || file.ends_with(".safetensors")
+        || file.ends_with(".safetensors.index.json")
+    {
         return Ok(file.to_string());
     }
 
@@ -594,7 +597,8 @@ pub(super) fn file_preference_score(file: &str) -> usize {
     PREFERRED
         .iter()
         .position(|needle| file.contains(needle))
-        .unwrap_or(PREFERRED.len() + 1)
+        .map(|pos| pos + 1)
+        .unwrap_or(PREFERRED.len() + 2)
 }
 
 async fn remote_size_label(url: &str) -> Option<String> {

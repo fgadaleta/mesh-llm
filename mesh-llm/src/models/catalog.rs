@@ -220,6 +220,46 @@ fn expand_split_asset(asset: &HfAsset) -> Result<Vec<HfAsset>> {
 
 fn is_mlx_primary_asset(file: &str) -> bool {
     matches!(file, "model.safetensors" | "model.safetensors.index.json")
+        || is_split_mlx_first_shard_file(file)
+}
+
+/// Returns true if `file` is the first shard of a sharded MLX safetensors set,
+/// i.e. `model-00001-of-NNNNN.safetensors`.
+fn is_split_mlx_first_shard_file(file: &str) -> bool {
+    let Some(rest) = file.strip_prefix("model-") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(".safetensors") else {
+        return false;
+    };
+    let Some((left, right)) = rest.split_once("-of-") else {
+        return false;
+    };
+    left == "00001" && right.len() == 5 && right.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Expands a first-shard MLX ref (`model-00001-of-NNNNN.safetensors`) into the
+/// full list of shard assets without needing to download the index.
+fn expand_split_mlx_first_shard(asset: &HfAsset) -> Vec<HfAsset> {
+    let Some(rest) = asset.file.strip_prefix("model-00001-of-") else {
+        return Vec::new();
+    };
+    let Some(total_str) = rest.strip_suffix(".safetensors") else {
+        return Vec::new();
+    };
+    if total_str.len() != 5 || !total_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Vec::new();
+    }
+    let Ok(count): Result<u32> = total_str.parse().map_err(anyhow::Error::from) else {
+        return Vec::new();
+    };
+    (1..=count)
+        .map(|index| HfAsset {
+            repo: asset.repo.clone(),
+            revision: asset.revision.clone(),
+            file: format!("model-{index:05}-of-{total_str}.safetensors"),
+        })
+        .collect()
 }
 
 fn mlx_sidecar_assets(asset: &HfAsset) -> Vec<(bool, HfAsset)> {
@@ -448,7 +488,12 @@ fn download_hf_assets_blocking(label: &str, assets: Vec<HfAsset>) -> Result<Vec<
         for sidecar in mlx_sidecar_assets(&asset) {
             download_plan.insert(sidecar);
         }
+        // Expand shards from an index file (downloads index to discover shard names)
         for shard in mlx_sharded_weight_assets(&api, &cache, &asset)? {
+            download_plan.insert((true, shard));
+        }
+        // Expand shards from a first-shard ref without needing to download the index
+        for shard in expand_split_mlx_first_shard(&asset) {
             download_plan.insert((true, shard));
         }
     }
@@ -1330,5 +1375,61 @@ mod tests {
 
         let resolved = download_model(&model).await.unwrap();
         assert_eq!(resolved, expected_file);
+    }
+
+    #[test]
+    fn is_split_mlx_first_shard_file_identifies_correct_patterns() {
+        assert!(is_split_mlx_first_shard_file(
+            "model-00001-of-00004.safetensors"
+        ));
+        assert!(is_split_mlx_first_shard_file(
+            "model-00001-of-00048.safetensors"
+        ));
+        assert!(!is_split_mlx_first_shard_file(
+            "model-00002-of-00004.safetensors"
+        ));
+        assert!(!is_split_mlx_first_shard_file("model.safetensors"));
+        assert!(!is_split_mlx_first_shard_file(
+            "model.safetensors.index.json"
+        ));
+        assert!(!is_split_mlx_first_shard_file("model-00001-of-00004.gguf"));
+    }
+
+    #[test]
+    fn expand_split_mlx_first_shard_generates_all_shards() {
+        let asset = HfAsset {
+            repo: "org/repo".to_string(),
+            revision: "main".to_string(),
+            file: "model-00001-of-00003.safetensors".to_string(),
+        };
+        let shards = expand_split_mlx_first_shard(&asset);
+        assert_eq!(shards.len(), 3);
+        assert_eq!(shards[0].file, "model-00001-of-00003.safetensors");
+        assert_eq!(shards[1].file, "model-00002-of-00003.safetensors");
+        assert_eq!(shards[2].file, "model-00003-of-00003.safetensors");
+        for shard in &shards {
+            assert_eq!(shard.repo, "org/repo");
+            assert_eq!(shard.revision, "main");
+        }
+    }
+
+    #[test]
+    fn expand_split_mlx_first_shard_returns_empty_for_non_first_shard() {
+        let asset = HfAsset {
+            repo: "org/repo".to_string(),
+            revision: "main".to_string(),
+            file: "model-00002-of-00003.safetensors".to_string(),
+        };
+        let shards = expand_split_mlx_first_shard(&asset);
+        assert!(shards.is_empty());
+    }
+
+    #[test]
+    fn is_mlx_primary_asset_includes_first_shard() {
+        assert!(is_mlx_primary_asset("model.safetensors"));
+        assert!(is_mlx_primary_asset("model.safetensors.index.json"));
+        assert!(is_mlx_primary_asset("model-00001-of-00048.safetensors"));
+        assert!(!is_mlx_primary_asset("model-00002-of-00048.safetensors"));
+        assert!(!is_mlx_primary_asset("model-00048-of-00048.safetensors"));
     }
 }

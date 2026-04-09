@@ -108,9 +108,14 @@ where
         let (index, result) = joined.context("Join Hugging Face repo inspection task")?;
         completed += 1;
         progress(SearchProgress::InspectingRepos { completed, total });
-        if let Ok(hits) = result {
-            for hit in hits {
-                indexed_hits.push((index, hit));
+        match result {
+            Ok(hits) => {
+                for (rank, hit) in hits.into_iter().enumerate() {
+                    indexed_hits.push((index, rank, hit));
+                }
+            }
+            Err(err) => {
+                eprintln!("⚠️  Failed to inspect Hugging Face repo: {err:#}");
             }
         }
         if let Some((next_index, repo)) = pending.next() {
@@ -119,10 +124,10 @@ where
         }
     }
 
-    indexed_hits.sort_by_key(|(index, _)| *index);
+    indexed_hits.sort_by_key(|(index, rank, _)| (*index, *rank));
     let mut hits: Vec<SearchHit> = indexed_hits
         .into_iter()
-        .map(|(_, hit)| hit)
+        .map(|(_, _, hit)| hit)
         .take(limit)
         .collect();
     if hits.len() > limit {
@@ -278,13 +283,23 @@ fn collect_repo_artifact_candidates(siblings: &[String]) -> Vec<RepoArtifactCand
 }
 
 fn is_split_mlx_weight_file(file: &str) -> bool {
-    let re = regex_lite::Regex::new(r"^model-\d{5}-of-\d{5}\.safetensors$").unwrap();
-    re.is_match(file)
+    let Some(rest) = file.strip_prefix("model-") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(".safetensors") else {
+        return false;
+    };
+    let Some((left, right)) = rest.split_once("-of-") else {
+        return false;
+    };
+    left.len() == 5
+        && right.len() == 5
+        && left.bytes().all(|b| b.is_ascii_digit())
+        && right.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn is_split_mlx_first_shard(file: &str) -> bool {
-    let re = regex_lite::Regex::new(r"^model-00001-of-\d{5}\.safetensors$").unwrap();
-    re.is_match(file)
+    is_split_mlx_weight_file(file) && file.starts_with("model-00001-of-")
 }
 
 fn is_mlx_weight_file(file: &str) -> bool {
