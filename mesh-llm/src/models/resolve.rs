@@ -960,7 +960,8 @@ pub(super) fn file_preference_score(file: &str) -> usize {
     PREFERRED
         .iter()
         .position(|needle| file.contains(needle))
-        .unwrap_or(PREFERRED.len() + 1)
+        .map(|pos| pos + 1)
+        .unwrap_or(PREFERRED.len() + 2)
 }
 
 async fn remote_size_label(url: &str) -> Option<String> {
