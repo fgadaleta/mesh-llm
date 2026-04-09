@@ -1740,11 +1740,13 @@ export function App() {
     if ((!trimmed && pendingAttachments.length === 0) || !status)
       return;
     if (isSending) {
+      // Interrupt the current stream and slot this message in immediately.
+      // The abort handler sets isSending=false, which triggers the drain
+      // effect to pick up the queued message.
       queuedInputRef.current = trimmed;
-      // For attachment-only sends trimmed is ""; show a placeholder so the
-      // queued-message UI indicator is visible.
       setQueuedText(trimmed || "📎 Attachment");
       setInput("");
+      currentAbortRef.current?.abort();
       return;
     }
     if (attachmentSendIssue) {
@@ -3410,10 +3412,19 @@ export function ChatPage(props: {
                   ))}
 
                   {isSending ? (
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" /> Streaming
-                      response...
-                    </div>
+                    <button
+                      type="button"
+                      onClick={onStop}
+                      className="group flex items-center gap-2 rounded-md px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+                      title="Click to stop (Esc)"
+                    >
+                      <Loader2 className="h-3.5 w-3.5 animate-spin group-hover:hidden" />
+                      <Square className="hidden h-3.5 w-3.5 group-hover:block" />
+                      <span>
+                        <span className="group-hover:hidden">Streaming response...</span>
+                        <span className="hidden group-hover:inline">Stop generating</span>
+                      </span>
+                    </button>
                   ) : null}
 
                   {queuedText ? (
@@ -3538,6 +3549,10 @@ export function ChatPage(props: {
                     e.preventDefault();
                     onSubmit();
                   }
+                  if (e.key === "Escape" && isSending) {
+                    e.preventDefault();
+                    onStop();
+                  }
                 }}
                 data-testid="chat-input"
                 rows={2}
@@ -3551,7 +3566,9 @@ export function ChatPage(props: {
               />
               <div className="flex items-center justify-between gap-2">
                 <div className="hidden md:block text-xs text-muted-foreground">
-                  Enter to send. Shift+Enter for newline.
+                  {isSending
+                    ? "Esc to stop. Enter to interrupt and send."
+                    : "Enter to send. Shift+Enter for newline."}
                 </div>
                 <div className="flex items-center gap-2">
                   {selectedModelVision && (
@@ -3625,12 +3642,13 @@ export function ChatPage(props: {
                   {isSending ? (
                     <Button
                       type="button"
-                      variant="outline"
-                      size="icon"
+                      variant="destructive"
                       onClick={onStop}
-                      aria-label="Stop"
+                      aria-label="Stop generating"
+                      className="gap-1.5"
                     >
                       <Square className="h-3.5 w-3.5" />
+                      <span className="hidden sm:inline">Stop</span>
                     </Button>
                   ) : (
                     <Button
