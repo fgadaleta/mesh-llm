@@ -72,6 +72,11 @@ echo "Building for AMDGPU targets: $AMDGPU_TARGETS"
 
 configure_compiler_cache
 
+rocm_cmake_prefix="$ROCM_PATH"
+if [[ -n "${CMAKE_PREFIX_PATH:-}" ]]; then
+    rocm_cmake_prefix="$ROCM_PATH;${CMAKE_PREFIX_PATH}"
+fi
+
 HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
 cmake -B "$BUILD_DIR" -S "$LLAMA_DIR" \
     -DGGML_HIP=ON \
@@ -82,6 +87,7 @@ cmake -B "$BUILD_DIR" -S "$LLAMA_DIR" \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DBUILD_SHARED_LIBS=OFF \
     -DLLAMA_OPENSSL=OFF \
+    -DCMAKE_PREFIX_PATH="$rocm_cmake_prefix" \
     -DAMDGPU_TARGETS="$AMDGPU_TARGETS" \
     "${compiler_launcher_flags[@]}"
 

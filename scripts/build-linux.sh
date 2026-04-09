@@ -323,9 +323,13 @@ elif [[ "$BACKEND" == "cuda" ]]; then
         -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH"
     )
 elif [[ "$BACKEND" == "rocm" ]]; then
+    rocm_cmake_prefix="${CMAKE_PREFIX_PATH:-}"
     if command -v hipconfig &>/dev/null; then
         export HIPCXX="$(hipconfig -l)/clang"
         export HIP_PATH="$(hipconfig -R)"
+        rocm_cmake_prefix="${HIP_PATH}${CMAKE_PREFIX_PATH:+;${CMAKE_PREFIX_PATH}}"
+    elif [[ -z "$rocm_cmake_prefix" ]]; then
+        rocm_cmake_prefix="/opt/rocm"
     fi
     cmake_flags+=(
         -DGGML_CUDA=OFF
@@ -333,6 +337,7 @@ elif [[ "$BACKEND" == "rocm" ]]; then
         -DGGML_VULKAN=OFF
         -DGGML_METAL=OFF
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+        -DCMAKE_PREFIX_PATH="$rocm_cmake_prefix"
         -DAMDGPU_TARGETS="$ROCM_ARCH"
     )
 else
