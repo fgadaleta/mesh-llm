@@ -1,6 +1,7 @@
 use super::ModelCapabilities;
 use super::{capabilities, catalog, find_model_path, format_size_bytes};
 use anyhow::{anyhow, bail, Context, Result};
+use hf_hub::{Repo, RepoType};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -8,6 +9,7 @@ pub struct ModelDetails {
     pub display_name: String,
     pub exact_ref: String,
     pub source: &'static str,
+    pub kind: &'static str,
     pub download_url: String,
     pub size_label: Option<String>,
     pub description: Option<String>,
@@ -61,6 +63,7 @@ pub async fn download_exact_ref(input: &str) -> Result<PathBuf> {
             revision,
             file,
         } => {
+            let file = resolve_huggingface_file(&repo, revision.as_deref(), &file).await?;
             if let Some(model) =
                 matching_catalog_primary_for_huggingface(&repo, revision.as_deref(), &file)
             {
@@ -115,6 +118,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
             display_name: model.name.to_string(),
             exact_ref: model.name.to_string(),
             source: "catalog",
+            kind: catalog_model_kind(model),
             download_url: match (
                 model.source_repo(),
                 model.source_revision(),
@@ -134,6 +138,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
             revision,
             file,
         } => {
+            let file = resolve_huggingface_file(&repo, revision.as_deref(), &file).await?;
             let exact_ref = format_huggingface_exact_ref(&repo, revision.as_deref(), &file);
             let catalog = matching_catalog_model_for_huggingface(&repo, revision.as_deref(), &file);
             let download_url = huggingface_resolve_url(&repo, revision.as_deref(), &file);
@@ -171,6 +176,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                     .to_string(),
                 exact_ref,
                 source: "huggingface",
+                kind: artifact_kind_for_file(&file),
                 download_url,
                 size_label,
                 description: catalog.map(|model| model.description.to_string()),
@@ -189,6 +195,7 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                 display_name: filename,
                 exact_ref: url.clone(),
                 source: "url",
+                kind: artifact_kind_for_file(&url),
                 download_url: url,
                 size_label,
                 description: catalog.map(|model| model.description.to_string()),
@@ -199,6 +206,29 @@ pub async fn show_exact_model(input: &str) -> Result<ModelDetails> {
                 moe: catalog.and_then(|model| model.moe.clone()),
             })
         }
+    }
+}
+
+fn artifact_kind_for_file(file: &str) -> &'static str {
+    if file.ends_with(".safetensors") || file.ends_with(".safetensors.index.json") {
+        "🍎 MLX"
+    } else {
+        "🦙 GGUF"
+    }
+}
+
+fn catalog_model_kind(model: &catalog::CatalogModel) -> &'static str {
+    if model
+        .source_file()
+        .map(|file| {
+            file.ends_with("model.safetensors") || file.ends_with("model.safetensors.index.json")
+        })
+        .unwrap_or(false)
+        || model.url.contains("model.safetensors")
+    {
+        "🍎 MLX"
+    } else {
+        "🦙 GGUF"
     }
 }
 
@@ -370,6 +400,26 @@ mod tests {
         )
         .is_none());
     }
+
+    #[test]
+    fn split_stem_resolves_to_first_part() {
+        let siblings = vec![
+            "zai-org.GLM-5.1.Q2_K-00002-of-00018.gguf".to_string(),
+            "zai-org.GLM-5.1.Q2_K-00001-of-00018.gguf".to_string(),
+        ];
+        let resolved = resolve_hf_file_from_siblings("zai-org.GLM-5.1.Q2_K", &siblings).unwrap();
+        assert_eq!(resolved, "zai-org.GLM-5.1.Q2_K-00001-of-00018.gguf");
+    }
+
+    #[test]
+    fn stem_without_split_resolves_to_gguf() {
+        let siblings = vec![
+            "Qwen3-8B-Q4_K_M.gguf".to_string(),
+            "Qwen3-8B-Q8_0.gguf".to_string(),
+        ];
+        let resolved = resolve_hf_file_from_siblings("Qwen3-8B-Q4_K_M", &siblings).unwrap();
+        assert_eq!(resolved, "Qwen3-8B-Q4_K_M.gguf");
+    }
 }
 
 fn matching_catalog_model_by_basename(repo_file: &str) -> Option<&'static catalog::CatalogModel> {
@@ -403,9 +453,6 @@ pub(super) fn parse_hf_resolve_url(url: &str) -> Option<(String, Option<String>,
 pub(super) fn parse_huggingface_ref(input: &str) -> Option<(String, Option<String>, String)> {
     if let Some(parsed) = parse_hf_resolve_url(input) {
         return Some(parsed);
-    }
-    if !input.ends_with(".gguf") {
-        return None;
     }
 
     let parts: Vec<&str> = input.splitn(3, '/').collect();
@@ -441,7 +488,74 @@ fn parse_exact_model_ref(input: &str) -> Result<ExactModelRef> {
         });
     }
     bail!(
-        "Expected an exact model ref. Use a catalog id, a Hugging Face ref like org/repo/file.gguf, or a direct URL."
+        "Expected an exact model ref. Use a catalog id, a Hugging Face ref like org/repo/file.gguf, org/repo/file-stem for split GGUFs, org/repo/model.safetensors, or org/repo/model-00001-of-00048.safetensors, or a direct URL."
+    )
+}
+
+fn resolve_hf_file_from_siblings(requested: &str, siblings: &[String]) -> Option<String> {
+    if requested.ends_with(".gguf") {
+        return Some(requested.to_string());
+    }
+
+    let requested_lower = requested.to_lowercase();
+    let exact_with_ext = format!("{requested}.gguf").to_lowercase();
+    let split_prefix = format!("{requested}-00001-of-").to_lowercase();
+
+    siblings
+        .iter()
+        .filter(|file| file.to_lowercase().ends_with(".gguf"))
+        .filter_map(|file| {
+            let lower = file.to_lowercase();
+            let rank = if lower == requested_lower {
+                0
+            } else if lower == exact_with_ext {
+                1
+            } else if lower.starts_with(&split_prefix) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, file_preference_score(file), file.clone()))
+        })
+        .min_by(|left, right| left.cmp(right))
+        .map(|(_, _, file)| file)
+}
+
+async fn resolve_huggingface_file(
+    repo: &str,
+    revision: Option<&str>,
+    file: &str,
+) -> Result<String> {
+    if file.ends_with(".gguf")
+        || file.ends_with(".safetensors")
+        || file.ends_with(".safetensors.index.json")
+    {
+        return Ok(file.to_string());
+    }
+
+    let revision = revision.unwrap_or("main");
+    let api = super::build_hf_tokio_api(false)?;
+    let detail = api
+        .repo(Repo::with_revision(
+            repo.to_string(),
+            RepoType::Model,
+            revision.to_string(),
+        ))
+        .info()
+        .await
+        .with_context(|| format!("Fetch Hugging Face repo {repo}@{revision}"))?;
+    let siblings: Vec<String> = detail
+        .siblings
+        .iter()
+        .map(|sibling| sibling.rfilename.clone())
+        .collect();
+
+    if let Some(resolved) = resolve_hf_file_from_siblings(file, &siblings) {
+        return Ok(resolved);
+    }
+
+    bail!(
+        "No GGUF file matching stem '{file}' in {repo}@{revision}. Use a full ref like org/repo/file.gguf."
     )
 }
 
@@ -483,7 +597,8 @@ pub(super) fn file_preference_score(file: &str) -> usize {
     PREFERRED
         .iter()
         .position(|needle| file.contains(needle))
-        .unwrap_or(PREFERRED.len() + 1)
+        .map(|pos| pos + 1)
+        .unwrap_or(PREFERRED.len() + 2)
 }
 
 async fn remote_size_label(url: &str) -> Option<String> {

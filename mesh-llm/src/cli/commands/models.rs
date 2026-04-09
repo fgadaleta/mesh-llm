@@ -2,21 +2,45 @@ use crate::cli::models::ModelsCommand;
 use crate::models::{
     capabilities, catalog, download_exact_ref, find_catalog_model_exact, huggingface_hub_cache_dir,
     installed_model_capabilities, scan_installed_models, search_catalog_models, search_huggingface,
-    show_exact_model, SearchProgress,
+    show_exact_model, SearchArtifactFilter, SearchProgress,
 };
 use crate::system::hardware;
 use anyhow::{anyhow, Result};
 use std::io::Write;
 
-pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize) -> Result<()> {
+pub async fn run_model_search(
+    query: &[String],
+    prefer_gguf: bool,
+    prefer_mlx: bool,
+    catalog_only: bool,
+    limit: usize,
+) -> Result<()> {
     let query = query.join(" ");
+    let filter = if prefer_mlx {
+        SearchArtifactFilter::Mlx
+    } else if prefer_gguf {
+        SearchArtifactFilter::Gguf
+    } else {
+        SearchArtifactFilter::Gguf
+    };
+    let filter_label = match filter {
+        SearchArtifactFilter::Gguf => "GGUF",
+        SearchArtifactFilter::Mlx => "MLX",
+    };
+
     if catalog_only {
-        let results = search_catalog_models(&query);
+        let results: Vec<_> = search_catalog_models(&query)
+            .into_iter()
+            .filter(|model| match filter {
+                SearchArtifactFilter::Gguf => !catalog_model_is_mlx(model),
+                SearchArtifactFilter::Mlx => catalog_model_is_mlx(model),
+            })
+            .collect();
         if results.is_empty() {
-            eprintln!("🔎 No catalog models matched '{query}'.");
+            eprintln!("🔎 No {filter_label} catalog models matched '{query}'.");
             return Ok(());
         }
-        println!("📚 Catalog matches for '{query}'");
+        println!("📚 {filter_label} catalog matches for '{query}'");
         if let Some(summary) = local_capacity_summary() {
             println!("{}", summary);
         }
@@ -31,9 +55,9 @@ pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize
         return Ok(());
     }
 
-    eprintln!("🔎 Searching Hugging Face GGUF repos for '{query}'...");
+    eprintln!("🔎 Searching Hugging Face {filter_label} repos for '{query}'...");
     let mut announced_repo_scan = false;
-    let results = search_huggingface(&query, limit, |progress| match progress {
+    let results = search_huggingface(&query, limit, filter, |progress| match progress {
         SearchProgress::SearchingHub => {}
         SearchProgress::InspectingRepos { completed, total } => {
             if total == 0 {
@@ -55,18 +79,18 @@ pub async fn run_model_search(query: &[String], catalog_only: bool, limit: usize
     })
     .await?;
     if results.is_empty() {
-        eprintln!("🔎 No Hugging Face GGUF matches for '{query}'.");
+        eprintln!("🔎 No Hugging Face {filter_label} matches for '{query}'.");
         return Ok(());
     }
 
-    println!("🔎 Hugging Face GGUF matches for '{query}'");
+    println!("🔎 Hugging Face {filter_label} matches for '{query}'");
     if let Some(summary) = local_capacity_summary() {
         println!("{}", summary);
     }
     println!();
     for (index, result) in results.iter().enumerate() {
-        println!("{}. 📦 {}", index + 1, result.file);
-        println!("   repo: {}", result.repo_id);
+        println!("{}. 📦 {}", index + 1, result.repo_id);
+        println!("   type: {}", result.kind);
         let mut stats = Vec::new();
         if let Some(size) = &result.size_label {
             stats.push(format!("📏 {}", size));
@@ -193,6 +217,7 @@ pub async fn run_model_show(model_ref: &str) -> Result<()> {
     }
     println!();
     println!("Ref: {}", details.exact_ref);
+    println!("Type: {}", details.kind);
     println!("Source: {}", format_source_label(details.source));
     if let Some(size) = details.size_label {
         println!("Size: {size}");
@@ -239,15 +264,19 @@ pub async fn run_model_show(model_ref: &str) -> Result<()> {
 }
 
 pub async fn run_model_download(model_ref: &str, include_draft: bool) -> Result<()> {
+    let details = show_exact_model(model_ref).await.ok();
     let path = download_exact_ref(model_ref).await?;
     println!("✅ Downloaded model");
+    if let Some(details) = &details {
+        println!("   type: {}", details.kind);
+    }
     println!("   {}", path.display());
 
     if !include_draft {
         return Ok(());
     }
 
-    let Some(details) = show_exact_model(model_ref).await.ok() else {
+    let Some(details) = details else {
         return Ok(());
     };
     let Some(draft) = details.draft else {
@@ -327,9 +356,11 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
         ModelsCommand::Installed => run_model_installed(),
         ModelsCommand::Search {
             query,
+            gguf,
+            mlx,
             catalog,
             limit,
-        } => run_model_search(query, *catalog, *limit).await?,
+        } => run_model_search(query, *gguf, *mlx, *catalog, *limit).await?,
         ModelsCommand::Show { model } => run_model_show(model).await?,
         ModelsCommand::Download { model, draft } => run_model_download(model, *draft).await?,
         ModelsCommand::Updates { repo, all, check } => {
@@ -337,4 +368,14 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn catalog_model_is_mlx(model: &catalog::CatalogModel) -> bool {
+    model
+        .source_file()
+        .map(|file| {
+            file.ends_with("model.safetensors") || file.ends_with("model.safetensors.index.json")
+        })
+        .unwrap_or(false)
+        || model.url.contains("model.safetensors")
 }

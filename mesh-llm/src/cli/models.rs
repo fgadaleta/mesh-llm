@@ -9,11 +9,17 @@ pub enum ModelsCommand {
     /// List built-in catalog models.
     #[command(hide = true)]
     List,
-    /// Search for GGUF models in the catalog or on Hugging Face.
+    /// Search for catalog models and downloadable GGUF/MLX artifacts on Hugging Face.
     Search {
         /// Search terms.
         #[arg(required = true)]
         query: Vec<String>,
+        /// Filter search results to GGUF artifacts (default).
+        #[arg(long, conflicts_with = "mlx")]
+        gguf: bool,
+        /// Filter search results to MLX artifacts.
+        #[arg(long, conflicts_with = "gguf")]
+        mlx: bool,
         /// Search only the built-in catalog.
         #[arg(long)]
         catalog: bool,

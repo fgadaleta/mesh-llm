@@ -23,7 +23,7 @@ pub use resolve::{
     download_exact_ref, find_catalog_model_exact, installed_model_capabilities,
     installed_model_display_name, resolve_model_spec, show_exact_model,
 };
-pub use search::{search_catalog_models, search_huggingface, SearchProgress};
+pub use search::{search_catalog_models, search_huggingface, SearchArtifactFilter, SearchProgress};
 pub use topology::{infer_local_model_topology, ModelMoeInfo, ModelTopology};
 
 fn build_hf_api(progress: bool) -> Result<Api> {
