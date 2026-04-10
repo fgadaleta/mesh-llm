@@ -60,14 +60,8 @@ release-build-cuda-windows cuda_arch="75;80;86;89;90;120":
 release-build-rocm rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201":
     @scripts/build-linux-rocm.sh "{{ rocm_arch }}"
 
-release-build-amd rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201":
-    @just release-build-rocm "{{ rocm_arch }}"
-
 release-build-rocm-windows rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201":
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend rocm -RocmArch "{{rocm_arch}}"
-
-release-build-amd-windows rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201":
-    @just release-build-rocm-windows "{{ rocm_arch }}"
 
 # Build a Linux Vulkan release artifact.
 release-build-vulkan:
@@ -249,14 +243,8 @@ release-bundle-cuda-windows version output="dist":
 release-bundle-rocm version output="dist":
     MESH_RELEASE_FLAVOR=rocm scripts/package-release.sh "{{ version }}" "{{ output }}"
 
-release-bundle-amd version output="dist":
-    @just release-bundle-rocm "{{ version }}" "{{ output }}"
-
 release-bundle-rocm-windows version output="dist":
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}" -Flavor rocm
-
-release-bundle-amd-windows version output="dist":
-    @just release-bundle-rocm-windows "{{ version }}" "{{ output }}"
 
 # Create Linux Vulkan release archive(s).
 release-bundle-vulkan version output="dist":

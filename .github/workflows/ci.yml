@@ -156,7 +156,7 @@ jobs:
           cp target/debug/mesh-llm ci-artifacts/linux-binaries/
           cp llama.cpp/build/bin/rpc-server ci-artifacts/linux-binaries/
           cp llama.cpp/build/bin/llama-server ci-artifacts/linux-binaries/
-          cp llama.cpp/build/bin/llama-moe-split ci-artifacts/linux-binaries/ 2>/dev/null || true
+          cp llama.cpp/build/bin/llama-moe-split ci-artifacts/linux-binaries/
           tar -czf ci-artifacts/linux-binaries.tgz -C ci-artifacts linux-binaries
 
       - name: Upload Linux binaries
@@ -659,7 +659,7 @@ jobs:
         env:
           MESH_LLM_LLAMA_PIN_SHA: ${{ steps.llama_sha.outputs.sha }}
         run: |
-          just --shell bash --shell-arg -lc release-build-amd gfx1100
+          just --shell bash --shell-arg -lc release-build-rocm gfx1100
 
       - name: Build mesh-llm binary only (cache hit — llama.cpp skipped)
         if: steps.llama_rocm_cache.outputs.cache-hit == 'true'

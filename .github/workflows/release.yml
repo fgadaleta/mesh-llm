@@ -315,8 +315,8 @@ jobs:
   #           artifact_name: release-windows-cuda
   #         - name: ROCm
   #           backend: rocm
-  #           build_recipe: release-build-amd-windows
-  #           bundle_recipe: release-bundle-amd-windows
+  #           build_recipe: release-build-rocm-windows
+  #           bundle_recipe: release-bundle-rocm-windows
   #           artifact_name: release-windows-rocm
   #         - name: Vulkan
   #           backend: vulkan
