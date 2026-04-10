@@ -244,9 +244,18 @@ jobs:
           cp target/debug/mesh-llm ci-artifacts/macos-binaries/
           cp llama.cpp/build/bin/rpc-server ci-artifacts/macos-binaries/
           cp llama.cpp/build/bin/llama-server ci-artifacts/macos-binaries/
-          cp llama.cpp/build/bin/llama-moe-split ci-artifacts/macos-binaries/ 2>/dev/null || true
-          cp llama.cpp/build/bin/*.dylib ci-artifacts/macos-binaries/ 2>/dev/null || true
+          if [[ ! -f llama.cpp/build/bin/llama-moe-split ]]; then
+            echo "Expected macOS artifact missing: llama.cpp/build/bin/llama-moe-split" >&2
+            exit 1
+          fi
+          cp llama.cpp/build/bin/llama-moe-split ci-artifacts/macos-binaries/
           shopt -s nullglob
+          dylibs=(llama.cpp/build/bin/*.dylib)
+          if [ "${#dylibs[@]}" -eq 0 ]; then
+            echo "Expected macOS artifacts missing: no .dylib files found in llama.cpp/build/bin/" >&2
+            exit 1
+          fi
+          cp "${dylibs[@]}" ci-artifacts/macos-binaries/
           metallibs=(
             target/debug/build/mlx-sys-*/out/build/lib/mlx.metallib
             target/release/build/mlx-sys-*/out/build/lib/mlx.metallib
