@@ -89,7 +89,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v6
         with:
-          name: release-linux-inference-binaries
+          name: ci-linux-inference-binaries
           path: ci-artifacts/linux-binaries.tgz
           if-no-files-found: error
 
@@ -410,7 +410,7 @@ jobs:
       - name: Download Linux inference binaries
         uses: actions/download-artifact@v7
         with:
-          name: release-linux-inference-binaries
+          name: ci-linux-inference-binaries
           path: ci-artifacts
 
       - name: Extract Linux inference binaries
