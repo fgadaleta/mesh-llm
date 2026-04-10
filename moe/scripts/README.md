@@ -43,6 +43,8 @@ uv run moe/scripts/analyze_and_publish.py \
 Notes:
 
 - `micro-v1` runs one `llama-moe-analyze` pass per prompt and combines the resulting CSVs.
+- The built-in analyzer ids do not accept `--prompt-file`.
+- `micro-v1` is bound to the built-in canonical prompt set.
 - `full-v1` runs a single `llama-moe-analyze` pass.
 - The script forces CPU execution with `-ngl 0`.
 - `--analyzer-source local` uses a locally built `llama-moe-analyze`.

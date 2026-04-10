@@ -127,7 +127,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt-file",
-        help="Optional UTF-8 text file with one prompt per line for micro-v1.",
+        help="Reserved for future non-canonical analyzer ids. Not supported by the built-in analyzer ids.",
     )
     parser.add_argument(
         "--download-dir",
@@ -179,7 +179,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip analysis if the local artifact directory already has metadata.json and ranking.csv.",
+        help="Reuse an existing local artifact if metadata.json and ranking.csv are already present.",
     )
     parser.add_argument(
         "--dry-run",
@@ -191,6 +191,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--analyzer-bin is required when --analyzer-source=local")
     if args.analyzer_source == "release" and args.analyzer_bin:
         parser.error("--analyzer-bin cannot be combined with --analyzer-source=release")
+    if args.prompt_file:
+        parser.error(
+            "--prompt-file is not supported by the built-in analyzer ids; add a new analyzer id for a custom prompt set"
+        )
     return args
 
 
@@ -354,7 +358,6 @@ def download_distribution(
                 filename=repo_file,
                 revision=distribution.source_revision,
                 local_dir=str(download_dir),
-                local_dir_use_symlinks=False,
             )
         )
         local_files.append(local_path)
@@ -424,16 +427,45 @@ def build_command(
 
 def read_ranking_rows(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as handle:
-        reader = csv.DictReader(handle)
-        rows = list(reader)
+        rows = [
+            row
+            for row in csv.reader(handle)
+            if row and row[0].strip() and not row[0].lstrip().startswith("#")
+        ]
+
     if not rows:
         raise SystemExit(f"Ranking output was empty: {path}")
+
+    first = [cell.strip() for cell in rows[0]]
+    if first and first[0] == "expert_id":
+        header = first
+        data_rows = rows[1:]
+    else:
+        header = ["expert_id", "gate_mass", "mass_pct", "selection_count"]
+        data_rows = rows
+
+    normalized: list[dict[str, str]] = []
+    for row in data_rows:
+        values = [cell.strip() for cell in row]
+        if len(values) < len(header):
+            raise SystemExit(f"Ranking CSV row had too few columns in {path}: {row}")
+        raw = dict(zip(header, values, strict=False))
+        normalized.append(
+            {
+                "expert_id": raw["expert_id"],
+                "total_mass": raw.get("total_mass", raw.get("gate_mass", "")),
+                "mass_fraction": raw.get("mass_fraction", raw.get("mass_pct", "")),
+                "selection_count": raw["selection_count"],
+            }
+        )
+
     required = {"expert_id", "total_mass", "mass_fraction", "selection_count"}
-    if set(reader.fieldnames or []) != required:
-        missing = required.difference(reader.fieldnames or [])
+    for row in normalized:
+        missing = [key for key in required if not row.get(key)]
         if missing:
-            raise SystemExit(f"Ranking CSV missing expected columns {sorted(missing)}: {path}")
-    return rows
+            raise SystemExit(f"Ranking CSV missing expected columns {missing} in {path}")
+
+    return normalized
 
 
 def combine_rankings(per_prompt_paths: Iterable[Path], output_path: Path) -> None:
@@ -562,7 +594,7 @@ def write_metadata(
             for repo_file, local_path in zip(distribution.files, local_files, strict=True)
         },
         "llama_cpp_commit": os.environ.get("LLAMA_CPP_COMMIT"),
-        "prompt_set": "default-micro-v1" if args.analyzer_id == "micro-v1" and not args.prompt_file else None,
+        "prompt_set": "meshllm-micro-v1" if args.analyzer_id == "micro-v1" else None,
         "prompt_file": args.prompt_file,
         "prompt_count": len(load_prompts(args.prompt_file)) if args.analyzer_id == "micro-v1" else None,
         "token_count": args.token_count if args.analyzer_id == "micro-v1" else 32,
@@ -631,6 +663,10 @@ def remote_artifact_exists(
     return any(path.startswith(prefix) for path in repo_files)
 
 
+def local_artifact_exists(artifact_dir: Path) -> bool:
+    return (artifact_dir / "metadata.json").exists() and (artifact_dir / "ranking.csv").exists()
+
+
 def main() -> int:
     require_hf_dependencies()
     args = parse_args()
@@ -684,16 +720,15 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    if args.skip_existing:
-        existing_metadata = artifact_dir / "metadata.json"
-        existing_ranking = artifact_dir / "ranking.csv"
-        if existing_metadata.exists() and existing_ranking.exists():
-            print(f"Skipping existing artifact: {artifact_dir}")
-            return 0
+    if args.skip_existing and local_artifact_exists(artifact_dir):
+        print(f"Reusing existing local artifact: {artifact_dir}")
+        metadata_path = artifact_dir / "metadata.json"
+        ranking_path = artifact_dir / "ranking.csv"
+    else:
+        local_files = download_distribution(distribution, args.download_dir)
+        ranking_path, _ = run_analysis(analyzer, args, distribution, local_files, artifact_dir)
+        metadata_path = write_metadata(analyzer, args, distribution, local_files, artifact_dir, ranking_path)
 
-    local_files = download_distribution(distribution, args.download_dir)
-    ranking_path, _ = run_analysis(analyzer, args, distribution, local_files, artifact_dir)
-    metadata_path = write_metadata(analyzer, args, distribution, local_files, artifact_dir, ranking_path)
     upload_artifacts(api, args, distribution, artifact_dir)
 
     print(f"Wrote metadata: {metadata_path}")
