@@ -381,7 +381,7 @@ jobs:
   linux_cuda:
     needs: changes
     if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' }}
-    name: Linux CUDA
+    name: Linux CUDA slim
     runs-on: ubuntu-latest
     container:
       image: nvidia/cuda:12.8.0-devel-ubuntu22.04
@@ -578,7 +578,7 @@ jobs:
   linux_rocm:
     needs: changes
     if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' }}
-    name: Linux ROCm
+    name: Linux ROCm slim
     runs-on: ubuntu-latest
     container:
       image: rocm/dev-ubuntu-24.04:7.0-complete
