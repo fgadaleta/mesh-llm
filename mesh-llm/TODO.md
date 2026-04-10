@@ -16,7 +16,7 @@ Design: [NODE_OWNER_IDENTITY.md](docs/NODE_OWNER_IDENTITY.md)
 
 - [x] Add non-breaking owner attestation for node identities.
 - [x] Surface verified owner state in gossip, `/api/status`, and the console.
-- [ ] Add optional trust policy and owner allowlists for private meshes.
+- [x] Add optional trust policy and owner allowlists for private meshes.
 
 ## Multi-Model Per Host
 

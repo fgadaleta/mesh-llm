@@ -39,9 +39,6 @@ pub(crate) enum TrustCommand {
 pub(crate) enum AuthCommand {
     /// Generate a new owner keypair and save to keystore.
     Init {
-        /// Path to the keystore file (default: ~/.mesh-llm/owner-keystore.json).
-        #[arg(long)]
-        owner_key: Option<PathBuf>,
         /// Overwrite an existing keystore.
         #[arg(long)]
         force: bool,
@@ -57,9 +54,6 @@ pub(crate) enum AuthCommand {
     },
     /// Show current owner identity status.
     Status {
-        /// Path to the keystore file.
-        #[arg(long)]
-        owner_key: Option<PathBuf>,
         /// Path to the node identity file (default: ~/.mesh-llm/key).
         #[arg(long)]
         node_key: Option<PathBuf>,
@@ -72,18 +66,12 @@ pub(crate) enum AuthCommand {
     },
     /// Sign the current node identity with the existing owner keystore.
     SignNode {
-        /// Path to the keystore file.
-        #[arg(long)]
-        owner_key: Option<PathBuf>,
         /// Path to the node identity file (default: ~/.mesh-llm/key).
         #[arg(long)]
         node_key: Option<PathBuf>,
         /// Output path for the signed node certificate.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Optional label attached to the signed node certificate.
-        #[arg(long)]
-        node_label: Option<String>,
         /// Optional hostname hint attached to the certificate.
         #[arg(long)]
         hostname_hint: Option<String>,
@@ -93,18 +81,12 @@ pub(crate) enum AuthCommand {
     },
     /// Renew the local node ownership certificate in place.
     RenewNode {
-        /// Path to the keystore file.
-        #[arg(long)]
-        owner_key: Option<PathBuf>,
         /// Path to the node identity file (default: ~/.mesh-llm/key).
         #[arg(long)]
         node_key: Option<PathBuf>,
         /// Output path for the signed node certificate.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Optional label attached to the signed node certificate.
-        #[arg(long)]
-        node_label: Option<String>,
         /// Optional hostname hint attached to the certificate.
         #[arg(long)]
         hostname_hint: Option<String>,
@@ -129,18 +111,12 @@ pub(crate) enum AuthCommand {
     },
     /// Rotate the local node identity key.
     RotateNode {
-        /// Path to the keystore file used to immediately sign the new node key.
-        #[arg(long)]
-        owner_key: Option<PathBuf>,
         /// Path to the node identity file (default: ~/.mesh-llm/key).
         #[arg(long)]
         node_key: Option<PathBuf>,
         /// Output path for the signed node certificate.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Optional label attached to the signed node certificate.
-        #[arg(long)]
-        node_label: Option<String>,
         /// Optional hostname hint attached to the certificate.
         #[arg(long)]
         hostname_hint: Option<String>,
@@ -185,9 +161,6 @@ pub(crate) enum AuthCommand {
     },
     /// Rotate the existing owner keystore identity.
     RotateOwner {
-        /// Path to the keystore file.
-        #[arg(long)]
-        owner_key: Option<PathBuf>,
         /// Skip passphrase prompt (store keys unencrypted).
         #[arg(long)]
         no_passphrase: bool,

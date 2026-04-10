@@ -4030,25 +4030,36 @@ impl Node {
 
         let mut rev_rx = self.config_revision_tx.subscribe();
         loop {
-            if rev_rx.changed().await.is_err() {
-                break;
-            }
-            let notification = {
-                let state = self.config_state.lock().await;
-                let proto_cfg = mesh_config_to_proto(state.config());
-                ConfigUpdateNotification {
-                    gen: NODE_PROTOCOL_GENERATION,
-                    node_id: self.endpoint.id().as_bytes().to_vec(),
-                    revision: state.revision(),
-                    config_hash: state.config_hash().to_vec(),
-                    config: Some(proto_cfg),
+            tokio::select! {
+                changed = rev_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let notification = {
+                        let state = self.config_state.lock().await;
+                        let proto_cfg = mesh_config_to_proto(state.config());
+                        ConfigUpdateNotification {
+                            gen: NODE_PROTOCOL_GENERATION,
+                            node_id: self.endpoint.id().as_bytes().to_vec(),
+                            revision: state.revision(),
+                            config_hash: state.config_hash().to_vec(),
+                            config: Some(proto_cfg),
+                        }
+                    };
+                    if write_len_prefixed(&mut send, &notification.encode_to_vec()).await.is_err() {
+                        break;
+                    }
                 }
-            };
-            if write_len_prefixed(&mut send, &notification.encode_to_vec())
-                .await
-                .is_err()
-            {
-                break;
+                inbound = read_len_prefixed(&mut recv) => {
+                    match inbound {
+                        Ok(_) => tracing::debug!(
+                            "config subscribe from {} sent unexpected extra frame; closing stream",
+                            remote.fmt_short()
+                        ),
+                        Err(_) => {}
+                    }
+                    break;
+                }
             }
         }
 

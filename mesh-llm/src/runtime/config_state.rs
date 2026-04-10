@@ -179,7 +179,6 @@ impl ConfigState {
         if let Err(e) = atomic_write(&sidecar, new_revision.to_string().as_bytes()) {
             self.config = new_config;
             self.config_hash = new_hash;
-            self.last_write_hash = new_hash;
             self.revision = new_revision;
             return ApplyResult::PersistedWithRevisionTrackingError {
                 revision: self.revision,
