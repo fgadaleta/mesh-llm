@@ -247,7 +247,10 @@ jobs:
           cp llama.cpp/build/bin/llama-moe-split ci-artifacts/macos-binaries/ 2>/dev/null || true
           cp llama.cpp/build/bin/*.dylib ci-artifacts/macos-binaries/ 2>/dev/null || true
           shopt -s nullglob
-          metallibs=(target/release/build/mlx-sys-*/out/build/lib/mlx.metallib)
+          metallibs=(
+            target/debug/build/mlx-sys-*/out/build/lib/mlx.metallib
+            target/release/build/mlx-sys-*/out/build/lib/mlx.metallib
+          )
           if [ "${#metallibs[@]}" -gt 0 ]; then
             cp "${metallibs[0]}" ci-artifacts/macos-binaries/mlx.metallib
           fi
