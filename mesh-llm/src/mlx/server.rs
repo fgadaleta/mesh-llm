@@ -66,7 +66,11 @@ fn collapse_alpha_outline_marker_line(line: &str) -> String {
     for bullet in ["- ", "* "] {
         if let Some(rest) = trimmed.strip_prefix(bullet) {
             let bytes = rest.as_bytes();
-            if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b'.' && bytes[2] == b' ' {
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b'.'
+                && bytes[2] == b' '
+            {
                 return format!("{indent}{bullet}{}", &rest[3..]);
             }
         }
@@ -118,7 +122,17 @@ fn has_behavior_repetition_issue(text: &str) -> bool {
     }
 
     let tokens = tokenize_behavior_words(normalized);
-    if repeated_ngram(tokens.iter().map(String::as_str).collect::<Vec<_>>().as_slice(), 6, 3).is_some() {
+    if repeated_ngram(
+        tokens
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        6,
+        3,
+    )
+    .is_some()
+    {
         return true;
     }
 
@@ -153,7 +167,10 @@ fn split_behavior_sentences(text: &str) -> Vec<String> {
     while index < chars.len() {
         let (byte_idx, ch) = chars[index];
         let is_sentence_break = matches!(ch, '.' | '!' | '?')
-            && chars.get(index + 1).map(|(_, c)| c.is_whitespace()).unwrap_or(true);
+            && chars
+                .get(index + 1)
+                .map(|(_, c)| c.is_whitespace())
+                .unwrap_or(true);
         let is_line_break = ch == '\n';
         if is_sentence_break || is_line_break {
             let end = if is_line_break {
@@ -183,7 +200,9 @@ fn split_behavior_sentences(text: &str) -> Vec<String> {
 }
 
 fn tokenize_behavior_words(text: &str) -> Vec<String> {
-    text.split_whitespace().map(|token| token.to_lowercase()).collect()
+    text.split_whitespace()
+        .map(|token| token.to_lowercase())
+        .collect()
 }
 
 fn repeated_ngram(tokens: &[&str], size: usize, threshold: usize) -> Option<String> {
@@ -563,7 +582,12 @@ async fn handle_chat_completions(
         let reasoning_template = state.model.prompt_template.reasoning_template();
         let prompt_req = prepare_reasoning_request(
             &req,
-            state.model.prompt_template.behavior().prompt_template.as_deref(),
+            state
+                .model
+                .prompt_template
+                .behavior()
+                .prompt_template
+                .as_deref(),
             state.model.reasoning_family,
             &reasoning_template,
             &generation.response_policy,
@@ -597,8 +621,8 @@ fn prepare_reasoning_request(
     let needs_olmo2_brevity_nudge = matches!(prompt_template, Some("olmo2"));
     if !needs_olmo2_brevity_nudge
         && (!policy.strip_reasoning_blocks
-        || (reasoning_family == model::ReasoningFamily::None
-            && !reasoning_template.supports_explicit_reasoning))
+            || (reasoning_family == model::ReasoningFamily::None
+                && !reasoning_template.supports_explicit_reasoning))
     {
         return req.clone();
     }
@@ -1261,8 +1285,12 @@ fn parse_generation_config(req: &serde_json::Value, model: &MlxModel) -> Generat
     stop_sequences.sort();
     stop_sequences.dedup();
     let requested_max_tokens = req["max_tokens"].as_u64().unwrap_or(2048) as usize;
-    let message_count = req["messages"].as_array().map(|messages| messages.len()).unwrap_or(0);
-    let max_tokens = if model.prompt_template.behavior().prompt_template.as_deref() == Some("olmo2") {
+    let message_count = req["messages"]
+        .as_array()
+        .map(|messages| messages.len())
+        .unwrap_or(0);
+    let max_tokens = if model.prompt_template.behavior().prompt_template.as_deref() == Some("olmo2")
+    {
         if message_count >= 4 {
             requested_max_tokens.min(48)
         } else {

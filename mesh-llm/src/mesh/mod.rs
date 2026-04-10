@@ -2081,28 +2081,29 @@ impl Node {
             .find(|descriptor| descriptor.identity.model_name == model_name)
             .and_then(|descriptor| descriptor.identity.identity_hash.clone());
         let mut runtimes = self.model_runtime_descriptors.lock().await;
-        if let Some(context_length) = context_length {
-            if let Some(runtime) = runtimes
-                .iter_mut()
-                .find(|runtime| runtime.model_name == model_name)
-            {
-                runtime.identity_hash = identity_hash.or_else(|| runtime.identity_hash.clone());
-                runtime.context_length = Some(context_length);
-                runtime.backend = backend
-                    .map(str::to_string)
-                    .or_else(|| runtime.backend.clone());
-                runtime.ready = true;
-            } else {
-                runtimes.push(ModelRuntimeDescriptor {
-                    model_name: model_name.to_string(),
-                    identity_hash,
-                    context_length: Some(context_length),
-                    backend: backend.map(str::to_string),
-                    ready: true,
-                });
-            }
-        } else {
+        if context_length.is_none() {
             runtimes.retain(|runtime| runtime.model_name != model_name);
+            return;
+        }
+
+        if let Some(runtime) = runtimes
+            .iter_mut()
+            .find(|runtime| runtime.model_name == model_name)
+        {
+            runtime.identity_hash = identity_hash.or_else(|| runtime.identity_hash.clone());
+            runtime.context_length = context_length;
+            runtime.backend = backend
+                .map(str::to_string)
+                .or_else(|| runtime.backend.clone());
+            runtime.ready = true;
+        } else {
+            runtimes.push(ModelRuntimeDescriptor {
+                model_name: model_name.to_string(),
+                identity_hash,
+                context_length,
+                backend: backend.map(str::to_string),
+                ready: true,
+            });
         }
     }
 

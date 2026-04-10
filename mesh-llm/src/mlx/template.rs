@@ -190,9 +190,7 @@ impl PromptTemplate {
             PromptTemplate::ChatMl { .. }
             | PromptTemplate::Olmo2
             | PromptTemplate::Gemma3
-            | PromptTemplate::Llama3 => {
-                ReasoningTemplate::default()
-            }
+            | PromptTemplate::Llama3 => ReasoningTemplate::default(),
         }
     }
 }
@@ -224,7 +222,8 @@ fn heuristic_prompt_template(config: &Value) -> PromptTemplate {
             default_system_prompt: Some("You are a helpful assistant.".to_string()),
         };
     }
-    if model_type.starts_with("olmo2") || architectures.iter().any(|value| value.contains("olmo2")) {
+    if model_type.starts_with("olmo2") || architectures.iter().any(|value| value.contains("olmo2"))
+    {
         return PromptTemplate::Olmo2;
     }
     if model_type.starts_with("gemma") || architectures.iter().any(|value| value.contains("gemma"))
