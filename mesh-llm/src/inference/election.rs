@@ -585,27 +585,41 @@ fn resolve_runtime_moe_config(
     let started = std::time::Instant::now();
     let (ranking, ranking_source, ranking_origin) = match options.ranking_strategy {
         moe::MoeRankingStrategy::Auto => {
-            if let Some(artifact) = moe::best_shared_ranking_artifact(model_path) {
-                let cached = moe::shared_ranking_cache_path(model_path, &artifact);
+            if let Some(resolved) = crate::system::moe_planner::resolve_runtime_ranking(
+                model_path,
+                crate::system::moe_planner::DEFAULT_MOE_RANKINGS_DATASET,
+            )? {
                 eprintln!(
-                    "🧩 [{model_name}] Using cached MoE ranking mode={} origin={} cache={}",
-                    artifact.kind.label(),
-                    artifact.origin.label(),
-                    cached.display()
+                    "🧩 [{model_name}] Using {} MoE ranking mode={} path={}",
+                    resolved.source.label(),
+                    resolved.analyzer_id,
+                    resolved.path.display()
                 );
                 (
-                    artifact.ranking,
-                    artifact.kind.label().to_string(),
-                    artifact.origin.label().to_string(),
+                    moe::load_cached_ranking(&resolved.path).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Failed to load resolved ranking {}",
+                            resolved.path.display()
+                        )
+                    })?,
+                    resolved.analyzer_id,
+                    resolved.source.label().to_string(),
                 )
             } else {
                 if should_attempt_local_micro_analyze(model_path, model_name, local_vram_budget) {
                     match ensure_micro_analyze_ranking(bin_dir, model_name, model_path, options) {
-                        Ok(artifact) => (
-                            artifact.ranking,
-                            artifact.kind.label().to_string(),
-                            artifact.origin.label().to_string(),
-                        ),
+                        Ok(artifact) => {
+                            print_runtime_submit_suggestion(
+                                model_name,
+                                model_path,
+                                &moe::shared_ranking_cache_path(model_path, &artifact),
+                            );
+                            (
+                                artifact.ranking,
+                                artifact.kind.label().to_string(),
+                                artifact.origin.label().to_string(),
+                            )
+                        }
                         Err(err) => {
                             eprintln!(
                                 "⚠ [{model_name}] micro-analyze failed ({err}); falling back to sequential expert order"
@@ -672,25 +686,53 @@ fn refresh_auto_moe_config_from_cache(
     if !matches!(cfg.ranking_strategy, moe::MoeRankingStrategy::Auto) {
         return false;
     }
-    let Some(artifact) = moe::best_shared_ranking_artifact(model_path) else {
+    let Some(resolved) = crate::system::moe_planner::resolve_runtime_ranking(
+        model_path,
+        crate::system::moe_planner::DEFAULT_MOE_RANKINGS_DATASET,
+    )
+    .ok()
+    .flatten() else {
         return false;
     };
-    if cfg.config.ranking == artifact.ranking
-        && cfg.ranking_source == artifact.kind.label()
-        && cfg.ranking_origin == artifact.origin.label()
+    let Some(ranking) = moe::load_cached_ranking(&resolved.path) else {
+        return false;
+    };
+    if cfg.config.ranking == ranking
+        && cfg.ranking_source == resolved.analyzer_id
+        && cfg.ranking_origin == resolved.source.label()
     {
         return false;
     }
 
     eprintln!(
-        "🧩 [{model_name}] Switching to better cached MoE ranking mode={} origin={}",
-        artifact.kind.label(),
-        artifact.origin.label()
+        "🧩 [{model_name}] Switching to better {} MoE ranking mode={}",
+        resolved.source.label(),
+        resolved.analyzer_id
     );
-    cfg.config.ranking = artifact.ranking;
-    cfg.ranking_source = artifact.kind.label().to_string();
-    cfg.ranking_origin = artifact.origin.label().to_string();
+    cfg.config.ranking = ranking;
+    cfg.ranking_source = resolved.analyzer_id;
+    cfg.ranking_origin = resolved.source.label().to_string();
     true
+}
+
+fn print_runtime_submit_suggestion(model_name: &str, model_path: &Path, ranking_path: &Path) {
+    let Some(identity) = crate::models::huggingface_identity_for_path(model_path) else {
+        return;
+    };
+    eprintln!("🧠 [{model_name}] Generated a local MoE ranking");
+    eprintln!(
+        "📍 [{model_name}] Ranking cache: {}",
+        ranking_path.display()
+    );
+    eprintln!(
+        "☁️  [{model_name}] Published source: {}",
+        crate::system::moe_planner::DEFAULT_MOE_RANKINGS_DATASET
+    );
+    eprintln!("⚠️  [{model_name}] This run did not use a published ranking.");
+    eprintln!(
+        "📤 [{model_name}] Contribute it with: mesh-llm moe submit '{}'",
+        identity.canonical_ref
+    );
 }
 
 fn resolve_analyze_binary(bin_dir: &Path) -> anyhow::Result<std::path::PathBuf> {
@@ -993,6 +1035,7 @@ fn ensure_full_analyze_ranking(
         started.elapsed().as_secs_f64(),
         artifact.origin.label()
     );
+    print_runtime_submit_suggestion(model_name, model_path, cached_path);
     Ok(artifact)
 }
 
@@ -1167,6 +1210,16 @@ fn run_micro_analyze_ranking(
         },
         started.elapsed().as_secs_f64()
     );
+    print_runtime_submit_suggestion(
+        model_name,
+        model_path,
+        &moe::micro_ranking_cache_path(
+            model_path,
+            options.micro_prompt_count,
+            options.micro_tokens,
+            options.micro_layer_scope,
+        ),
+    );
     Ok(ranking)
 }
 
@@ -1265,7 +1318,13 @@ pub async fn election_loop(
             if matches!(
                 moe_runtime_options.ranking_strategy,
                 moe::MoeRankingStrategy::Auto
-            ) && moe::best_shared_ranking_artifact(&model).is_none()
+            ) && crate::system::moe_planner::resolve_runtime_ranking(
+                &model,
+                crate::system::moe_planner::DEFAULT_MOE_RANKINGS_DATASET,
+            )
+            .ok()
+            .flatten()
+            .is_none()
             {
                 wait_for_peer_moe_ranking(
                     &model_name,

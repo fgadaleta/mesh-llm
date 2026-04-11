@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::cli::benchmark::BenchmarkCommand;
+use crate::cli::moe::MoeCommand;
 use crate::cli::runtime::RuntimeCommand;
 use crate::crypto::TrustPolicy;
 
@@ -215,6 +216,7 @@ pub(crate) enum GpuCommand {
 pub(crate) mod benchmark;
 pub(crate) mod commands;
 pub mod models;
+pub(crate) mod moe;
 pub(crate) mod runtime;
 
 #[derive(Parser, Debug)]
@@ -419,6 +421,11 @@ pub(crate) enum Command {
         json: bool,
         #[command(subcommand)]
         command: Option<GpuCommand>,
+    },
+    /// Plan, analyze, and contribute MoE expert rankings.
+    Moe {
+        #[command(subcommand)]
+        command: MoeCommand,
     },
     /// Inspect and manage local runtime-served models.
     #[command(hide = true)]

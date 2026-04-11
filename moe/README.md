@@ -9,6 +9,8 @@ This directory contains the MoE ranking work for `mesh-llm`.
   - Defines the optional colocated model-repo sidecar layout for `moe-analyze/` metadata next to GGUF files.
 - [`MOE_PLACEMENT_PLAN.md`](MOE_PLACEMENT_PLAN.md)
   - Defines how deployment-oriented split planning is derived from canonical `moe-analyze` results rather than stored as part of the first artifact.
+- [`MOE_CLI_PLAN.md`](MOE_CLI_PLAN.md)
+  - Defines the planned `mesh-llm moe` command family, ranking resolution rules, UX decisions, and `serve` integration.
 - [`scripts/`](scripts/)
   - Contains the dataset-generation tooling for downloading GGUF distributions, running `llama-moe-analyze`, publishing artifacts, and submitting the same workflow to Hugging Face Jobs.
 
@@ -17,11 +19,14 @@ This directory contains the MoE ranking work for `mesh-llm`.
 - GGUF source models
 - `micro-v1` and `full-v1` analyzer ids
 - Canonical publication to the `meshllm/moe-rankings` Hugging Face dataset
+- `mesh-llm moe plan` console and `--json` output modes
+- `mesh-llm moe submit` opening contribution PRs against `meshllm/moe-rankings`
 
 ## Entry Points
 
 - Read the storage contract in [`MOE_ANALYZE_STORAGE_SPEC.md`](MOE_ANALYZE_STORAGE_SPEC.md).
 - Read the placement-planning note in [`MOE_PLACEMENT_PLAN.md`](MOE_PLACEMENT_PLAN.md).
+- Read the CLI and UX plan in [`MOE_CLI_PLAN.md`](MOE_CLI_PLAN.md).
 - Use [`scripts/analyze_and_publish.py`](scripts/analyze_and_publish.py) to generate and publish canonical dataset artifacts.
 - Use [`scripts/submit_hf_job.py`](scripts/submit_hf_job.py) to run the same workflow on Hugging Face Jobs.
 - See [`scripts/README.md`](scripts/README.md) for usage examples.

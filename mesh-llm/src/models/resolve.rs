@@ -63,9 +63,15 @@ pub fn find_catalog_model_exact(query: &str) -> Option<&'static catalog::Catalog
 }
 
 pub async fn download_exact_ref(input: &str) -> Result<PathBuf> {
+    download_exact_ref_with_progress(input, true).await
+}
+
+pub async fn download_exact_ref_with_progress(input: &str, progress: bool) -> Result<PathBuf> {
     let input = canonicalize_model_ref_input(input).await?;
     match parse_exact_model_ref(&input)? {
-        ExactModelRef::Catalog(model) => catalog::download_model(model).await,
+        ExactModelRef::Catalog(model) => {
+            catalog::download_model_with_progress(model, progress).await
+        }
         ExactModelRef::HuggingFace {
             repo,
             revision,
@@ -75,25 +81,37 @@ pub async fn download_exact_ref(input: &str) -> Result<PathBuf> {
             if let Some(model) =
                 matching_catalog_primary_for_huggingface(&repo, revision.as_deref(), &file)
             {
-                return catalog::download_model(model).await;
+                return catalog::download_model_with_progress(model, progress).await;
             }
-            catalog::download_hf_repo_file(&repo, revision.as_deref(), &file).await
+            catalog::download_hf_repo_file_with_progress(
+                &repo,
+                revision.as_deref(),
+                &file,
+                progress,
+            )
+            .await
         }
         ExactModelRef::Url { url, filename } => {
             if let Some(model) = matching_catalog_primary_for_url(&url) {
-                return catalog::download_model(model).await;
+                return catalog::download_model_with_progress(model, progress).await;
             }
             let dest = catalog::models_dir().join(&filename);
             if existing_download(&dest).await {
                 return Ok(dest);
             }
-            eprintln!("📥 Downloading {}...", dest.display());
+            if progress {
+                eprintln!("📥 Downloading {}...", dest.display());
+            }
             catalog::download_hf_split_gguf(&url, &filename).await
         }
     }
 }
 
 pub async fn resolve_model_spec(input: &Path) -> Result<PathBuf> {
+    resolve_model_spec_with_progress(input, true).await
+}
+
+pub async fn resolve_model_spec_with_progress(input: &Path, progress: bool) -> Result<PathBuf> {
     let raw = input.to_string_lossy();
 
     if input.exists() {
@@ -107,11 +125,11 @@ pub async fn resolve_model_spec(input: &Path) -> Result<PathBuf> {
             return Ok(installed_path);
         }
         if let Some(entry) = catalog::find_model(&raw) {
-            return catalog::download_model(entry).await;
+            return catalog::download_model_with_progress(entry, progress).await;
         }
         if let Ok(canonical) = canonicalize_model_ref_input(&raw).await {
             if canonical != raw {
-                return download_exact_ref(&canonical)
+                return download_exact_ref_with_progress(&canonical, progress)
                     .await
                     .with_context(|| format!("Resolve model spec {raw}"));
             }
@@ -122,7 +140,7 @@ pub async fn resolve_model_spec(input: &Path) -> Result<PathBuf> {
         );
     }
 
-    download_exact_ref(&raw)
+    download_exact_ref_with_progress(&raw, progress)
         .await
         .with_context(|| format!("Resolve model spec {raw}"))
 }
