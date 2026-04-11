@@ -2473,6 +2473,7 @@ mod tests {
             model_ref: PathBuf::from("Qwen3-8B-Q4_K_M"),
             mmproj_ref: None,
             ctx_size: None,
+            backend_hint: StartupBackendHint::Auto,
         }];
 
         assert!(!should_show_serve_config_help(
