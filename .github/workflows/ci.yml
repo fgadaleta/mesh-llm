@@ -159,7 +159,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_OPENSSL=OFF \
             "${CACHE_FLAGS[@]}"
-          cmake --build llama.cpp/build --config Release -j$(nproc) --target rpc-server llama-server llama-moe-split
+          cmake --build llama.cpp/build --config Release -j$(nproc) --target rpc-server llama-server llama-moe-analyze llama-moe-split
 
       - name: CLI smoke test
         run: |
@@ -177,6 +177,7 @@ jobs:
             target/debug/mesh-llm
             llama.cpp/build/bin/rpc-server
             llama.cpp/build/bin/llama-server
+            llama.cpp/build/bin/llama-moe-analyze
             llama.cpp/build/bin/llama-moe-split
           if-no-files-found: error
 
@@ -425,7 +426,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DLLAMA_OPENSSL=OFF \
             "${CACHE_FLAGS[@]}"
-          cmake --build llama.cpp/build --config Release -j$(sysctl -n hw.ncpu) --target rpc-server llama-server llama-moe-split
+          cmake --build llama.cpp/build --config Release -j$(sysctl -n hw.ncpu) --target rpc-server llama-server llama-moe-analyze llama-moe-split
 
       # ── Download model ──
       - name: Cache model
