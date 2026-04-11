@@ -19,7 +19,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::cli::moe::MoeCommand;
+use crate::cli::moe::{MoeAnalyzeCommand, MoeCommand};
 use crate::cli::Cli;
 use crate::inference::moe;
 use crate::models;
@@ -58,21 +58,23 @@ pub(crate) async fn dispatch_moe_command(command: &MoeCommand, cli: &Cli) -> Res
             )
             .await
         }
-        MoeCommand::AnalyzeFull {
-            model,
-            context_size,
-        } => run_analyze_full(model, *context_size).await,
-        MoeCommand::AnalyzeMicro {
-            model,
-            prompt_count,
-            token_count,
-            context_size,
-        } => run_analyze_micro(model, *prompt_count, *token_count, *context_size).await,
-        MoeCommand::Submit {
+        MoeCommand::Analyze { command } => match command {
+            MoeAnalyzeCommand::Full {
+                model,
+                context_size,
+            } => run_analyze_full(model, *context_size).await,
+            MoeAnalyzeCommand::Micro {
+                model,
+                prompt_count,
+                token_count,
+                context_size,
+            } => run_analyze_micro(model, *prompt_count, *token_count, *context_size).await,
+        },
+        MoeCommand::Share {
             model,
             ranking_file,
             dataset_repo,
-        } => run_submit(model, ranking_file.as_deref(), dataset_repo).await,
+        } => run_share(model, ranking_file.as_deref(), dataset_repo).await,
     }
 }
 
@@ -137,6 +139,7 @@ async fn run_analyze_full(model: &str, context_size: u32) -> Result<()> {
     println!("✅ Full MoE analysis complete");
     println!("  Ranking: {}", output_path.display());
     println!("  Log: {}", log_path.display());
+    print_submit_suggestion(&resolved.path);
     Ok(())
 }
 
@@ -256,11 +259,20 @@ async fn run_analyze_micro(
     println!("✅ Micro MoE analysis complete");
     println!("  Ranking: {}", cache_path.display());
     println!("  Log: {}", log_path.display());
+    print_submit_suggestion(&resolved.path);
     Ok(())
 }
 
-async fn run_submit(model: &str, ranking_file: Option<&Path>, dataset_repo: &str) -> Result<()> {
-    let submit_error = |title: &str, detail: &str| -> anyhow::Error {
+fn print_submit_suggestion(model_path: &Path) {
+    let Some(identity) = models::huggingface_identity_for_path(model_path) else {
+        return;
+    };
+    println!("📤 Contribute this ranking to mesh-llm so other users can reuse it:");
+    println!("  mesh-llm moe share '{}'", identity.canonical_ref);
+}
+
+async fn run_share(model: &str, ranking_file: Option<&Path>, dataset_repo: &str) -> Result<()> {
+    let share_error = |title: &str, detail: &str| -> anyhow::Error {
         eprintln!("❌ {title}");
         eprintln!("   {detail}");
         anyhow::anyhow!("{title}: {detail}")
@@ -270,7 +282,7 @@ async fn run_submit(model: &str, ranking_file: Option<&Path>, dataset_repo: &str
     let ranking = moe_planner::local_submit_ranking(&resolved, ranking_file)?;
     let log_path = log_path_for(&resolved.path, &ranking.analyzer_id);
     let bundle = moe_planner::build_submit_bundle(&resolved, &ranking, Some(log_path.as_path()))?;
-    let api = models::build_hf_api(false).context("Build Hugging Face client for MoE submit")?;
+    let api = models::build_hf_api(false).context("Build Hugging Face client for MoE share")?;
     let dataset = api.repo(hf_hub::Repo::with_revision(
         dataset_repo.to_string(),
         hf_hub::RepoType::Dataset,
@@ -286,7 +298,7 @@ async fn run_submit(model: &str, ranking_file: Option<&Path>, dataset_repo: &str
         .cloned()
         .collect::<Vec<_>>();
 
-    println!("📤 MoE ranking submit");
+    println!("📤 MoE ranking share");
     println!("📦 {}", resolved.display_name);
     println!("   ranking: {}", ranking.path.display());
     println!("   source: {}", ranking.source.label());
@@ -300,16 +312,16 @@ async fn run_submit(model: &str, ranking_file: Option<&Path>, dataset_repo: &str
         }
         return Ok(());
     } else if !existing.is_empty() {
-        return Err(submit_error(
+        return Err(share_error(
             "Remote artifact prefix is partially populated",
             &format!("{} already contains: {}", dataset_repo, existing.join(", ")),
         ));
     }
 
     let token = models::hf_token_override().ok_or_else(|| {
-        submit_error(
+        share_error(
             "Missing Hugging Face token",
-            "Set HF_TOKEN or HUGGING_FACE_HUB_TOKEN before running `mesh-llm moe submit`.",
+            "Set HF_TOKEN or HUGGING_FACE_HUB_TOKEN before running `mesh-llm moe share`.",
         )
     })?;
 
@@ -359,7 +371,7 @@ async fn run_submit(model: &str, ranking_file: Option<&Path>, dataset_repo: &str
         .send()
         .await
         .map_err(|err| {
-            submit_error(
+            share_error(
                 "Dataset contribution request failed",
                 &format!("POST {}: {}", commit_url, err),
             )
@@ -367,13 +379,13 @@ async fn run_submit(model: &str, ranking_file: Option<&Path>, dataset_repo: &str
     if response.status() != StatusCode::OK {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(submit_error(
+        return Err(share_error(
             "Dataset contribution failed",
             &format!("{}: {}", status, body.trim()),
         ));
     }
     let commit: HfCommitResponse = response.json().await.map_err(|err| {
-        submit_error(
+        share_error(
             "Could not decode Hugging Face response",
             &format!("{}", err),
         )

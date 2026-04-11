@@ -24,8 +24,8 @@ All core phases are complete and integrated into mesh-llm.
 ### MoE CLI
 
 - `mesh-llm moe plan <model>` resolves rankings from local cache or `meshllm/moe-rankings` and produces a placement recommendation.
-- `mesh-llm moe analyze-full <model>` and `mesh-llm moe analyze-micro <model>` generate local ranking artifacts.
-- `mesh-llm moe submit <model>` opens a contribution PR against `meshllm/moe-rankings` when a locally generated ranking is new.
+- `mesh-llm moe analyze full <model>` and `mesh-llm moe analyze micro <model>` generate local ranking artifacts.
+- `mesh-llm moe share <model>` opens a contribution PR against `meshllm/moe-rankings` when a locally generated ranking is new.
 
 ### Splitting (`moe.rs` + `llama-moe-split`)
 - `compute_assignments()` implements the overlap strategy: shared core (top N experts by gate mass) replicated to every node, remaining experts distributed uniquely.

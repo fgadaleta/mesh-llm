@@ -280,7 +280,7 @@ pub(crate) fn local_submit_ranking(
 
     let Some(artifact) = moe::best_shared_ranking_artifact(&model.path) else {
         bail!(
-                "No local ranking artifact found for {}. Run `mesh-llm moe analyze-full {}` or `mesh-llm moe analyze-micro {}` first.",
+                "No local ranking artifact found for {}. Run `mesh-llm moe analyze full {}` or `mesh-llm moe analyze micro {}` first.",
                 model.display_name,
                 model.input,
                 model.input

@@ -20,7 +20,7 @@ This directory contains the MoE ranking work for `mesh-llm`.
 - `micro-v1` and `full-v1` analyzer ids
 - Canonical publication to the `meshllm/moe-rankings` Hugging Face dataset
 - `mesh-llm moe plan` console and `--json` output modes
-- `mesh-llm moe submit` opening contribution PRs against `meshllm/moe-rankings`
+- `mesh-llm moe share` opening contribution PRs against `meshllm/moe-rankings`
 
 ## Entry Points
 

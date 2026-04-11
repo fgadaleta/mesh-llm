@@ -23,9 +23,29 @@ pub(crate) enum MoeCommand {
         #[arg(long, default_value = "meshllm/moe-rankings")]
         dataset_repo: String,
     },
+    /// Run local MoE analysis and cache the result.
+    Analyze {
+        #[command(subcommand)]
+        command: MoeAnalyzeCommand,
+    },
+    /// Share a local ranking artifact with other mesh-llm users via the canonical Hugging Face dataset.
+    Share {
+        /// Model spec: local path, catalog name, HF exact ref, or HF URL.
+        model: String,
+        /// Override the ranking CSV path instead of resolving a local cached artifact.
+        /// The path must include `micro-v1` or `full-v1` so mesh-llm can infer the analyzer id.
+        #[arg(long)]
+        ranking_file: Option<PathBuf>,
+        /// Published dataset repo used for duplicate checks and PR target reporting.
+        #[arg(long, default_value = "meshllm/moe-rankings")]
+        dataset_repo: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum MoeAnalyzeCommand {
     /// Run the canonical full MoE analysis and cache it locally.
-    #[command(name = "analyze-full")]
-    AnalyzeFull {
+    Full {
         /// Model spec: local path, catalog name, HF exact ref, or HF URL.
         model: String,
         /// Override context size passed to llama-moe-analyze.
@@ -33,8 +53,7 @@ pub(crate) enum MoeCommand {
         context_size: u32,
     },
     /// Run the canonical micro MoE analysis and cache it locally.
-    #[command(name = "analyze-micro")]
-    AnalyzeMicro {
+    Micro {
         /// Model spec: local path, catalog name, HF exact ref, or HF URL.
         model: String,
         /// Number of canonical prompts to use.
@@ -46,17 +65,5 @@ pub(crate) enum MoeCommand {
         /// Override context size passed to llama-moe-analyze.
         #[arg(long, default_value = "4096")]
         context_size: u32,
-    },
-    /// Open a contribution PR for a local ranking artifact on the canonical Hugging Face dataset.
-    Submit {
-        /// Model spec: local path, catalog name, HF exact ref, or HF URL.
-        model: String,
-        /// Override the ranking CSV path instead of resolving a local cached artifact.
-        /// The path must include `micro-v1` or `full-v1` so mesh-llm can infer the analyzer id.
-        #[arg(long)]
-        ranking_file: Option<PathBuf>,
-        /// Published dataset repo used for duplicate checks and PR target reporting.
-        #[arg(long, default_value = "meshllm/moe-rankings")]
-        dataset_repo: String,
     },
 }

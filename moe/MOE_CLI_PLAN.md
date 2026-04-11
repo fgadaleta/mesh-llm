@@ -22,9 +22,9 @@ Planned command family:
 
 ```text
 mesh-llm moe plan <model>
-mesh-llm moe analyze-full <model>
-mesh-llm moe analyze-micro <model>
-mesh-llm moe submit <model>
+mesh-llm moe analyze full <model>
+mesh-llm moe analyze micro <model>
+mesh-llm moe share <model>
 ```
 
 These are explicit subcommands, not flag modes.
@@ -128,7 +128,7 @@ Behavior:
 - validate the supplied ranking file
 - clearly state that an override was used
 
-## `mesh-llm moe analyze-full`
+## `mesh-llm moe analyze full`
 
 Purpose:
 
@@ -140,7 +140,7 @@ This should align to:
 
 - `full-v1`
 
-## `mesh-llm moe analyze-micro`
+## `mesh-llm moe analyze micro`
 
 Purpose:
 
@@ -201,7 +201,7 @@ Log: ~/.cache/mesh-llm/moe/.../run.log
 Cause: llama-moe-analyze exited with code 1
 ```
 
-## `mesh-llm moe submit`
+## `mesh-llm moe share`
 
 Purpose:
 
@@ -266,7 +266,7 @@ Example:
 📍 Cached at: ~/.cache/mesh-llm/...
 ☁️ No published ranking was found in meshllm/moe-rankings
 📤 Consider contributing it with:
-   mesh-llm moe submit <model>
+   mesh-llm moe share <model>
 ```
 
 `serve` should not auto-submit.

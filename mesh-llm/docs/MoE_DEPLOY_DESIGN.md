@@ -160,8 +160,8 @@ This gives us two important properties:
 
 Contribution flow:
 
-- use `mesh-llm moe analyze-full` or `mesh-llm moe analyze-micro` to generate local rankings
-- use `mesh-llm moe submit` to open contribution PRs against `meshllm/moe-rankings`
-- when `serve` had to generate a local ranking because no published one was available, it should suggest `mesh-llm moe submit <model>`
+- use `mesh-llm moe analyze full` or `mesh-llm moe analyze micro` to generate local rankings
+- use `mesh-llm moe share` to open contribution PRs against `meshllm/moe-rankings`
+- when `serve` had to generate a local ranking because no published one was available, it should suggest `mesh-llm moe share <model>`
 
 Longer term, we may also use lighter-weight local signals such as short warm-up inference or recent router statistics to improve unknown models. That data should remain explicitly lower-confidence than `moe-analyze`, and should be treated as a hinting/calibration layer rather than the canonical topology source.

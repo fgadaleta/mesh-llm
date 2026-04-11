@@ -347,9 +347,9 @@ Use this to inspect MoE rankings, generate new rankings locally, plan expert pla
 Subcommands:
 
 - `moe plan <MODEL>`: resolve a ranking and compute a placement recommendation.
-- `moe analyze-full <MODEL>`: run a full local MoE analysis and cache the result.
-- `moe analyze-micro <MODEL>`: run the canonical micro analysis and cache the result.
-- `moe submit <MODEL>`: validate a local ranking artifact and open a contribution PR to the canonical dataset.
+- `moe analyze full <MODEL>`: run a full local MoE analysis and cache the result.
+- `moe analyze micro <MODEL>`: run the canonical micro analysis and cache the result.
+- `moe share <MODEL>`: validate a local ranking artifact and open a contribution PR to the canonical dataset.
 
 ### `moe plan`
 
@@ -378,14 +378,14 @@ Switches:
 - `--ranking-file <RANKING_FILE>`: bypass normal ranking resolution and use one specific ranking CSV.
 - `--json`: machine-readable output.
 
-### `moe analyze-full`
+### `moe analyze full`
 
 Use this when you want to produce a full local MoE ranking for a model and cache it for planning or later submission.
 
 Usage:
 
 ```bash
-mesh-llm moe analyze-full unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_S
+mesh-llm moe analyze full unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_S
 ```
 
 Behavior:
@@ -395,14 +395,14 @@ Behavior:
 - Writes durable logs so failures can be inspected after the command exits.
 - Caches the generated ranking locally for later `moe plan`, `serve`, or `moe submit`.
 
-### `moe analyze-micro`
+### `moe analyze micro`
 
 Use this when you want a faster local fallback ranking using the canonical micro prompt set.
 
 Usage:
 
 ```bash
-mesh-llm moe analyze-micro unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ2_M
+mesh-llm moe analyze micro unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ2_M
 ```
 
 Behavior:
@@ -412,15 +412,15 @@ Behavior:
 - Caches the generated ranking locally for later planning or submission.
 - Writes a durable log path on success or failure.
 
-### `moe submit`
+### `moe share`
 
 Use this to open a contribution PR for a local ranking artifact on the canonical dataset repo on Hugging Face.
 
 Usage:
 
 ```bash
-mesh-llm moe submit unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_S
-mesh-llm moe submit unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_S --ranking-file ~/.cache/mesh-llm/moe/.../ranking.csv
+mesh-llm moe share unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_S
+mesh-llm moe share unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_S --ranking-file ~/.cache/mesh-llm/moe/.../ranking.csv
 ```
 
 Behavior:
@@ -437,7 +437,7 @@ Requirements:
 
 Switches:
 
-- `--ranking-file <RANKING_FILE>`: submit one specific local ranking file instead of resolving the default cached artifact.
+- `--ranking-file <RANKING_FILE>`: share one specific local ranking file instead of resolving the default cached artifact.
 - `--dataset-repo <DATASET_REPO>`: override the target dataset repo (default `meshllm/moe-rankings`).
 
 ## Model reference formats
