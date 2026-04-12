@@ -1485,7 +1485,8 @@ mod tests {
             available_model_sizes: HashMap::new(),
             served_model_descriptors: Vec::new(),
             served_model_runtime: Vec::new(),
-            owner_id: None,
+            owner_attestation: None,
+            owner_summary: crate::crypto::OwnershipSummary::default(),
         }
     }
 

@@ -479,7 +479,26 @@ pub mod validate {
                 Ok(s) => Ok(Some(s.trim().to_string())),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    tracing::debug!(pid, "permission denied reading /proc/{pid}/comm");
+                    tracing::debug!(pid, path, "permission denied reading process comm");
+                    Ok(None)
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+
+        pub fn process_executable_name(pid: u32) -> anyhow::Result<Option<String>> {
+            let path = format!("/proc/{pid}/exe");
+            match std::fs::read_link(&path) {
+                Ok(target) => Ok(target
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    tracing::debug!(
+                        pid,
+                        path,
+                        "permission denied reading process executable path"
+                    );
                     Ok(None)
                 }
                 Err(e) => Err(e.into()),
@@ -631,6 +650,10 @@ pub mod validate {
 
             Ok(Some(local_dt.timestamp()))
         }
+
+        pub fn process_executable_name(pid: u32) -> anyhow::Result<Option<String>> {
+            process_comm(pid)
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -640,6 +663,10 @@ pub mod validate {
         }
 
         pub fn process_started_at_unix(_pid: u32) -> anyhow::Result<Option<i64>> {
+            Ok(None)
+        }
+
+        pub fn process_executable_name(_pid: u32) -> anyhow::Result<Option<String>> {
             Ok(None)
         }
     }
@@ -660,6 +687,11 @@ pub mod validate {
         platform::process_started_at_unix(pid)
     }
 
+    /// Read the executable basename for the given process when available.
+    pub fn process_executable_name(pid: u32) -> anyhow::Result<Option<String>> {
+        platform::process_executable_name(pid)
+    }
+
     /// Determine liveness of a process by attempting to read its comm.
     ///
     /// - [`Liveness::Alive`]   — comm is readable.
@@ -673,6 +705,18 @@ pub mod validate {
         }
     }
 
+    /// Returns `true` iff the live process name matches the expected spawned binary.
+    ///
+    /// Linux prefers `/proc/{pid}/exe` because `/proc/{pid}/comm` truncates names to
+    /// 15 bytes, which breaks flavored binaries like `llama-server-vulkan`.
+    pub fn process_name_matches(pid: u32, expected_comm: &str) -> bool {
+        process_executable_name(pid)
+            .ok()
+            .flatten()
+            .or_else(|| process_comm(pid).ok().flatten())
+            .is_some_and(|name| name == expected_comm)
+    }
+
     /// Returns `true` iff the live process identified by `pid` has:
     /// 1. A comm that equals `expected_comm`, **and**
     /// 2. A start time within [`START_TIME_TOLERANCE_SECS`] of `expected_started_at_unix`.
@@ -683,9 +727,9 @@ pub mod validate {
         expected_comm: &str,
         expected_started_at_unix: i64,
     ) -> bool {
-        match (process_comm(pid), process_started_at_unix(pid)) {
-            (Ok(Some(comm)), Ok(Some(t))) => {
-                comm == expected_comm
+        match process_started_at_unix(pid) {
+            Ok(Some(t)) => {
+                process_name_matches(pid, expected_comm)
                     && (t - expected_started_at_unix).abs() <= START_TIME_TOLERANCE_SECS
             }
             _ => false,
@@ -1013,6 +1057,10 @@ pub mod reap {
                 continue;
             }
 
+            if !entry_path.is_dir() {
+                continue;
+            }
+
             if super::is_locked(&entry_path.join("lock")) {
                 result.summary.dirs_skipped_alive += 1;
                 continue;
@@ -1074,19 +1122,20 @@ pub mod reap {
             }
 
             let child_liveness = super::validate::process_liveness(metadata.child_pid);
-            let child_comm_matches = super::validate::process_comm(metadata.child_pid)
-                .ok()
-                .flatten()
-                .map(|c| c == metadata.cmd_name)
-                .unwrap_or(false);
-            let child_start_matches = super::validate::process_started_at_unix(metadata.child_pid)
-                .ok()
-                .flatten()
-                .map(|t| {
-                    (t - metadata.child_started_at_unix).abs()
-                        <= super::validate::START_TIME_TOLERANCE_SECS
-                })
-                .unwrap_or(false);
+            let child_comm_matches =
+                super::validate::process_name_matches(metadata.child_pid, &metadata.cmd_name);
+            let child_start_matches = if metadata.child_started_at_unix == 0 {
+                true
+            } else {
+                super::validate::process_started_at_unix(metadata.child_pid)
+                    .ok()
+                    .flatten()
+                    .map(|t| {
+                        (t - metadata.child_started_at_unix).abs()
+                            <= super::validate::START_TIME_TOLERANCE_SECS
+                    })
+                    .unwrap_or(false)
+            };
 
             let action = if own_runtime {
                 if child_liveness == super::validate::Liveness::Alive
@@ -2224,6 +2273,28 @@ mod tests {
         assert_eq!(summary.pidfiles_removed, 1, "dead pidfile must be removed");
         assert_eq!(summary.children_killed, 0, "dead PID must not be killed");
         assert!(!pidfile_path.exists(), "pidfile must be gone from disk");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cross_runtime_reaper_ignores_non_directories() {
+        let root = tempdir().unwrap();
+        let my_dir = root.path().join("self");
+        fs::create_dir_all(&my_dir).unwrap();
+
+        let stray_file = root.path().join("README.txt");
+        fs::write(&stray_file, "not a runtime directory").unwrap();
+
+        let result = reap::reap_cross_runtime_orphans(root.path(), &my_dir)
+            .await
+            .unwrap();
+
+        assert_eq!(result.dirs_scanned, 0);
+        assert_eq!(result.dirs_gc_d, 0);
+        assert!(
+            stray_file.exists(),
+            "non-directory entries must not be collected"
+        );
     }
 
     #[tokio::test]

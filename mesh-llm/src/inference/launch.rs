@@ -328,6 +328,22 @@ pub struct ModelLaunchSpec<'a> {
 
 pub(crate) const GB: u64 = 1_000_000_000;
 
+fn spawned_binary_name(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        path.file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    }
+
+    #[cfg(not(windows))]
+    {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    }
+}
+
 fn compute_context_size(
     ctx_size_override: Option<u32>,
     model_bytes: u64,
@@ -703,6 +719,7 @@ pub async fn start_rpc_server(
     gguf_path: Option<&Path>,
 ) -> Result<RpcServerHandle> {
     let rpc_server = resolve_binary_path(bin_dir, "rpc-server", binary_flavor)?;
+    let rpc_server_name = spawned_binary_name(&rpc_server.path);
 
     // Find a free port
     let port = find_free_port().await?;
@@ -767,7 +784,7 @@ pub async fn start_rpc_server(
     let owner_started_at: i64 =
         crate::runtime::instance::validate::current_process_start_time_unix().unwrap_or(0);
     let metadata = crate::runtime::instance::PidfileMetadata {
-        cmd_name: "rpc-server".to_string(),
+        cmd_name: rpc_server_name.clone(),
         child_pid: pid,
         child_started_at_unix: child_started_at.unwrap_or(0),
         owner_pid: std::process::id(),
@@ -797,7 +814,7 @@ pub async fn start_rpc_server(
                 pid,
                 port,
                 expected_exit,
-                expected_comm: "rpc-server".to_string(),
+                expected_comm: rpc_server_name.clone(),
                 expected_start_time: child_started_at,
                 _pidfile_guard: Some(pidfile_guard),
             });
@@ -858,22 +875,30 @@ fn send_signal_if_matches(
         return SignalOutcome::Failed;
     }
 
-    if let Some(expected_t) = expected_start_time {
-        if !crate::runtime::instance::validate::validate_pid_matches(pid, expected_comm, expected_t)
-        {
-            tracing::warn!("pid {pid} no longer matches expected identity, skipping signal");
-            return SignalOutcome::Skipped;
-        }
-    } else {
-        let comm_ok = crate::runtime::instance::validate::process_comm(pid)
-            .ok()
-            .flatten()
-            .map(|comm| comm == expected_comm)
-            .unwrap_or(false);
-        if !comm_ok {
+    #[cfg(not(windows))]
+    {
+        if let Some(expected_t) = expected_start_time {
+            if !crate::runtime::instance::validate::validate_pid_matches(
+                pid,
+                expected_comm,
+                expected_t,
+            ) {
+                tracing::warn!("pid {pid} no longer matches expected identity, skipping signal");
+                return SignalOutcome::Skipped;
+            }
+        } else if !crate::runtime::instance::validate::process_name_matches(pid, expected_comm) {
             tracing::warn!("pid {pid} no longer matches {expected_comm}, skipping signal");
             return SignalOutcome::Skipped;
         }
+    }
+
+    #[cfg(windows)]
+    {
+        tracing::debug!(
+            pid,
+            expected_comm,
+            "skipping process identity validation on Windows"
+        );
     }
 
     #[cfg(unix)]
@@ -1281,8 +1306,9 @@ pub async fn start_llama_server(
                 crate::runtime::instance::validate::process_started_at_unix(pid).unwrap_or(None);
             let owner_started_at: i64 =
                 crate::runtime::instance::validate::current_process_start_time_unix().unwrap_or(0);
+            let llama_server_name = spawned_binary_name(&llama_server.path);
             let metadata = crate::runtime::instance::PidfileMetadata {
-                cmd_name: "llama-server".to_string(),
+                cmd_name: llama_server_name.clone(),
                 child_pid: pid,
                 child_started_at_unix: child_started_at.unwrap_or(0),
                 owner_pid: std::process::id(),
@@ -1298,7 +1324,7 @@ pub async fn start_llama_server(
             let handle = InferenceServerHandle {
                 pid,
                 expected_exit: expected_exit.clone(),
-                expected_comm: "llama-server".to_string(),
+                expected_comm: llama_server_name,
                 expected_start_time: child_started_at,
                 _pidfile_guard: Some(pidfile_guard),
             };
@@ -1392,6 +1418,11 @@ pub async fn force_kill_process(
 
 /// Poll until process exits or timeout_ms elapses. Returns true if dead within timeout.
 pub async fn wait_for_exit(pid: u32, timeout_ms: u64) -> bool {
+    if crate::runtime::instance::validate::process_liveness(pid)
+        == crate::runtime::instance::validate::Liveness::Dead
+    {
+        return true;
+    }
     let steps = timeout_ms / 100;
     for _ in 0..steps {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1900,6 +1931,15 @@ No devices found
         assert!(
             !result,
             "live process with short timeout should return false"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_exit_immediately_detects_dead_process() {
+        let result = wait_for_exit(999_999, 0).await;
+        assert!(
+            result,
+            "dead process should be detected before entering the poll loop"
         );
     }
 
