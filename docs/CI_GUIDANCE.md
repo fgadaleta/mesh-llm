@@ -31,7 +31,7 @@ PR CI is the fast validation path.
 Smoke testing should consume previously built Linux inference binaries instead of rebuilding them.
 
 - Download the uploaded artifact from the producer job.
-- Stage `mesh-llm`, `rpc-server`, `llama-server`, and `llama-moe-split` into the expected paths.
+- Stage `mesh-llm`, `rpc-server`, `llama-server`, `llama-moe-analyze`, and `llama-moe-split` into the expected paths.
 - Own the heavier inference checks, including real inference, OpenAI compatibility, split-mode, and MoE smokes.
 
 ### `.github/workflows/warm-caches.yml`

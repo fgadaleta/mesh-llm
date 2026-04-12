@@ -43,7 +43,7 @@ Each should only show the binary name — no `/opt/homebrew/` paths.
 just bundle
 ```
 
-Creates `/tmp/mesh-bundle.tar.gz` containing `mesh-llm`, flavor-specific llama.cpp runtime binaries, and `llama-moe-split` for MoE shard generation.
+Creates `/tmp/mesh-bundle.tar.gz` containing `mesh-llm`, flavor-specific llama.cpp runtime binaries, `llama-moe-analyze` for MoE ranking generation, and `llama-moe-split` for MoE shard generation.
 
 Bundle naming now follows the same convention everywhere:
 
@@ -84,6 +84,14 @@ just release v0.X.0
 
 Run this from a clean local `main` branch. It bumps the version in source + Cargo manifests, refreshes `Cargo.lock` without upgrading dependencies, commits as `v0.X.0: release`, pushes `main`, and then pushes only the new release tag.
 
+### 5a. Prerelease
+
+```bash
+just prerelease v0.X.0-rc.1
+```
+
+Run this from a clean branch. It bumps the version in source + Cargo manifests, refreshes `Cargo.lock` without upgrading dependencies, commits as `v0.X.0-rc.1: prerelease`, pushes the current branch, and then pushes the prerelease tag.
+
 ### 6. Let GitHub Actions build and publish the release
 
 Pushing a `v*` tag triggers `.github/workflows/release.yml`, which:
@@ -101,6 +109,15 @@ Pushing a `v*` tag triggers `.github/workflows/release.yml`, which:
 - uploads Windows Vulkan assets such as `mesh-llm-x86_64-pc-windows-msvc-vulkan.zip`
 - keeps the legacy macOS `mesh-bundle.tar.gz` asset available for direct archive installs
 - creates the GitHub release automatically with generated notes
+- marks hyphenated tags such as `v0.X.0-rc.1` as GitHub prereleases
+
+### 6a. Autoupdater behavior and compatibility
+
+- Stable releases still use GitHub's `releases/latest` endpoint, so ordinary installs only see stable releases.
+- GitHub prereleases are excluded from `releases/latest`, so publishing `v0.X.0-rc.1` does not advertise that prerelease to older stable clients.
+- This change updates mesh-llm's version comparison to proper semver ordering, so a prerelease binary such as `0.X.0-rc.1` will correctly upgrade to the eventual stable `0.X.0` release, or to a specific tagged release when you run `mesh-llm update --version vX.Y.Z`.
+- Older binaries that predate this change use a dot-splitting numeric comparison instead of semver. If one of those binaries somehow carries a prerelease version string such as `0.X.0-rc.1`, it can mis-order versions and may fail to recognize `0.X.0` or `0.X.1` as newer. In practice that only affects manually produced prerelease builds, because the old release tooling did not support `-rc.N` tags.
+- Result: the change is backward compatible for existing stable users, and it fixes updater behavior for official prerelease builds going forward.
 
 ### 7. Verify the release assets
 
@@ -129,6 +146,6 @@ After the workflow finishes, verify:
 - The Windows release workflows are compile-and-package only. They do not run inference tests against real GPUs during the workflow.
 - `codesign` and `xattr` may be needed on the receiving machine if macOS Gatekeeper blocks unsigned binaries:
   ```bash
-  codesign -s - /usr/local/bin/mesh-llm /usr/local/bin/rpc-server /usr/local/bin/llama-server /usr/local/bin/llama-moe-split
-  xattr -cr /usr/local/bin/mesh-llm /usr/local/bin/rpc-server /usr/local/bin/llama-server /usr/local/bin/llama-moe-split
+  codesign -s - /usr/local/bin/mesh-llm /usr/local/bin/rpc-server-metal /usr/local/bin/llama-server-metal /usr/local/bin/llama-moe-analyze /usr/local/bin/llama-moe-split
+  xattr -cr /usr/local/bin/mesh-llm /usr/local/bin/rpc-server-metal /usr/local/bin/llama-server-metal /usr/local/bin/llama-moe-analyze /usr/local/bin/llama-moe-split
   ```

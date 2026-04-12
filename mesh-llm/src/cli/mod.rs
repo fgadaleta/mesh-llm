@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::cli::benchmark::BenchmarkCommand;
+use crate::cli::moe::MoeCommand;
 use crate::cli::runtime::RuntimeCommand;
 use crate::crypto::TrustPolicy;
 
@@ -39,6 +40,9 @@ pub(crate) enum TrustCommand {
 pub(crate) enum AuthCommand {
     /// Generate a new owner keypair and save to keystore.
     Init {
+        /// Path to the owner keystore.
+        #[arg(long)]
+        owner_key: Option<PathBuf>,
         /// Overwrite an existing keystore.
         #[arg(long)]
         force: bool,
@@ -54,6 +58,9 @@ pub(crate) enum AuthCommand {
     },
     /// Show current owner identity status.
     Status {
+        /// Path to the owner keystore.
+        #[arg(long)]
+        owner_key: Option<PathBuf>,
         /// Path to the node identity file (default: ~/.mesh-llm/key).
         #[arg(long)]
         node_key: Option<PathBuf>,
@@ -66,6 +73,9 @@ pub(crate) enum AuthCommand {
     },
     /// Sign the current node identity with the existing owner keystore.
     SignNode {
+        /// Path to the owner keystore.
+        #[arg(long)]
+        owner_key: Option<PathBuf>,
         /// Path to the node identity file (default: ~/.mesh-llm/key).
         #[arg(long)]
         node_key: Option<PathBuf>,
@@ -75,12 +85,18 @@ pub(crate) enum AuthCommand {
         /// Optional hostname hint attached to the certificate.
         #[arg(long)]
         hostname_hint: Option<String>,
+        /// Optional human label attached to this node certificate.
+        #[arg(long)]
+        node_label: Option<String>,
         /// Certificate lifetime in hours.
         #[arg(long, default_value = "168")]
         expires_in_hours: u64,
     },
     /// Renew the local node ownership certificate in place.
     RenewNode {
+        /// Path to the owner keystore.
+        #[arg(long)]
+        owner_key: Option<PathBuf>,
         /// Path to the node identity file (default: ~/.mesh-llm/key).
         #[arg(long)]
         node_key: Option<PathBuf>,
@@ -90,6 +106,9 @@ pub(crate) enum AuthCommand {
         /// Optional hostname hint attached to the certificate.
         #[arg(long)]
         hostname_hint: Option<String>,
+        /// Optional human label attached to this node certificate.
+        #[arg(long)]
+        node_label: Option<String>,
         /// Certificate lifetime in hours.
         #[arg(long, default_value = "168")]
         expires_in_hours: u64,
@@ -111,6 +130,9 @@ pub(crate) enum AuthCommand {
     },
     /// Rotate the local node identity key.
     RotateNode {
+        /// Path to the owner keystore.
+        #[arg(long)]
+        owner_key: Option<PathBuf>,
         /// Path to the node identity file (default: ~/.mesh-llm/key).
         #[arg(long)]
         node_key: Option<PathBuf>,
@@ -120,6 +142,9 @@ pub(crate) enum AuthCommand {
         /// Optional hostname hint attached to the certificate.
         #[arg(long)]
         hostname_hint: Option<String>,
+        /// Optional human label attached to this node certificate.
+        #[arg(long)]
+        node_label: Option<String>,
         /// Certificate lifetime in hours.
         #[arg(long, default_value = "168")]
         expires_in_hours: u64,
@@ -161,6 +186,9 @@ pub(crate) enum AuthCommand {
     },
     /// Rotate the existing owner keystore identity.
     RotateOwner {
+        /// Path to the owner keystore.
+        #[arg(long)]
+        owner_key: Option<PathBuf>,
         /// Skip passphrase prompt (store keys unencrypted).
         #[arg(long)]
         no_passphrase: bool,
@@ -175,9 +203,20 @@ pub(crate) enum AuthCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub(crate) enum GpuCommand {
+    /// Force a fresh local GPU benchmark and rewrite the cached fingerprint.
+    Benchmark {
+        /// Print machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 pub(crate) mod benchmark;
 pub(crate) mod commands;
 pub mod models;
+pub(crate) mod moe;
 pub(crate) mod runtime;
 
 #[derive(Parser, Debug)]
@@ -333,23 +372,23 @@ pub(crate) struct Cli {
     pub(crate) config: Option<PathBuf>,
 
     /// Path to the owner keystore used to attest this node.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pub(crate) owner_key: Option<PathBuf>,
 
     /// Fail startup if owner attestation cannot be loaded or signed.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pub(crate) owner_required: bool,
 
     /// Optional human label attached to this node certificate.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pub(crate) node_label: Option<String>,
 
     /// Override peer ownership trust policy.
-    #[arg(long, global = true, value_enum)]
+    #[arg(long, value_enum)]
     pub(crate) trust_policy: Option<TrustPolicy>,
 
     /// Add trusted owner IDs on top of the local trust store.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pub(crate) trust_owner: Vec<String>,
 
     /// Internal: set when this node joined via Nostr discovery (not --join).
@@ -372,11 +411,26 @@ pub(crate) enum Command {
         #[arg(long)]
         draft: bool,
     },
-    /// Update mesh-llm to the latest bundled release and exit.
-    Update,
+    /// Update mesh-llm to a bundled release and exit.
+    Update {
+        /// Install this specific release tag or version (e.g. v0.60.0 or 0.60.0-rc.1).
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Inspect local GPUs, stable IDs, and cached bandwidth.
     #[command(alias = "gpu")]
-    Gpus,
+    Gpus {
+        /// Print machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        command: Option<GpuCommand>,
+    },
+    /// Plan, analyze, and contribute MoE expert rankings.
+    Moe {
+        #[command(subcommand)]
+        command: MoeCommand,
+    },
     /// Inspect and manage local runtime-served models.
     #[command(hide = true)]
     Runtime {
@@ -623,10 +677,7 @@ fn suggested_client_command(original_args: &[OsString]) -> String {
 }
 
 fn shell_join(args: &[OsString]) -> String {
-    args.iter()
-        .map(|arg| shell_display(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
+    args.iter().map(shell_display).collect::<Vec<_>>().join(" ")
 }
 
 fn shell_display(arg: &OsString) -> String {
@@ -747,5 +798,93 @@ mod tests {
             normalized.explicit_surface
         )
         .is_none());
+    }
+
+    #[test]
+    fn auth_status_accepts_owner_key_locally() {
+        let cli = Cli::parse_from(["mesh-llm", "auth", "status", "--owner-key", "owner.json"]);
+
+        match cli.command.expect("auth command expected") {
+            Command::Auth {
+                command: AuthCommand::Status { owner_key, .. },
+            } => {
+                assert_eq!(owner_key, Some(PathBuf::from("owner.json")));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_status_rejects_runtime_only_owner_required_flag() {
+        let err = Cli::try_parse_from(["mesh-llm", "auth", "status", "--owner-required"])
+            .expect_err("runtime-only flag should be rejected for auth status");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("--owner-required"));
+    }
+
+    #[test]
+    fn gpus_command_parses_without_subcommand() {
+        let cli = Cli::parse_from(["mesh-llm", "gpus"]);
+
+        match cli.command.expect("gpu command expected") {
+            Command::Gpus { json, command } => {
+                assert!(!json);
+                assert!(command.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpu_alias_parses_without_subcommand() {
+        let cli = Cli::parse_from(["mesh-llm", "gpu"]);
+
+        match cli.command.expect("gpu command expected") {
+            Command::Gpus { json, command } => {
+                assert!(!json);
+                assert!(command.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpus_command_accepts_json_flag() {
+        let cli = Cli::parse_from(["mesh-llm", "gpus", "--json"]);
+
+        match cli.command.expect("gpu command expected") {
+            Command::Gpus { json, command } => {
+                assert!(json);
+                assert!(command.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpu_benchmark_subcommand_parses() {
+        let cli = Cli::parse_from(["mesh-llm", "gpu", "benchmark"]);
+
+        match cli.command.expect("gpu command expected") {
+            Command::Gpus {
+                json: false,
+                command: Some(GpuCommand::Benchmark { json: false }),
+            } => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpu_benchmark_subcommand_accepts_json_flag() {
+        let cli = Cli::parse_from(["mesh-llm", "gpu", "benchmark", "--json"]);
+
+        match cli.command.expect("gpu command expected") {
+            Command::Gpus {
+                json: false,
+                command: Some(GpuCommand::Benchmark { json: true }),
+            } => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

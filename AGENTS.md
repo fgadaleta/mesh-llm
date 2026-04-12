@@ -125,7 +125,8 @@ Current structure notes.
 
 ## Key Source Files
 
-- `mesh-llm/src/main.rs` — CLI args, orchestration: `run_auto()`, `run_idle()`, `run_passive()`
+- `mesh-llm/src/main.rs` — Binary entrypoint; calls `mesh_llm::run()`
+- `mesh-llm/src/runtime/mod.rs` — Top-level startup flows, runtime orchestration, and command dispatch
 - `mesh-llm/src/mesh/mod.rs` — `Node` struct, gossip, mesh_id, peer management
 - `mesh-llm/src/inference/election.rs` — Host election, tensor split calculation
 - `mesh-llm/src/inference/launch.rs` — llama-server/rpc-server process management
@@ -138,6 +139,7 @@ Current structure notes.
 - `mesh-llm/src/models/catalog.rs` — Model catalog, HuggingFace downloads
 - `mesh-llm/src/models/capabilities.rs` — Multimodal/vision/audio/reasoning capability inference
 - `mesh-llm/src/plugins/blobstore/mod.rs` — Request-scoped media object storage for multimodal
+- `mesh-llm/src/runtime/instance.rs` — Per-instance runtime directory management: `InstanceRuntime`, pidfiles, flock liveness, scoped orphan reaping, local instance scanning
 
 ## Mesh Protocol Compatibility
 
@@ -179,9 +181,33 @@ When making changes that touch gossip, routing, proxy, election, or capability a
 
 Run `cargo` commands serially. Do not run multiple `cargo` commands in parallel (including parallel test runs), because this repo frequently hits Cargo lock conflicts (`package cache` / `artifact directory`) under concurrent invocation.
 
-## Formatting
+## Pre-Commit Checklist
 
-Before committing Rust changes, format only the changed Rust files from the repo root, for example with `cargo fmt --all -- path/to/file.rs`, and include those formatting changes in the commit.
+Before committing, run the local checks most likely to fail in CI for the files you touched. Do not rely on CI to catch basic formatting, compile, or stale UI build issues.
+
+### Minimum bar before every commit
+
+- Rust-only change — format the changed Rust files and run `cargo check -p mesh-llm`.
+- UI-only change — run `just build`.
+- Mixed Rust and UI change — run `just build`.
+
+### Rust changes
+
+- Format only the changed Rust files from the repo root, for example with `cargo fmt --all -- path/to/file.rs`, and include those formatting changes in the commit.
+- After Rust changes, run `cargo check -p mesh-llm`.
+- If you touched tests, public APIs, routing, inference, gossip, plugin protocol, or CLI behavior, run the relevant tests before committing.
+- Run Rust validation serially. Do not run multiple `cargo` commands at the same time.
+
+### UI changes
+
+- Use the repo's supported workflow and run `just build`.
+- If `just build` fails on the UI step with `npm error Exit handler never called!`, run `just clean-ui` and then rerun `just build`.
+
+### Commit standard
+
+- Do not commit if formatting has not been applied.
+- Do not commit if basic local validation for your change type has not been run.
+- Do not commit known warnings in code you touched.
 
 ## Warnings
 
@@ -212,6 +238,17 @@ just bundle
 
 ### Cleanup
 
+Clean shutdown removes the instance's runtime directory automatically. Prefer the scoped runtime-aware commands first:
+
+```bash
+mesh-llm stop
+just stop
+```
+
+Those paths use the runtime metadata under `~/.mesh-llm/runtime/` to stop the tracked mesh-llm instance and its child servers cleanly.
+
+If an instance is wedged badly enough that the scoped stop path cannot reach it, fall back to an emergency kill:
+
 ```bash
 pkill -f mesh-llm; pkill -f rpc-server; pkill -f llama-server
 ```
@@ -239,13 +276,28 @@ pkill -f mesh-llm; pkill -f rpc-server; pkill -f llama-server
 
 ### Debugging llama-server startup
 
-If llama-server fails to start (stuck at "⏳ Starting llama-server..."), check its log file. Rust's `std::env::temp_dir()` on macOS points to the per-user temp dir, **not** `/tmp`:
+If llama-server fails to start (stuck at "⏳ Starting llama-server..."), check its log file inside the per-instance runtime directory:
 
 ```bash
-cat "$(python3 -c 'import tempfile; print(tempfile.gettempdir())')/mesh-llm-llama-server.log"
+# Default location
+ls ~/.mesh-llm/runtime/
+# Your instance ID is the mesh-llm process PID
+cat ~/.mesh-llm/runtime/$(pgrep -f mesh-llm | head -1)/logs/llama-server.log
+
+# Or look at the stderr output from mesh-llm itself — it now prints
+# the absolute log path when spawning llama-server / rpc-server.
 ```
 
-Typical path: `/var/folders/XX/.../T/mesh-llm-llama-server.log`. rpc-server logs are in the same directory as `mesh-llm-rpc-{port}.log`.
+rpc-server logs live at `~/.mesh-llm/runtime/{pid}/logs/rpc-server-{port}.log`.
+
+To override the runtime root (e.g., for tests or systemd):
+- `MESH_LLM_RUNTIME_ROOT=/path/to/custom/root` — highest priority
+- `XDG_RUNTIME_DIR` — if set (typical on systemd: `/run/user/{uid}/mesh-llm/runtime`)
+- `$HOME/.mesh-llm/runtime` — default fallback
+
+For stale instances (crashed mesh-llm leaving behind a runtime dir):
+- Other running mesh-llm instances GC dead-owner dirs older than 1 hour on startup
+- Manual cleanup: `rm -rf ~/.mesh-llm/runtime/<stale_pid>/`
 
 ### Common failures
 - **nohup over SSH doesn't stick** — use `bash -c "nohup ... & disown"`, verify process survives disconnect.
