@@ -1224,6 +1224,22 @@ impl PeerInfo {
         }
     }
 
+    pub fn accepts_http_inference(&self) -> bool {
+        matches!(self.role, NodeRole::Host { .. })
+    }
+
+    pub fn http_routable_models(&self) -> Vec<String> {
+        if self.accepts_http_inference() {
+            self.routable_models()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn routes_http_model(&self, model: &str) -> bool {
+        self.accepts_http_inference() && self.routes_model(model)
+    }
+
     pub fn moe_recovery_ready(&self) -> bool {
         moe_recovery_ready_at(self.moe_recovered_at, std::time::Instant::now())
     }
@@ -1802,7 +1818,6 @@ impl Node {
         ))
     }
 
-    #[cfg(test)]
     #[cfg(test)]
     pub async fn new_for_tests(role: NodeRole) -> Result<Self> {
         use iroh::endpoint::QuicTransportConfig;
@@ -3133,7 +3148,11 @@ impl Node {
             .collect()
     }
 
-    /// Get all models currently being served in the mesh (loaded in VRAM somewhere).
+    /// Get all models currently reachable via the mesh HTTP/API ingress.
+    ///
+    /// This is intentionally stricter than "loaded in VRAM somewhere": split
+    /// workers may contribute compute for a model but cannot accept chat
+    /// requests directly.
     pub async fn models_being_served(&self) -> Vec<String> {
         let my_hosted_models = self.hosted_models.lock().await.clone();
         let peer_data: Vec<_> = {
@@ -3145,7 +3164,7 @@ impl Node {
             served.insert(s.clone());
         }
         for peer in &peer_data {
-            for m in peer.routable_models() {
+            for m in peer.http_routable_models() {
                 served.insert(m.clone());
             }
         }
@@ -3163,7 +3182,7 @@ impl Node {
         let mut hosts: Vec<EndpointId> = state
             .peers
             .values()
-            .filter(|p| p.routes_model(model))
+            .filter(|p| p.routes_http_model(model))
             .map(|p| p.id)
             .collect();
         hosts.sort();
@@ -3186,7 +3205,7 @@ impl Node {
         state
             .peers
             .values()
-            .find(|p| !p.routable_models().is_empty())
+            .find(|p| !p.http_routable_models().is_empty())
             .cloned()
     }
 
@@ -3214,7 +3233,7 @@ impl Node {
 
         // Include peers that are serving through their local API proxies
         for peer in &peer_data {
-            for model in peer.routable_models() {
+            for model in peer.http_routable_models() {
                 hosts.push(RouteEntry {
                     model,
                     node_id: format!("{}", peer.id.fmt_short()),
@@ -7439,6 +7458,32 @@ mod tests {
             "passive client must reject stale RouteTable: {:?}",
             err
         );
+    }
+
+    #[test]
+    fn worker_only_legacy_models_are_excluded_from_http_routes() {
+        let host_id = EndpointId::from(iroh::SecretKey::from_bytes(&[0xD2; 32]).public());
+        let worker_id = EndpointId::from(iroh::SecretKey::from_bytes(&[0xD3; 32]).public());
+
+        let mut legacy_host = make_test_peer_info(host_id);
+        legacy_host.role = super::NodeRole::Host { http_port: 9337 };
+        legacy_host.serving_models = vec!["legacy-host-model".to_string()];
+        legacy_host.hosted_models_known = false;
+
+        let mut legacy_worker = make_test_peer_info(worker_id);
+        legacy_worker.role = super::NodeRole::Worker;
+        legacy_worker.serving_models = vec!["worker-only-model".to_string()];
+        legacy_worker.hosted_models_known = false;
+
+        assert!(legacy_host.accepts_http_inference());
+        assert!(!legacy_worker.accepts_http_inference());
+        assert_eq!(
+            legacy_host.http_routable_models(),
+            vec!["legacy-host-model".to_string()]
+        );
+        assert!(legacy_host.routes_http_model("legacy-host-model"));
+        assert!(legacy_worker.http_routable_models().is_empty());
+        assert!(!legacy_worker.routes_http_model("worker-only-model"));
     }
 
     /// Verifies that dead-peer cleanup prevents re-admission: after a peer is cleaned

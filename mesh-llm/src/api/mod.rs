@@ -90,6 +90,59 @@ fn likely_reasoning_model(name: &str, description: Option<&str>) -> bool {
         .any(|needle| haystack.contains(needle))
 }
 
+#[derive(Debug, Default, PartialEq)]
+struct HttpRouteStats {
+    node_count: usize,
+    active_nodes: Vec<String>,
+    mesh_vram_gb: f64,
+}
+
+fn http_route_stats(
+    model_name: &str,
+    peers: &[mesh::PeerInfo],
+    my_hosted_models: &[String],
+    my_hostname: Option<&str>,
+    my_vram_gb: f64,
+) -> HttpRouteStats {
+    let mut active_nodes = Vec::new();
+    let mut node_count = 0usize;
+    let mut mesh_vram_gb = 0.0;
+
+    if my_hosted_models.iter().any(|hosted| hosted == model_name) {
+        node_count += 1;
+        mesh_vram_gb += my_vram_gb;
+        active_nodes.push(
+            my_hostname
+                .filter(|hostname| !hostname.trim().is_empty())
+                .unwrap_or("This node")
+                .to_string(),
+        );
+    }
+
+    for peer in peers {
+        if !peer.routes_http_model(model_name) {
+            continue;
+        }
+        node_count += 1;
+        mesh_vram_gb += peer.vram_bytes as f64 / 1e9;
+        active_nodes.push(
+            peer.hostname
+                .clone()
+                .filter(|hostname| !hostname.trim().is_empty())
+                .unwrap_or_else(|| peer.id.fmt_short().to_string()),
+        );
+    }
+
+    active_nodes.sort();
+    active_nodes.dedup();
+
+    HttpRouteStats {
+        node_count,
+        active_nodes,
+        mesh_vram_gb,
+    }
+}
+
 fn likely_vision_model(name: &str, description: Option<&str>) -> bool {
     let haystack = format!("{} {}", name, description.unwrap_or_default()).to_ascii_lowercase();
     ["vision", "-vl", "llava", "omni", "qwen2.5-vl", "mllama"]
@@ -374,59 +427,27 @@ impl MeshApi {
                     || my_serving_models.iter().any(|s| s == name)
                     || name == &model_name;
                 let display_name = crate::models::installed_model_display_name(name);
-                let node_count = if is_warm {
-                    let peer_count = all_peers.iter().filter(|p| p.routes_model(name)).count();
-                    let me = if my_hosted_models.iter().any(|s| s == name) {
-                        1
-                    } else {
-                        0
-                    };
-                    peer_count + me
-                } else {
-                    0
-                };
-                let active_nodes: Vec<String> = if is_warm {
-                    let mut nodes = Vec::new();
-                    if my_hosted_models.iter().any(|s| s == name) {
-                        nodes.push(
-                            node.hostname
-                                .clone()
-                                .filter(|hostname| !hostname.trim().is_empty())
-                                .unwrap_or_else(|| "This node".to_string()),
-                        );
-                    }
-                    nodes.extend(all_peers.iter().filter_map(|peer| {
-                        if !peer.routes_model(name) {
-                            return None;
-                        }
-                        Some(
-                            peer.hostname
-                                .clone()
-                                .filter(|hostname| !hostname.trim().is_empty())
-                                .unwrap_or_else(|| peer.id.fmt_short().to_string()),
-                        )
-                    }));
-                    nodes.sort();
-                    nodes.dedup();
-                    nodes
-                } else {
-                    Vec::new()
-                };
-                let mesh_vram_gb = if is_warm {
-                    let peer_vram = all_peers
-                        .iter()
-                        .filter(|p| p.routes_model(name))
-                        .map(|p| p.vram_bytes as f64 / 1e9)
-                        .sum::<f64>();
-                    let my_vram = if my_hosted_models.iter().any(|s| s == name) {
-                        my_vram_gb
-                    } else {
-                        0.0
-                    };
-                    peer_vram + my_vram
-                } else {
-                    0.0
-                };
+                let route_stats = is_warm.then(|| {
+                    http_route_stats(
+                        name,
+                        &all_peers,
+                        &my_hosted_models,
+                        node.hostname.as_deref(),
+                        my_vram_gb,
+                    )
+                });
+                let node_count = route_stats
+                    .as_ref()
+                    .map(|stats| stats.node_count)
+                    .unwrap_or(0);
+                let active_nodes = route_stats
+                    .as_ref()
+                    .map(|stats| stats.active_nodes.clone())
+                    .unwrap_or_default();
+                let mesh_vram_gb = route_stats
+                    .as_ref()
+                    .map(|stats| stats.mesh_vram_gb)
+                    .unwrap_or(0.0);
                 let size_gb = if name == &model_name && model_size_bytes > 0 {
                     model_size_bytes as f64 / 1e9
                 } else {
@@ -1386,6 +1407,48 @@ mod tests {
         serde_json::from_str(body).unwrap_or(serde_json::Value::Null)
     }
 
+    fn make_test_peer(
+        seed: u8,
+        role: mesh::NodeRole,
+        serving_models: Vec<&str>,
+        hosted_models: Vec<&str>,
+        hosted_models_known: bool,
+    ) -> mesh::PeerInfo {
+        let peer_id = iroh::EndpointId::from(iroh::SecretKey::from_bytes(&[seed; 32]).public());
+        mesh::PeerInfo {
+            id: peer_id,
+            addr: iroh::EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            tunnel_port: None,
+            role,
+            models: Vec::new(),
+            vram_bytes: 24_000_000_000,
+            rtt_ms: None,
+            model_source: None,
+            serving_models: serving_models.into_iter().map(str::to_string).collect(),
+            hosted_models: hosted_models.into_iter().map(str::to_string).collect(),
+            hosted_models_known,
+            available_models: Vec::new(),
+            requested_models: Vec::new(),
+            last_seen: std::time::Instant::now(),
+            moe_recovered_at: None,
+            version: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_bandwidth_gbps: None,
+            available_model_metadata: Vec::new(),
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: Vec::new(),
+            served_model_runtime: Vec::new(),
+            owner_id: None,
+        }
+    }
+
     #[derive(Clone)]
     struct BlobstoreApiTestBridge {
         plugin_name: String,
@@ -1828,6 +1891,34 @@ mod tests {
         assert!(models_body.get("mesh_models").is_some());
 
         models_handle.abort();
+    }
+
+    #[test]
+    fn test_http_route_stats_only_count_http_callable_legacy_hosts() {
+        let peers = vec![
+            make_test_peer(
+                0x41,
+                mesh::NodeRole::Host { http_port: 9337 },
+                vec!["legacy-host-model"],
+                Vec::new(),
+                false,
+            ),
+            make_test_peer(
+                0x42,
+                mesh::NodeRole::Worker,
+                vec!["worker-only-model"],
+                Vec::new(),
+                false,
+            ),
+        ];
+
+        let host_stats = http_route_stats("legacy-host-model", &peers, &[], None, 0.0);
+        assert_eq!(host_stats.node_count, 1);
+        assert_eq!(host_stats.active_nodes.len(), 1);
+        assert!(host_stats.mesh_vram_gb > 0.0);
+
+        let worker_stats = http_route_stats("worker-only-model", &peers, &[], None, 0.0);
+        assert_eq!(worker_stats, HttpRouteStats::default());
     }
 
     #[tokio::test]

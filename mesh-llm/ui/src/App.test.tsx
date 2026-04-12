@@ -99,7 +99,8 @@ const statusTemplate = {
   gpus: [] as unknown[],
 };
 
-const modelsPayload = { mesh_models: [] };
+let statusPayload = createStatusPayload();
+let modelsPayload = { mesh_models: [] as Array<Record<string, unknown>> };
 const mockFetch = vi.fn();
 
 function createStatusPayload() {
@@ -132,7 +133,7 @@ function setupFetchMock() {
   mockFetch.mockImplementation((input: RequestInfo | URL) => {
     const url = getRequestUrl(input);
     if (url.endsWith("/api/status")) {
-      return Promise.resolve(createResponse(createStatusPayload()));
+      return Promise.resolve(createResponse(statusPayload));
     }
     if (url.endsWith("/api/models")) {
       return Promise.resolve(createResponse(modelsPayload));
@@ -195,6 +196,8 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  statusPayload = createStatusPayload();
+  modelsPayload = { mesh_models: [] };
   setupFetchMock();
   Object.defineProperty(window, "EventSource", {
     configurable: true,
@@ -360,5 +363,23 @@ describe("App routing and status", () => {
       ),
     );
     await screen.findByText("Mesh LLM v1.0.0");
+  });
+
+  it("keeps client chat disabled until /api/models reports a warm model", async () => {
+    statusPayload = {
+      ...createStatusPayload(),
+      is_client: true,
+      is_host: false,
+      llama_ready: false,
+      model_name: "ghost-model",
+      hosted_models: [],
+      serving_models: [],
+    };
+    setPath("/chat");
+    render(<App />);
+
+    const input = await screen.findByTestId("chat-input");
+    expect(input).toBeDisabled();
+    expect(input).toHaveAttribute("placeholder", "Waiting for a warm model...");
   });
 });

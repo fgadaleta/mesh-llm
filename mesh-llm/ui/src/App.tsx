@@ -1015,12 +1015,10 @@ export function App() {
   const meshModels = modelsPayload?.mesh_models ?? [];
 
   const warmModels = useMemo(() => {
-    const list = meshModels
+    return meshModels
       .filter((m) => m.status === "warm")
       .map((m) => m.name);
-    if (!list.length && status?.model_name) list.push(status.model_name);
-    return list;
-  }, [meshModels, status?.model_name]);
+  }, [meshModels]);
   const modelStatsByName = useMemo<Record<string, ModelServingStat>>(() => {
     const stats: Record<string, ModelServingStat> = {};
     for (const model of warmModels) stats[model] = { nodes: 0, vramGb: 0 };
