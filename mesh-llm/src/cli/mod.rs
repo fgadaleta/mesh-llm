@@ -202,6 +202,16 @@ pub(crate) enum AuthCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub(crate) enum GpuCommand {
+    /// Force a fresh local GPU benchmark and rewrite the cached fingerprint.
+    Benchmark {
+        /// Print machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 pub(crate) mod benchmark;
 pub(crate) mod commands;
 pub mod models;
@@ -403,7 +413,13 @@ pub(crate) enum Command {
     Update,
     /// Inspect local GPUs, stable IDs, and cached bandwidth.
     #[command(alias = "gpu")]
-    Gpus,
+    Gpus {
+        /// Print machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        command: Option<GpuCommand>,
+    },
     /// Inspect and manage local runtime-served models.
     #[command(hide = true)]
     Runtime {
@@ -650,10 +666,7 @@ fn suggested_client_command(original_args: &[OsString]) -> String {
 }
 
 fn shell_join(args: &[OsString]) -> String {
-    args.iter()
-        .map(|arg| shell_display(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
+    args.iter().map(shell_display).collect::<Vec<_>>().join(" ")
 }
 
 fn shell_display(arg: &OsString) -> String {
@@ -797,5 +810,70 @@ mod tests {
 
         let rendered = err.to_string();
         assert!(rendered.contains("--owner-required"));
+    }
+
+    #[test]
+    fn gpus_command_parses_without_subcommand() {
+        let cli = Cli::parse_from(["mesh-llm", "gpus"]);
+
+        match cli.command.expect("gpu command expected") {
+            Command::Gpus { json, command } => {
+                assert!(!json);
+                assert!(command.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpu_alias_parses_without_subcommand() {
+        let cli = Cli::parse_from(["mesh-llm", "gpu"]);
+
+        match cli.command.expect("gpu command expected") {
+            Command::Gpus { json, command } => {
+                assert!(!json);
+                assert!(command.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpus_command_accepts_json_flag() {
+        let cli = Cli::parse_from(["mesh-llm", "gpus", "--json"]);
+
+        match cli.command.expect("gpu command expected") {
+            Command::Gpus { json, command } => {
+                assert!(json);
+                assert!(command.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpu_benchmark_subcommand_parses() {
+        let cli = Cli::parse_from(["mesh-llm", "gpu", "benchmark"]);
+
+        match cli.command.expect("gpu command expected") {
+            Command::Gpus {
+                json: false,
+                command: Some(GpuCommand::Benchmark { json: false }),
+            } => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gpu_benchmark_subcommand_accepts_json_flag() {
+        let cli = Cli::parse_from(["mesh-llm", "gpu", "benchmark", "--json"]);
+
+        match cli.command.expect("gpu command expected") {
+            Command::Gpus {
+                json: false,
+                command: Some(GpuCommand::Benchmark { json: true }),
+            } => {}
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

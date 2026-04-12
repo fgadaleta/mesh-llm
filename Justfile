@@ -4,6 +4,7 @@ llama_dir := "llama.cpp"
 build_dir := llama_dir / "build"
 mesh_dir := "mesh-llm"
 ui_dir := mesh_dir / "ui"
+benchmark_src_dir := mesh_dir / "benchmarks"
 home_dir := if os_family() == "windows" { env("USERPROFILE") } else { env("HOME") }
 xdg_cache_dir := env("XDG_CACHE_HOME", home_dir / ".cache")
 hf_home := env("HF_HOME", xdg_cache_dir / "huggingface")
@@ -213,7 +214,7 @@ bundle output="/tmp/mesh-bundle.tar.gz":
         install_name_tool -add_rpath @executable_path/ "$bin" 2>/dev/null || true
     done
     # Include Apple Silicon benchmark binary if built
-    BENCH="{{ mesh_dir }}/target/release/membench-fingerprint"
+    BENCH="target/release/membench-fingerprint"
     if [ -f "$BENCH" ]; then
         cp "$BENCH" "$BUNDLE/"
         echo "Included: membench-fingerprint"
@@ -259,37 +260,37 @@ release-bundle-vulkan-windows version output="dist":
 # Build Apple Silicon memory bandwidth benchmark (macOS only)
 [macos]
 benchmark-build-apple:
-    swiftc -O benchmarks/membench-fingerprint.swift -o {{mesh_dir}}/target/release/membench-fingerprint
-    echo "Built: {{mesh_dir}}/target/release/membench-fingerprint"
+    swiftc -O {{ benchmark_src_dir }}/membench-fingerprint.swift -o target/release/membench-fingerprint
+    echo "Built: target/release/membench-fingerprint"
 
 # Build NVIDIA CUDA memory bandwidth benchmark (requires CUDA toolkit)
 benchmark-build-cuda:
-    nvcc -O3 -o {{mesh_dir}}/target/release/membench-fingerprint-cuda benchmarks/membench-fingerprint.cu
-    echo "Built: {{mesh_dir}}/target/release/membench-fingerprint-cuda"
+    nvcc -O3 -o target/release/membench-fingerprint-cuda {{ benchmark_src_dir }}/membench-fingerprint.cu
+    echo "Built: target/release/membench-fingerprint-cuda"
 
 [windows]
 benchmark-build-cuda-windows:
-    @powershell -NoProfile -ExecutionPolicy Bypass -Command "nvcc -O3 -o '{{mesh_dir}}/target/release/membench-fingerprint-cuda.exe' 'benchmarks/membench-fingerprint.cu'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: {{mesh_dir}}/target/release/membench-fingerprint-cuda.exe'"
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "nvcc -O3 -o 'target/release/membench-fingerprint-cuda.exe' '{{ benchmark_src_dir }}/membench-fingerprint.cu'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: target/release/membench-fingerprint-cuda.exe'"
 
 # Build AMD ROCm/HIP memory bandwidth benchmark (requires ROCm)
 benchmark-build-hip:
-    hipcc -O3 -std=c++17 -o {{mesh_dir}}/target/release/membench-fingerprint-hip benchmarks/membench-fingerprint.hip
-    echo "Built: {{mesh_dir}}/target/release/membench-fingerprint-hip"
+    hipcc -O3 -std=c++17 -o target/release/membench-fingerprint-hip {{ benchmark_src_dir }}/membench-fingerprint.hip
+    echo "Built: target/release/membench-fingerprint-hip"
 
 [windows]
 benchmark-build-hip-windows:
-    @powershell -NoProfile -ExecutionPolicy Bypass -Command "hipcc -O3 -std=c++17 -o '{{mesh_dir}}/target/release/membench-fingerprint-hip.exe' 'benchmarks/membench-fingerprint.hip'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: {{mesh_dir}}/target/release/membench-fingerprint-hip.exe'"
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "hipcc -O3 -std=c++17 -o 'target/release/membench-fingerprint-hip.exe' '{{ benchmark_src_dir }}/membench-fingerprint.hip'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: target/release/membench-fingerprint-hip.exe'"
 
 # Build Intel Arc SYCL memory bandwidth benchmark (requires Intel oneAPI) — UNVALIDATED
 benchmark-build-intel:
     @echo "WARNING: Intel Arc benchmark is unvalidated — no Intel Arc hardware has been tested"
-    icpx -O3 -fsycl -o {{mesh_dir}}/target/release/membench-fingerprint-intel benchmarks/membench-fingerprint-intel.cpp
-    echo "Built: {{mesh_dir}}/target/release/membench-fingerprint-intel"
+    icpx -O3 -fsycl -o target/release/membench-fingerprint-intel {{ benchmark_src_dir }}/membench-fingerprint-intel.cpp
+    echo "Built: target/release/membench-fingerprint-intel"
 
 [windows]
 benchmark-build-intel-windows:
     @echo "WARNING: Intel Arc benchmark is unvalidated — no Intel Arc hardware has been tested"
-    @powershell -NoProfile -ExecutionPolicy Bypass -Command "icpx -O3 -fsycl -o '{{mesh_dir}}/target/release/membench-fingerprint-intel.exe' 'benchmarks/membench-fingerprint-intel.cpp'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: {{mesh_dir}}/target/release/membench-fingerprint-intel.exe'"
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "icpx -O3 -fsycl -o 'target/release/membench-fingerprint-intel.exe' '{{ benchmark_src_dir }}/membench-fingerprint-intel.cpp'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: target/release/membench-fingerprint-intel.exe'"
 
 # Run the UI with Vite HMR and proxy /api to mesh-llm (default: http://127.0.0.1:3131)
 ui-dev api="http://127.0.0.1:3131" port="5173":

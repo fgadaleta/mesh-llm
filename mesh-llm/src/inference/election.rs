@@ -494,10 +494,10 @@ impl MoePlacementPlan {
     }
 }
 
-fn running_plan_state<'a>(
-    last_plan: Option<&'a MoePlacementPlan>,
+fn running_plan_state(
+    last_plan: Option<&MoePlacementPlan>,
     currently_running: bool,
-) -> (&'a [iroh::EndpointId], &'a [iroh::EndpointId]) {
+) -> (&[iroh::EndpointId], &[iroh::EndpointId]) {
     if currently_running {
         let active_ids = last_plan
             .map(|plan| plan.active_ids.as_slice())
@@ -743,9 +743,10 @@ fn resolve_runtime_moe_config(
     };
 
     eprintln!(
-        "🧩 [{}] MoE ranking={} resolved in {:.1}s",
+        "🧩 [{}] MoE ranking={} origin={} resolved in {:.1}s",
         model_name,
-        format!("{ranking_source} origin={ranking_origin}"),
+        ranking_source,
+        ranking_origin,
         started.elapsed().as_secs_f64()
     );
 
@@ -836,6 +837,7 @@ fn format_moe_analysis_progress_line(
     total: Option<usize>,
     elapsed: std::time::Duration,
 ) -> String {
+    let mode_label = format!("MoE {mode}");
     let progress = match total {
         Some(total) if total > 0 => format!(
             "{:>5.1}%  {}/{}",
@@ -846,13 +848,67 @@ fn format_moe_analysis_progress_line(
         Some(total) => format!("       0/{}", total),
         None => "starting".to_string(),
     };
+    let spinner_progress = format!("{spinner} {progress}");
     format!(
         "🧩 [{}] {:<17} {}  {:>3}s",
         model_name,
-        format!("MoE {mode}"),
-        format!("{spinner} {progress}"),
+        mode_label,
+        spinner_progress,
         elapsed.as_secs()
     )
+}
+
+struct MoeElectionParams {
+    runtime: Arc<crate::runtime::instance::InstanceRuntime>,
+    node: mesh::Node,
+    tunnel_mgr: tunnel::Manager,
+    ingress_http_port: u16,
+    bin_dir: std::path::PathBuf,
+    model: std::path::PathBuf,
+    model_name: String,
+    moe_cfg: ResolvedMoeConfig,
+    my_vram: u64,
+    model_bytes: u64,
+    binary_flavor: Option<launch::BinaryFlavor>,
+    ctx_size_override: Option<u32>,
+    target_tx: Arc<watch::Sender<ModelTargets>>,
+    stop_rx: watch::Receiver<bool>,
+}
+
+struct StartLlamaParams<'a> {
+    runtime: &'a crate::runtime::instance::InstanceRuntime,
+    node: &'a mesh::Node,
+    tunnel_mgr: &'a tunnel::Manager,
+    bin_dir: &'a Path,
+    model: &'a Path,
+    model_name: &'a str,
+    model_peers: &'a [mesh::PeerInfo],
+    explicit_mmproj: Option<&'a Path>,
+    draft: Option<&'a Path>,
+    draft_max: u16,
+    force_split: bool,
+    binary_flavor: Option<launch::BinaryFlavor>,
+    ctx_size_override: Option<u32>,
+}
+
+pub struct ElectionLoopParams {
+    pub runtime: Arc<crate::runtime::instance::InstanceRuntime>,
+    pub node: mesh::Node,
+    pub tunnel_mgr: tunnel::Manager,
+    pub ingress_http_port: u16,
+    pub rpc_port: u16,
+    pub bin_dir: std::path::PathBuf,
+    pub model: std::path::PathBuf,
+    pub model_name: String,
+    pub explicit_mmproj: Option<std::path::PathBuf>,
+    pub draft: Option<std::path::PathBuf>,
+    pub draft_max: u16,
+    pub force_split: bool,
+    pub binary_flavor: Option<launch::BinaryFlavor>,
+    pub ctx_size_override: Option<u32>,
+    pub moe_runtime_options: moe::MoeRuntimeOptions,
+    pub target_tx: Arc<watch::Sender<ModelTargets>>,
+    pub stop_rx: watch::Receiver<bool>,
 }
 
 fn spawn_moe_analysis_spinner(
@@ -1252,26 +1308,29 @@ fn default_micro_prompts() -> &'static [&'static str] {
 /// API proxy knows where to forward requests.
 #[allow(clippy::too_many_arguments)]
 pub async fn election_loop(
-    runtime: Arc<crate::runtime::instance::InstanceRuntime>,
-    node: mesh::Node,
-    tunnel_mgr: tunnel::Manager,
-    ingress_http_port: u16,
-    rpc_port: u16,
-    bin_dir: std::path::PathBuf,
-    model: std::path::PathBuf,
-    model_name: String,
-    explicit_mmproj: Option<std::path::PathBuf>,
-    draft: Option<std::path::PathBuf>,
-    draft_max: u16,
-    force_split: bool,
-    binary_flavor: Option<launch::BinaryFlavor>,
-    ctx_size_override: Option<u32>,
-    moe_runtime_options: moe::MoeRuntimeOptions,
-    target_tx: Arc<watch::Sender<ModelTargets>>,
-    mut stop_rx: watch::Receiver<bool>,
+    params: ElectionLoopParams,
     mut on_change: impl FnMut(bool, bool) + Send,
     mut on_process: impl FnMut(Option<LocalProcessInfo>) + Send,
 ) {
+    let ElectionLoopParams {
+        runtime,
+        node,
+        tunnel_mgr,
+        ingress_http_port,
+        rpc_port: _rpc_port,
+        bin_dir,
+        model,
+        model_name,
+        explicit_mmproj,
+        draft,
+        draft_max,
+        force_split,
+        binary_flavor,
+        ctx_size_override,
+        moe_runtime_options,
+        target_tx,
+        mut stop_rx,
+    } = params;
     let mut peer_rx = node.peer_change_rx.clone();
 
     // Track the actual running launch topology so we only restart on real split changes.
@@ -1289,12 +1348,10 @@ pub async fn election_loop(
 
     // Check if this is a MoE model with enough metadata to plan expert routing.
     let moe_config = lookup_moe_config(&model_name, &model);
-    if moe_config.is_some() {
+    if let Some(moe_config) = &moe_config {
         eprintln!(
             "🧩 [{}] MoE model detected ({} experts, top-{})",
-            model_name,
-            moe_config.as_ref().unwrap().n_expert,
-            moe_config.as_ref().unwrap().n_expert_used
+            model_name, moe_config.n_expert, moe_config.n_expert_used
         );
     }
 
@@ -1339,20 +1396,22 @@ pub async fn election_loop(
                 }
             };
             moe_election_loop(
-                runtime.clone(),
-                node,
-                tunnel_mgr,
-                ingress_http_port,
-                bin_dir,
-                model,
-                model_name,
-                resolved_moe_cfg,
-                my_vram,
-                model_bytes as u64,
-                binary_flavor,
-                ctx_size_override,
-                target_tx,
-                stop_rx,
+                MoeElectionParams {
+                    runtime: runtime.clone(),
+                    node,
+                    tunnel_mgr,
+                    ingress_http_port,
+                    bin_dir,
+                    model,
+                    model_name,
+                    moe_cfg: resolved_moe_cfg,
+                    my_vram,
+                    model_bytes,
+                    binary_flavor,
+                    ctx_size_override,
+                    target_tx,
+                    stop_rx,
+                },
                 &mut on_change,
                 &mut on_process,
             )
@@ -1540,22 +1599,27 @@ pub async fn election_loop(
             }
             on_change(true, false);
 
-            let (llama_port, process) = match start_llama(
-                &runtime,
-                &node,
-                &tunnel_mgr,
-                rpc_port,
-                &bin_dir,
-                &model,
-                &model_name,
-                &model_peers,
-                &desired_launch,
-                explicit_mmproj.as_deref(),
-                draft.as_deref(),
+            // In solo mode, pass empty model_peers so start_llama won't use any workers
+            let peers_for_launch = if matches!(desired_launch, DenseLaunchPlan::Split { .. }) {
+                &model_peers[..]
+            } else {
+                &[]
+            };
+            let (llama_port, process) = match start_llama(StartLlamaParams {
+                runtime: &runtime,
+                node: &node,
+                tunnel_mgr: &tunnel_mgr,
+                bin_dir: &bin_dir,
+                model: &model,
+                model_name: &model_name,
+                model_peers: peers_for_launch,
+                explicit_mmproj: explicit_mmproj.as_deref(),
+                draft: draft.as_deref(),
                 draft_max,
+                force_split,
                 binary_flavor,
                 ctx_size_override,
-            )
+            })
             .await
             {
                 Some((port, death_rx)) => (port, death_rx),
@@ -1689,23 +1753,26 @@ pub async fn election_loop(
 /// - The proxy routes sessions to nodes via hash-based affinity
 #[allow(clippy::too_many_arguments)]
 async fn moe_election_loop(
-    runtime: Arc<crate::runtime::instance::InstanceRuntime>,
-    node: mesh::Node,
-    tunnel_mgr: tunnel::Manager,
-    ingress_http_port: u16,
-    bin_dir: std::path::PathBuf,
-    model: std::path::PathBuf,
-    model_name: String,
-    mut moe_cfg: ResolvedMoeConfig,
-    my_vram: u64,
-    model_bytes: u64,
-    binary_flavor: Option<launch::BinaryFlavor>,
-    ctx_size_override: Option<u32>,
-    target_tx: Arc<watch::Sender<ModelTargets>>,
-    mut stop_rx: watch::Receiver<bool>,
+    params: MoeElectionParams,
     on_change: &mut impl FnMut(bool, bool),
     on_process: &mut impl FnMut(Option<LocalProcessInfo>),
 ) {
+    let MoeElectionParams {
+        runtime,
+        node,
+        tunnel_mgr,
+        ingress_http_port,
+        bin_dir,
+        model,
+        model_name,
+        mut moe_cfg,
+        my_vram,
+        model_bytes,
+        binary_flavor,
+        ctx_size_override,
+        target_tx,
+        mut stop_rx,
+    } = params;
     let mut peer_rx = node.peer_change_rx.clone();
     let mut currently_running = false;
     let mut last_plan: Option<MoePlacementPlan> = None;
@@ -2362,23 +2429,27 @@ async fn update_targets(
 /// Returns the ephemeral port and a death notification receiver, or None on failure.
 #[allow(clippy::too_many_arguments)]
 async fn start_llama(
-    runtime: &crate::runtime::instance::InstanceRuntime,
-    node: &mesh::Node,
-    tunnel_mgr: &tunnel::Manager,
-    _my_rpc_port: u16,
-    bin_dir: &Path,
-    model: &Path,
-    model_name: &str,
-    model_peers: &[mesh::PeerInfo],
-    launch_plan: &DenseLaunchPlan,
-    explicit_mmproj: Option<&Path>,
-    draft: Option<&Path>,
-    draft_max: u16,
-    binary_flavor: Option<launch::BinaryFlavor>,
-    ctx_size_override: Option<u32>,
+    params: StartLlamaParams<'_>,
 ) -> Option<(u16, launch::InferenceServerProcess)> {
+    let StartLlamaParams {
+        runtime,
+        node,
+        tunnel_mgr,
+        bin_dir,
+        model,
+        model_name,
+        model_peers,
+        explicit_mmproj,
+        draft,
+        draft_max,
+        force_split,
+        binary_flavor,
+        ctx_size_override,
+    } = params;
     let my_vram = node.vram_bytes();
     let model_bytes = total_model_bytes(model);
+    let launch_plan =
+        build_dense_launch_plan(my_vram, model_bytes, force_split, model_name, model_peers);
     let worker_ids = match launch_plan {
         DenseLaunchPlan::Solo => {
             let worker_count = model_peers
@@ -2396,7 +2467,7 @@ async fn start_llama(
             Vec::new()
         }
         DenseLaunchPlan::Split { worker_ids, .. } => {
-            for id in worker_ids {
+            for id in &worker_ids {
                 if let Some(peer) = model_peers.iter().find(|peer| peer.id == *id) {
                     let rtt_str = peer
                         .rtt_ms
@@ -2490,8 +2561,7 @@ async fn start_llama(
     };
 
     // Look up mmproj for vision models
-    let mmproj_path =
-        crate::models::resolve_mmproj_path(model_name, model, explicit_mmproj.as_deref());
+    let mmproj_path = crate::models::resolve_mmproj_path(model_name, model, explicit_mmproj);
 
     // In split mode (pipeline parallel), pass total group VRAM so context size
     // accounts for the host only holding its share of layers. KV cache is also
@@ -2587,7 +2657,10 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),

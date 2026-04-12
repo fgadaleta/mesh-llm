@@ -211,7 +211,7 @@ Switches:
 
 ### `gpus`
 
-Use this to inspect local GPU identity/capacity.
+Use this to inspect local GPU identity and capacity, including per-device VRAM, unified-memory state, and cached benchmark-derived bandwidth when present.
 
 
 ### `load`

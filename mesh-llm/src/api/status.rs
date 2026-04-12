@@ -1,6 +1,7 @@
 use super::{RuntimeModelPayload, RuntimeProcessPayload};
 use crate::crypto::{OwnershipStatus, OwnershipSummary};
 use crate::network::affinity;
+use crate::system::hardware::expand_gpu_names;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -18,33 +19,88 @@ pub(super) struct GpuEntry {
     pub(super) name: String,
     pub(super) vram_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) bandwidth_gbps: Option<f64>,
+    pub(super) reserved_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mem_bandwidth_gbps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) compute_tflops_fp32: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) compute_tflops_fp16: Option<f64>,
+}
+
+fn inferred_gpu_name_count(gpu_name: Option<&str>) -> usize {
+    let Some(raw) = gpu_name.map(str::trim) else {
+        return 0;
+    };
+    if raw.is_empty() {
+        return 0;
+    }
+
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.split_once('×')
+                .or_else(|| part.split_once('x'))
+                .or_else(|| part.split_once('X'))
+                .and_then(|(count, _)| count.trim().parse::<usize>().ok())
+                .filter(|&count| count > 0)
+                .unwrap_or(1)
+        })
+        .sum()
 }
 
 pub(super) fn build_gpus(
     gpu_name: Option<&str>,
     gpu_vram: Option<&str>,
-    gpu_bandwidth: Option<&str>,
+    gpu_reserved_bytes: Option<&str>,
+    gpu_mem_bandwidth: Option<&str>,
+    gpu_compute_tflops_fp32: Option<&str>,
+    gpu_compute_tflops_fp16: Option<&str>,
 ) -> Vec<GpuEntry> {
-    let names: Vec<&str> = gpu_name
-        .map(|s| s.split(", ").collect())
-        .unwrap_or_default();
-    if names.is_empty() {
-        return vec![];
-    }
     let vrams: Vec<Option<u64>> = gpu_vram
         .map(|s| s.split(',').map(|v| v.trim().parse::<u64>().ok()).collect())
         .unwrap_or_default();
-    let bandwidths: Vec<Option<f64>> = gpu_bandwidth
+    let reserved: Vec<Option<u64>> = gpu_reserved_bytes
+        .map(|s| s.split(',').map(|v| v.trim().parse::<u64>().ok()).collect())
+        .unwrap_or_default();
+    let bandwidths: Vec<Option<f64>> = gpu_mem_bandwidth
         .map(|s| s.split(',').map(|v| v.trim().parse::<f64>().ok()).collect())
         .unwrap_or_default();
+    let compute_fp32: Vec<Option<f64>> = gpu_compute_tflops_fp32
+        .map(|s| s.split(',').map(|v| v.trim().parse::<f64>().ok()).collect())
+        .unwrap_or_default();
+    let compute_fp16: Vec<Option<f64>> = gpu_compute_tflops_fp16
+        .map(|s| s.split(',').map(|v| v.trim().parse::<f64>().ok()).collect())
+        .unwrap_or_default();
+    let expected_count = [
+        vrams.len(),
+        reserved.len(),
+        bandwidths.len(),
+        compute_fp32.len(),
+        compute_fp16.len(),
+        inferred_gpu_name_count(gpu_name),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    let names = expand_gpu_names(gpu_name, expected_count)
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return vec![];
+    }
     names
         .into_iter()
         .enumerate()
         .map(|(i, name)| GpuEntry {
-            name: name.to_string(),
+            name,
             vram_bytes: vrams.get(i).copied().flatten().unwrap_or(0),
-            bandwidth_gbps: bandwidths.get(i).copied().flatten(),
+            reserved_bytes: reserved.get(i).copied().flatten(),
+            mem_bandwidth_gbps: bandwidths.get(i).copied().flatten(),
+            compute_tflops_fp32: compute_fp32.get(i).copied().flatten(),
+            compute_tflops_fp16: compute_fp16.get(i).copied().flatten(),
         })
         .collect()
 }

@@ -808,6 +808,7 @@ fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool {
         || old.served_model_runtime != new.served_model_runtime
         || old.version != new.version
         || old.owner_summary != new.owner_summary
+        || old.gpu_reserved_bytes != new.gpu_reserved_bytes
 }
 
 fn policy_accepts_peer(policy: TrustPolicy, owner_summary: &OwnershipSummary) -> bool {
@@ -925,7 +926,17 @@ pub(crate) struct PeerAnnouncementV0 {
     #[serde(default)]
     gpu_vram: Option<String>,
     #[serde(default)]
-    gpu_bandwidth_gbps: Option<String>,
+    gpu_reserved_bytes: Option<String>,
+    #[serde(
+        default,
+        rename = "gpu_bandwidth_gbps",
+        alias = "gpu_mem_bandwidth_gbps"
+    )]
+    gpu_mem_bandwidth_gbps: Option<String>,
+    #[serde(default)]
+    gpu_compute_tflops_fp32: Option<String>,
+    #[serde(default)]
+    gpu_compute_tflops_fp16: Option<String>,
     #[serde(default)]
     available_model_sizes: HashMap<String, u64>,
     #[serde(skip_serializing, skip_deserializing, default)]
@@ -958,7 +969,10 @@ impl PeerAnnouncementV0 {
             hostname: self.hostname,
             is_soc: self.is_soc,
             gpu_vram: self.gpu_vram,
-            gpu_bandwidth_gbps: self.gpu_bandwidth_gbps,
+            gpu_reserved_bytes: self.gpu_reserved_bytes,
+            gpu_mem_bandwidth_gbps: self.gpu_mem_bandwidth_gbps,
+            gpu_compute_tflops_fp32: self.gpu_compute_tflops_fp32,
+            gpu_compute_tflops_fp16: self.gpu_compute_tflops_fp16,
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: self.available_model_sizes,
@@ -988,7 +1002,10 @@ impl From<&PeerAnnouncement> for PeerAnnouncementV0 {
             hostname: ann.hostname.clone(),
             is_soc: ann.is_soc,
             gpu_vram: ann.gpu_vram.clone(),
-            gpu_bandwidth_gbps: ann.gpu_bandwidth_gbps.clone(),
+            gpu_reserved_bytes: ann.gpu_reserved_bytes.clone(),
+            gpu_mem_bandwidth_gbps: ann.gpu_mem_bandwidth_gbps.clone(),
+            gpu_compute_tflops_fp32: ann.gpu_compute_tflops_fp32.clone(),
+            gpu_compute_tflops_fp16: ann.gpu_compute_tflops_fp16.clone(),
             available_model_sizes: ann.available_model_sizes.clone(),
             served_model_descriptors: ann.served_model_descriptors.clone(),
             served_model_runtime: ann.served_model_runtime.clone(),
@@ -1030,8 +1047,17 @@ fn apply_transitive_ann(
     if ann.gpu_vram.is_some() {
         existing.gpu_vram = ann.gpu_vram.clone();
     }
-    if ann.gpu_bandwidth_gbps.is_some() {
-        existing.gpu_bandwidth_gbps = ann.gpu_bandwidth_gbps.clone();
+    if ann.gpu_reserved_bytes.is_some() {
+        existing.gpu_reserved_bytes = ann.gpu_reserved_bytes.clone();
+    }
+    if ann.gpu_mem_bandwidth_gbps.is_some() {
+        existing.gpu_mem_bandwidth_gbps = ann.gpu_mem_bandwidth_gbps.clone();
+    }
+    if ann.gpu_compute_tflops_fp32.is_some() {
+        existing.gpu_compute_tflops_fp32 = ann.gpu_compute_tflops_fp32.clone();
+    }
+    if ann.gpu_compute_tflops_fp16.is_some() {
+        existing.gpu_compute_tflops_fp16 = ann.gpu_compute_tflops_fp16.clone();
     }
     existing.models = ann.models.clone();
     existing.available_models.clear();
@@ -1061,20 +1087,15 @@ pub fn merge_demand(
 }
 
 /// Role a node plays in the mesh.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum NodeRole {
     /// Provides GPU compute via rpc-server for a specific model.
+    #[default]
     Worker,
     /// Runs llama-server for a specific model, orchestrates inference, provides HTTP API.
     Host { http_port: u16 },
     /// Lite client — no compute, accesses the API via tunnel.
     Client,
-}
-
-impl Default for NodeRole {
-    fn default() -> Self {
-        NodeRole::Worker
-    }
 }
 
 /// Gossip payload — extends EndpointAddr with role metadata.
@@ -1098,7 +1119,10 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) hostname: Option<String>,
     pub(crate) is_soc: Option<bool>,
     pub(crate) gpu_vram: Option<String>,
-    pub(crate) gpu_bandwidth_gbps: Option<String>,
+    pub(crate) gpu_reserved_bytes: Option<String>,
+    pub(crate) gpu_mem_bandwidth_gbps: Option<String>,
+    pub(crate) gpu_compute_tflops_fp32: Option<String>,
+    pub(crate) gpu_compute_tflops_fp16: Option<String>,
     pub(crate) available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
     pub(crate) experts_summary: Option<crate::proto::node::ExpertsSummary>,
     pub(crate) available_model_sizes: HashMap<String, u64>,
@@ -1141,7 +1165,10 @@ pub struct PeerInfo {
     pub hostname: Option<String>,
     pub is_soc: Option<bool>,
     pub gpu_vram: Option<String>,
-    pub gpu_bandwidth_gbps: Option<String>,
+    pub gpu_reserved_bytes: Option<String>,
+    pub gpu_mem_bandwidth_gbps: Option<String>,
+    pub gpu_compute_tflops_fp32: Option<String>,
+    pub gpu_compute_tflops_fp16: Option<String>,
     pub available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
     pub experts_summary: Option<crate::proto::node::ExpertsSummary>,
     pub available_model_sizes: HashMap<String, u64>,
@@ -1193,7 +1220,10 @@ impl PeerInfo {
             hostname: ann.hostname.clone(),
             is_soc: ann.is_soc,
             gpu_vram: ann.gpu_vram.clone(),
-            gpu_bandwidth_gbps: ann.gpu_bandwidth_gbps.clone(),
+            gpu_reserved_bytes: ann.gpu_reserved_bytes.clone(),
+            gpu_mem_bandwidth_gbps: ann.gpu_mem_bandwidth_gbps.clone(),
+            gpu_compute_tflops_fp32: ann.gpu_compute_tflops_fp32.clone(),
+            gpu_compute_tflops_fp16: ann.gpu_compute_tflops_fp16.clone(),
             available_model_metadata: ann.available_model_metadata.clone(),
             experts_summary: ann.experts_summary.clone(),
             available_model_sizes: ann.available_model_sizes.clone(),
@@ -1367,7 +1397,7 @@ async fn stun_public_addr(advertised_port: u16) -> Option<std::net::SocketAddr> 
                     }
 
                     // Attributes are padded to 4-byte boundary
-                    i += 4 + (attr_len + 3) & !3;
+                    i += (4 + (attr_len + 3)) & !3;
                 }
             }
             _ => continue,
@@ -1417,7 +1447,10 @@ pub struct Node {
     pub hostname: Option<String>,
     pub is_soc: Option<bool>,
     pub gpu_vram: Option<String>,
-    pub gpu_bandwidth_gbps: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub gpu_reserved_bytes: Option<String>,
+    pub gpu_mem_bandwidth_gbps: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub gpu_compute_tflops_fp32: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub gpu_compute_tflops_fp16: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
     config_state: Arc<tokio::sync::Mutex<crate::runtime::config_state::ConfigState>>,
     config_revision_tx: Arc<tokio::sync::watch::Sender<u64>>,
 }
@@ -1692,6 +1725,17 @@ impl Node {
                     .join(","),
             )
         };
+        let gpu_reserved_bytes = if hw.gpu_reserved.iter().all(Option::is_none) {
+            None
+        } else {
+            Some(
+                hw.gpu_reserved
+                    .iter()
+                    .map(|value| value.map(|v| v.to_string()).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        };
         if let Some(max_gb) = max_vram_gb {
             let max_bytes = (max_gb * 1e9) as u64;
             if max_bytes < vram {
@@ -1794,7 +1838,10 @@ impl Node {
             hostname,
             is_soc,
             gpu_vram,
-            gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_reserved_bytes,
+            gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
             config_state: Arc::new(tokio::sync::Mutex::new(config_state_init)),
             config_revision_tx: {
                 let (tx, _rx) = tokio::sync::watch::channel(config_revision_init);
@@ -1889,7 +1936,10 @@ impl Node {
             hostname: None,
             is_soc: Some(false),
             gpu_vram: None,
-            gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
             config_state: Arc::new(tokio::sync::Mutex::new(
                 crate::runtime::config_state::ConfigState::default(),
             )),
@@ -2299,7 +2349,7 @@ impl Node {
             // If RTT dropped from above the split threshold (80ms) to below it
             // (e.g. relay → direct), trigger a re-election so the peer can now
             // be included in split mode.
-            let was_above = old_rtt.map_or(false, |r| r > MAX_SPLIT_RTT_MS);
+            let was_above = old_rtt.is_some_and(|r| r > MAX_SPLIT_RTT_MS);
             if was_above && rtt_ms <= MAX_SPLIT_RTT_MS {
                 eprintln!(
                     "📡 Peer {} RTT improved ({}ms → {}ms) — re-electing for split",
@@ -3630,7 +3680,6 @@ impl Node {
             match stream_type {
                 STREAM_GOSSIP => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if let Err(e) = node
                             .handle_gossip_stream(remote, protocol, send, recv)
@@ -3648,7 +3697,6 @@ impl Node {
                 }
                 STREAM_TUNNEL_MAP => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if let Err(e) = node.handle_tunnel_map_stream(remote, protocol, recv).await
                         {
@@ -3667,7 +3715,6 @@ impl Node {
                 }
                 STREAM_ROUTE_REQUEST => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         if protocol == ControlProtocol::ProtoV1 {
                             let proto_buf = match read_len_prefixed(&mut recv).await {
@@ -3717,7 +3764,6 @@ impl Node {
                 }
                 STREAM_PEER_DOWN => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         let peer_id_arr: [u8; 32] = match protocol {
                             ControlProtocol::ProtoV1 => {
@@ -3812,7 +3858,6 @@ impl Node {
                 }
                 STREAM_PEER_LEAVING => {
                     let node = self.clone();
-                    let protocol = protocol;
                     tokio::spawn(async move {
                         let leaving_id = match protocol {
                             ControlProtocol::ProtoV1 => {
@@ -4070,12 +4115,11 @@ impl Node {
                     }
                 }
                 inbound = read_len_prefixed(&mut recv) => {
-                    match inbound {
-                        Ok(_) => tracing::debug!(
+                    if inbound.is_ok() {
+                        tracing::debug!(
                             "config subscribe from {} sent unexpected extra frame; closing stream",
                             remote.fmt_short()
-                        ),
-                        Err(_) => {}
+                        );
                     }
                     break;
                 }
@@ -4358,24 +4402,21 @@ impl Node {
             // Keep the request stream's send half alive while subscribed so the
             // remote side does not treat immediate EOF as an unsubscribe.
             let _send = send;
-            loop {
-                match read_len_prefixed(&mut recv).await {
-                    Ok(buf) => match ConfigUpdateNotification::decode(buf.as_slice()) {
-                        Ok(notif) => {
-                            if let Err(e) = notif.validate_frame() {
-                                tracing::warn!("ConfigUpdateNotification validation error: {e}");
-                                break;
-                            }
-                            if notif_tx.send(notif).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("ConfigUpdateNotification decode error: {e}");
+            while let Ok(buf) = read_len_prefixed(&mut recv).await {
+                match ConfigUpdateNotification::decode(buf.as_slice()) {
+                    Ok(notif) => {
+                        if let Err(e) = notif.validate_frame() {
+                            tracing::warn!("ConfigUpdateNotification validation error: {e}");
                             break;
                         }
-                    },
-                    Err(_) => break,
+                        if notif_tx.send(notif).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("ConfigUpdateNotification decode error: {e}");
+                        break;
+                    }
                 }
             }
         });
@@ -4804,7 +4845,10 @@ impl Node {
             existing.hostname = ann.hostname.clone();
             existing.is_soc = ann.is_soc;
             existing.gpu_vram = ann.gpu_vram.clone();
-            existing.gpu_bandwidth_gbps = ann.gpu_bandwidth_gbps.clone();
+            existing.gpu_reserved_bytes = ann.gpu_reserved_bytes.clone();
+            existing.gpu_mem_bandwidth_gbps = ann.gpu_mem_bandwidth_gbps.clone();
+            existing.gpu_compute_tflops_fp32 = ann.gpu_compute_tflops_fp32.clone();
+            existing.gpu_compute_tflops_fp16 = ann.gpu_compute_tflops_fp16.clone();
             if ann.experts_summary.is_some() {
                 existing.experts_summary = ann.experts_summary.clone();
             }
@@ -4814,7 +4858,10 @@ impl Node {
                 || old_peer.hostname != updated_peer.hostname
                 || old_peer.is_soc != updated_peer.is_soc
                 || old_peer.gpu_vram != updated_peer.gpu_vram
-                || old_peer.gpu_bandwidth_gbps != updated_peer.gpu_bandwidth_gbps;
+                || old_peer.gpu_reserved_bytes != updated_peer.gpu_reserved_bytes
+                || old_peer.gpu_mem_bandwidth_gbps != updated_peer.gpu_mem_bandwidth_gbps
+                || old_peer.gpu_compute_tflops_fp32 != updated_peer.gpu_compute_tflops_fp32
+                || old_peer.gpu_compute_tflops_fp16 != updated_peer.gpu_compute_tflops_fp16;
             if role_changed || serving_changed {
                 let count = state.peers.len();
                 drop(state);
@@ -4999,7 +5046,10 @@ impl Node {
                     hostname: p.hostname.clone(),
                     is_soc: p.is_soc,
                     gpu_vram: p.gpu_vram.clone(),
-                    gpu_bandwidth_gbps: p.gpu_bandwidth_gbps.clone(),
+                    gpu_reserved_bytes: p.gpu_reserved_bytes.clone(),
+                    gpu_mem_bandwidth_gbps: p.gpu_mem_bandwidth_gbps.clone(),
+                    gpu_compute_tflops_fp32: p.gpu_compute_tflops_fp32.clone(),
+                    gpu_compute_tflops_fp16: p.gpu_compute_tflops_fp16.clone(),
                     available_model_metadata: p.available_model_metadata.clone(),
                     experts_summary: p.experts_summary.clone(),
                     available_model_sizes: p.available_model_sizes.clone(),
@@ -5038,7 +5088,24 @@ impl Node {
             } else {
                 None
             },
-            gpu_bandwidth_gbps: self.gpu_bandwidth_gbps.lock().await.as_ref().map(|v| {
+            gpu_reserved_bytes: if self.enumerate_host {
+                self.gpu_reserved_bytes.clone()
+            } else {
+                None
+            },
+            gpu_mem_bandwidth_gbps: self.gpu_mem_bandwidth_gbps.lock().await.as_ref().map(|v| {
+                v.iter()
+                    .map(|f| format!("{:.2}", f))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
+            gpu_compute_tflops_fp32: self.gpu_compute_tflops_fp32.lock().await.as_ref().map(|v| {
+                v.iter()
+                    .map(|f| format!("{:.2}", f))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
+            gpu_compute_tflops_fp16: self.gpu_compute_tflops_fp16.lock().await.as_ref().map(|v| {
                 v.iter()
                     .map(|f| format!("{:.2}", f))
                     .collect::<Vec<_>>()
@@ -5148,7 +5215,10 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
             config_state: Arc::new(tokio::sync::Mutex::new(
                 crate::runtime::config_state::ConfigState::default(),
             )),
@@ -5531,35 +5601,214 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_announcement_with_bandwidth_serde_roundtrip() {
-        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    fn test_peer_announcement_v0_gossip_wire_backward_compat() {
+        #[derive(Deserialize)]
         struct TestAnnouncement {
-            #[serde(default)]
-            gpu_bandwidth_gbps: Option<String>,
+            #[serde(
+                default,
+                rename = "gpu_bandwidth_gbps",
+                alias = "gpu_mem_bandwidth_gbps"
+            )]
+            gpu_mem_bandwidth_gbps: Option<String>,
         }
 
-        let test = TestAnnouncement {
-            gpu_bandwidth_gbps: Some("1671.7,722.2".to_string()),
+        let json = r#"{"gpu_bandwidth_gbps":"1671.7,722.2"}"#;
+        let decoded: TestAnnouncement = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            decoded.gpu_mem_bandwidth_gbps,
+            Some("1671.7,722.2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_peer_announcement_v0_gossip_wire_new_alias() {
+        #[derive(Deserialize)]
+        struct TestAnnouncement {
+            #[serde(
+                default,
+                rename = "gpu_bandwidth_gbps",
+                alias = "gpu_mem_bandwidth_gbps"
+            )]
+            gpu_mem_bandwidth_gbps: Option<String>,
+        }
+
+        let json = r#"{"gpu_mem_bandwidth_gbps":"1671.7,722.2"}"#;
+        let decoded: TestAnnouncement = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            decoded.gpu_mem_bandwidth_gbps,
+            Some("1671.7,722.2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_peer_announcement_v0_serializes_with_old_name() {
+        #[derive(Serialize)]
+        struct TestAnnouncement {
+            #[serde(
+                default,
+                rename = "gpu_bandwidth_gbps",
+                alias = "gpu_mem_bandwidth_gbps"
+            )]
+            gpu_mem_bandwidth_gbps: Option<String>,
+        }
+
+        let announcement = TestAnnouncement {
+            gpu_mem_bandwidth_gbps: Some("1671.7,722.2".to_string()),
         };
 
-        let json = serde_json::to_string(&test).unwrap();
-        let decoded: TestAnnouncement = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(decoded.gpu_bandwidth_gbps, Some("1671.7,722.2".to_string()));
+        let value = serde_json::to_value(&announcement).unwrap();
+        assert_eq!(
+            value.get("gpu_bandwidth_gbps").unwrap(),
+            &serde_json::json!("1671.7,722.2")
+        );
+        assert!(value.get("gpu_mem_bandwidth_gbps").is_none());
     }
 
     #[test]
     fn test_peer_announcement_backward_compat_no_bandwidth_field() {
-        #[derive(Deserialize, Debug)]
+        #[derive(Deserialize)]
         struct TestAnnouncement {
-            #[serde(default)]
-            gpu_bandwidth_gbps: Option<String>,
+            #[serde(
+                default,
+                rename = "gpu_bandwidth_gbps",
+                alias = "gpu_mem_bandwidth_gbps"
+            )]
+            gpu_mem_bandwidth_gbps: Option<String>,
         }
 
         let json = r#"{"other_field": "value"}"#;
         let decoded: TestAnnouncement = serde_json::from_str(json).unwrap();
 
-        assert_eq!(decoded.gpu_bandwidth_gbps, None);
+        assert_eq!(decoded.gpu_mem_bandwidth_gbps, None);
+    }
+
+    #[test]
+    fn test_peer_announcement_v0_gpu_compute_tflops_serde_roundtrip() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x21; 32]).public());
+        let ann = super::PeerAnnouncementV0 {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Host { http_port: 9337 },
+            models: vec!["GLM".into()],
+            vram_bytes: 48_000_000_000,
+            model_source: Some("glm.gguf".into()),
+            serving: Some("GLM".into()),
+            serving_models: vec!["GLM".into()],
+            available_models: vec!["GLM".into()],
+            requested_models: vec![],
+            version: Some("0.54.0".into()),
+            model_demand: HashMap::new(),
+            mesh_id: Some("mesh-tflops".into()),
+            gpu_name: Some("NVIDIA A100".into()),
+            hostname: Some("worker-01".into()),
+            is_soc: Some(false),
+            gpu_vram: Some("51539607552".into()),
+            gpu_reserved_bytes: Some("1073741824".into()),
+            gpu_mem_bandwidth_gbps: Some("2039.4".into()),
+            gpu_compute_tflops_fp32: Some("19.49".into()),
+            gpu_compute_tflops_fp16: Some("38.98".into()),
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+        };
+
+        let json = serde_json::to_string(&ann).unwrap();
+        let decoded: super::PeerAnnouncementV0 = serde_json::from_str(&json).unwrap();
+        let internal = decoded.into_internal();
+
+        assert_eq!(internal.gpu_reserved_bytes.as_deref(), Some("1073741824"));
+        assert_eq!(internal.gpu_compute_tflops_fp32.as_deref(), Some("19.49"));
+        assert_eq!(internal.gpu_compute_tflops_fp16.as_deref(), Some("38.98"));
+        assert_eq!(internal.gpu_mem_bandwidth_gbps.as_deref(), Some("2039.4"));
+    }
+
+    #[test]
+    fn test_peer_announcement_v0_backward_compat_no_tflops() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x22; 32]).public());
+        let mut value = serde_json::to_value(super::PeerAnnouncementV0 {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving: None,
+            serving_models: vec![],
+            available_models: vec![],
+            requested_models: vec![],
+            version: None,
+            model_demand: HashMap::new(),
+            mesh_id: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: Some("15.75".into()),
+            gpu_compute_tflops_fp16: Some("31.50".into()),
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+        })
+        .unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("gpu_compute_tflops_fp32");
+        object.remove("gpu_compute_tflops_fp16");
+
+        let decoded: super::PeerAnnouncementV0 = serde_json::from_value(value).unwrap();
+        let internal = decoded.into_internal();
+
+        assert_eq!(internal.gpu_compute_tflops_fp32, None);
+        assert_eq!(internal.gpu_compute_tflops_fp16, None);
+    }
+
+    #[test]
+    fn test_peer_announcement_v0_fp32_only_without_fp16() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0x23; 32]).public());
+        let mut value = serde_json::to_value(super::PeerAnnouncementV0 {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving: None,
+            serving_models: vec![],
+            available_models: vec![],
+            requested_models: vec![],
+            version: None,
+            model_demand: HashMap::new(),
+            mesh_id: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: Some("15.75".into()),
+            gpu_compute_tflops_fp16: Some("31.50".into()),
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+        })
+        .unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("gpu_compute_tflops_fp16");
+
+        let decoded: super::PeerAnnouncementV0 = serde_json::from_value(value).unwrap();
+        let internal = decoded.into_internal();
+
+        assert_eq!(internal.gpu_compute_tflops_fp32.as_deref(), Some("15.75"));
+        assert_eq!(internal.gpu_compute_tflops_fp16, None);
     }
 
     fn make_valid_gossip_frame() -> GossipFrame {
@@ -5631,7 +5880,10 @@ mod tests {
             hostname: Some("legacy-peer".to_string()),
             is_soc: Some(false),
             gpu_vram: Some((48_u64 * 1024 * 1024 * 1024).to_string()),
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
@@ -5846,7 +6098,10 @@ mod tests {
             hostname: Some("worker-01".into()),
             is_soc: Some(false),
             gpu_vram: Some("51539607552".into()),
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_sizes: HashMap::from([("Qwen".into(), 1234_u64)]),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
@@ -5914,7 +6169,10 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
@@ -6091,6 +6349,18 @@ mod tests {
             &peer,
             "Qwen3-Coder-Next-Q4_K_M"
         ));
+    }
+
+    #[test]
+    fn peer_meaningfully_changed_detects_reserved_bytes_updates() {
+        let peer_id = make_test_endpoint_id(12);
+        let mut old_peer = make_test_peer_info(peer_id);
+        let mut new_peer = old_peer.clone();
+
+        old_peer.gpu_reserved_bytes = Some("1000".to_string());
+        new_peer.gpu_reserved_bytes = Some("2000".to_string());
+
+        assert!(peer_meaningfully_changed(&old_peer, &new_peer));
     }
 
     #[test]
@@ -6385,7 +6655,10 @@ mod tests {
             hostname: Some("test-node".to_string()),
             is_soc: Some(true),
             gpu_vram: Some("128 GB".to_string()),
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![meta.clone()],
             experts_summary: Some(experts.clone()),
             available_model_sizes: model_sizes.clone(),
@@ -6621,7 +6894,10 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![meta],
             experts_summary: None,
             available_model_sizes: new_sizes,
@@ -6689,7 +6965,10 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
@@ -6736,7 +7015,10 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![],
             experts_summary: None,
             available_model_sizes: HashMap::new(),
@@ -7752,7 +8034,10 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
@@ -7938,7 +8223,10 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
@@ -8146,7 +8434,10 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
@@ -8362,7 +8653,10 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![],
             experts_summary: None,
             tunnel_port: None,
@@ -8840,7 +9134,10 @@ mod tests {
             hostname: None,
             is_soc: None,
             gpu_vram: None,
-            gpu_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
             config_state: Arc::new(tokio::sync::Mutex::new(config_state)),
             config_revision_tx: {
                 let (tx, _rx) = tokio::sync::watch::channel(revision);

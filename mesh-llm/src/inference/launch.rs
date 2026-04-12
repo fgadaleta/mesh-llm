@@ -1542,7 +1542,7 @@ mod tests {
 
     #[test]
     fn kv_quant_small_model_is_plain_f16() {
-        let quant = KvCacheQuant::for_model_size(1 * GB);
+        let quant = KvCacheQuant::for_model_size(GB);
         assert_eq!(quant.k_type, KvType::F16);
         assert_eq!(quant.v_type, KvType::F16);
         assert!(
@@ -1699,7 +1699,7 @@ mod tests {
     #[test]
     fn kv_quant_append_args_is_silent_for_f16_default() {
         let mut args: Vec<String> = Vec::new();
-        KvCacheQuant::for_model_size(1 * GB).append_args(&mut args, 1 * GB);
+        KvCacheQuant::for_model_size(GB).append_args(&mut args, GB);
         assert!(
             args.is_empty(),
             "f16/f16 must not emit --cache-type-* flags (it's the llama-server default): {args:?}"

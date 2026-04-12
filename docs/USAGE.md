@@ -270,9 +270,11 @@ mesh-llm models updates Qwen/Qwen3-8B-GGUF
 
 ```bash
 mesh-llm gpus
+mesh-llm gpus --json
+mesh-llm gpu benchmark --json
 ```
 
-This prints the local GPU inventory with stable IDs, backend device names, VRAM, unified-memory status, and cached bandwidth if a benchmark fingerprint is already present.
+This prints the local GPU inventory with stable IDs, backend device names, VRAM, unified-memory status, and cached bandwidth when a benchmark fingerprint is already present. Add `--json` for machine-readable inventory output, or run `mesh-llm gpu benchmark --json` to refresh the cached fingerprint and print the benchmark summary as JSON.
 
 ## Local runtime control
 

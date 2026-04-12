@@ -1004,7 +1004,7 @@ fn free_disk_space(path: &Path) -> Option<u64> {
         let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
         if ret == 0 {
             // f_bavail = blocks available to unprivileged users
-            Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+            Some(stat.f_bavail as u64 * stat.f_frsize)
         } else {
             None
         }
@@ -1181,7 +1181,7 @@ mod tests {
         };
         let sidecars = mlx_sidecar_assets(&asset);
         assert_eq!(sidecars.len(), 4);
-        assert_eq!(sidecars[0].0, true);
+        assert!(sidecars[0].0);
         assert_eq!(sidecars[0].1.file, "tokenizer.json");
         assert!(sidecars
             .iter()
