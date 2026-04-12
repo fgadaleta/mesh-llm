@@ -10,10 +10,13 @@ type FileLike = {
 };
 
 type AttachmentSupportOptions = {
+  /** The *effective* media kinds that still need model support.
+   *  Images and PDFs are always handled in-browser (Florence-2 / pdf.js)
+   *  so they should NOT appear here. Only audio and generic files need
+   *  model support. */
   pendingKinds: ReadonlySet<AttachmentKind>;
   selectedModel: string;
   warmModels: readonly string[];
-  visionModels: ReadonlySet<string>;
   audioModels: ReadonlySet<string>;
   multimodalModels: ReadonlySet<string>;
 };
@@ -53,24 +56,32 @@ export function getAttachmentSendIssue({
   pendingKinds,
   selectedModel,
   warmModels,
-  visionModels,
   audioModels,
   multimodalModels,
 }: AttachmentSupportOptions): string | null {
+  // Images and PDFs are always handled in the browser (described via
+  // Florence-2 / extracted via pdf.js) so they never require model support.
+  // Only audio and generic file attachments still need a capable model.
   if (!pendingKinds.size) return null;
 
   const modelSupports = (modelName: string) =>
-    (!pendingKinds.has("image") || visionModels.has(modelName)) &&
     (!pendingKinds.has("audio") || audioModels.has(modelName)) &&
     (!pendingKinds.has("file") || multimodalModels.has(modelName));
 
   if (selectedModel && selectedModel !== "auto") {
-    return modelSupports(selectedModel)
-      ? null
-      : "Selected model does not support the attached media. Choose a compatible model or remove the attachment.";
+    if (modelSupports(selectedModel)) return null;
+
+    if (pendingKinds.has("audio") && !audioModels.has(selectedModel)) {
+      return `${selectedModel} doesn't support audio. Choose an audio-capable model or remove the attachment.`;
+    }
+    return "Selected model does not support the attached media. Choose a compatible model or remove the attachment.";
   }
 
-  return warmModels.some(modelSupports)
-    ? null
-    : "No warm model supports the attached media. Warm a compatible model or remove the attachment.";
+  if (warmModels.some(modelSupports)) return null;
+
+  // Auto mode but no warm model supports it.
+  if (pendingKinds.has("audio")) {
+    return "No warm model supports audio input. Warm an audio-capable model to use audio attachments.";
+  }
+  return "No warm model supports the attached media. Warm a compatible model or remove the attachment.";
 }

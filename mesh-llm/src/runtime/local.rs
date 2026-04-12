@@ -162,6 +162,7 @@ pub(super) async fn remove_serving_assignment(node: &mesh::Node, model_name: &st
 }
 
 pub(super) async fn start_runtime_local_model(
+    runtime: &crate::runtime::instance::InstanceRuntime,
     bin_dir: &Path,
     binary_flavor: Option<launch::BinaryFlavor>,
     node: &mesh::Node,
@@ -186,6 +187,7 @@ pub(super) async fn start_runtime_local_model(
         .map(Path::to_path_buf)
         .or_else(|| mmproj_path_for_model(&model_name));
     let process = launch::start_llama_server(
+        runtime,
         bin_dir,
         binary_flavor,
         launch::ModelLaunchSpec {

@@ -148,6 +148,8 @@ just --list           # list all recipes
 
 CI uses [`dorny/paths-filter`](https://github.com/dorny/paths-filter) to skip jobs when unchanged areas of the repo are modified. A `changes` detection job runs first on every push and PR, then each build job gates on its output.
 
+For the repo's CI design rules and workflow responsibilities, see [`docs/CI_GUIDANCE.md`](docs/CI_GUIDANCE.md).
+
 ### What triggers what
 
 | Changed paths                                                                                           | `linux` / `macos` | `linux_cuda` / `linux_rocm` / `linux_vulkan` / `windows` |
@@ -169,7 +171,7 @@ If you add a new Rust crate, build script, or test directory, add its path to th
 
 ## Benchmark Binaries
 
-Memory bandwidth benchmark source files live in `benchmarks/`. These are optional — they are **not** compiled by `just build`. Each target platform requires its own toolchain.
+Memory bandwidth benchmark source files live in `mesh-llm/benchmarks/`. These are optional — they are **not** compiled by `just build`. Each target platform requires its own toolchain.
 
 ### Building
 
@@ -190,9 +192,9 @@ just benchmark-build-intel-windows
 
 These produce `.exe` binaries next to `mesh-llm.exe`.
 
-> **AMD note:** The AMD benchmark (`benchmarks/membench-fingerprint.hip`) has not been tested on real AMD hardware. The recipe is provided for reference only.
+> **AMD note:** The AMD benchmark (`mesh-llm/benchmarks/membench-fingerprint.hip`) has not been tested on real AMD hardware. The recipe is provided for reference only.
 
-> **Intel Arc note:** The Intel Arc benchmark (`benchmarks/membench-fingerprint-intel.cpp`) has not been tested on real Intel Arc hardware. The recipe is provided for reference only.
+> **Intel Arc note:** The Intel Arc benchmark (`mesh-llm/benchmarks/membench-fingerprint-intel.cpp`) has not been tested on real Intel Arc hardware. The recipe is provided for reference only.
 
 ### Output location
 

@@ -1,5 +1,6 @@
 pub(crate) mod config_state;
 mod discovery;
+pub mod instance;
 mod local;
 mod proxy;
 
@@ -13,6 +14,10 @@ use self::local::{
 use self::proxy::{api_proxy, bootstrap_proxy};
 use crate::api;
 use crate::cli::{Cli, Command, RuntimeSurface};
+use crate::crypto::{
+    default_keystore_path, default_trust_store_path, keystore_exists, keystore_metadata,
+    load_keystore, load_owner_keypair_from_keychain, load_trust_store, OwnerKeychainLoadError,
+};
 use crate::inference::{election, launch, moe};
 use crate::mesh;
 use crate::mesh::NodeRole;
@@ -24,7 +29,9 @@ use crate::system::{autoupdate, benchmark, hardware};
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StartupModelSpec {
@@ -39,6 +46,123 @@ struct StartupModelPlan {
     resolved_path: PathBuf,
     mmproj_path: Option<PathBuf>,
     ctx_size: Option<u32>,
+}
+
+fn resolve_runtime_owner_key_path(cli: &Cli) -> Result<Option<PathBuf>> {
+    if let Some(path) = cli.owner_key.clone() {
+        return Ok(Some(path));
+    }
+
+    let default_path = default_keystore_path()?;
+    if keystore_exists(&default_path) {
+        Ok(Some(default_path))
+    } else {
+        Ok(None)
+    }
+}
+
+fn resolve_owner_passphrase(path: &Path) -> Result<Option<Zeroizing<String>>> {
+    let info = keystore_metadata(path)?;
+    if !info.encrypted {
+        return Ok(None);
+    }
+
+    if let Ok(passphrase) = std::env::var("MESH_LLM_OWNER_PASSPHRASE") {
+        return Ok(Some(Zeroizing::new(passphrase)));
+    }
+
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        let prompt = format!("Enter owner keystore passphrase for {}: ", path.display());
+        let passphrase = rpassword::prompt_password_stderr(&prompt)?;
+        return Ok(Some(Zeroizing::new(passphrase)));
+    }
+
+    Err(crate::crypto::CryptoError::MissingPassphrase.into())
+}
+
+fn load_owner_keypair_for_runtime(path: &Path) -> Result<crate::crypto::OwnerKeypair> {
+    let info = keystore_metadata(path)?;
+    if info.encrypted && std::env::var("MESH_LLM_OWNER_PASSPHRASE").is_err() {
+        match load_owner_keypair_from_keychain(path) {
+            Ok(keypair) => return Ok(keypair),
+            Err(OwnerKeychainLoadError::NoEntry)
+            | Err(OwnerKeychainLoadError::Crypto(crate::crypto::CryptoError::DecryptionFailed))
+            | Err(OwnerKeychainLoadError::Crypto(
+                crate::crypto::CryptoError::KeychainUnavailable { .. },
+            ))
+            | Err(OwnerKeychainLoadError::Crypto(
+                crate::crypto::CryptoError::KeychainAccessDenied { .. },
+            )) => {}
+            Err(OwnerKeychainLoadError::Crypto(err)) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to load owner keystore {}", path.display()));
+            }
+        }
+    }
+
+    let passphrase = resolve_owner_passphrase(path)?;
+    load_keystore(path, passphrase.as_deref().map(|value| value.as_str()))
+        .with_context(|| format!("Failed to load owner keystore {}", path.display()))
+}
+
+fn owner_runtime_config(cli: &Cli) -> Result<mesh::OwnerRuntimeConfig> {
+    let trust_store_path = default_trust_store_path()?;
+    let trust_store = load_trust_store(&trust_store_path)
+        .with_context(|| format!("Failed to load trust store {}", trust_store_path.display()))?
+        .merged_with_trusted_owners(&cli.trust_owner);
+    let trust_policy = cli.trust_policy.unwrap_or(trust_store.policy);
+
+    let keypair = match resolve_runtime_owner_key_path(cli)? {
+        Some(path) => match load_owner_keypair_for_runtime(&path) {
+            Ok(keypair) => Some(keypair),
+            Err(err) if !cli.owner_required => {
+                eprintln!(
+                    "⚠️ Owner identity unavailable at {}: {err}\n  Starting without owner attestation.",
+                    path.display()
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        },
+        None if cli.owner_required => {
+            anyhow::bail!(
+                "Owner identity is required but no keystore was found. Use --owner-key or run `mesh-llm auth init`."
+            );
+        }
+        None => None,
+    };
+
+    Ok(mesh::OwnerRuntimeConfig {
+        keypair,
+        node_label: cli.node_label.clone(),
+        trust_store,
+        trust_policy,
+    })
+}
+
+/// Wait for either SIGINT (ctrl-c) or SIGTERM. Without this, an unhandled
+/// SIGTERM aborts the process before destructors run, so PidfileGuard never
+/// removes its file and child llama-server / rpc-server are left orphaned.
+async fn wait_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -97,7 +221,7 @@ pub(crate) async fn run() -> Result<()> {
     let checked_updates = autoupdate::maybe_auto_update(&cli).await?;
 
     // Finish the release check before startup continues.
-    if !checked_updates && !matches!(cli.command, Some(Command::Update)) {
+    if !checked_updates && !matches!(cli.command, Some(Command::Update { .. })) {
         autoupdate::check_for_update().await;
     }
 
@@ -110,12 +234,67 @@ pub(crate) async fn run() -> Result<()> {
     let has_config_models = !config.models.is_empty();
     let has_startup_models = cli_has_explicit_models || has_config_models;
 
-    // Clean up orphan processes from previous runs (skip for client — never runs llama-server).
+    // Acquire the per-instance runtime directory and flock (skip for --client — no local servers).
+    // Wrap in Arc so it can be cheaply shared with election/spawn tasks that
+    // need to write pidfiles for child processes (rpc-server, llama-server).
+    let runtime: Option<std::sync::Arc<crate::runtime::instance::InstanceRuntime>> = if !cli.client
+    {
+        match crate::runtime::instance::InstanceRuntime::acquire(std::process::id()) {
+            Ok(rt) => Some(std::sync::Arc::new(rt)),
+            Err(e) => {
+                tracing::warn!("failed to acquire instance runtime: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Write owner.json into the runtime dir so sibling-instance discovery can find us.
+    if let Some(ref rt) = runtime {
+        let started_at =
+            crate::runtime::instance::validate::current_process_start_time_unix().unwrap_or(0);
+        let owner_meta = serde_json::json!({
+            "pid": std::process::id(),
+            "api_port": cli.console,
+            "version": crate::VERSION,
+            "started_at_unix": started_at,
+            "mesh_llm_binary": std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+        });
+        let owner_path = rt.dir().join("owner.json");
+        if let Ok(json) = serde_json::to_string_pretty(&owner_meta) {
+            let _ = crate::runtime::instance::write_text_file_atomic(&owner_path, &json);
+        }
+    }
+
+    // Reap orphans from dead sibling instances (skip for client — never runs llama-server).
     // This intentionally happens after subcommand dispatch so control commands
     // targeting a live instance don't kill it before sending the request.
+    // Uses scoped reap that only touches runtime dirs whose owner has died (flock-released).
     if !cli.client {
-        launch::kill_llama_server().await;
-        launch::kill_orphan_rpc_servers().await;
+        if let Some(ref rt) = runtime {
+            match crate::runtime::instance::runtime_root() {
+                Ok(root) => {
+                    let my_dir = rt.dir().to_path_buf();
+                    match crate::runtime::instance::reap::reap_cross_runtime_orphans(&root, &my_dir)
+                        .await
+                    {
+                        Ok(summary) => {
+                            if summary.children_killed > 0 || summary.dirs_gc_d > 0 {
+                                eprintln!(
+                                    "🧹 Reaped {} orphan children from {} dead instance(s)",
+                                    summary.children_killed, summary.dirs_gc_d
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!("cross-runtime reap failed: {e}"),
+                    }
+                }
+                Err(e) => tracing::warn!("runtime_root resolution failed during reap: {e}"),
+            }
+        }
     }
 
     // Auto-enable publishing when mesh is named
@@ -134,6 +313,8 @@ pub(crate) async fn run() -> Result<()> {
         eprintln!("🔑 Previous run was public — rotating identity for private mesh");
         mesh::clear_public_identity();
     }
+
+    let mut auto_join_candidates: Vec<(String, Option<String>)> = Vec::new();
 
     // --- Auto-discover ---
     if cli.auto && cli.join.is_empty() {
@@ -212,25 +393,8 @@ pub(crate) async fn run() -> Result<()> {
                                 String::new()
                             }
                         );
-                        if cli.mesh_name.is_none() {
-                            if let Some(ref name) = mesh.listing.name {
-                                cli.mesh_name = Some(name.clone());
-                            }
-                        }
-                        eprintln!(
-                            "✅ Joining: {} ({} nodes, {} models{})",
-                            mesh.listing.name.as_deref().unwrap_or("unnamed"),
-                            mesh.listing.node_count,
-                            mesh.listing.serving.len(),
-                            mesh.listing
-                                .region
-                                .as_ref()
-                                .map(|r| format!(", region: {r}"))
-                                .unwrap_or_default()
-                        );
-                        cli.join.push(token.clone());
+                        auto_join_candidates.push((token.clone(), mesh.listing.name.clone()));
                         joined = true;
-                        break;
                     }
                     if !joined {
                         eprintln!("⚠️  No meshes found — starting new");
@@ -325,7 +489,7 @@ pub(crate) async fn run() -> Result<()> {
         .filter_map(|m| {
             m.file_stem()
                 .and_then(|s| s.to_str())
-                .map(|s| router::strip_split_suffix_owned(s))
+                .map(router::strip_split_suffix_owned)
         })
         .collect();
 
@@ -334,7 +498,16 @@ pub(crate) async fn run() -> Result<()> {
         None => detect_bin_dir()?,
     };
 
-    run_auto(cli, config, startup_models, requested_model_names, bin_dir).await
+    run_auto(
+        cli,
+        config,
+        startup_models,
+        requested_model_names,
+        bin_dir,
+        runtime,
+        auto_join_candidates,
+    )
+    .await
 }
 
 /// Resolve a model path: local file, catalog name, or HuggingFace URL.
@@ -465,6 +638,7 @@ pub async fn ensure_draft(model: &std::path::Path) -> Option<PathBuf> {
 /// Priority:
 /// 1. Models the mesh needs that we already have on disk
 /// 2. Models in the mesh catalog that nobody is serving yet (on disk preferred)
+///
 /// Parse a catalog size string like "18.3GB" or "491MB" into bytes.
 fn parse_size_str(s: &str) -> u64 {
     let s = s.trim();
@@ -841,12 +1015,15 @@ async fn join_mesh_for_mcp(cli: &Cli, node: &mesh::Node) -> Result<()> {
 
 pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
     let resolved_plugins = load_resolved_plugins(cli)?;
+    let owner_config = owner_runtime_config(cli)?;
     let (node, _channels) = mesh::Node::start(
         NodeRole::Client,
         &cli.relay,
         cli.bind_port,
         Some(0.0),
         cli.enumerate_host,
+        Some(owner_config),
+        cli.config.as_deref(),
     )
     .await?;
     node.start_accepting();
@@ -856,7 +1033,7 @@ pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
 
     let (plugin_mesh_tx, plugin_mesh_rx) = tokio::sync::mpsc::channel(256);
     let plugin_manager =
-        plugin::PluginManager::start(&resolved_plugins, plugin_host_mode(&cli), plugin_mesh_tx)
+        plugin::PluginManager::start(&resolved_plugins, plugin_host_mode(cli), plugin_mesh_tx)
             .await?;
     node.set_plugin_manager(plugin_manager.clone()).await;
     node.start_plugin_channel_forwarder(plugin_mesh_rx);
@@ -870,6 +1047,17 @@ pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
 
 pub(crate) use self::discovery::{check_mesh, nostr_relays};
 
+async fn store_benchmark_metrics(
+    mem_arc: std::sync::Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    fp32_arc: std::sync::Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    fp16_arc: std::sync::Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    result: Option<&benchmark::BenchmarkResult>,
+) {
+    *mem_arc.lock().await = result.map(|r| r.mem_bandwidth_gbps.clone());
+    *fp32_arc.lock().await = result.and_then(|r| r.compute_tflops_fp32.clone());
+    *fp16_arc.lock().await = result.and_then(|r| r.compute_tflops_fp16.clone());
+}
+
 /// Auto-election mode: start rpc-server, join mesh, auto-elect host.
 async fn run_auto(
     mut cli: Cli,
@@ -877,6 +1065,8 @@ async fn run_auto(
     startup_models: Vec<StartupModelPlan>,
     requested_model_names: Vec<String>,
     bin_dir: PathBuf,
+    runtime: Option<std::sync::Arc<crate::runtime::instance::InstanceRuntime>>,
+    auto_join_candidates: Vec<(String, Option<String>)>,
 ) -> Result<()> {
     let resolved_plugins = resolve_plugins_from_config(&config, &cli)?;
     let api_port = cli.port;
@@ -901,6 +1091,7 @@ async fn run_auto(
     } else {
         NodeRole::Worker
     };
+    let owner_config = owner_runtime_config(&cli)?;
     // Clients report 0 VRAM so they're never assigned a model to serve
     let max_vram = if is_client { Some(0.0) } else { cli.max_vram };
     let (node, channels) = mesh::Node::start(
@@ -909,6 +1100,8 @@ async fn run_auto(
         cli.bind_port,
         max_vram,
         cli.enumerate_host,
+        Some(owner_config),
+        cli.config.as_deref(),
     )
     .await?;
     node.start_accepting();
@@ -932,7 +1125,9 @@ async fn run_auto(
     // Launch memory bandwidth benchmark in background (non-blocking)
     // Skip for client nodes — they have no GPU to benchmark
     if !is_client {
-        let bw_arc = node.gpu_bandwidth_gbps.clone();
+        let mem_arc = node.gpu_mem_bandwidth_gbps.clone();
+        let compute_fp32_arc = node.gpu_compute_tflops_fp32.clone();
+        let compute_fp16_arc = node.gpu_compute_tflops_fp16.clone();
         let bin_dir_clone = bin_dir.clone();
         tokio::spawn(async move {
             let result = tokio::time::timeout(
@@ -943,7 +1138,7 @@ async fn run_auto(
                         tracing::debug!("no GPUs detected — skipping memory bandwidth benchmark");
                         return None;
                     }
-                    benchmark::run_or_load(&hw, &bin_dir_clone, std::time::Duration::from_secs(25))
+                    benchmark::run_or_load(&hw, &bin_dir_clone, benchmark::BENCHMARK_TIMEOUT)
                 }),
             )
             .await
@@ -954,36 +1149,89 @@ async fn run_auto(
             .and_then(|r| r.ok())
             .flatten();
 
-            if let Some(ref per_gpu) = result {
-                let total: f64 = per_gpu.iter().sum();
+            if let Some(ref run) = result {
+                let total: f64 = run.mem_bandwidth_gbps.iter().sum();
                 tracing::info!(
                     "Memory bandwidth fingerprint: {} GPUs, {:.1} GB/s total",
-                    per_gpu.len(),
+                    run.mem_bandwidth_gbps.len(),
                     total
                 );
-                for (i, gbps) in per_gpu.iter().enumerate() {
+                for (i, gbps) in run.mem_bandwidth_gbps.iter().enumerate() {
                     tracing::debug!("  GPU {}: {:.1} GB/s", i, gbps);
                 }
+                if let Some(fp32s) = &run.compute_tflops_fp32 {
+                    let total_fp32: f64 = fp32s.iter().sum();
+                    tracing::info!(
+                        "Compute FP32 TFLOPS: {} GPUs, {:.1} TFLOPS total",
+                        fp32s.len(),
+                        total_fp32
+                    );
+                    for (i, tf) in fp32s.iter().enumerate() {
+                        tracing::debug!("  GPU {}: {:.1} TF32", i, tf);
+                    }
+                }
+                if let Some(fp16s) = &run.compute_tflops_fp16 {
+                    let total_fp16: f64 = fp16s.iter().sum();
+                    tracing::info!(
+                        "Compute FP16 TFLOPS: {} GPUs, {:.1} TFLOPS total",
+                        fp16s.len(),
+                        total_fp16
+                    );
+                    for (i, tf) in fp16s.iter().enumerate() {
+                        tracing::debug!("  GPU {}: {:.1} TF16", i, tf);
+                    }
+                }
             }
-            *bw_arc.lock().await = result;
+            store_benchmark_metrics(
+                mem_arc.clone(),
+                compute_fp32_arc.clone(),
+                compute_fp16_arc.clone(),
+                result.as_ref(),
+            )
+            .await;
         });
     } else {
         tracing::debug!("client node — skipping memory bandwidth benchmark");
     }
 
-    // Join mesh if --join was given
-    if !cli.join.is_empty() {
+    // Join mesh if --join was given or auto-discovery queued fallback candidates.
+    if !cli.join.is_empty() || !auto_join_candidates.is_empty() {
         let mut joined = false;
-        for t in &cli.join {
+        let join_attempts: Vec<(String, Option<String>)> = if !cli.join.is_empty() {
+            cli.join
+                .iter()
+                .cloned()
+                .map(|token| (token, None))
+                .collect()
+        } else {
+            auto_join_candidates.clone()
+        };
+        let mut successful_join: Option<(String, Option<String>)> = None;
+
+        for (t, mesh_name) in &join_attempts {
             match node.join(t).await {
                 Ok(()) => {
                     eprintln!("Joined mesh");
                     joined = true;
+                    successful_join = Some((t.clone(), mesh_name.clone()));
                     break;
                 }
                 Err(e) => tracing::warn!("Failed to join via token: {e}"),
             }
         }
+
+        if cli.join.is_empty() {
+            cli.join.clear();
+            if let Some((token, mesh_name)) = successful_join {
+                cli.join.push(token);
+                if cli.mesh_name.is_none() {
+                    if let Some(name) = mesh_name {
+                        cli.mesh_name = Some(name);
+                    }
+                }
+            }
+        }
+
         if !joined {
             eprintln!("Failed to join any peer — running standalone");
         }
@@ -1152,12 +1400,7 @@ async fn run_auto(
             match run_passive(&cli, node.clone(), is_client, plugin_manager.clone()).await? {
                 Some(model_name) => {
                     // Promoted! Resolve the model path and continue to serving
-                    let model_path = models::find_model_path(&model_name);
-                    if model_path.exists() {
-                        model_path
-                    } else {
-                        model_path
-                    }
+                    models::find_model_path(&model_name)
                 }
                 None => return Ok(()), // clean shutdown
             }
@@ -1200,21 +1443,36 @@ async fn run_auto(
         }
     }
 
-    // Clean up stale processes from previous runs
-    launch::kill_orphan_rpc_servers().await;
+    // Drain stale pidfiles from our own runtime dir before spawning a new rpc-server
+    if let Some(ref rt) = runtime {
+        let _ = crate::runtime::instance::reap::reap_own_stale_pidfiles(rt.dir()).await;
+    }
 
-    // Start rpc-server
-    let rpc_port = launch::start_rpc_server(
+    // Serve mode (non-client) always has the InstanceRuntime acquired above.
+    // The fallback was only relevant during the T1-T11 staging when acquisition
+    // wasn't yet wired into run() — keep an explicit error here so any future
+    // refactor that drops the acquire surfaces immediately instead of panicking
+    // mid-spawn from a child task.
+    let runtime_arc = runtime
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("serve mode requires an instance runtime"))?
+        .clone();
+    let rpc_handle = launch::start_rpc_server(
+        &runtime_arc,
         &bin_dir,
         cli.llama_flavor,
         cli.device.as_deref(),
         Some(&model),
     )
     .await?;
-    tracing::info!("rpc-server on 127.0.0.1:{rpc_port} serving {model_name}");
+    tracing::info!(
+        "rpc-server on 127.0.0.1:{} (pid {}) serving {model_name}",
+        rpc_handle.port,
+        rpc_handle.pid
+    );
 
     let tunnel_mgr =
-        tunnel::Manager::start(node.clone(), rpc_port, channels.rpc, channels.http).await?;
+        tunnel::Manager::start(node.clone(), rpc_handle.port, channels.rpc, channels.http).await?;
 
     // Election publishes per-model targets
     let (target_tx, target_rx) = tokio::sync::watch::channel(election::ModelTargets::default());
@@ -1308,6 +1566,24 @@ async fn run_auto(
         None
     };
 
+    if !is_client {
+        if let Some(ref cs) = console_state {
+            if let Ok(root) = crate::runtime::instance::runtime_root() {
+                let li_handle = cs.local_instances_handle().await;
+                if let Ok(initial) =
+                    crate::runtime::instance::scan_local_instances(&root, std::process::id()).await
+                {
+                    *li_handle.lock().await = initial;
+                }
+                crate::runtime::instance::spawn_local_instance_scanner(
+                    root,
+                    std::process::id(),
+                    li_handle,
+                );
+            }
+        }
+    }
+
     // Election loop
     tracing::info!("Entering auto-election for model: {model_name}");
     let node2 = node.clone();
@@ -1336,12 +1612,28 @@ async fn run_auto(
         .as_ref()
         .and_then(|model| model.ctx_size);
     let (primary_stop_tx, primary_stop_rx) = tokio::sync::watch::channel(false);
+    let primary_runtime = runtime_arc.clone();
     let primary_task = tokio::spawn(async move {
         election::election_loop(
-            node2, tunnel_mgr2, api_port, rpc_port, bin_dir2, model2, model_name_for_election,
-            primary_mmproj,
-            draft2, draft_max, force_split, llama_flavor, primary_ctx_size, moe_runtime_options, primary_target_tx,
-            primary_stop_rx,
+            election::ElectionLoopParams {
+                runtime: primary_runtime,
+                node: node2,
+                tunnel_mgr: tunnel_mgr2,
+                ingress_http_port: api_port,
+                rpc_port: rpc_handle.port,
+                bin_dir: bin_dir2,
+                model: model2,
+                model_name: model_name_for_election,
+                explicit_mmproj: primary_mmproj,
+                draft: draft2,
+                draft_max,
+                force_split,
+                binary_flavor: llama_flavor,
+                ctx_size_override: primary_ctx_size,
+                moe_runtime_options,
+                target_tx: primary_target_tx,
+                stop_rx: primary_stop_rx,
+            },
             move |is_host, llama_ready| {
                 let advertise_node = node_for_cb.clone();
                 let advertise_model = primary_model_name_for_advertise.clone();
@@ -1474,12 +1766,28 @@ async fn run_auto(
             let managed_model_name = extra_name.clone();
             eprintln!("  + {extra_name}");
             let (extra_stop_tx, extra_stop_rx) = tokio::sync::watch::channel(false);
+            let extra_runtime = runtime_arc.clone();
             let extra_task = tokio::spawn(async move {
                 election::election_loop(
-                    extra_node, extra_tunnel, api_port_extra, 0, extra_bin, extra_path, extra_model_name.clone(),
-                    extra_mmproj,
-                    None, 8, false, extra_llama_flavor, extra_ctx_size, extra_moe_runtime_options, extra_target_tx,
-                    extra_stop_rx,
+                    election::ElectionLoopParams {
+                        runtime: extra_runtime,
+                        node: extra_node,
+                        tunnel_mgr: extra_tunnel,
+                        ingress_http_port: api_port_extra,
+                        rpc_port: 0,
+                        bin_dir: extra_bin,
+                        model: extra_path,
+                        model_name: extra_model_name.clone(),
+                        explicit_mmproj: extra_mmproj,
+                        draft: None,
+                        draft_max: 8,
+                        force_split: false,
+                        binary_flavor: extra_llama_flavor,
+                        ctx_size_override: extra_ctx_size,
+                        moe_runtime_options: extra_moe_runtime_options,
+                        target_tx: extra_target_tx,
+                        stop_rx: extra_stop_rx,
+                    },
                     move |is_host, llama_ready| {
                         let advertise_node = extra_node_for_advertise.clone();
                         let model_name = extra_model_name_for_advertise.clone();
@@ -1575,11 +1883,11 @@ async fn run_auto(
         None
     };
 
-    // Wait for ctrl-c or runtime model control commands.
+    // Wait for SIGINT/SIGTERM or runtime model control commands.
     let primary_model_name = model_name.clone();
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = wait_shutdown_signal() => {
                 eprintln!("\nShutting down...");
                 break;
             }
@@ -1601,6 +1909,7 @@ async fn run_auto(
                             add_serving_assignment(&node, &primary_model_name, &runtime_model_name)
                                 .await;
                             let (loaded_name, handle, death_rx) = start_runtime_local_model(
+                                &runtime_arc,
                                 &bin_dir,
                                 cli.llama_flavor,
                                 &node,
@@ -1740,15 +2049,40 @@ async fn run_auto(
         handle.shutdown().await;
     }
 
+    // Signal each election loop to stop, then give it a short window to drop
+    // its `llama_process` (which sends SIGTERM via the handle's Drop). Abort
+    // only as a fallback so the Drop chain still runs.
     for (_, controller) in managed_models.drain() {
         let _ = controller.stop_tx.send(true);
-        controller.task.abort();
+        let mut task = controller.task;
+        match tokio::time::timeout(std::time::Duration::from_secs(3), &mut task).await {
+            Ok(join_result) => {
+                let _ = join_result;
+            }
+            Err(_) => {
+                tracing::warn!("election task did not stop within 3s during shutdown");
+                task.abort();
+                let _ = task.await;
+            }
+        }
     }
 
     node.set_serving_models(Vec::new()).await;
     node.set_hosted_models(Vec::new()).await;
-    launch::kill_llama_server().await;
-    launch::kill_orphan_rpc_servers().await;
+    rpc_handle.shutdown().await;
+    if let Some(rt) = runtime {
+        let outstanding_refs = std::sync::Arc::strong_count(&rt);
+        if outstanding_refs == 1 {
+            let dir = rt.dir().to_path_buf();
+            drop(rt);
+            let _ = std::fs::remove_dir_all(&dir);
+        } else {
+            tracing::warn!(
+                outstanding_refs,
+                "skipping runtime directory removal during shutdown because runtime references remain"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1910,7 +2244,7 @@ async fn run_passive(
                 eprintln!("⬆️  Standby promoting to serve: {model_name}");
                 return Ok(Some(model_name));
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = wait_shutdown_signal() => {
                 eprintln!("\nShutting down...");
                 node.broadcast_leaving().await;
                 return Ok(None);
@@ -2459,5 +2793,29 @@ mod tests {
             draft = None;
         }
         assert!(draft.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_benchmark_result_bandwidth_still_works() {
+        let mem_arc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let fp32_arc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let fp16_arc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let result = benchmark::BenchmarkResult {
+            mem_bandwidth_gbps: vec![10.5, 20.0],
+            compute_tflops_fp32: None,
+            compute_tflops_fp16: None,
+        };
+
+        store_benchmark_metrics(
+            mem_arc.clone(),
+            fp32_arc.clone(),
+            fp16_arc.clone(),
+            Some(&result),
+        )
+        .await;
+
+        assert_eq!(*mem_arc.lock().await, Some(vec![10.5, 20.0]));
+        assert!(fp32_arc.lock().await.is_none());
+        assert!(fp16_arc.lock().await.is_none());
     }
 }

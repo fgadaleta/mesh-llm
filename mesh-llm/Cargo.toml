@@ -1,6 +1,6 @@
 [package]
 name = "mesh-llm"
-version = "0.58.0"
+version = "0.60.0-rc.2"
 edition = "2021"
 
 [dependencies]
@@ -22,6 +22,7 @@ include_dir = "0.7"
 nostr-sdk = { version = "0.44.1", default-features = false }
 rustls = "0.23.36"
 reqwest = { version = "0.12", features = ["stream", "json"] }
+semver = "1"
 sha2 = "0.10"
 ed25519-dalek = { version = "=3.0.0-pre.1", features = ["rand_core"] }
 crypto_box = "0.9"
@@ -43,11 +44,13 @@ schemars = "1"
 prost = "0.14"
 toml = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-hf-hub = { git = "https://github.com/i386/hf-hub.git", rev = "a123ed91f20317d117f83d943b204137d0d24c5e", default-features = false, features = ["ureq", "tokio", "rustls-tls", "cache-manager"] }
+hf-hub = { git = "https://github.com/i386/hf-hub.git", rev = "d938c23e74bc7d8a3919843daa8065eb8f10fdf8", default-features = false, features = ["ureq", "tokio", "rustls-tls", "cache-manager"] }
+unicode-width = "0.2"
 
 [dev-dependencies]
 axum = "0.8"
 serial_test = "3"
+tempfile = "3"
 
 [build-dependencies]
 prost-build = "0.14"
