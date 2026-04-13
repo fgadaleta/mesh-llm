@@ -57,7 +57,8 @@ pub(super) fn merge_capabilities(
 pub fn find_catalog_model_exact(query: &str) -> Option<&'static catalog::CatalogModel> {
     let q = query.to_lowercase();
     catalog::MODEL_CATALOG.iter().find(|model| {
-        model.name.to_lowercase() == q
+        model.id.to_lowercase() == q
+            || model.name.to_lowercase() == q
             || model.file.to_lowercase() == q
             || model.file.trim_end_matches(".gguf").to_lowercase() == q
     })
@@ -428,7 +429,7 @@ where
     Ok(Some(out))
 }
 
-pub(super) fn quant_selector_from_gguf_file(file: &str) -> Option<String> {
+pub(crate) fn quant_selector_from_gguf_file(file: &str) -> Option<String> {
     if !file.ends_with(".gguf") {
         return None;
     }

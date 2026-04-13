@@ -1,9 +1,35 @@
 use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
+pub enum RecommendedCommand {
+    /// Share one recommended model entry to the Hugging Face dataset.
+    Share {
+        /// Model spec: catalog id, HF repo selector, HF exact ref, or HF URL.
+        model: String,
+        /// Short human description shown in `mesh-llm models recommended`.
+        #[arg(long)]
+        description: String,
+        /// Override the display name stored in the recommendation entry.
+        #[arg(long)]
+        name: Option<String>,
+        /// Recommended draft model id for speculative decoding.
+        #[arg(long)]
+        draft: Option<String>,
+        /// Hugging Face dataset repo that stores recommended models.
+        #[arg(long, default_value = crate::models::catalog::DEFAULT_RECOMMENDED_MODELS_DATASET_REPO)]
+        dataset_repo: String,
+        /// Emit JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ModelsCommand {
-    /// List built-in recommended models.
+    /// List or share recommended models from the Hugging Face dataset.
     Recommended {
+        #[command(subcommand)]
+        command: Option<RecommendedCommand>,
         /// Emit JSON output.
         #[arg(long)]
         json: bool,

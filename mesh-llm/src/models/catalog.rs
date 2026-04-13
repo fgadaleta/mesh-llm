@@ -1,9 +1,10 @@
-//! Built-in model catalog plus managed acquisition helpers.
+//! Dataset-backed recommended model catalog plus managed acquisition helpers.
 
 use anyhow::{Context, Result};
 use hf_hub::api::Progress as HfProgress;
 use hf_hub::{Repo, RepoType};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::io::Write;
@@ -15,19 +16,33 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-#[derive(Clone, Debug, Deserialize)]
+
+pub const DEFAULT_RECOMMENDED_MODELS_DATASET_REPO: &str = "meshllm/recommended-models";
+const RECOMMENDED_MODELS_DATASET_REVISION: &str = "main";
+const RECOMMENDED_MODELS_PREFIX: &str = "models/";
+const RECOMMENDED_MODELS_INDEX_FILE: &str = "index.json";
+const RECOMMENDED_MODELS_METADATA_FILE: &str = "metadata.json";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CatalogAsset {
     pub file: String,
     pub url: String,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
 pub struct CatalogModel {
+    /// Raw model identifier supplied when this recommendation was curated.
+    /// This is the dataset entry identity, e.g. `org/repo`, `org/repo:Q4_K_M`,
+    /// or `org/repo/file.gguf`.
+    pub id: String,
     pub name: String,
     pub file: String,
     /// Legacy transport field. Prefer `source_repo()`, `source_revision()`,
     /// and `source_file()` for curated model identity.
     pub url: String,
+    pub primary_size_bytes: Option<u64>,
     pub size: String,
     pub description: String,
     /// If set, this model has a recommended draft model for speculative decoding.
@@ -73,8 +88,9 @@ pub struct MoeConfig {
     pub ranking: Vec<u32>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CatalogModelJson {
+#[derive(Debug, Deserialize, Serialize)]
+struct LegacyCatalogModelJson {
+    id: String,
     name: String,
     file: String,
     url: String,
@@ -87,27 +103,258 @@ struct CatalogModelJson {
     mmproj: Option<CatalogAsset>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct MoeConfigJson {
     n_expert: u32,
     n_expert_used: u32,
     min_experts_per_node: u32,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct CatalogMetadataV1 {
+    schema_version: u32,
+    id: String,
+    name: String,
+    source: CatalogSourceV1,
+    artifacts: Vec<CatalogArtifactV1>,
+    curation: CatalogCurationV1,
+    moe: Option<MoeConfigJson>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CatalogSourceV1 {
+    repo: String,
+    #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    selector: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CatalogArtifactV1 {
+    role: String,
+    path: String,
+    url: String,
+    #[serde(default)]
+    size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CatalogCurationV1 {
+    description: String,
+    #[serde(default)]
+    draft_model_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogLoadProgress {
+    ListingEntries,
+    LoadingEntry { completed: usize, total: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogIndexEntry {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CatalogIndexJson {
+    schema_version: u32,
+    entries: Vec<CatalogIndexEntryJson>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CatalogIndexEntryJson {
+    id: String,
+    name: String,
+    path: String,
+}
+
 pub static MODEL_CATALOG: LazyLock<Vec<CatalogModel>> = LazyLock::new(load_catalog);
 
 fn load_catalog() -> Vec<CatalogModel> {
-    let raw: Vec<CatalogModelJson> =
-        serde_json::from_str(include_str!("catalog.json")).expect("parse bundled catalog.json");
-    raw.into_iter().map(CatalogModel::from_json).collect()
+    load_catalog_from_dataset(DEFAULT_RECOMMENDED_MODELS_DATASET_REPO, None).unwrap_or_else(|err| {
+        eprintln!(
+            "⚠️ Failed to load recommended model dataset {}: {err:#}",
+            DEFAULT_RECOMMENDED_MODELS_DATASET_REPO
+        );
+        Vec::new()
+    })
+}
+
+pub fn preload_catalog_dataset_with_progress<F>(dataset_repo: &str, mut progress: F) -> Result<()>
+where
+    F: FnMut(CatalogLoadProgress),
+{
+    load_catalog_from_dataset(dataset_repo, Some(&mut progress)).map(|_| ())
+}
+
+fn load_catalog_from_dataset(
+    dataset_repo: &str,
+    mut progress: Option<&mut dyn FnMut(CatalogLoadProgress)>,
+) -> Result<Vec<CatalogModel>> {
+    let api = super::build_hf_api(false)?;
+    let repo = api.repo(Repo::with_revision(
+        dataset_repo.to_string(),
+        RepoType::Dataset,
+        RECOMMENDED_MODELS_DATASET_REVISION.to_string(),
+    ));
+    if let Some(progress) = progress.as_mut() {
+        progress(CatalogLoadProgress::ListingEntries);
+    }
+    let metadata_paths = match load_catalog_index_json(&repo) {
+        Ok(index) => index
+            .entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>(),
+        Err(_) => {
+            let info = repo.info().with_context(|| {
+                format!(
+                    "fetch recommended model dataset info {}@{}",
+                    dataset_repo, RECOMMENDED_MODELS_DATASET_REVISION
+                )
+            })?;
+            let mut metadata_paths: Vec<_> = info
+                .siblings
+                .into_iter()
+                .map(|entry| entry.rfilename)
+                .filter(|path| is_recommended_model_metadata_path(path))
+                .collect();
+            metadata_paths.sort();
+            metadata_paths
+        }
+    };
+
+    let total = metadata_paths.len();
+    let mut out = Vec::with_capacity(total);
+    for (index, metadata_path) in metadata_paths.into_iter().enumerate() {
+        if let Some(progress) = progress.as_mut() {
+            progress(CatalogLoadProgress::LoadingEntry {
+                completed: index,
+                total,
+            });
+        }
+        let path = repo.download(&metadata_path).with_context(|| {
+            format!(
+                "download {} from dataset {}@{}",
+                metadata_path, dataset_repo, RECOMMENDED_MODELS_DATASET_REVISION
+            )
+        })?;
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        out.push(parse_catalog_metadata(&text, &metadata_path, &path)?);
+    }
+    if let Some(progress) = progress.as_mut() {
+        progress(CatalogLoadProgress::LoadingEntry {
+            completed: total,
+            total,
+        });
+    }
+    Ok(out)
+}
+
+fn is_recommended_model_metadata_path(path: &str) -> bool {
+    path.starts_with(RECOMMENDED_MODELS_PREFIX) && path.ends_with(RECOMMENDED_MODELS_METADATA_FILE)
+}
+
+pub fn recommended_models_index_path() -> &'static str {
+    RECOMMENDED_MODELS_INDEX_FILE
+}
+
+pub fn dataset_entry_prefix_for_model_id(model_id: &str) -> String {
+    let digest = Sha256::digest(model_id.as_bytes());
+    format!("{RECOMMENDED_MODELS_PREFIX}sha256-{digest:x}")
+}
+
+pub fn dataset_metadata_path_for_model_id(model_id: &str) -> String {
+    format!(
+        "{}/{}",
+        dataset_entry_prefix_for_model_id(model_id),
+        RECOMMENDED_MODELS_METADATA_FILE
+    )
+}
+
+pub fn dataset_entry_id_from_metadata_path(path: &str) -> Option<String> {
+    let _ = path.strip_prefix(RECOMMENDED_MODELS_PREFIX)?;
+    None
+}
+
+pub fn build_catalog_index_entry(model: &CatalogModel) -> CatalogIndexEntry {
+    CatalogIndexEntry {
+        id: model.id.clone(),
+        name: model.name.clone(),
+        path: dataset_metadata_path_for_model_id(&model.id),
+    }
+}
+
+pub fn serialize_recommended_catalog_index(entries: &[CatalogIndexEntry]) -> Result<String> {
+    let mut entries = entries.to_vec();
+    entries.sort_by(|left, right| left.id.cmp(&right.id));
+    let raw = CatalogIndexJson {
+        schema_version: 1,
+        entries: entries
+            .into_iter()
+            .map(|entry| CatalogIndexEntryJson {
+                id: entry.id,
+                name: entry.name,
+                path: entry.path,
+            })
+            .collect(),
+    };
+    Ok(serde_json::to_string_pretty(&raw)? + "\n")
+}
+
+pub fn load_catalog_index(dataset_repo: &str) -> Result<Vec<CatalogIndexEntry>> {
+    let api = super::build_hf_api(false)?;
+    let repo = api.repo(Repo::with_revision(
+        dataset_repo.to_string(),
+        RepoType::Dataset,
+        RECOMMENDED_MODELS_DATASET_REVISION.to_string(),
+    ));
+    let index = load_catalog_index_json(&repo)?;
+    Ok(index
+        .entries
+        .into_iter()
+        .map(|entry| CatalogIndexEntry {
+            id: entry.id,
+            name: entry.name,
+            path: entry.path,
+        })
+        .collect())
+}
+
+pub fn serialize_recommended_model_metadata(model: &CatalogModel) -> Result<String> {
+    let raw = CatalogMetadataV1::from_model(model);
+    Ok(serde_json::to_string_pretty(&raw)? + "\n")
+}
+
+fn load_catalog_index_json(repo: &hf_hub::api::sync::ApiRepo) -> Result<CatalogIndexJson> {
+    let path = repo
+        .download(RECOMMENDED_MODELS_INDEX_FILE)
+        .with_context(|| {
+            format!(
+                "download {} from dataset repo",
+                RECOMMENDED_MODELS_INDEX_FILE
+            )
+        })?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }
 
 impl CatalogModel {
-    fn from_json(raw: CatalogModelJson) -> Self {
+    fn from_legacy_json(raw: LegacyCatalogModelJson) -> Self {
         Self {
+            id: raw.id,
             name: raw.name,
             file: raw.file,
             url: raw.url,
+            primary_size_bytes: parse_size_bytes_label(&raw.size),
             size: raw.size,
             description: raw.description,
             draft: raw.draft,
@@ -126,6 +373,179 @@ impl MoeConfig {
             min_experts_per_node: raw.min_experts_per_node,
             ranking: Vec::new(),
         }
+    }
+}
+
+impl MoeConfigJson {
+    fn from_config(raw: &MoeConfig) -> Self {
+        Self {
+            n_expert: raw.n_expert,
+            n_expert_used: raw.n_expert_used,
+            min_experts_per_node: raw.min_experts_per_node,
+        }
+    }
+}
+
+impl CatalogMetadataV1 {
+    fn from_model(model: &CatalogModel) -> Self {
+        let repo = model.source_repo().unwrap_or_default().to_string();
+        let revision = model.source_revision().map(str::to_string);
+        let selector = model
+            .source_file()
+            .and_then(crate::models::resolve::quant_selector_from_gguf_file);
+        let mut artifacts = vec![CatalogArtifactV1 {
+            role: "primary".to_string(),
+            path: model
+                .source_file()
+                .map(str::to_string)
+                .unwrap_or_else(|| model.file.clone()),
+            url: model.url.clone(),
+            size_bytes: model.primary_size_bytes,
+        }];
+        artifacts.extend(model.extra_files.iter().map(|asset| CatalogArtifactV1 {
+            role: "split".to_string(),
+            path: repo_relative_asset_path(asset).unwrap_or_else(|| asset.file.clone()),
+            url: asset.url.clone(),
+            size_bytes: asset.size_bytes,
+        }));
+        if let Some(asset) = model.mmproj.as_ref() {
+            artifacts.push(CatalogArtifactV1 {
+                role: "mmproj".to_string(),
+                path: repo_relative_asset_path(asset).unwrap_or_else(|| asset.file.clone()),
+                url: asset.url.clone(),
+                size_bytes: asset.size_bytes,
+            });
+        }
+        Self {
+            schema_version: 1,
+            id: model.id.clone(),
+            name: model.name.clone(),
+            source: CatalogSourceV1 {
+                repo,
+                revision: revision.clone(),
+                commit: revision,
+                selector,
+            },
+            artifacts,
+            curation: CatalogCurationV1 {
+                description: model.description.clone(),
+                draft_model_id: model.draft.clone(),
+            },
+            moe: model.moe.as_ref().map(MoeConfigJson::from_config),
+        }
+    }
+}
+
+fn parse_catalog_metadata(text: &str, metadata_path: &str, path: &Path) -> Result<CatalogModel> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).with_context(|| format!("parse {}", path.display()))?;
+    if value
+        .get("schema_version")
+        .and_then(|value| value.as_u64())
+        .is_some()
+    {
+        let raw: CatalogMetadataV1 =
+            serde_json::from_value(value).with_context(|| format!("parse {}", path.display()))?;
+        return CatalogModel::from_metadata_v1(raw);
+    }
+    let mut raw: LegacyCatalogModelJson =
+        serde_json::from_value(value).with_context(|| format!("parse {}", path.display()))?;
+    if raw.id.trim().is_empty() {
+        raw.id = dataset_entry_id_from_metadata_path(metadata_path).unwrap_or_default();
+    }
+    Ok(CatalogModel::from_legacy_json(raw))
+}
+
+impl CatalogModel {
+    fn from_metadata_v1(raw: CatalogMetadataV1) -> Result<Self> {
+        let primary = raw
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.role == "primary")
+            .context("missing primary artifact in catalog metadata")?;
+        let file = Path::new(&primary.path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&primary.path)
+            .to_string();
+        let extra_files = raw
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.role == "split")
+            .map(|artifact| CatalogAsset {
+                file: Path::new(&artifact.path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(&artifact.path)
+                    .to_string(),
+                url: artifact.url.clone(),
+                size_bytes: artifact.size_bytes,
+            })
+            .collect();
+        let mmproj = raw
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.role == "mmproj")
+            .map(|artifact| CatalogAsset {
+                file: Path::new(&artifact.path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(&artifact.path)
+                    .to_string(),
+                url: artifact.url.clone(),
+                size_bytes: artifact.size_bytes,
+            });
+        Ok(Self {
+            id: raw.id,
+            name: raw.name,
+            file,
+            url: primary.url.clone(),
+            primary_size_bytes: primary.size_bytes,
+            size: primary
+                .size_bytes
+                .map(format_catalog_size_bytes)
+                .unwrap_or_else(|| "unknown".to_string()),
+            description: raw.curation.description,
+            draft: raw.curation.draft_model_id,
+            moe: raw.moe.map(MoeConfig::from_json),
+            extra_files,
+            mmproj,
+        })
+    }
+}
+
+fn repo_relative_asset_path(asset: &CatalogAsset) -> Option<String> {
+    parse_hf_resolve_url_parts(&asset.url).map(|(_, _, file)| file.to_string())
+}
+
+fn parse_size_bytes_label(size: &str) -> Option<u64> {
+    let size = size.trim();
+    if let Some(gb) = size.strip_suffix("GB") {
+        return gb
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| (value * 1e9) as u64);
+    }
+    if let Some(mb) = size.strip_suffix("MB") {
+        return mb
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| (value * 1e6) as u64);
+    }
+    None
+}
+
+fn format_catalog_size_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1}GB", bytes as f64 / 1e9)
+    } else if bytes >= 1_000_000 {
+        format!("{:.0}MB", bytes as f64 / 1e6)
+    } else if bytes >= 1_000 {
+        format!("{:.0}KB", bytes as f64 / 1e3)
+    } else {
+        format!("{bytes}B")
     }
 }
 
@@ -151,11 +571,11 @@ pub fn find_model(query: &str) -> Option<&'static CatalogModel> {
     let q = query.to_lowercase();
     MODEL_CATALOG
         .iter()
-        .find(|m| m.name.to_lowercase() == q)
+        .find(|m| m.id.to_lowercase() == q || m.name.to_lowercase() == q)
         .or_else(|| {
             MODEL_CATALOG
                 .iter()
-                .find(|m| m.name.to_lowercase().contains(&q))
+                .find(|m| m.id.to_lowercase().contains(&q) || m.name.to_lowercase().contains(&q))
         })
 }
 
