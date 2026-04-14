@@ -269,7 +269,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -c 'import json; main_data=json.load(open("/tmp/debug-cache-main.json", "r", encoding="utf-8")); current_data=json.load(open("/tmp/debug-cache-current.json", "r", encoding="utf-8")); main_count=int(main_data.get("total_count", 0) or 0); current_count=int(current_data.get("total_count", 0) or 0); print(f"main_inventory_count={main_count}"); print(f"current_ref_inventory_count={current_count}"); raise SystemExit("ERROR: expected at least one exact-key cache on refs/heads/main before restore") if main_count < 1 else None'
+          python3 -c 'import json, sys; main_data=json.load(open("/tmp/debug-cache-main.json", "r", encoding="utf-8")); current_data=json.load(open("/tmp/debug-cache-current.json", "r", encoding="utf-8")); main_count=int(main_data.get("total_count", 0) or 0); current_count=int(current_data.get("total_count", 0) or 0); print(f"main_inventory_count={main_count}"); print(f"current_ref_inventory_count={current_count}"); sys.exit("ERROR: expected at least one exact-key cache on refs/heads/main before restore" if main_count < 1 else 0)'
 
       - name: Clarify restore proof mode
         shell: bash
