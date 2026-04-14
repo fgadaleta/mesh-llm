@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-REPO="${MESH_LLM_INSTALL_REPO:-michaelneale/mesh-llm}"
+REPO="${MESH_LLM_INSTALL_REPO:-Mesh-LLM/mesh-llm}"
 REPO_REF="${MESH_LLM_INSTALL_REF:-main}"
 INSTALL_DIR="${MESH_LLM_INSTALL_DIR:-$HOME/.local/bin}"
 INSTALL_FLAVOR="${MESH_LLM_INSTALL_FLAVOR:-}"
@@ -293,84 +293,72 @@ asset_name() {
 
 latest_prerelease_tag() {
     local api_url="https://api.github.com/repos/${REPO}/releases?per_page=20"
+    local releases_page_url="https://github.com/${REPO}/releases"
     local response
-    response="$(curl -fsSL \
-        -H 'Accept: application/vnd.github+json' \
-        -H 'X-GitHub-Api-Version: 2022-11-28' \
-        "$api_url")"
+    local -a curl_args=(
+        -fsSL
+        -H 'Accept: application/vnd.github+json'
+        -H 'X-GitHub-Api-Version: 2022-11-28'
+    )
+
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        curl_args+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+    elif [[ -n "${GH_TOKEN:-}" ]]; then
+        curl_args+=(-H "Authorization: Bearer ${GH_TOKEN}")
+    fi
 
     local tag
-    tag="$(
-        printf '%s' "$response" | awk '
-            BEGIN {
-                in_string = 0
-                escape = 0
-                depth = 0
-                capture = 0
-                object = ""
-            }
-            {
-                for (i = 1; i <= length($0); i++) {
-                    c = substr($0, i, 1)
+    if response="$(curl "${curl_args[@]}" "$api_url" 2>/dev/null)"; then
+        local compact
+        compact="$(printf '%s' "$response" | tr -d '\n\r\t ')"
 
-                    if (capture) {
-                        object = object c
-                    }
-
-                    if (escape) {
-                        escape = 0
-                        continue
-                    }
-
-                    if (c == "\\") {
-                        if (in_string) {
-                            escape = 1
+        tag="$(
+            printf '%s' "$compact" |
+                sed 's/},{/}\
+{/g' |
+                awk '
+                    /"prerelease":true/ && !/"draft":true/ {
+                        if (match($0, /"tag_name":"[^"]+"/)) {
+                            value = substr($0, RSTART, RLENGTH)
+                            sub(/^"tag_name":"/, "", value)
+                            sub(/"$/, "", value)
+                            print value
+                            exit
                         }
-                        continue
                     }
+                '
+        )"
+    fi
 
-                    if (c == "\"") {
-                        in_string = !in_string
-                        continue
-                    }
+    if [[ -z "${tag:-}" ]]; then
+        if ! response="$(curl -fsSL "$releases_page_url" 2>/dev/null)"; then
+            echo "error: could not query GitHub releases for ${REPO}" >&2
+            return 1
+        fi
 
-                    if (in_string) {
-                        continue
+        tag="$(
+            printf '%s' "$response" |
+                tr '\n' ' ' |
+                sed "s#<a href=\"/${REPO}/releases/tag/#\\
+TAG:#g; s#Pre-release#\\
+PRE-RELEASE#g" |
+                awk '
+                    /TAG:/ {
+                        tag = $0
+                        sub(/^.*TAG:/, "", tag)
+                        sub(/".*$/, "", tag)
                     }
-
-                    if (c == "{") {
-                        depth++
-                        if (depth == 1) {
-                            capture = 1
-                            object = "{"
-                        }
-                        continue
+                    /PRE-RELEASE/ && tag != "" {
+                        print tag
+                        exit
                     }
-
-                    if (c == "}") {
-                        if (depth == 1 && capture) {
-                            if (object ~ /"prerelease":true/ && object !~ /"draft":true/) {
-                                value = object
-                                sub(/^.*"tag_name":"/, "", value)
-                                sub(/".*$/, "", value)
-                                if (value != "") {
-                                    print value
-                                    exit
-                                }
-                            }
-                            capture = 0
-                            object = ""
-                        }
-                        depth--
-                    }
-                }
-            }
-        '
-    )"
+                '
+        )"
+    fi
 
     if [[ -z "$tag" ]]; then
         echo "error: could not find a published prerelease for ${REPO}" >&2
-        exit 1
+        return 1
     fi
 
     printf '%s\n' "$tag"
@@ -380,7 +368,9 @@ release_url() {
     local asset="$1"
     if bool_is_true "$INSTALL_PRERELEASE"; then
         local tag
-        tag="$(latest_prerelease_tag)"
+        if ! tag="$(latest_prerelease_tag)"; then
+            return 1
+        fi
         printf 'https://github.com/%s/releases/download/%s/%s\n' "$REPO" "$tag" "$asset"
         return 0
     fi
@@ -668,7 +658,9 @@ main() {
     local asset
     asset="$(asset_name "$flavor")"
     local url
-    url="$(release_url "$asset")"
+    if ! url="$(release_url "$asset")"; then
+        exit 1
+    fi
 
     local tmp_dir
     tmp_dir="$(mktemp -d)"
