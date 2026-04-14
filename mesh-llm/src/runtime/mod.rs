@@ -1782,6 +1782,12 @@ async fn run_auto(
     let force_split = cli.split;
     let llama_flavor = cli.llama_flavor;
     let cb_console_port = console_port;
+    let primary_backend_label =
+        if crate::mlx::mlx_model_dir(&model).is_some_and(crate::mlx::is_mlx_model_dir) {
+            "MLX server"
+        } else {
+            "llama-server"
+        };
     let model_name_for_cb = model_name.clone();
     let model_name_for_election = model_name.clone();
     let node_for_cb = node.clone();
@@ -1851,7 +1857,7 @@ async fn run_auto(
                     eprintln!("  pi:    pi --provider mesh --model {model_name_for_cb}");
                     eprintln!("  goose: GOOSE_PROVIDER=openai OPENAI_HOST={url} OPENAI_API_KEY=mesh GOOSE_MODEL={model_name_for_cb} goose session");
                 } else if is_host {
-                    eprintln!("⏳ Starting llama-server...");
+                    eprintln!("⏳ Starting {primary_backend_label}...");
                 } else {
                     eprintln!("  API: http://localhost:{api_port} (proxied to host)");
                 }

@@ -270,6 +270,16 @@ fn stop_requested(stop_rx: &watch::Receiver<bool>) -> bool {
     *stop_rx.borrow()
 }
 
+fn local_backend_name(model: &Path) -> &'static str {
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = crate::mlx::mlx_model_dir(model) {
+        if crate::mlx::is_mlx_model_dir(dir) {
+            return "MLX server";
+        }
+    }
+    "llama-server"
+}
+
 async fn wait_for_peer_moe_ranking(
     model_name: &str,
     model_path: &Path,
@@ -1847,8 +1857,13 @@ pub async fn election_loop(
             .await;
             llama_process = Some(process);
             if let Some(ref process) = llama_process {
+                let backend = if local_backend_name(&model) == "MLX server" {
+                    "mlx"
+                } else {
+                    "llama"
+                };
                 on_process(Some(LocalProcessInfo {
-                    backend: "llama".into(),
+                    backend: backend.into(),
                     pid: process.handle.pid(),
                     port: llama_port,
                     context_length: process.context_length,
@@ -1856,8 +1871,9 @@ pub async fn election_loop(
             }
             on_change(true, true);
             eprintln!(
-                "✅ [{}] llama-server ready on internal port {llama_port}",
-                model_name
+                "✅ [{}] {} ready on internal port {llama_port}",
+                model_name,
+                local_backend_name(&model)
             );
         } else {
             // We're a worker in split mode. Find who the host is.
@@ -2234,8 +2250,13 @@ async fn moe_election_loop(
                     current_local_port = Some(llama_port);
                     llama_process = Some(process);
                     if let Some(ref process) = llama_process {
+                        let backend = if local_backend_name(&model) == "MLX server" {
+                            "mlx"
+                        } else {
+                            "llama"
+                        };
                         on_process(Some(LocalProcessInfo {
-                            backend: "llama".into(),
+                            backend: backend.into(),
                             pid: process.handle.pid(),
                             port: llama_port,
                             context_length: process.context_length,
@@ -2322,8 +2343,13 @@ async fn moe_election_loop(
                         current_local_port = Some(llama_port);
                         llama_process = Some(process);
                         if let Some(ref process) = llama_process {
+                            let backend = if local_backend_name(&model) == "MLX server" {
+                                "mlx"
+                            } else {
+                                "llama"
+                            };
                             on_process(Some(LocalProcessInfo {
-                                backend: "llama".into(),
+                                backend: backend.into(),
                                 pid: process.handle.pid(),
                                 port: llama_port,
                                 context_length: process.context_length,
@@ -2468,8 +2494,13 @@ async fn moe_election_loop(
                     current_local_port = Some(llama_port);
                     llama_process = Some(process);
                     if let Some(ref process) = llama_process {
+                        let backend = if local_backend_name(&shard_path) == "MLX server" {
+                            "mlx"
+                        } else {
+                            "llama"
+                        };
                         on_process(Some(LocalProcessInfo {
-                            backend: "llama".into(),
+                            backend: backend.into(),
                             pid: process.handle.pid(),
                             port: llama_port,
                             context_length: process.context_length,
