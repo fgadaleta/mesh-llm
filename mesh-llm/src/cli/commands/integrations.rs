@@ -66,16 +66,10 @@ fn opencode_missing_binary_guidance(
     vec![
         "opencode not found in PATH".to_string(),
         spec.install_hint.to_string(),
-        "Manual rerun examples:".to_string(),
+        "Then rerun through mesh-llm:".to_string(),
         format!("  mesh-llm opencode --port {port} --model {chosen}"),
-        format!(
-            "  {}='{}' {}='{}' opencode -m {}",
-            OPENCODE_CONFIG_ENV,
-            spec.config_content,
-            spec.api_key_env,
-            spec.api_key_value,
-            spec.model,
-        ),
+        "mesh-llm injects OPENCODE_CONFIG_CONTENT automatically when launching OpenCode."
+            .to_string(),
     ]
 }
 
@@ -332,13 +326,14 @@ mod tests {
 
         assert_eq!(lines[0], "opencode not found in PATH");
         assert_eq!(lines[1], OPENCODE_INSTALL_HINT);
-        assert_eq!(lines[2], "Manual rerun examples:");
+        assert_eq!(lines[2], "Then rerun through mesh-llm:");
         assert_eq!(
             lines[3],
             "  mesh-llm opencode --port 9337 --model GLM-4.7-Flash-Q4_K_M"
         );
-        assert!(lines[4].contains("opencode -m mesh/GLM-4.7-Flash-Q4_K_M"));
-        assert!(lines[4].contains("OPENCODE_CONFIG_CONTENT='{"));
-        assert!(lines[4].contains("OPENAI_API_KEY='dummy'"));
+        assert_eq!(
+            lines[4],
+            "mesh-llm injects OPENCODE_CONFIG_CONTENT automatically when launching OpenCode."
+        );
     }
 }
