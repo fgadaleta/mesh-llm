@@ -2,6 +2,7 @@ name: Debug slim cache visibility
 
 # Temporary workflow for proving GitHub Actions cache save/list/restore behavior
 # on the same cache path used by the slim llama.cpp lanes.
+# PR proof trigger comment: no behavior change.
 
 on:
   push:
