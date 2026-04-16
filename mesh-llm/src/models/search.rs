@@ -635,10 +635,16 @@ mod tests {
     #[ignore = "live Hugging Face search; run explicitly when validating hub integration"]
     async fn live_search_huggingface_gguf_returns_results_and_reports_progress() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let results = search_huggingface("llama", 5, SearchArtifactFilter::Gguf, {
-            let events = Arc::clone(&events);
-            move |progress| events.lock().unwrap().push(progress)
-        })
+        let results = search_huggingface(
+            "llama",
+            5,
+            SearchArtifactFilter::Gguf,
+            SearchSort::Trending,
+            {
+                let events = Arc::clone(&events);
+                move |progress| events.lock().unwrap().push(progress)
+            },
+        )
         .await
         .expect("live gguf search should succeed");
 
@@ -665,10 +671,16 @@ mod tests {
     #[ignore = "live Hugging Face search; run explicitly when validating hub integration"]
     async fn live_search_huggingface_mlx_returns_results_and_reports_progress() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let results = search_huggingface("llama", 5, SearchArtifactFilter::Mlx, {
-            let events = Arc::clone(&events);
-            move |progress| events.lock().unwrap().push(progress)
-        })
+        let results = search_huggingface(
+            "llama",
+            5,
+            SearchArtifactFilter::Mlx,
+            SearchSort::Trending,
+            {
+                let events = Arc::clone(&events);
+                move |progress| events.lock().unwrap().push(progress)
+            },
+        )
         .await
         .expect("live mlx search should succeed");
 
