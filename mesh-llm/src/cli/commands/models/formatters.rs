@@ -1,6 +1,6 @@
 use crate::models::{
     capabilities, catalog, huggingface_hub_cache_dir, ModelCapabilities, ModelDetails,
-    SearchArtifactFilter, SearchHit,
+    SearchArtifactFilter, SearchHit, SearchSort,
 };
 use crate::system::hardware;
 use anyhow::Result;
@@ -10,19 +10,31 @@ use unicode_width::UnicodeWidthStr;
 
 pub(crate) trait SearchFormatter {
     fn is_json(&self) -> bool;
-    fn render_catalog_empty(&self, query: &str, filter: SearchArtifactFilter) -> Result<()>;
+    fn render_catalog_empty(
+        &self,
+        query: &str,
+        filter: SearchArtifactFilter,
+        sort: SearchSort,
+    ) -> Result<()>;
     fn render_catalog_results(
         &self,
         query: &str,
         filter: SearchArtifactFilter,
         results: &[&'static catalog::CatalogModel],
         limit: usize,
+        sort: SearchSort,
     ) -> Result<()>;
-    fn render_hf_empty(&self, query: &str, filter: SearchArtifactFilter) -> Result<()>;
+    fn render_hf_empty(
+        &self,
+        query: &str,
+        filter: SearchArtifactFilter,
+        sort: SearchSort,
+    ) -> Result<()>;
     fn render_hf_results(
         &self,
         query: &str,
         filter: SearchArtifactFilter,
+        sort: SearchSort,
         results: &[SearchHit],
     ) -> Result<()>;
 }
@@ -82,6 +94,30 @@ pub(crate) fn filter_name(filter: SearchArtifactFilter) -> &'static str {
     match filter {
         SearchArtifactFilter::Gguf => "gguf",
         SearchArtifactFilter::Mlx => "mlx",
+    }
+}
+
+pub(crate) fn sort_label(sort: SearchSort) -> &'static str {
+    match sort {
+        SearchSort::Trending => "trending",
+        SearchSort::Downloads => "most downloads",
+        SearchSort::Likes => "most likes",
+        SearchSort::Created => "recently created",
+        SearchSort::Updated => "recently updated",
+        SearchSort::ParametersDesc => "most parameters",
+        SearchSort::ParametersAsc => "least parameters",
+    }
+}
+
+pub(crate) fn sort_name(sort: SearchSort) -> &'static str {
+    match sort {
+        SearchSort::Trending => "trending",
+        SearchSort::Downloads => "downloads",
+        SearchSort::Likes => "likes",
+        SearchSort::Created => "created",
+        SearchSort::Updated => "updated",
+        SearchSort::ParametersDesc => "most_parameters",
+        SearchSort::ParametersAsc => "least_parameters",
     }
 }
 

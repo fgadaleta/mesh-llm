@@ -5,7 +5,9 @@ use super::resolve::{
 use super::ModelCapabilities;
 use super::{build_hf_tokio_api, capabilities, catalog};
 use anyhow::{Context, Result};
-use hf_hub::{ListModelsParams, ModelInfo, RepoInfo, RepoInfoParams};
+use hf_hub::{ListModelsParams, ModelInfo};
+use regex_lite::Regex;
+use std::sync::LazyLock;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 
@@ -31,6 +33,17 @@ pub enum SearchProgress {
 pub enum SearchArtifactFilter {
     Gguf,
     Mlx,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchSort {
+    Trending,
+    Downloads,
+    Likes,
+    Created,
+    Updated,
+    ParametersDesc,
+    ParametersAsc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +78,7 @@ pub async fn search_huggingface<F>(
     query: &str,
     limit: usize,
     filter: SearchArtifactFilter,
+    sort: SearchSort,
     mut progress: F,
 ) -> Result<Vec<SearchHit>>
 where
@@ -72,10 +86,13 @@ where
 {
     const SEARCH_CONCURRENCY: usize = 10;
 
-    let repo_limit = limit.clamp(1, 100);
+    let repo_limit = match sort {
+        SearchSort::ParametersDesc | SearchSort::ParametersAsc => (limit.saturating_mul(5)).clamp(1, 100),
+        _ => limit.clamp(1, 100),
+    };
     progress(SearchProgress::SearchingHub);
     let api = build_hf_tokio_api(false)?;
-    let params = ListModelsParams::builder()
+    let base_builder = ListModelsParams::builder()
         .search(query.to_string())
         .filter(
             match filter {
@@ -84,8 +101,12 @@ where
             }
             .to_string(),
         )
-        .limit(repo_limit)
-        .build();
+        .full(true)
+        .limit(repo_limit);
+    let params = match api_sort_key(sort) {
+        Some(api_sort) => base_builder.sort(api_sort.to_string()).build(),
+        None => base_builder.build(),
+    };
     let stream = api.list_models(&params).context("Search Hugging Face")?;
     tokio::pin!(stream);
     let mut repos = Vec::new();
@@ -115,11 +136,10 @@ where
         completed += 1;
         progress(SearchProgress::InspectingRepos { completed, total });
         match result {
-            Ok(hits) => {
-                for (rank, hit) in hits.into_iter().enumerate() {
-                    indexed_hits.push((index, rank, hit));
-                }
+            Ok(Some(hit)) => {
+                indexed_hits.push((index, hit));
             }
+            Ok(None) => {}
             Err(err) => {
                 eprintln!("⚠️  Failed to inspect Hugging Face repo: {err:#}");
             }
@@ -130,15 +150,10 @@ where
         }
     }
 
-    indexed_hits.sort_by_key(|(index, rank, _)| (*index, *rank));
-    let mut hits: Vec<SearchHit> = indexed_hits
-        .into_iter()
-        .map(|(_, _, hit)| hit)
-        .take(limit)
-        .collect();
-    if hits.len() > limit {
-        hits.truncate(limit);
-    }
+    indexed_hits.sort_by_key(|(index, _)| *index);
+    let mut hits: Vec<SearchHit> = indexed_hits.into_iter().map(|(_, hit)| hit).collect();
+    apply_local_search_sort(&mut hits, sort);
+    hits.truncate(limit);
     Ok(hits)
 }
 
@@ -146,84 +161,152 @@ async fn build_search_hit(
     api: hf_hub::HFClient,
     repo: ModelInfo,
     filter: SearchArtifactFilter,
-) -> Result<Vec<SearchHit>> {
-    let repo_id = repo.id.clone();
-    let (owner, name) = repo_id.split_once('/').unwrap_or(("", repo_id.as_str()));
-    let detail = api
-        .model(owner, name)
-        .info(&RepoInfoParams::default())
-        .await
-        .with_context(|| format!("Fetch Hugging Face repo {}", repo_id))?;
-    let RepoInfo::Model(detail) = detail else {
-        return Ok(Vec::new());
-    };
-
+) -> Result<Option<SearchHit>> {
+    let repo_downloads = repo.downloads;
+    let repo_likes = repo.likes;
+    let detail = repo;
     let repo_id = detail.model_id.clone().unwrap_or(detail.id.clone());
-    let sibling_names: Vec<String> = detail
-        .siblings
-        .clone()
-        .unwrap_or_default()
+    let siblings = detail.siblings.clone().unwrap_or_default();
+    let sibling_names: Vec<String> = siblings
         .iter()
         .map(|sibling| sibling.rfilename.clone())
         .collect();
-    let sibling_size_entries: Vec<(String, Option<u64>)> = detail
-        .siblings
-        .clone()
-        .unwrap_or_default()
+    let sibling_size_entries: Vec<(String, Option<u64>)> = siblings
         .iter()
         .map(|sibling| (sibling.rfilename.clone(), sibling.size))
         .collect();
     let repo_has_mlx_weights = sibling_names.iter().any(|file| is_mlx_weight_file(file));
     let candidates = collect_repo_artifact_candidates(&sibling_names);
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
-    let mut hits = Vec::new();
-    for candidate in candidates {
-        let matches_filter = match filter {
+    let matching_candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|candidate| match filter {
             SearchArtifactFilter::Gguf => candidate.kind == RepoArtifactKind::Gguf,
             SearchArtifactFilter::Mlx => {
                 candidate.kind == RepoArtifactKind::Mlx && repo_has_mlx_weights
             }
-        };
-        if !matches_filter {
-            continue;
-        }
-        let catalog = matching_catalog_model_for_huggingface(&repo_id, None, &candidate.file);
-        let size_label = match catalog {
-            Some(model) => Some(model.size.to_string()),
-            None => match size_label_from_sibling_entries(&candidate.file, &sibling_size_entries) {
-                Some(size_label) => Some(size_label),
-                None => remote_hf_size_label_with_api(&api, &repo_id, None, &candidate.file).await,
-            },
-        };
-        let remote_caps = capabilities::infer_remote_hf_capabilities(
-            &repo_id,
-            None,
-            &candidate.file,
-            Some(&sibling_names),
-        )
-        .await;
-        let capabilities = match catalog {
-            Some(model) => {
-                let base = capabilities::infer_catalog_capabilities(model);
-                merge_capabilities(base, remote_caps)
-            }
-            None => remote_caps,
-        };
-        hits.push(SearchHit {
-            repo_id: repo_id.clone(),
-            kind: repo_artifact_kind_label(candidate.kind),
-            exact_ref: display_exact_ref(&repo_id, candidate.kind, &candidate.file),
-            size_label,
-            downloads: detail.downloads.or(repo.downloads),
-            likes: detail.likes.or(repo.likes),
-            catalog,
-            capabilities,
-        });
+        })
+        .collect();
+    if matching_candidates.is_empty() {
+        return Ok(None);
     }
-    Ok(hits)
+
+    let candidate = &matching_candidates[0];
+    let remote_metadata = capabilities::fetch_remote_hf_metadata_jsons(&repo_id, None).await;
+    let catalog = matching_catalog_model_for_huggingface(&repo_id, None, &candidate.file);
+    let size_label = match catalog {
+        Some(model) => Some(model.size.to_string()),
+        None => match size_label_from_sibling_entries(&candidate.file, &sibling_size_entries) {
+            Some(size_label) => Some(size_label),
+            None => remote_hf_size_label_with_api(&api, &repo_id, None, &candidate.file).await,
+        },
+    };
+    let remote_caps = capabilities::infer_remote_hf_capabilities_with_metadata(
+        &repo_id,
+        &candidate.file,
+        Some(&sibling_names),
+        &remote_metadata,
+    );
+    let capabilities = match catalog {
+        Some(model) => {
+            let base = capabilities::infer_catalog_capabilities(model);
+            merge_capabilities(base, remote_caps)
+        }
+        None => remote_caps,
+    };
+    Ok(Some(SearchHit {
+        repo_id: repo_id.clone(),
+        kind: repo_artifact_kind_label(candidate.kind),
+        exact_ref: display_exact_ref(&repo_id, candidate.kind, &candidate.file),
+        size_label,
+        downloads: detail.downloads.or(repo_downloads),
+        likes: detail.likes.or(repo_likes),
+        catalog,
+        capabilities,
+    }))
+}
+
+fn api_sort_key(sort: SearchSort) -> Option<&'static str> {
+    match sort {
+        SearchSort::Trending => Some("trendingScore"),
+        SearchSort::Downloads => Some("downloads"),
+        SearchSort::Likes => Some("likes"),
+        SearchSort::Created => Some("createdAt"),
+        SearchSort::Updated => Some("lastModified"),
+        SearchSort::ParametersDesc | SearchSort::ParametersAsc => None,
+    }
+}
+
+fn apply_local_search_sort(hits: &mut [SearchHit], sort: SearchSort) {
+    match sort {
+        SearchSort::ParametersDesc => {
+            hits.sort_by(|left, right| {
+                approx_parameter_count_b(right)
+                    .partial_cmp(&approx_parameter_count_b(left))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.repo_id.cmp(&right.repo_id))
+            });
+        }
+        SearchSort::ParametersAsc => {
+            hits.sort_by(|left, right| {
+                approx_parameter_count_b(left)
+                    .partial_cmp(&approx_parameter_count_b(right))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left.repo_id.cmp(&right.repo_id))
+            });
+        }
+        _ => {}
+    }
+}
+
+fn approx_parameter_count_b(hit: &SearchHit) -> f64 {
+    approximate_parameter_count_b_from_text(&format!("{} {}", hit.repo_id, hit.exact_ref))
+        .unwrap_or(-1.0)
+}
+
+fn approximate_parameter_count_b_from_text(text: &str) -> Option<f64> {
+    static MULTIPLIED_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)([bm])").unwrap()
+    });
+    static SIMPLE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)(\d+(?:\.\d+)?)([bm])").unwrap());
+
+    let mut best: Option<f64> = None;
+    for captures in MULTIPLIED_RE.captures_iter(text) {
+        let Some(left) = captures.get(1).and_then(|m| m.as_str().parse::<f64>().ok()) else {
+            continue;
+        };
+        let Some(right) = captures.get(2).and_then(|m| m.as_str().parse::<f64>().ok()) else {
+            continue;
+        };
+        let Some(unit) = captures.get(3).map(|m| m.as_str().to_ascii_lowercase()) else {
+            continue;
+        };
+        let value = match unit.as_str() {
+            "b" => left * right,
+            "m" => (left * right) / 1000.0,
+            _ => continue,
+        };
+        best = Some(best.map_or(value, |current| current.max(value)));
+    }
+    for captures in SIMPLE_RE.captures_iter(text) {
+        let Some(number) = captures.get(1).and_then(|m| m.as_str().parse::<f64>().ok()) else {
+            continue;
+        };
+        let Some(unit) = captures.get(2).map(|m| m.as_str().to_ascii_lowercase()) else {
+            continue;
+        };
+        let value = match unit.as_str() {
+            "b" => number,
+            "m" => number / 1000.0,
+            _ => continue,
+        };
+        best = Some(best.map_or(value, |current| current.max(value)));
+    }
+    best
 }
 
 fn repo_artifact_kind_label(kind: RepoArtifactKind) -> &'static str {

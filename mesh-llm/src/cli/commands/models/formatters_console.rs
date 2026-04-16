@@ -1,10 +1,10 @@
 use super::formatters::{
     catalog_model_capabilities, display_width, filter_label, fit_hint_for_size_label, format_count,
     format_installed_size, format_source_label, huggingface_cache_dir, installed_model_kind,
-    model_kind_code, pad_left_display, pad_right_display, variant_selector_label, ConsoleFormatter,
-    InstalledRow, ModelsFormatter, SearchFormatter,
+    model_kind_code, pad_left_display, pad_right_display, sort_label, variant_selector_label,
+    ConsoleFormatter, InstalledRow, ModelsFormatter, SearchFormatter,
 };
-use crate::models::{catalog, ModelDetails, SearchArtifactFilter, SearchHit};
+use crate::models::{catalog, ModelDetails, SearchArtifactFilter, SearchHit, SearchSort};
 use anyhow::Result;
 
 impl SearchFormatter for ConsoleFormatter {
@@ -12,11 +12,17 @@ impl SearchFormatter for ConsoleFormatter {
         false
     }
 
-    fn render_catalog_empty(&self, query: &str, filter: SearchArtifactFilter) -> Result<()> {
+    fn render_catalog_empty(
+        &self,
+        query: &str,
+        filter: SearchArtifactFilter,
+        sort: SearchSort,
+    ) -> Result<()> {
         eprintln!(
-            "🔎 No {} catalog models matched '{}'.",
+            "🔎 No {} catalog models matched '{}' (sorted by {}).",
             filter_label(filter),
-            query
+            query,
+            sort_label(sort)
         );
         Ok(())
     }
@@ -27,11 +33,13 @@ impl SearchFormatter for ConsoleFormatter {
         filter: SearchArtifactFilter,
         results: &[&'static catalog::CatalogModel],
         limit: usize,
+        sort: SearchSort,
     ) -> Result<()> {
         println!(
-            "📚 {} catalog matches for '{}'",
+            "📚 {} catalog matches for '{}' ({})",
             filter_label(filter),
-            query
+            query,
+            sort_label(sort)
         );
         if let Some(summary) = super::formatters::local_capacity_summary() {
             println!("{}", summary);
@@ -47,11 +55,17 @@ impl SearchFormatter for ConsoleFormatter {
         Ok(())
     }
 
-    fn render_hf_empty(&self, query: &str, filter: SearchArtifactFilter) -> Result<()> {
+    fn render_hf_empty(
+        &self,
+        query: &str,
+        filter: SearchArtifactFilter,
+        sort: SearchSort,
+    ) -> Result<()> {
         eprintln!(
-            "🔎 No Hugging Face {} matches for '{}'.",
+            "🔎 No Hugging Face {} matches for '{}' (sorted by {}).",
             filter_label(filter),
-            query
+            query,
+            sort_label(sort)
         );
         Ok(())
     }
@@ -60,12 +74,14 @@ impl SearchFormatter for ConsoleFormatter {
         &self,
         query: &str,
         filter: SearchArtifactFilter,
+        sort: SearchSort,
         results: &[SearchHit],
     ) -> Result<()> {
         println!(
-            "🔎 Hugging Face {} matches for '{}'",
+            "🔎 Hugging Face {} matches for '{}' ({})",
             filter_label(filter),
-            query
+            query,
+            sort_label(sort)
         );
         if let Some(summary) = super::formatters::local_capacity_summary() {
             println!("{}", summary);

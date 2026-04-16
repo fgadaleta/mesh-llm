@@ -27,6 +27,7 @@ pub use resolve::{
 };
 pub use search::{
     search_catalog_models, search_huggingface, SearchArtifactFilter, SearchHit, SearchProgress,
+    SearchSort,
 };
 pub use topology::{infer_local_model_topology, ModelMoeInfo, ModelTopology};
 

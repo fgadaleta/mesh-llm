@@ -3,12 +3,13 @@ mod formatters_console;
 mod formatters_json;
 
 use crate::cli::models::ModelsCommand;
+use crate::cli::models::ModelSearchSort;
 use crate::cli::terminal_progress::{clear_stderr_line, start_spinner, DeterminateProgressLine};
 use crate::models::{
     catalog, download_model_ref_with_progress_details, find_catalog_model_exact,
     installed_model_capabilities, scan_installed_models, search_catalog_models, search_huggingface,
     show_exact_model, show_model_variants_with_progress, SearchArtifactFilter, SearchProgress,
-    ShowVariantsProgress,
+    SearchSort, ShowVariantsProgress,
 };
 use anyhow::{anyhow, Result};
 use std::io::IsTerminal;
@@ -24,6 +25,7 @@ pub async fn run_model_search(
     prefer_mlx: bool,
     catalog_only: bool,
     limit: usize,
+    sort: ModelSearchSort,
     json_output: bool,
 ) -> Result<()> {
     let formatter = search_formatter(json_output);
@@ -33,6 +35,7 @@ pub async fn run_model_search(
     } else {
         SearchArtifactFilter::Gguf
     };
+    let search_sort = map_search_sort(sort);
 
     if catalog_only {
         let results: Vec<_> = search_catalog_models(&query)
@@ -43,34 +46,38 @@ pub async fn run_model_search(
             })
             .collect();
         if results.is_empty() {
-            return formatter.render_catalog_empty(&query, filter);
+            return formatter.render_catalog_empty(&query, filter, search_sort);
         }
-        return formatter.render_catalog_results(&query, filter, &results, limit);
+        return formatter.render_catalog_results(&query, filter, &results, limit, search_sort);
     }
 
-    if !formatter.is_json() {
-        eprintln!(
-            "🔎 Searching Hugging Face {} repos for '{}'...",
-            formatters::filter_label(filter),
-            query
-        );
-    }
     let mut announced_repo_scan = false;
     let mut last_reported_completed = 0usize;
+    let mut search_spinner = if formatter.is_json() {
+        None
+    } else {
+        Some(start_spinner(&format!(
+            "Searching Hugging Face {} repos for '{}'",
+            formatters::filter_label(filter),
+            query
+        )))
+    };
     let mut repo_spinner = None;
     let repo_progress = DeterminateProgressLine::new("🔎");
-    let results = search_huggingface(&query, limit, filter, |progress| match progress {
+    let results = search_huggingface(&query, limit, filter, search_sort, |progress| match progress {
         SearchProgress::SearchingHub => {}
         SearchProgress::InspectingRepos { completed, total } => {
             if formatter.is_json() {
                 return;
+            }
+            if let Some(mut spinner) = search_spinner.take() {
+                spinner.finish();
             }
             if total == 0 {
                 return;
             }
             if !announced_repo_scan {
                 announced_repo_scan = true;
-                eprintln!("   Inspecting {total} candidate repos...");
                 repo_spinner = Some(start_spinner(&format!(
                     "Inspecting {total} candidate repos..."
                 )));
@@ -98,13 +105,16 @@ pub async fn run_model_search(
         }
     })
     .await?;
+    if let Some(mut spinner) = search_spinner.take() {
+        spinner.finish();
+    }
     if let Some(mut spinner) = repo_spinner.take() {
         spinner.finish();
     }
     if results.is_empty() {
-        return formatter.render_hf_empty(&query, filter);
+        return formatter.render_hf_empty(&query, filter, search_sort);
     }
-    formatter.render_hf_results(&query, filter, &results)
+    formatter.render_hf_results(&query, filter, search_sort, &results)
 }
 
 pub fn run_model_recommended(json_output: bool) -> Result<()> {
@@ -261,8 +271,9 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
             mlx,
             catalog,
             limit,
+            sort,
             json,
-        } => run_model_search(query, *gguf, *mlx, *catalog, *limit, *json).await?,
+        } => run_model_search(query, *gguf, *mlx, *catalog, *limit, *sort, *json).await?,
         ModelsCommand::Show { model, json } => run_model_show(model, *json).await?,
         ModelsCommand::Download { model, draft, json } => {
             run_model_download(model, *draft, *json).await?
@@ -289,4 +300,16 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn map_search_sort(sort: ModelSearchSort) -> SearchSort {
+    match sort {
+        ModelSearchSort::Trending => SearchSort::Trending,
+        ModelSearchSort::Downloads => SearchSort::Downloads,
+        ModelSearchSort::Likes => SearchSort::Likes,
+        ModelSearchSort::Created => SearchSort::Created,
+        ModelSearchSort::Updated => SearchSort::Updated,
+        ModelSearchSort::MostParameters => SearchSort::ParametersDesc,
+        ModelSearchSort::LeastParameters => SearchSort::ParametersAsc,
+    }
 }

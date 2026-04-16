@@ -204,12 +204,22 @@ pub async fn infer_remote_hf_capabilities(
     file: &str,
     siblings: Option<&[String]>,
 ) -> ModelCapabilities {
+    let metadata = fetch_remote_hf_metadata_jsons(repo, revision).await;
+    infer_remote_hf_capabilities_with_metadata(repo, file, siblings, &metadata)
+}
+
+pub fn infer_remote_hf_capabilities_with_metadata(
+    repo: &str,
+    file: &str,
+    siblings: Option<&[String]>,
+    metadata: &[Value],
+) -> ModelCapabilities {
     let mut caps = ModelCapabilities::default();
     caps = merge_name_signals(caps, &[repo, file]);
     if let Some(files) = siblings {
         caps = merge_sibling_signals(caps, files.iter().map(String::as_str));
     }
-    for config in fetch_remote_metadata_jsons(repo, revision).await {
+    for config in metadata {
         caps = merge_config_signals(caps, &config);
     }
     caps.normalize()
@@ -648,25 +658,47 @@ fn read_local_metadata_jsons(path: &Path) -> Vec<Value> {
     values
 }
 
-async fn fetch_remote_metadata_jsons(repo: &str, revision: Option<&str>) -> Vec<Value> {
+pub async fn fetch_remote_hf_metadata_jsons(repo: &str, revision: Option<&str>) -> Vec<Value> {
+    let Some(api) = build_hf_tokio_api(false).ok() else {
+        return Vec::new();
+    };
+    let revision = revision.unwrap_or("main").to_string();
+    let config = fetch_remote_json_with_api(
+        api.clone(),
+        repo.to_string(),
+        revision.clone(),
+        "config.json",
+    );
+    let tokenizer = fetch_remote_json_with_api(
+        api.clone(),
+        repo.to_string(),
+        revision.clone(),
+        "tokenizer_config.json",
+    );
+    let chat_template =
+        fetch_remote_json_with_api(api, repo.to_string(), revision, "chat_template.json");
+
+    let (config, tokenizer, chat_template) = tokio::join!(config, tokenizer, chat_template);
     let mut values = Vec::new();
-    for filename in ["config.json", "tokenizer_config.json", "chat_template.json"] {
-        if let Some(value) = fetch_remote_json(repo, revision, filename).await {
-            values.push(value);
-        }
+    for value in [config, tokenizer, chat_template].into_iter().flatten() {
+        values.push(value);
     }
     values
 }
 
-async fn fetch_remote_json(repo: &str, revision: Option<&str>, file: &str) -> Option<Value> {
-    let api = build_hf_tokio_api(false).ok()?;
-    let (owner, name) = repo.split_once('/').unwrap_or(("", repo));
+async fn fetch_remote_json_with_api(
+    api: hf_hub::HFClient,
+    repo: String,
+    revision: String,
+    file: &'static str,
+) -> Option<Value> {
+    let (owner, name) = repo.split_once('/').unwrap_or(("", repo.as_str()));
     let path = api
         .repo(RepoType::Model, owner, name)
         .download_file(
             &RepoDownloadFileParams::builder()
                 .filename(file.to_string())
-                .revision(revision.unwrap_or("main").to_string())
+                .revision(revision)
                 .build(),
         )
         .await
