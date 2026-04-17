@@ -64,16 +64,18 @@ release-build-cuda cuda_arch="75;80;86;87;89;90":
     @scripts/build-linux.sh --backend cuda --cuda-arch "{{ cuda_arch }}"
 
 # Build a Linux CUDA release artifact (Blackwell lane).
-# Must be invoked under the CUDA 12.8 toolkit. Emitted sm_100/103/120
-# cubins require the R550+ driver series at runtime; the produced bundle
-# is NOT compatible with R535. See docs/cuda-release-lanes.md.
-release-build-cuda-blackwell cuda_arch="75;80;86;87;89;90;100;103;120":
+# Must be invoked under the CUDA 12.8 toolkit. Emitted sm_100/120 cubins
+# require the R550+ driver series at runtime; the produced bundle is
+# NOT compatible with R535. Note: nvcc 12.8.0 does not know sm_103
+# (that arch was introduced in a later CUDA release), so it's omitted
+# here. See docs/cuda-release-lanes.md.
+release-build-cuda-blackwell cuda_arch="75;80;86;87;89;90;100;120":
     @scripts/build-linux.sh --backend cuda --cuda-arch "{{ cuda_arch }}"
 
 release-build-cuda-windows cuda_arch="75;80;86;87;89;90":
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cuda -CudaArch "{{cuda_arch}}"
 
-release-build-cuda-blackwell-windows cuda_arch="75;80;86;87;89;90;100;103;120":
+release-build-cuda-blackwell-windows cuda_arch="75;80;86;87;89;90;100;120":
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cuda -CudaArch "{{cuda_arch}}"
 
 # Build a Linux ROCm release artifact with an explicit architecture list.
@@ -450,7 +452,7 @@ docker-build-cpu tag="mesh-llm:cpu":
 
 # Build the CUDA full-node Docker image.
 # Default arch list targets the CUDA 12.6.3 toolkit baked into
-# docker/Dockerfile.cuda (Turing..Hopper). For Blackwell (sm_100/103/120)
+# docker/Dockerfile.cuda (Turing..Hopper). For Blackwell (sm_100/120)
 # override cuda_arch AND cuda_version: the 12.6.3 base image's nvcc cannot
 # emit those cubins. See docs/cuda-release-lanes.md.
 [unix]

@@ -16,9 +16,11 @@ though sm_80 cubins are physically present in the binary
 on the **CUDA 12.6.3** toolkit produces a working bundle on the same
 hardware/driver.
 
-At the same time, Blackwell compute capabilities (sm_100, sm_103,
-sm_120 — B100/B200, Thor, RTX 50-series) were **first introduced in CUDA
-12.8**; nvcc 12.6 cannot emit them at all.
+At the same time, Blackwell compute capabilities (sm_100 B100/B200,
+sm_120 RTX 50-series) were **first introduced in CUDA 12.8**; nvcc 12.6
+cannot emit them at all. (sm_103 is a related Blackwell variant, but
+nvcc 12.8.0 does not know it — that arch landed in a later CUDA
+release; it's therefore omitted from our 12.8-toolkit Blackwell lane.)
 
 There is no single toolkit that satisfies both audiences, so the release
 workflow builds both.
@@ -28,7 +30,7 @@ workflow builds both.
 | Asset suffix | Toolkit | Arch coverage | Driver requirement |
 |---|---|---|---|
 | `-cuda` (primary) | CUDA 12.6.3 | sm_75, sm_80, sm_86, sm_87, sm_89, sm_90 (Turing → Hopper) | R535+ (CUDA 12.2 native) |
-| `-cuda-blackwell` | CUDA 12.8 | sm_75..sm_90 plus sm_100, sm_103, sm_120 (adds Blackwell) | R550+ (CUDA 12.4 native) |
+| `-cuda-blackwell` | CUDA 12.8 | sm_75..sm_90 plus sm_100, sm_120 (adds Blackwell) | R550+ (CUDA 12.4 native) |
 
 - **Primary `-cuda`** covers the currently-deployed A30/A100/Ada/Hopper
   fleet on the stable R535 driver series. This is the recommended
@@ -124,7 +126,7 @@ The `mesh-llm:cuda` Docker image (built by
 tracks the **primary lane only** (CUDA 12.6.3, sm_75..sm_90). A
 `mesh-llm:cuda-blackwell` tag is a planned follow-up; for now, Blackwell
 Docker users should build locally with
-`just docker-build-cuda mesh-llm:cuda-blackwell "75;80;86;87;89;90;100;103;120" 12.8.0`.
+`just docker-build-cuda mesh-llm:cuda-blackwell "75;80;86;87;89;90;100;120" 12.8.0`.
 
 ## History
 

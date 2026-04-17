@@ -203,9 +203,10 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
-  # Blackwell lane: builds sm_100/103/120 cubins under the CUDA 12.8
+  # Blackwell lane: builds sm_100/120 cubins under the CUDA 12.8
   # toolkit. The resulting bundle REQUIRES an R550+ driver at runtime
-  # and is not compatible with R535. See docs/cuda-release-lanes.md.
+  # and is not compatible with R535. Note: nvcc 12.8.0 does not know
+  # sm_103; omitted from the arch list. See docs/cuda-release-lanes.md.
   build_linux_cuda_blackwell:
     name: Build Linux CUDA (Blackwell)
     runs-on: ubuntu-latest

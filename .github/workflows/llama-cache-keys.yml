@@ -121,6 +121,6 @@ jobs:
           set -euo pipefail
           echo "cuda_slim_cache_key=${CACHE_NAMESPACE}-llama-cuda-slim-${LLAMA_SHA}-${CUDA_HASH}-arch89-fa-off-cuda${CUDA_VERSION}" >> "$GITHUB_OUTPUT"
           echo "cuda_fat_cache_key=${CACHE_NAMESPACE}-llama-cuda-fat-${LLAMA_SHA}-${CUDA_HASH}-arch75-80-86-87-89-90-fa-on-cuda${CUDA_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "cuda_blackwell_fat_cache_key=${CACHE_NAMESPACE}-llama-cuda-blackwell-fat-${LLAMA_SHA}-${CUDA_HASH}-arch75-80-86-87-89-90-100-103-120-fa-on-cuda${CUDA_BLACKWELL_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "cuda_blackwell_fat_cache_key=${CACHE_NAMESPACE}-llama-cuda-blackwell-fat-${LLAMA_SHA}-${CUDA_HASH}-arch75-80-86-87-89-90-100-120-fa-on-cuda${CUDA_BLACKWELL_VERSION}" >> "$GITHUB_OUTPUT"
           echo "rocm_slim_cache_key=${CACHE_NAMESPACE}-llama-rocm-slim-${LLAMA_SHA}-${ROCM_HASH}-gfx1100-rocm7.0" >> "$GITHUB_OUTPUT"
           echo "rocm_fat_cache_key=${CACHE_NAMESPACE}-llama-rocm-fat-${LLAMA_SHA}-${ROCM_HASH}-gfx90a-gfx942-gfx1100-gfx1101-gfx1102-gfx1200-gfx1201-rocm7.0" >> "$GITHUB_OUTPUT"
