@@ -385,7 +385,8 @@ async fn run_share(model: &str, ranking_file: Option<&Path>, dataset_repo: &str)
     })?;
     let log_path = log_path_for(&resolved.path, &ranking.analyzer_id);
     let bundle = moe_planner::build_submit_bundle(&resolved, &ranking, Some(log_path.as_path()))?;
-    let api = models::build_hf_api(false).context("Build Hugging Face client for MoE share")?;
+    let api =
+        models::build_hf_tokio_api(false).context("Build Hugging Face client for MoE share")?;
     let (owner, name) = dataset_repo.split_once('/').unwrap_or(("", dataset_repo));
     let dataset = api.dataset(owner, name);
     let info = dataset
@@ -394,6 +395,7 @@ async fn run_share(model: &str, ranking_file: Option<&Path>, dataset_repo: &str)
                 .revision("main".to_string())
                 .build(),
         )
+        .await
         .with_context(|| format!("Fetch dataset info for {}", dataset_repo))?;
     let hf_hub::RepoInfo::Dataset(info) = info else {
         anyhow::bail!("Expected dataset repo info for {}", dataset_repo);
