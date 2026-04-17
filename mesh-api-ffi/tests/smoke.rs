@@ -1,6 +1,10 @@
 use mesh_ffi::{create_client, EventDto, EventListener, FfiError};
 use std::sync::{Arc, Mutex};
 
+fn valid_owner_keypair_hex() -> String {
+    mesh_api::OwnerKeypair::generate().to_hex()
+}
+
 struct MockListener {
     events: Arc<Mutex<Vec<String>>>,
 }
@@ -28,13 +32,20 @@ fn create_client_with_invalid_token_fails() {
 
 #[test]
 fn create_client_with_valid_token_succeeds() {
-    let result = create_client("".to_string(), "valid-token".to_string());
+    let result = create_client(valid_owner_keypair_hex(), "valid-token".to_string());
     assert!(result.is_ok());
 }
 
 #[test]
+fn create_client_with_empty_owner_keypair_fails() {
+    // Empty keypair is rejected rather than silently generating a fresh identity.
+    let result = create_client("".to_string(), "valid-token".to_string());
+    assert!(matches!(result, Err(FfiError::InvalidOwnerKeypair)));
+}
+
+#[test]
 fn client_handle_status_returns_disconnected() {
-    let handle = create_client("".to_string(), "valid-token".to_string()).unwrap();
+    let handle = create_client(valid_owner_keypair_hex(), "valid-token".to_string()).unwrap();
     let status = handle.status();
     assert!(!status.connected);
     assert_eq!(status.peer_count, 0);
@@ -42,7 +53,7 @@ fn client_handle_status_returns_disconnected() {
 
 #[test]
 fn client_handle_cancel_unknown_id_is_noop() {
-    let handle = create_client("".to_string(), "valid-token".to_string()).unwrap();
+    let handle = create_client(valid_owner_keypair_hex(), "valid-token".to_string()).unwrap();
     handle.cancel("unknown-id".to_string());
 }
 
@@ -107,8 +118,8 @@ fn mock_listener_receives_events() {
 fn handle_create_destroy_loop_25_times() {
     for i in 0..25 {
         let token = format!("invite-token-{}", i);
-        let handle = create_client("".to_string(), token)
-            .expect("create_client should succeed with non-empty token");
+        let handle = create_client(valid_owner_keypair_hex(), token)
+            .expect("create_client should succeed with valid inputs");
         let status = handle.status();
         assert!(!status.connected, "iteration {}: expected disconnected", i);
     }

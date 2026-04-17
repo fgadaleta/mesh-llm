@@ -114,12 +114,15 @@ pub fn create_client(
     let token = invite_token
         .parse::<InviteToken>()
         .map_err(|_| FfiError::InvalidInviteToken)?;
-    let kp = if owner_keypair_bytes_hex.trim().is_empty() {
-        OwnerKeypair::generate()
-    } else {
-        OwnerKeypair::from_hex(owner_keypair_bytes_hex.trim())
-            .map_err(|_| FfiError::InvalidOwnerKeypair)?
-    };
+    // An empty keypair is rejected rather than silently generating a fresh one:
+    // a caller that forgets to pass their persisted owner keypair would otherwise
+    // get a brand-new identity every launch with no error. Callers that genuinely
+    // want a new keypair should create one explicitly before calling create_client.
+    let trimmed = owner_keypair_bytes_hex.trim();
+    if trimmed.is_empty() {
+        return Err(FfiError::InvalidOwnerKeypair);
+    }
+    let kp = OwnerKeypair::from_hex(trimmed).map_err(|_| FfiError::InvalidOwnerKeypair)?;
     let client = ClientBuilder::new(kp, token)
         .build()
         .map_err(|_| FfiError::JoinFailed)?;
