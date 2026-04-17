@@ -517,6 +517,12 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
+  # Windows release builds remain disabled until the llama.cpp CUDA fix lands.
+  # Re-enable by restoring the dedicated Windows build matrix here and adding
+  # it back to publish.needs.
+  #
+  # build_windows:
+
   publish:
     name: Publish GitHub release
     runs-on: ubuntu-latest
@@ -528,6 +534,7 @@ jobs:
       - build_linux_rocm
       - build_linux_vulkan
       - inference_smoke_tests
+      # - build_windows  # disabled until llama.cpp CUDA fix
 
     steps:
       - name: Download release artifacts
