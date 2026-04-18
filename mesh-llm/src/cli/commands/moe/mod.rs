@@ -4,10 +4,7 @@ mod formatters_json;
 mod hf_jobs;
 
 use anyhow::{bail, Context, Result};
-use base64::Engine as _;
-use reqwest::StatusCode;
-use serde::Deserialize;
-use serde_json::json;
+use hf_hub::RepoUploadFolderParams;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -422,9 +419,15 @@ async fn run_share_resolved(
     })?;
     let log_path = log_path_for(&resolved.path, &ranking.analyzer_id);
     let bundle = moe_planner::build_submit_bundle(&resolved, &ranking, Some(log_path.as_path()))?;
+    models::hf_token_override().ok_or_else(|| {
+        share_error(
+            "Missing Hugging Face token",
+            "Set HF_TOKEN or HUGGING_FACE_HUB_TOKEN before running `mesh-llm moe share`.",
+        )
+    })?;
     let api =
         models::build_hf_tokio_api(false).context("Build Hugging Face client for MoE share")?;
-    let (owner, name) = dataset_repo.split_once('/').unwrap_or(("", dataset_repo));
+    let (owner, name) = parse_dataset_repo(dataset_repo)?;
     let dataset = api.dataset(owner, name);
     let info = dataset
         .info(
@@ -437,14 +440,11 @@ async fn run_share_resolved(
     let hf_hub::RepoInfo::Dataset(info) = info else {
         anyhow::bail!("Expected dataset repo info for {}", dataset_repo);
     };
+    let siblings = info.siblings.as_deref().unwrap_or(&[]);
     let existing = bundle
         .dataset_paths
         .iter()
-        .filter(|path| {
-            info.siblings
-                .as_ref()
-                .is_some_and(|siblings| siblings.iter().any(|entry| &entry.rfilename == *path))
-        })
+        .filter(|path| siblings.iter().any(|entry| &entry.rfilename == *path))
         .cloned()
         .collect::<Vec<_>>();
 
@@ -472,142 +472,107 @@ async fn run_share_resolved(
         SharePrefixState::New => {}
     }
 
-    let token = models::hf_token_override().ok_or_else(|| {
-        share_error(
-            "Missing Hugging Face token",
-            "Set HF_TOKEN or HUGGING_FACE_HUB_TOKEN before running `mesh-llm moe share`.",
-        )
-    })?;
+    let temp_root = std::env::temp_dir().join(format!(
+        "mesh-llm-moe-share-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _temp_root_guard = TempRootGuard(temp_root.clone());
 
-    let mut operations = vec![ndjson_header(
-        &bundle.commit_message,
-        &bundle.commit_description,
-    )];
-    operations.push(ndjson_file_op(
+    stage_share_file(
+        &temp_root,
         &format!("{}/ranking.csv", bundle.dataset_prefix),
-        &fs::read(&bundle.ranking_path)
-            .with_context(|| format!("Read {}", bundle.ranking_path.display()))?,
-    ));
-    operations.push(ndjson_file_op(
+        &bundle.ranking_path,
+    )?;
+    stage_share_text(
+        &temp_root,
         &format!("{}/metadata.json", bundle.dataset_prefix),
-        bundle.metadata_content.as_bytes(),
-    ));
-    operations.push(ndjson_file_op(
+        &bundle.metadata_content,
+    )?;
+    stage_share_text(
+        &temp_root,
         &format!("{}/analysis.json", bundle.dataset_prefix),
-        bundle.analysis_content.as_bytes(),
-    ));
+        &bundle.analysis_content,
+    )?;
     if let Some(log_path) = bundle.log_path.as_ref() {
-        operations.push(ndjson_file_op(
+        stage_share_file(
+            &temp_root,
             &format!("{}/run.log", bundle.dataset_prefix),
-            &fs::read(log_path).with_context(|| format!("Read {}", log_path.display()))?,
-        ));
+            log_path,
+        )?;
     }
 
-    let endpoint = std::env::var("HF_ENDPOINT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "https://huggingface.co".to_string());
-    let commit_url = format!(
-        "{}/api/datasets/{}/commit/main",
-        endpoint.trim_end_matches('/'),
-        dataset_repo
-    );
-    let body = operations
-        .into_iter()
-        .map(|value| serde_json::to_string(&value))
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .join("\n")
-        + "\n";
-
     println!("⬆️ Opening contribution PR...");
-    let response = reqwest::Client::new()
-        .post(&commit_url)
-        .bearer_auth(token)
-        .query(&[("create_pr", "1")])
-        .header("Content-Type", "application/x-ndjson")
-        .body(body)
-        .send()
+    let commit = dataset
+        .upload_folder(
+            &RepoUploadFolderParams::builder()
+                .folder_path(temp_root.clone())
+                .revision("main".to_string())
+                .commit_message(bundle.commit_message.clone())
+                .commit_description(bundle.commit_description.clone())
+                .create_pr(true)
+                .build(),
+        )
         .await
         .map_err(|err| {
             share_error(
-                "Dataset contribution request failed",
-                &format!("POST {}: {}", commit_url, err),
+                "Dataset contribution failed",
+                &format!("Upload staged files to {}: {}", dataset_repo, err),
             )
         })?;
-    if response.status() != StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(share_error(
-            "Dataset contribution failed",
-            &format!("{}: {}", status, body.trim()),
-        ));
-    }
-    let commit: HfCommitResponse = response.json().await.map_err(|err| {
-        share_error(
-            "Could not decode Hugging Face response",
-            &format!("{}", err),
-        )
-    })?;
     println!("✅ Opened MoE dataset contribution");
-    println!("   commit: {}", commit.commit_oid);
-    println!("   url: {}", commit.commit_url);
-    if let Some(pr_url) = commit.pull_request_url.as_deref() {
+    if let Some(commit_oid) = commit.commit_oid.as_deref() {
+        println!("   commit: {commit_oid}");
+    }
+    if let Some(commit_url) = commit.commit_url.as_deref() {
+        println!("   url: {commit_url}");
+    }
+    if let Some(pr_url) = commit.pr_url.as_deref() {
         println!("   pr: {}", pr_url);
     }
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct HfCommitResponse {
-    #[serde(rename = "commitOid")]
-    commit_oid: String,
-    #[serde(rename = "commitUrl")]
-    commit_url: String,
-    #[serde(rename = "pullRequestUrl")]
-    pull_request_url: Option<String>,
-}
-
-fn ndjson_header(summary: &str, description: &str) -> serde_json::Value {
-    json!({
-        "key": "header",
-        "value": {
-            "summary": summary,
-            "description": description,
-        }
+fn parse_dataset_repo(dataset_repo: &str) -> Result<(&str, &str)> {
+    dataset_repo.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!("Dataset repo must look like `owner/name`, got {dataset_repo}")
     })
 }
 
-fn ndjson_file_op(path_in_repo: &str, content: &[u8]) -> serde_json::Value {
-    json!({
-        "key": "file",
-        "value": {
-            "content": base64::engine::general_purpose::STANDARD.encode(content),
-            "path": path_in_repo,
-            "encoding": "base64",
+fn stage_share_text(temp_root: &Path, relative_path: &str, content: &str) -> Result<()> {
+    let target = temp_root.join(relative_path);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(target, content).with_context(|| format!("Write staged {}", relative_path))?;
+    Ok(())
+}
+
+fn stage_share_file(temp_root: &Path, relative_path: &str, source: &Path) -> Result<()> {
+    let target = temp_root.join(relative_path);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if target.exists() {
+        fs::remove_file(&target).with_context(|| format!("Remove staged {}", target.display()))?;
+    }
+    match fs::hard_link(source, &target) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(source, &target)
+                .with_context(|| format!("Copy {} to {}", source.display(), target.display()))?;
+            Ok(())
         }
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ndjson_header_uses_expected_shape() {
-        let value = ndjson_header("summary", "description");
-        assert_eq!(value["key"], "header");
-        assert_eq!(value["value"]["summary"], "summary");
-        assert_eq!(value["value"]["description"], "description");
-    }
-
-    #[test]
-    fn ndjson_file_op_uses_base64_payload() {
-        let value = ndjson_file_op("path/in/repo.txt", b"hello");
-        assert_eq!(value["key"], "file");
-        assert_eq!(value["value"]["path"], "path/in/repo.txt");
-        assert_eq!(value["value"]["encoding"], "base64");
-        assert_eq!(value["value"]["content"], "aGVsbG8=");
-    }
 
     #[test]
     fn classify_share_prefix_distinguishes_new_existing_and_partial() {
@@ -626,6 +591,12 @@ mod tests {
             classify_share_prefix(&all, &all[..1]),
             SharePrefixState::PartiallyPopulated(vec!["a/ranking.csv".to_string()])
         );
+    }
+
+    #[test]
+    fn parse_dataset_repo_requires_owner_and_name() {
+        assert!(parse_dataset_repo("meshllm/moe-rankings").is_ok());
+        assert!(parse_dataset_repo("invalid").is_err());
     }
 }
 
