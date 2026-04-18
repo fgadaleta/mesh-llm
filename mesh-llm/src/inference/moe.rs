@@ -7,6 +7,7 @@
 //! No cross-node traffic during inference — each node runs independently.
 
 use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -98,6 +99,29 @@ impl Default for MoeRuntimeOptions {
             micro_layer_scope: MoeMicroLayerScope::All,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExpertComponentsManifest {
+    pub schema_version: u32,
+    pub source_repo: Option<String>,
+    pub source_revision: Option<String>,
+    pub distribution_id: String,
+    pub analyzer_id: String,
+    pub ranking_sha256: String,
+    pub format: String,
+    pub expert_count: u32,
+    pub expert_used_count: u32,
+    pub trunk: ExpertComponentFile,
+    pub experts: Vec<ExpertComponentFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExpertComponentFile {
+    pub path: String,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expert_id: Option<u32>,
 }
 // ── GGUF assembler: combine trunk + expert files into a shard ──
 
@@ -803,6 +827,28 @@ fn resolve_split_binary(bin_dir: &Path) -> anyhow::Result<PathBuf> {
     );
 }
 
+fn resolve_components_binary(bin_dir: &Path) -> anyhow::Result<PathBuf> {
+    let candidate_names = ["llama-moe-components", "llama-moe-pack", "llama-moe-build"];
+    let mut candidates = Vec::new();
+    for name in candidate_names {
+        candidates.push(bin_dir.join(name));
+        candidates.push(bin_dir.join(format!("../llama.cpp/build/bin/{name}")));
+        candidates.push(bin_dir.join(format!("../../llama.cpp/build/bin/{name}")));
+        candidates.push(bin_dir.join(format!("../../../llama.cpp/build/bin/{name}")));
+    }
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate.canonicalize().unwrap_or(candidate));
+        }
+    }
+
+    anyhow::bail!(
+        "MoE component tool not found in {} or nearby llama.cpp/build/bin directories (tried llama-moe-components, llama-moe-pack, llama-moe-build)",
+        bin_dir.display()
+    );
+}
+
 /// Run llama-moe-split to produce a split GGUF for one node.
 pub fn run_split(
     bin_dir: &Path,
@@ -830,6 +876,101 @@ pub fn run_split(
 
     anyhow::ensure!(status.success(), "llama-moe-split exited with {status}");
     Ok(())
+}
+
+pub fn run_extract_trunk(
+    bin_dir: &Path,
+    model_path: &Path,
+    output_path: &Path,
+) -> anyhow::Result<()> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tool = resolve_components_binary(bin_dir)?;
+    let status = std::process::Command::new(&tool)
+        .args([
+            "extract-trunk",
+            "-m",
+            &model_path.to_string_lossy(),
+            "-o",
+            &output_path.to_string_lossy(),
+        ])
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to run {}: {e}", tool.display()))?;
+
+    anyhow::ensure!(
+        status.success(),
+        "{} extract-trunk exited with {status}",
+        tool.display()
+    );
+    Ok(())
+}
+
+pub fn run_extract_expert(
+    bin_dir: &Path,
+    model_path: &Path,
+    expert_id: u32,
+    output_path: &Path,
+) -> anyhow::Result<()> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tool = resolve_components_binary(bin_dir)?;
+    let status = std::process::Command::new(&tool)
+        .args([
+            "extract-expert",
+            "-m",
+            &model_path.to_string_lossy(),
+            "--expert",
+            &expert_id.to_string(),
+            "-o",
+            &output_path.to_string_lossy(),
+        ])
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to run {}: {e}", tool.display()))?;
+
+    anyhow::ensure!(
+        status.success(),
+        "{} extract-expert exited with {status}",
+        tool.display()
+    );
+    Ok(())
+}
+
+pub fn run_assemble_from_components(
+    bin_dir: &Path,
+    trunk_path: &Path,
+    expert_paths: &[PathBuf],
+    output_path: &Path,
+) -> anyhow::Result<()> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tool = resolve_components_binary(bin_dir)?;
+    let mut command = std::process::Command::new(&tool);
+    command.args(["assemble", "--trunk", &trunk_path.to_string_lossy()]);
+    for expert_path in expert_paths {
+        command.args(["--expert-file", &expert_path.to_string_lossy()]);
+    }
+    command.args(["-o", &output_path.to_string_lossy()]);
+    let status = command
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to run {}: {e}", tool.display()))?;
+
+    anyhow::ensure!(
+        status.success(),
+        "{} assemble exited with {status}",
+        tool.display()
+    );
+    Ok(())
+}
+
+pub fn expert_component_filename(expert_id: u32, expert_count: u32) -> String {
+    let width = expert_count.saturating_sub(1).to_string().len().max(3);
+    format!("expert-{expert_id:0width$}.gguf")
 }
 
 #[cfg(test)]

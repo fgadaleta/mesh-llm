@@ -82,6 +82,13 @@ pub(crate) struct MoeSubmitBundle {
     pub commit_description: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedExpertComponents {
+    pub prefix: String,
+    pub trunk_path: PathBuf,
+    pub expert_paths: Vec<PathBuf>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub(crate) struct MoeAnalysisJson {
     pub schema_version: u32,
@@ -839,6 +846,19 @@ fn canonical_dataset_prefix(
     format!("data/{namespace}/{repo}/{source_revision}/gguf/{distribution_id}")
 }
 
+fn canonical_expert_components_prefix(
+    source_repo: &str,
+    source_revision: &str,
+    distribution_id: &str,
+    analyzer_id: &str,
+) -> String {
+    format!(
+        "{}/{}/experts",
+        canonical_dataset_prefix(source_repo, source_revision, distribution_id),
+        analyzer_id,
+    )
+}
+
 pub(crate) fn canonical_dataset_prefix_for_model(model: &MoeModelContext) -> Result<String> {
     let Some(source_repo) = model.source_repo.as_ref() else {
         bail!("A Hugging Face-backed model is required to derive the canonical dataset path.");
@@ -851,6 +871,157 @@ pub(crate) fn canonical_dataset_prefix_for_model(model: &MoeModelContext) -> Res
         source_revision,
         &model.distribution_id,
     ))
+}
+
+pub(crate) fn canonical_expert_components_prefix_for_model(
+    model: &MoeModelContext,
+    analyzer_id: &str,
+) -> Result<String> {
+    let Some(source_repo) = model.source_repo.as_ref() else {
+        bail!(
+            "A Hugging Face-backed model is required to derive the expert component dataset path."
+        );
+    };
+    let Some(source_revision) = model.source_revision.as_ref() else {
+        bail!(
+            "A resolved source revision is required to derive the expert component dataset path."
+        );
+    };
+    Ok(canonical_expert_components_prefix(
+        source_repo,
+        source_revision,
+        &model.distribution_id,
+        analyzer_id,
+    ))
+}
+
+pub(crate) fn fetch_remote_expert_components(
+    dataset_repo_name: &str,
+    source_repo: &str,
+    source_revision: &str,
+    distribution_id: &str,
+    analyzer_id: &str,
+    ranking_sha256: &str,
+    expected_experts: &[u32],
+    progress: bool,
+) -> Result<Option<ResolvedExpertComponents>> {
+    let api = build_hf_api(progress)
+        .context("Build Hugging Face client for MoE expert component lookup")?;
+    let (owner, name) = dataset_repo_name
+        .split_once('/')
+        .unwrap_or(("", dataset_repo_name));
+    let dataset_repo = api.dataset(owner, name);
+    let info = dataset_repo.info(
+        &RepoInfoParams::builder()
+            .revision(DEFAULT_DATASET_REVISION.to_string())
+            .build(),
+    )?;
+    let hf_hub::RepoInfo::Dataset(info) = info else {
+        bail!("Expected dataset repo info for {}", dataset_repo_name);
+    };
+
+    let dataset_revision = info.sha.as_deref().unwrap_or(DEFAULT_DATASET_REVISION);
+    let prefix = canonical_expert_components_prefix(
+        source_repo,
+        source_revision,
+        distribution_id,
+        analyzer_id,
+    );
+    let manifest_rel = format!("{prefix}/manifest.json");
+    let siblings = info.siblings.as_deref().unwrap_or(&[]);
+    if !siblings.iter().any(|entry| entry.rfilename == manifest_rel) {
+        return Ok(None);
+    }
+
+    let manifest_path = dataset_repo
+        .download_file(
+            &RepoDownloadFileParams::builder()
+                .filename(manifest_rel.clone())
+                .revision(dataset_revision.to_string())
+                .build(),
+        )
+        .with_context(|| format!("Download {}", manifest_rel))?;
+    let manifest_content = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("Read {}", manifest_path.display()))?;
+    let manifest: moe::ExpertComponentsManifest = serde_json::from_str(&manifest_content)
+        .with_context(|| format!("Parse {}", manifest_path.display()))?;
+
+    if manifest.analyzer_id != analyzer_id
+        || manifest.ranking_sha256 != ranking_sha256
+        || manifest.distribution_id != distribution_id
+        || manifest.source_repo.as_deref() != Some(source_repo)
+        || manifest.source_revision.as_deref() != Some(source_revision)
+        || manifest.format != "gguf-moe-components"
+    {
+        return Ok(None);
+    }
+
+    let trunk_rel = repo_component_path(&prefix, &manifest.trunk.path);
+    if !siblings.iter().any(|entry| entry.rfilename == trunk_rel) {
+        return Ok(None);
+    }
+    let trunk_path = dataset_repo
+        .download_file(
+            &RepoDownloadFileParams::builder()
+                .filename(trunk_rel.clone())
+                .revision(dataset_revision.to_string())
+                .build(),
+        )
+        .with_context(|| format!("Download {}", trunk_rel))?;
+    if sha256_file(&trunk_path)? != manifest.trunk.sha256 {
+        bail!("Downloaded trunk component hash mismatch for {}", trunk_rel);
+    }
+
+    let mut expert_paths = Vec::with_capacity(expected_experts.len());
+    for expert_id in expected_experts {
+        let Some(entry) = manifest
+            .experts
+            .iter()
+            .find(|entry| entry.expert_id == Some(*expert_id))
+        else {
+            return Ok(None);
+        };
+        let expert_rel = repo_component_path(&prefix, &entry.path);
+        if !siblings
+            .iter()
+            .any(|sibling| sibling.rfilename == expert_rel)
+        {
+            return Ok(None);
+        }
+        let expert_path = dataset_repo
+            .download_file(
+                &RepoDownloadFileParams::builder()
+                    .filename(expert_rel.clone())
+                    .revision(dataset_revision.to_string())
+                    .build(),
+            )
+            .with_context(|| format!("Download {}", expert_rel))?;
+        if sha256_file(&expert_path)? != entry.sha256 {
+            bail!(
+                "Downloaded expert component hash mismatch for {}",
+                expert_rel
+            );
+        }
+        expert_paths.push(expert_path);
+    }
+
+    Ok(Some(ResolvedExpertComponents {
+        prefix,
+        trunk_path,
+        expert_paths,
+    }))
+}
+
+fn repo_component_path(prefix: &str, relative_path: &str) -> String {
+    if relative_path.starts_with(prefix) {
+        relative_path.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            prefix.trim_end_matches('/'),
+            relative_path.trim_start_matches('/')
+        )
+    }
 }
 
 pub(crate) fn build_submit_bundle(
@@ -1431,7 +1602,7 @@ fn collect_distribution_files(
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let mut digest = Sha256::new();
     let mut file = fs::File::open(path).with_context(|| format!("Open {}", path.display()))?;
     let mut buf = [0u8; 1024 * 1024];
@@ -1800,5 +1971,43 @@ mod tests {
             .dataset_paths
             .contains(&format!("{}/run.log", bundle.dataset_prefix)));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn canonical_expert_components_prefix_uses_shared_experts_dir() {
+        let model = MoeModelContext {
+            input: "demo".to_string(),
+            path: PathBuf::from("/tmp/model.gguf"),
+            display_name: "demo".to_string(),
+            source_repo: Some("unsloth/demo-gguf".to_string()),
+            source_revision: Some("deadbeef".to_string()),
+            distribution_id: "demo-q4".to_string(),
+            expert_count: 8,
+            used_expert_count: 2,
+            min_experts_per_node: 4,
+            total_model_bytes: 1,
+        };
+
+        let prefix = canonical_expert_components_prefix_for_model(&model, "full-v1").unwrap();
+        assert_eq!(
+            prefix,
+            "data/unsloth/demo-gguf/deadbeef/gguf/demo-q4/full-v1/experts"
+        );
+    }
+
+    #[test]
+    fn repo_component_path_joins_prefix_once() {
+        let prefix = "data/org/repo/rev/gguf/dist/full-v1/experts";
+        assert_eq!(
+            repo_component_path(prefix, "trunk.gguf"),
+            "data/org/repo/rev/gguf/dist/full-v1/experts/trunk.gguf"
+        );
+        assert_eq!(
+            repo_component_path(
+                prefix,
+                "data/org/repo/rev/gguf/dist/full-v1/experts/trunk.gguf"
+            ),
+            "data/org/repo/rev/gguf/dist/full-v1/experts/trunk.gguf"
+        );
     }
 }

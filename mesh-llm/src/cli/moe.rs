@@ -39,6 +39,9 @@ pub(crate) enum MoeCommand {
         /// Published dataset repo used for duplicate checks and PR target reporting.
         #[arg(long, default_value = "meshllm/moe-rankings")]
         dataset_repo: String,
+        /// Also publish topology-independent MoE expert components under the ranking prefix.
+        #[arg(long)]
+        with_experts: bool,
     },
 }
 

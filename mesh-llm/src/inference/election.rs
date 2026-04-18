@@ -15,7 +15,7 @@ use mesh::NodeRole;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -458,6 +458,7 @@ struct ResolvedMoeConfig {
     ranking_strategy: moe::MoeRankingStrategy,
     ranking_source: String,
     ranking_origin: String,
+    ranking_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -695,7 +696,7 @@ fn resolve_runtime_moe_config(
     };
 
     let started = std::time::Instant::now();
-    let (ranking, ranking_source, ranking_origin) = match options.ranking_strategy {
+    let (ranking, ranking_source, ranking_origin, ranking_path) = match options.ranking_strategy {
         moe::MoeRankingStrategy::Auto => {
             let model_path_for_ranking = model_path.to_path_buf();
             let resolved_ranking_result: anyhow::Result<
@@ -753,15 +754,25 @@ fn resolve_runtime_moe_config(
                     })?,
                     resolved.analyzer_id,
                     resolved.source.label().to_string(),
+                    Some(resolved.path),
                 )
             } else {
                 if should_attempt_local_micro_analyze(model_path, model_name, local_vram_budget) {
                     match ensure_micro_analyze_ranking(bin_dir, model_name, model_path, options) {
-                        Ok(artifact) => (
-                            artifact.ranking,
-                            "micro-v1".to_string(),
-                            artifact.origin.label().to_string(),
-                        ),
+                        Ok(artifact) => {
+                            let cached_path = moe::micro_ranking_cache_path(
+                                model_path,
+                                options.micro_prompt_count,
+                                options.micro_tokens,
+                                options.micro_layer_scope,
+                            );
+                            (
+                                artifact.ranking,
+                                "micro-v1".to_string(),
+                                artifact.origin.label().to_string(),
+                                Some(cached_path),
+                            )
+                        }
                         Err(err) => {
                             eprintln!(
                                 "⚠ [{model_name}] micro-analyze failed ({err}); falling back to sequential expert order"
@@ -770,6 +781,7 @@ fn resolve_runtime_moe_config(
                                 (0..base.n_expert).collect(),
                                 "sequential-fallback".to_string(),
                                 "fallback".to_string(),
+                                None,
                             )
                         }
                     }
@@ -781,6 +793,7 @@ fn resolve_runtime_moe_config(
                         (0..base.n_expert).collect(),
                         "sequential-fallback".to_string(),
                         "fallback".to_string(),
+                        None,
                     )
                 }
             }
@@ -792,14 +805,22 @@ fn resolve_runtime_moe_config(
                 artifact.ranking,
                 "full-v1".to_string(),
                 artifact.origin.label().to_string(),
+                Some(cached),
             )
         }
         moe::MoeRankingStrategy::MicroAnalyze => {
             let artifact = ensure_micro_analyze_ranking(bin_dir, model_name, model_path, options)?;
+            let cached = moe::micro_ranking_cache_path(
+                model_path,
+                options.micro_prompt_count,
+                options.micro_tokens,
+                options.micro_layer_scope,
+            );
             (
                 artifact.ranking,
                 "micro-v1".to_string(),
                 artifact.origin.label().to_string(),
+                Some(cached),
             )
         }
     };
@@ -817,6 +838,7 @@ fn resolve_runtime_moe_config(
         ranking_strategy: options.ranking_strategy,
         ranking_source,
         ranking_origin,
+        ranking_path,
     }))
 }
 
@@ -861,6 +883,7 @@ fn refresh_auto_moe_config_from_cache(
     cfg.config.ranking = ranking;
     cfg.ranking_source = resolved.analyzer_id;
     cfg.ranking_origin = resolved.source.label().to_string();
+    cfg.ranking_path = Some(resolved.path);
     true
 }
 
@@ -882,6 +905,74 @@ fn print_runtime_submit_suggestion(model_name: &str, model_path: &Path, ranking_
         "📤 [{model_name}] Contribute it with: mesh-llm moe share '{}'",
         identity.distribution_ref()
     );
+}
+
+async fn try_materialize_remote_expert_components(
+    bin_dir: &Path,
+    model_path: &Path,
+    moe_cfg: &ResolvedMoeConfig,
+    assignment: &moe::NodeAssignment,
+    output_path: &Path,
+) -> anyhow::Result<Option<String>> {
+    let Some(ranking_path) = moe_cfg.ranking_path.as_ref() else {
+        return Ok(None);
+    };
+    let Some(identity) = crate::models::huggingface_identity_for_path(model_path) else {
+        return Ok(None);
+    };
+
+    let ranking_sha256 = crate::system::moe_planner::sha256_file(ranking_path)?;
+    let distribution_id =
+        crate::system::moe_planner::normalize_distribution_id(&identity.local_file_name);
+    let analyzer_id = moe_cfg.ranking_source.clone();
+    let repo_id = identity.repo_id.clone();
+    let revision = identity.revision.clone();
+    let expected_experts = assignment.experts.clone();
+    let fetch_result = tokio::task::spawn_blocking(move || {
+        crate::system::moe_planner::fetch_remote_expert_components(
+            crate::system::moe_planner::DEFAULT_MOE_RANKINGS_DATASET,
+            &repo_id,
+            &revision,
+            &distribution_id,
+            &analyzer_id,
+            &ranking_sha256,
+            &expected_experts,
+            false,
+        )
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("Join remote expert component fetch: {err}"))??;
+
+    let Some(remote) = fetch_result else {
+        return Ok(None);
+    };
+
+    let temp_output = assembling_shard_path(output_path);
+    if temp_output.exists() {
+        let _ = std::fs::remove_file(&temp_output);
+    }
+    moe::run_assemble_from_components(
+        bin_dir,
+        &remote.trunk_path,
+        &remote.expert_paths,
+        &temp_output,
+    )?;
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(&temp_output, output_path).or_else(|_| {
+        std::fs::copy(&temp_output, output_path)?;
+        std::fs::remove_file(&temp_output)
+    })?;
+    Ok(Some(remote.prefix))
+}
+
+fn assembling_shard_path(output_path: &Path) -> PathBuf {
+    let file_name = output_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("shard.gguf");
+    output_path.with_file_name(format!("{file_name}.assembling"))
 }
 
 fn resolve_analyze_binary(bin_dir: &Path) -> anyhow::Result<std::path::PathBuf> {
@@ -2458,33 +2549,62 @@ async fn moe_election_loop(
             node.regossip().await;
 
             let shard_path = moe::split_path(&model, plan.active_ids.len(), my_shard_index);
-
-            if !shard_path.exists() {
-                eprintln!("  Splitting GGUF → {} ...", shard_path.display());
-                match moe::run_split(&bin_dir, &model, my_assignment, &shard_path) {
-                    Ok(()) => {
-                        let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
-                        eprintln!("  Split complete: {:.1} GB", size as f64 / 1e9);
-                    }
-                    Err(e) => {
-                        eprintln!("  ❌ moe-split failed: {e}");
-                        node.set_model_runtime_context_length(&model_name, None)
-                            .await;
-                        node.regossip().await;
-                        if peer_rx.changed().await.is_err() {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                        continue;
-                    }
-                }
-            } else {
+            if shard_path.exists() {
                 let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
                 eprintln!(
                     "  Using cached shard: {} ({:.1} GB)",
                     shard_path.display(),
                     size as f64 / 1e9
                 );
+            } else {
+                let mut reused_published = false;
+                match try_materialize_remote_expert_components(
+                    &bin_dir,
+                    &model,
+                    &moe_cfg,
+                    my_assignment,
+                    &shard_path,
+                )
+                .await
+                {
+                    Ok(Some(prefix)) => {
+                        let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
+                        eprintln!(
+                            "  Materialized shard from published components in {} ({:.1} GB)",
+                            prefix,
+                            size as f64 / 1e9
+                        );
+                        reused_published = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        eprintln!(
+                            "  ⚠ failed to materialize published expert components for {}: {err}",
+                            model_name
+                        );
+                    }
+                }
+
+                if !reused_published {
+                    eprintln!("  Splitting GGUF → {} ...", shard_path.display());
+                    match moe::run_split(&bin_dir, &model, my_assignment, &shard_path) {
+                        Ok(_) => {
+                            let size = std::fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0);
+                            eprintln!("  Split complete: {:.1} GB", size as f64 / 1e9);
+                        }
+                        Err(e) => {
+                            eprintln!("  ❌ moe-split failed: {e}");
+                            node.set_model_runtime_context_length(&model_name, None)
+                                .await;
+                            node.regossip().await;
+                            if peer_rx.changed().await.is_err() {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    }
+                }
             }
 
             // Start llama-server with our shard
