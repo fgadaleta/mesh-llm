@@ -524,6 +524,8 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 public protocol MeshClientHandleProtocol: AnyObject, Sendable {
     
+    func addEventListener(listener: EventListener)  -> String
+    
     func cancel(requestId: String) 
     
     func chat(request: ChatRequestDto, listener: EventListener)  -> String
@@ -535,6 +537,8 @@ public protocol MeshClientHandleProtocol: AnyObject, Sendable {
     func listModels() throws  -> [ModelDto]
     
     func reconnect() throws 
+    
+    func removeEventListener(listenerId: String) 
     
     func responses(request: ResponsesRequestDto, listener: EventListener)  -> String
     
@@ -594,6 +598,15 @@ open class MeshClientHandle: MeshClientHandleProtocol, @unchecked Sendable {
     
 
     
+open func addEventListener(listener: EventListener) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_mesh_ffi_fn_method_meshclienthandle_add_event_listener(
+            self.uniffiCloneHandle(),
+        FfiConverterCallbackInterfaceEventListener_lower(listener),$0
+    )
+})
+}
+    
 open func cancel(requestId: String)  {try! rustCall() {
     uniffi_mesh_ffi_fn_method_meshclienthandle_cancel(
             self.uniffiCloneHandle(),
@@ -637,6 +650,14 @@ open func listModels()throws  -> [ModelDto]  {
 open func reconnect()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_mesh_ffi_fn_method_meshclienthandle_reconnect(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+open func removeEventListener(listenerId: String)  {try! rustCall() {
+    uniffi_mesh_ffi_fn_method_meshclienthandle_remove_event_listener(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(listenerId),$0
     )
 }
 }
@@ -1756,6 +1777,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mesh_ffi_checksum_func_generate_owner_keypair_hex() != 58861) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mesh_ffi_checksum_method_meshclienthandle_add_event_listener() != 21295) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mesh_ffi_checksum_method_meshclienthandle_cancel() != 27338) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1772,6 +1796,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mesh_ffi_checksum_method_meshclienthandle_reconnect() != 11257) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mesh_ffi_checksum_method_meshclienthandle_remove_event_listener() != 15534) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mesh_ffi_checksum_method_meshclienthandle_responses() != 13271) {

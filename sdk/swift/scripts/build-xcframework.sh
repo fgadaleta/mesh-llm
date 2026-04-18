@@ -8,11 +8,13 @@ TARGET_DIR="$REPO_ROOT/target"
 XCFRAMEWORK_DIR="$SWIFT_DIR/Generated"
 FRAMEWORK_NAME="MeshLLMFFI"
 GENERATED_SWIFT="$SWIFT_DIR/Sources/MeshLLM/Generated/mesh_ffi.swift"
+CARGO_BIN="${CARGO_BIN:-$HOME/.cargo/bin/cargo}"
 
 echo "Building $FRAMEWORK_NAME XCFramework..."
 echo "Repo root: $REPO_ROOT"
+echo "Using cargo: $CARGO_BIN"
 
-if ! cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"mesh-api-ffi"'; then
+if ! "$CARGO_BIN" metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"mesh-api-ffi"'; then
   echo "ERROR: mesh-api-ffi crate not found. Ensure the workspace is configured."
   exit 1
 fi
@@ -35,36 +37,38 @@ if [ ! -x "$RUSTUP_RUSTC" ]; then
   # Fallback: find any stable toolchain
   STABLE_TOOLCHAIN=$(rustup toolchain list | grep stable | head -1 | awk '{print $1}')
   RUSTUP_RUSTC="$(rustup run "$STABLE_TOOLCHAIN" which rustc)"
+  CARGO_BIN="$(rustup run "$STABLE_TOOLCHAIN" which cargo)"
 fi
 echo "Using rustc: $RUSTUP_RUSTC"
+echo "Resolved cargo: $CARGO_BIN"
 
 echo "Building for aarch64-apple-ios..."
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target aarch64-apple-ios --no-default-features
+  "$CARGO_BIN" build --release -p mesh-api-ffi --target aarch64-apple-ios --no-default-features
 
 echo "Building for aarch64-apple-ios-sim..."
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target aarch64-apple-ios-sim --no-default-features
+  "$CARGO_BIN" build --release -p mesh-api-ffi --target aarch64-apple-ios-sim --no-default-features
 
 echo "Building for x86_64-apple-ios..."
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target x86_64-apple-ios --no-default-features
+  "$CARGO_BIN" build --release -p mesh-api-ffi --target x86_64-apple-ios --no-default-features
 
 echo "Building for aarch64-apple-ios-macabi (Mac Catalyst)..."
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target aarch64-apple-ios-macabi --no-default-features
+  "$CARGO_BIN" build --release -p mesh-api-ffi --target aarch64-apple-ios-macabi --no-default-features
 
 echo "Building for x86_64-apple-ios-macabi (Mac Catalyst)..."
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target x86_64-apple-ios-macabi --no-default-features
+  "$CARGO_BIN" build --release -p mesh-api-ffi --target x86_64-apple-ios-macabi --no-default-features
 
 echo "Building for aarch64-apple-darwin (macOS)..."
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target aarch64-apple-darwin --no-default-features
+  "$CARGO_BIN" build --release -p mesh-api-ffi --target aarch64-apple-darwin --no-default-features
 
 echo "Building for x86_64-apple-darwin (macOS)..."
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target x86_64-apple-darwin --no-default-features
+  "$CARGO_BIN" build --release -p mesh-api-ffi --target x86_64-apple-darwin --no-default-features
 
 echo "Syncing UniFFI API checksums into generated Swift bindings..."
 python3 - "$TARGET_DIR/aarch64-apple-darwin/release/libmesh_ffi.a" "$GENERATED_SWIFT" <<'PY'

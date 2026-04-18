@@ -35,6 +35,10 @@ interface MeshClientHandle {
 
     string responses(ResponsesRequestDto request, EventListener listener);
 
+    string add_event_listener(EventListener listener);
+
+    void remove_event_listener(string listener_id);
+
     void cancel(string request_id);
 
     StatusDto status();

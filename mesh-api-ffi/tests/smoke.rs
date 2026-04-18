@@ -33,9 +33,17 @@ struct ReentrantListener {
 
 impl EventListener for ReentrantListener {
     fn on_event(&self, event: EventDto) {
-        if let EventDto::Completed { .. } = event {
-            let status = self.handle.status();
-            let _ = self.sender.lock().unwrap().send(status);
+        match event {
+            EventDto::Connecting
+            | EventDto::Joined { .. }
+            | EventDto::ModelsUpdated { .. }
+            | EventDto::TokenDelta { .. }
+            | EventDto::Completed { .. }
+            | EventDto::Failed { .. }
+            | EventDto::Disconnected { .. } => {
+                let status = self.handle.status();
+                let _ = self.sender.lock().unwrap().send(status);
+            }
         }
     }
 }

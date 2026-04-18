@@ -149,6 +149,15 @@ impl MeshClient {
         self.inner.reconnect_blocking()?;
         Ok(())
     }
+
+    pub fn add_event_listener(&self, listener: Arc<dyn EventListener>) -> String {
+        self.inner
+            .add_event_listener(Arc::new(EventListenerAdapter { inner: listener }))
+    }
+
+    pub fn remove_event_listener(&self, listener_id: &str) {
+        self.inner.remove_event_listener(listener_id);
+    }
 }
 
 #[derive(Clone, Debug)]

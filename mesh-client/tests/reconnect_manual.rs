@@ -31,7 +31,7 @@ async fn reconnect_emits_disconnected_then_joined() {
     });
 
     let mut client = ClientBuilder::new(kp, token).build().unwrap();
-    client.listeners.lock().unwrap().push(listener);
+    client.add_event_listener(listener);
 
     client.join().await.unwrap();
     events.lock().unwrap().clear();
@@ -78,7 +78,7 @@ async fn reconnect_emits_reconnect_requested_reason() {
     });
 
     let mut client = ClientBuilder::new(kp, token).build().unwrap();
-    client.listeners.lock().unwrap().push(listener);
+    client.add_event_listener(listener);
 
     client.reconnect().await.unwrap();
 
@@ -112,7 +112,7 @@ async fn disconnect_emits_disconnect_requested_reason() {
     });
 
     let mut client = ClientBuilder::new(kp, token).build().unwrap();
-    client.listeners.lock().unwrap().push(listener);
+    client.add_event_listener(listener);
 
     client.join().await.unwrap();
     client.disconnect().await;

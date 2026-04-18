@@ -269,6 +269,11 @@ uint64_t uniffi_mesh_ffi_fn_clone_meshclienthandle(uint64_t handle, RustCallStat
 void uniffi_mesh_ffi_fn_free_meshclienthandle(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MESH_FFI_FN_METHOD_MESHCLIENTHANDLE_ADD_EVENT_LISTENER
+#define UNIFFI_FFIDEF_UNIFFI_MESH_FFI_FN_METHOD_MESHCLIENTHANDLE_ADD_EVENT_LISTENER
+RustBuffer uniffi_mesh_ffi_fn_method_meshclienthandle_add_event_listener(uint64_t ptr, uint64_t listener, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MESH_FFI_FN_METHOD_MESHCLIENTHANDLE_CANCEL
 #define UNIFFI_FFIDEF_UNIFFI_MESH_FFI_FN_METHOD_MESHCLIENTHANDLE_CANCEL
 void uniffi_mesh_ffi_fn_method_meshclienthandle_cancel(uint64_t ptr, RustBuffer request_id, RustCallStatus *_Nonnull out_status
@@ -297,6 +302,11 @@ RustBuffer uniffi_mesh_ffi_fn_method_meshclienthandle_list_models(uint64_t ptr, 
 #ifndef UNIFFI_FFIDEF_UNIFFI_MESH_FFI_FN_METHOD_MESHCLIENTHANDLE_RECONNECT
 #define UNIFFI_FFIDEF_UNIFFI_MESH_FFI_FN_METHOD_MESHCLIENTHANDLE_RECONNECT
 void uniffi_mesh_ffi_fn_method_meshclienthandle_reconnect(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MESH_FFI_FN_METHOD_MESHCLIENTHANDLE_REMOVE_EVENT_LISTENER
+#define UNIFFI_FFIDEF_UNIFFI_MESH_FFI_FN_METHOD_MESHCLIENTHANDLE_REMOVE_EVENT_LISTENER
+void uniffi_mesh_ffi_fn_method_meshclienthandle_remove_event_listener(uint64_t ptr, RustBuffer listener_id, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MESH_FFI_FN_METHOD_MESHCLIENTHANDLE_RESPONSES
@@ -619,6 +629,12 @@ uint16_t uniffi_mesh_ffi_checksum_func_generate_owner_keypair_hex(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MESH_FFI_CHECKSUM_METHOD_MESHCLIENTHANDLE_ADD_EVENT_LISTENER
+#define UNIFFI_FFIDEF_UNIFFI_MESH_FFI_CHECKSUM_METHOD_MESHCLIENTHANDLE_ADD_EVENT_LISTENER
+uint16_t uniffi_mesh_ffi_checksum_method_meshclienthandle_add_event_listener(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MESH_FFI_CHECKSUM_METHOD_MESHCLIENTHANDLE_CANCEL
 #define UNIFFI_FFIDEF_UNIFFI_MESH_FFI_CHECKSUM_METHOD_MESHCLIENTHANDLE_CANCEL
 uint16_t uniffi_mesh_ffi_checksum_method_meshclienthandle_cancel(void
@@ -652,6 +668,12 @@ uint16_t uniffi_mesh_ffi_checksum_method_meshclienthandle_list_models(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_MESH_FFI_CHECKSUM_METHOD_MESHCLIENTHANDLE_RECONNECT
 #define UNIFFI_FFIDEF_UNIFFI_MESH_FFI_CHECKSUM_METHOD_MESHCLIENTHANDLE_RECONNECT
 uint16_t uniffi_mesh_ffi_checksum_method_meshclienthandle_reconnect(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MESH_FFI_CHECKSUM_METHOD_MESHCLIENTHANDLE_REMOVE_EVENT_LISTENER
+#define UNIFFI_FFIDEF_UNIFFI_MESH_FFI_CHECKSUM_METHOD_MESHCLIENTHANDLE_REMOVE_EVENT_LISTENER
+uint16_t uniffi_mesh_ffi_checksum_method_meshclienthandle_remove_event_listener(void
     
 );
 #endif

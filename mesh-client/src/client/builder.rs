@@ -1,7 +1,8 @@
 use crate::crypto::keys::OwnerKeypair;
 use crate::protocol::{
     connect_mesh, connection_protocol, read_len_prefixed, write_len_prefixed, ControlProtocol,
-    NODE_PROTOCOL_GENERATION, STREAM_GOSSIP, STREAM_TUNNEL_HTTP, ValidateControlFrame,
+    ValidateControlFrame, NODE_PROTOCOL_GENERATION, STREAM_GOSSIP, STREAM_TOPOLOGY_SUBSCRIBE,
+    STREAM_TUNNEL_HTTP,
 };
 use crate::runtime::CoreRuntime;
 use base64::Engine as _;
@@ -10,14 +11,15 @@ use iroh::{Endpoint, EndpointAddr, RelayConfig, RelayMap, SecretKey};
 use prost::Message as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 type CancelFlagMap =
     Arc<Mutex<HashMap<String, (Arc<AtomicBool>, Arc<dyn crate::events::EventListener>)>>>;
+type ListenerMap = Arc<Mutex<HashMap<String, Arc<dyn crate::events::EventListener>>>>;
 
 const DEFAULT_RELAY_URLS: &[&str] = &[
     "https://usw1-2.relay.michaelneale.mesh-llm.iroh.link./",
@@ -121,9 +123,8 @@ impl ClientBuilder {
                 admitted: false,
             })),
             cancel_flags: Arc::new(Mutex::new(HashMap::new())),
-            listeners: Arc::new(Mutex::new(
-                Vec::<Arc<dyn crate::events::EventListener>>::new(),
-            )),
+            listeners: Arc::new(Mutex::new(HashMap::new())),
+            event_stream_generation: Arc::new(AtomicU64::new(0)),
             reconnect_attempts: 0,
             user_disconnected: false,
         })
@@ -154,7 +155,8 @@ pub struct MeshClient {
     pub(crate) config: ClientConfig,
     state: Arc<Mutex<ClientState>>,
     pub(crate) cancel_flags: CancelFlagMap,
-    pub listeners: Arc<Mutex<Vec<Arc<dyn crate::events::EventListener>>>>,
+    pub listeners: ListenerMap,
+    event_stream_generation: Arc<AtomicU64>,
     pub reconnect_attempts: u32,
     pub user_disconnected: bool,
 }
@@ -170,6 +172,9 @@ impl MeshClient {
     /// Join the mesh using the invite token.
     pub async fn join(&mut self) -> Result<(), ClientError> {
         let _ = self.ensure_connected().await?;
+        if !self.listeners.lock().unwrap().is_empty() {
+            self.start_event_stream_observer();
+        }
         Ok(())
     }
 
@@ -180,33 +185,7 @@ impl MeshClient {
 
     /// List available models on the mesh.
     pub async fn list_models(&self) -> Result<Vec<Model>, ClientError> {
-        let request = format!(
-            "GET /v1/models HTTP/1.1\r\nHost: mesh\r\nUser-Agent: {}\r\nConnection: close\r\n\r\n",
-            self.config.user_agent
-        );
-        let response = mesh_http_request(
-            self.state.clone(),
-            self.config.connect_timeout,
-            request.into_bytes(),
-        )
-        .await
-        .map_err(ClientError::Endpoint)?;
-        let response: ModelsResponse =
-            parse_json_response(&response).map_err(ClientError::Endpoint)?;
-        let models: Vec<Model> = response
-            .data
-            .into_iter()
-            .map(|model| Model {
-                id: model.id.clone(),
-                name: model.id,
-            })
-            .collect();
-
-        self.emit_event(crate::events::Event::ModelsUpdated {
-            models: models.clone(),
-        });
-
-        Ok(models)
+        self.fetch_models().await
     }
 
     pub fn list_models_blocking(&self) -> Result<Vec<Model>, ClientError> {
@@ -330,8 +309,41 @@ impl MeshClient {
         self.block_on(self.status())
     }
 
+    /// Subscribe to mesh lifecycle and model-availability events.
+    ///
+    /// Returns a listener id that can be passed to `remove_event_listener`.
+    pub fn add_event_listener(&self, listener: Arc<dyn crate::events::EventListener>) -> String {
+        let listener_id = uuid::Uuid::new_v4().to_string();
+        let should_start = {
+            let mut listeners = self.listeners.lock().unwrap();
+            let was_empty = listeners.is_empty();
+            listeners.insert(listener_id.clone(), listener);
+            was_empty
+        };
+
+        if should_start && self.is_joined() {
+            self.start_event_stream_observer();
+        }
+
+        listener_id
+    }
+
+    /// Remove a previously-registered mesh event listener.
+    pub fn remove_event_listener(&self, listener_id: &str) {
+        let should_stop = {
+            let mut listeners = self.listeners.lock().unwrap();
+            listeners.remove(listener_id);
+            listeners.is_empty()
+        };
+
+        if should_stop {
+            self.event_stream_generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     pub async fn disconnect(&mut self) {
         self.user_disconnected = true;
+        self.event_stream_generation.fetch_add(1, Ordering::SeqCst);
         self.clear_connection();
         self.emit_event(crate::events::Event::Disconnected {
             reason: "disconnect_requested".to_string(),
@@ -346,6 +358,7 @@ impl MeshClient {
     pub async fn reconnect(&mut self) -> Result<(), ClientError> {
         self.user_disconnected = false;
         self.reconnect_attempts = 0;
+        self.event_stream_generation.fetch_add(1, Ordering::SeqCst);
         self.clear_connection();
         self.emit_event(crate::events::Event::Disconnected {
             reason: "reconnect_requested".to_string(),
@@ -356,6 +369,57 @@ impl MeshClient {
     pub fn reconnect_blocking(&mut self) -> Result<(), ClientError> {
         let handle = self.runtime.handle().clone();
         handle.block_on(self.reconnect())
+    }
+
+    fn fetch_models_request(&self) -> String {
+        format!(
+            "GET /v1/models HTTP/1.1\r\nHost: mesh\r\nUser-Agent: {}\r\nConnection: close\r\n\r\n",
+            self.config.user_agent
+        )
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<Model>, ClientError> {
+        let response = mesh_http_request(
+            self.state.clone(),
+            self.config.connect_timeout,
+            self.fetch_models_request().into_bytes(),
+        )
+        .await
+        .map_err(ClientError::Endpoint)?;
+        let response: ModelsResponse =
+            parse_json_response(&response).map_err(ClientError::Endpoint)?;
+        Ok(response
+            .data
+            .into_iter()
+            .map(|model| Model {
+                id: model.id.clone(),
+                name: model.id,
+            })
+            .collect())
+    }
+
+    fn start_event_stream_observer(&self) {
+        let generation = self.event_stream_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let state = self.state.clone();
+        let listeners = self.listeners.clone();
+        let connect_timeout = self.config.connect_timeout;
+        let generation_counter = self.event_stream_generation.clone();
+
+        self.runtime.handle().spawn(async move {
+            observe_mesh_events(
+                state,
+                listeners,
+                connect_timeout,
+                generation_counter,
+                generation,
+            )
+            .await;
+        });
+    }
+
+    fn is_joined(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.admitted && state.connection.is_some()
     }
 
     async fn ensure_connected(&self) -> Result<Connection, ClientError> {
@@ -430,10 +494,86 @@ impl MeshClient {
     }
 
     fn emit_event(&self, event: crate::events::Event) {
-        for listener in self.listeners.lock().unwrap().iter() {
-            listener.on_event(event.clone());
+        emit_event_to_listeners(&self.listeners, event);
+    }
+}
+
+fn emit_event_to_listeners(listeners: &ListenerMap, event: crate::events::Event) {
+    let snapshot = listeners
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for listener in snapshot {
+        listener.on_event(event.clone());
+    }
+}
+
+async fn observe_mesh_events(
+    state: Arc<Mutex<ClientState>>,
+    listeners: ListenerMap,
+    connect_timeout: Duration,
+    generation_counter: Arc<AtomicU64>,
+    generation: u64,
+) {
+    let mut last_models_signature = None::<String>;
+    let mut last_disconnect_reason = None::<String>;
+
+    loop {
+        if generation_counter.load(Ordering::SeqCst) != generation {
+            break;
+        }
+        if listeners.lock().unwrap().is_empty() {
+            break;
+        }
+
+        match subscribe_to_topology_stream(
+            state.clone(),
+            connect_timeout,
+            generation_counter.clone(),
+            generation,
+            &mut last_models_signature,
+            &listeners,
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(StreamOutcome::Disconnected(error)) => {
+                clear_connection_state(&state);
+                if last_disconnect_reason.as_ref() != Some(&error) {
+                    last_disconnect_reason = Some(error.clone());
+                    emit_event_to_listeners(
+                        &listeners,
+                        crate::events::Event::Disconnected { reason: error },
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
         }
     }
+}
+
+enum StreamOutcome {
+    Disconnected(String),
+}
+
+fn model_inventory_signature(models: &[Model]) -> String {
+    let mut ids = models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids.join(",")
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct TopologySubscribe {
+    #[prost(bytes = "vec", tag = "1")]
+    subscriber_id: Vec<u8>,
+    #[prost(uint32, tag = "2")]
+    r#gen: u32,
 }
 
 pub struct ChatRequest {
@@ -499,6 +639,115 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatMessageResponse {
     content: String,
+}
+
+fn clear_connection_state(state: &Arc<Mutex<ClientState>>) {
+    let mut guard = state.lock().unwrap();
+    guard.connection = None;
+    guard.admitted = false;
+}
+
+async fn subscribe_to_topology_stream(
+    state: Arc<Mutex<ClientState>>,
+    connect_timeout: Duration,
+    generation_counter: Arc<AtomicU64>,
+    generation: u64,
+    last_models_signature: &mut Option<String>,
+    listeners: &ListenerMap,
+) -> Result<(), StreamOutcome> {
+    let connection = ensure_mesh_connection(state.clone(), connect_timeout)
+        .await
+        .map_err(StreamOutcome::Disconnected)?;
+    let endpoint = {
+        let guard = state.lock().unwrap();
+        guard.endpoint.clone()
+    };
+
+    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), connection.open_bi())
+        .await
+        .map_err(|_| StreamOutcome::Disconnected("timed out opening topology stream".to_string()))?
+        .map_err(|err| StreamOutcome::Disconnected(format!("open topology stream: {err}")))?;
+
+    send.write_all(&[STREAM_TOPOLOGY_SUBSCRIBE])
+        .await
+        .map_err(|err| StreamOutcome::Disconnected(format!("write topology stream type: {err}")))?;
+
+    let request = TopologySubscribe {
+        subscriber_id: endpoint.id().as_bytes().to_vec(),
+        r#gen: NODE_PROTOCOL_GENERATION,
+    };
+    write_len_prefixed(&mut send, &request.encode_to_vec())
+        .await
+        .map_err(|err| StreamOutcome::Disconnected(format!("write topology subscribe: {err}")))?;
+
+    loop {
+        if generation_counter.load(Ordering::SeqCst) != generation {
+            return Ok(());
+        }
+        if listeners.lock().unwrap().is_empty() {
+            return Ok(());
+        }
+
+        let buf = match tokio::time::timeout(Duration::from_secs(1), read_len_prefixed(&mut recv))
+            .await
+        {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(err)) => {
+                return Err(StreamOutcome::Disconnected(format!(
+                    "read topology snapshot: {err}"
+                )));
+            }
+            Err(_) => continue,
+        };
+
+        let frame = crate::proto::node::GossipFrame::decode(buf.as_slice()).map_err(|err| {
+            StreamOutcome::Disconnected(format!("decode topology snapshot: {err}"))
+        })?;
+        frame.validate_frame().map_err(|err| {
+            StreamOutcome::Disconnected(format!("validate topology snapshot: {err}"))
+        })?;
+
+        let models = topology_models_from_gossip_frame(&frame);
+        let signature = model_inventory_signature(&models);
+        if last_models_signature.as_ref() != Some(&signature) {
+            *last_models_signature = Some(signature);
+            emit_event_to_listeners(listeners, crate::events::Event::ModelsUpdated { models });
+        }
+    }
+}
+
+fn topology_models_from_gossip_frame(frame: &crate::proto::node::GossipFrame) -> Vec<Model> {
+    let mut ids = BTreeSet::new();
+
+    for peer in &frame.peers {
+        let is_http_host = peer.role == crate::proto::node::NodeRole::Host as i32;
+        if !is_http_host {
+            continue;
+        }
+
+        let hosted_models_known = peer
+            .hosted_models_known
+            .unwrap_or(!peer.hosted_models.is_empty());
+        let model_names = if hosted_models_known {
+            &peer.hosted_models
+        } else {
+            &peer.serving_models
+        };
+
+        for model_name in model_names {
+            let trimmed = model_name.trim();
+            if !trimmed.is_empty() {
+                ids.insert(trimmed.to_string());
+            }
+        }
+    }
+
+    ids.into_iter()
+        .map(|id| Model {
+            name: id.clone(),
+            id,
+        })
+        .collect()
 }
 
 fn decode_invite_token(invite_token: &str) -> Result<EndpointAddr, String> {
@@ -704,8 +953,9 @@ fn parse_json_response<T: for<'de> Deserialize<'de>>(response: &[u8]) -> Result<
             // Some mesh paths hand back the upstream JSON body directly instead of a fully
             // framed HTTP response. Accept that shape too so the embedded SDK stays tolerant
             // across tunnel/proxy implementations.
-            return serde_json::from_slice(response)
-                .map_err(|err| format!("malformed HTTP response: decode JSON without headers: {err}"));
+            return serde_json::from_slice(response).map_err(|err| {
+                format!("malformed HTTP response: decode JSON without headers: {err}")
+            });
         }
     };
     let status_line_end = response

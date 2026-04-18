@@ -666,6 +666,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_mesh_ffi_checksum_func_generate_owner_keypair_hex(
     ): Short
+    external fun uniffi_mesh_ffi_checksum_method_meshclienthandle_add_event_listener(
+    ): Short
     external fun uniffi_mesh_ffi_checksum_method_meshclienthandle_cancel(
     ): Short
     external fun uniffi_mesh_ffi_checksum_method_meshclienthandle_chat(
@@ -677,6 +679,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_mesh_ffi_checksum_method_meshclienthandle_list_models(
     ): Short
     external fun uniffi_mesh_ffi_checksum_method_meshclienthandle_reconnect(
+    ): Short
+    external fun uniffi_mesh_ffi_checksum_method_meshclienthandle_remove_event_listener(
     ): Short
     external fun uniffi_mesh_ffi_checksum_method_meshclienthandle_responses(
     ): Short
@@ -707,6 +711,8 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_mesh_ffi_fn_free_meshclienthandle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_mesh_ffi_fn_method_meshclienthandle_add_event_listener(`ptr`: Long,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_mesh_ffi_fn_method_meshclienthandle_cancel(`ptr`: Long,`requestId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_mesh_ffi_fn_method_meshclienthandle_chat(`ptr`: Long,`request`: RustBuffer.ByValue,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -718,6 +724,8 @@ internal object UniffiLib {
     external fun uniffi_mesh_ffi_fn_method_meshclienthandle_list_models(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_mesh_ffi_fn_method_meshclienthandle_reconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_mesh_ffi_fn_method_meshclienthandle_remove_event_listener(`ptr`: Long,`listenerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_mesh_ffi_fn_method_meshclienthandle_responses(`ptr`: Long,`request`: RustBuffer.ByValue,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -864,6 +872,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_mesh_ffi_checksum_func_generate_owner_keypair_hex() != 23190.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_mesh_ffi_checksum_method_meshclienthandle_add_event_listener() != 34383.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_mesh_ffi_checksum_method_meshclienthandle_cancel() != 54410.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -880,6 +891,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_mesh_ffi_checksum_method_meshclienthandle_reconnect() != 31942.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_mesh_ffi_checksum_method_meshclienthandle_remove_event_listener() != 22796.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_mesh_ffi_checksum_method_meshclienthandle_responses() != 343.toShort()) {
@@ -1303,6 +1317,8 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
 
 public interface MeshClientHandleInterface {
     
+    fun `addEventListener`(`listener`: EventListener): kotlin.String
+    
     fun `cancel`(`requestId`: kotlin.String)
     
     fun `chat`(`request`: ChatRequestDto, `listener`: EventListener): kotlin.String
@@ -1314,6 +1330,8 @@ public interface MeshClientHandleInterface {
     fun `listModels`(): List<ModelDto>
     
     fun `reconnect`()
+    
+    fun `removeEventListener`(`listenerId`: kotlin.String)
     
     fun `responses`(`request`: ResponsesRequestDto, `listener`: EventListener): kotlin.String
     
@@ -1418,6 +1436,19 @@ open class MeshClientHandle: Disposable, AutoCloseable, MeshClientHandleInterfac
         }
     }
 
+    override fun `addEventListener`(`listener`: EventListener): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_mesh_ffi_fn_method_meshclienthandle_add_event_listener(
+        it,
+        FfiConverterTypeEventListener.lower(`listener`),_status)
+}
+    }
+    )
+    }
+    
+
     override fun `cancel`(`requestId`: kotlin.String)
         = 
     callWithHandle {
@@ -1490,6 +1521,18 @@ open class MeshClientHandle: Disposable, AutoCloseable, MeshClientHandleInterfac
     UniffiLib.uniffi_mesh_ffi_fn_method_meshclienthandle_reconnect(
         it,
         _status)
+}
+    }
+    
+    
+
+    override fun `removeEventListener`(`listenerId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_mesh_ffi_fn_method_meshclienthandle_remove_event_listener(
+        it,
+        FfiConverterString.lower(`listenerId`),_status)
 }
     }
     

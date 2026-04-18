@@ -156,6 +156,13 @@ enum ClientCommand {
         listener: Box<dyn EventListener>,
         response_tx: mpsc::SyncSender<String>,
     },
+    AddEventListener {
+        listener: Box<dyn EventListener>,
+        response_tx: mpsc::SyncSender<String>,
+    },
+    RemoveEventListener {
+        listener_id: String,
+    },
     Cancel {
         request_id: String,
     },
@@ -236,7 +243,8 @@ fn parse_owner_keypair(owner_keypair_bytes_hex: &str) -> Result<OwnerKeypair, Ff
             "owner keypair must not be empty".to_string(),
         ));
     }
-    OwnerKeypair::from_hex(trimmed).map_err(|error| FfiError::InvalidOwnerKeypair(error.to_string()))
+    OwnerKeypair::from_hex(trimmed)
+        .map_err(|error| FfiError::InvalidOwnerKeypair(error.to_string()))
 }
 
 fn map_mesh_api_error(error: mesh_api::MeshApiError) -> FfiError {
@@ -246,7 +254,9 @@ fn map_mesh_api_error(error: mesh_api::MeshApiError) -> FfiError {
         mesh_api::MeshApiError::NoPublicMeshFound => {
             FfiError::HostUnavailable("no public mesh matched the requested criteria".to_string())
         }
-        mesh_api::MeshApiError::InvalidInviteToken(message) => FfiError::InvalidInviteToken(message),
+        mesh_api::MeshApiError::InvalidInviteToken(message) => {
+            FfiError::InvalidInviteToken(message)
+        }
     }
 }
 
@@ -296,6 +306,22 @@ impl MeshClientHandle {
         response_rx
             .recv()
             .expect("mesh ffi client worker should return responses request ids")
+    }
+
+    pub fn add_event_listener(&self, listener: Box<dyn EventListener>) -> String {
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.send_command(ClientCommand::AddEventListener {
+            listener,
+            response_tx,
+        })
+        .expect("mesh ffi client worker should accept mesh event listeners");
+        response_rx
+            .recv()
+            .expect("mesh ffi client worker should return mesh event listener ids")
+    }
+
+    pub fn remove_event_listener(&self, listener_id: String) {
+        let _ = self.send_command(ClientCommand::RemoveEventListener { listener_id });
     }
 
     pub fn cancel(&self, request_id: String) {
@@ -436,6 +462,16 @@ fn run_client_worker(mut client: MeshClient, command_rx: mpsc::Receiver<ClientCo
                     input: request.input,
                 };
                 let _ = response_tx.send(client.responses(req, bridge).0);
+            }
+            ClientCommand::AddEventListener {
+                listener,
+                response_tx,
+            } => {
+                let bridge = Arc::new(EventListenerBridge { inner: listener });
+                let _ = response_tx.send(client.add_event_listener(bridge));
+            }
+            ClientCommand::RemoveEventListener { listener_id } => {
+                client.remove_event_listener(&listener_id);
             }
             ClientCommand::Cancel { request_id } => {
                 client.cancel(RequestId(request_id));

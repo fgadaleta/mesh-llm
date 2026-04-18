@@ -278,7 +278,7 @@ public final class MeshClient: @unchecked Sendable {
         }
     }
 
-    private func ensureHandle() throws -> MeshClientHandle {
+    func ensureHandle() throws -> MeshClientHandle {
         stateLock.lock()
         defer { stateLock.unlock() }
 

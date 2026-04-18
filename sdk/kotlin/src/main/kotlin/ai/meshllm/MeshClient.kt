@@ -222,6 +222,18 @@ class MeshClient(private val handle: MeshClientHandleInterface) {
             }
         }
     }
+
+    fun eventsFlow(): Flow<Event> = callbackFlow {
+        val bridge = object : FfiEventListener {
+            override fun onEvent(event: EventDto) {
+                trySend(event.toEvent())
+            }
+        }
+        val listenerId = handle.addEventListener(bridge)
+        awaitClose {
+            handle.removeEventListener(listenerId)
+        }
+    }
 }
 
 private fun Event.isTerminalFor(requestId: RequestId): Boolean =
