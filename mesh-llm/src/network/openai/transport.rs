@@ -1491,24 +1491,6 @@ async fn route_local_attempt(
     retry_context_overflow: bool,
     response_adapter: ResponseAdapter,
 ) -> RouteAttemptResult {
-    // ── Backpressure gate ───────────────────────────────────────────
-    // If the local backend is already at capacity, reject immediately
-    // instead of piling into llama-server's unbounded deferred queue.
-    if node.is_overloaded() {
-        let current = node.inflight_requests();
-        tracing::warn!(
-            "Backpressure: rejecting request (inflight={current}), local backend overloaded"
-        );
-        let msg = r#"{"error":{"message":"server overloaded — too many inflight requests","type":"overloaded","code":429}}"#;
-        let response = format!(
-            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            msg.len(),
-            msg
-        );
-        let _ = tcp_stream.write_all(response.as_bytes()).await;
-        return RouteAttemptResult::RetryableOverloaded;
-    }
-
     match TcpStream::connect(format!("127.0.0.1:{port}")).await {
         Ok(mut upstream) => {
             let _inflight = node.begin_inflight_request();

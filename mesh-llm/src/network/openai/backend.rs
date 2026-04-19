@@ -1,3 +1,4 @@
+use crate::mesh;
 use crate::network::openai::transport;
 use anyhow::Result;
 use tokio::io::AsyncWriteExt;
@@ -24,7 +25,10 @@ impl BackendProxyHandle {
     }
 }
 
-pub(crate) async fn start_backend_proxy(llama_port: u16) -> Result<BackendProxyHandle> {
+pub(crate) async fn start_backend_proxy(
+    llama_port: u16,
+    node: mesh::Node,
+) -> Result<BackendProxyHandle> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -47,8 +51,9 @@ pub(crate) async fn start_backend_proxy(llama_port: u16) -> Result<BackendProxyH
                 }
                 accept_result = listener.accept() => match accept_result {
                     Ok((stream, _)) => {
+                        let node = node.clone();
                         connections.spawn(async move {
-                        if let Err(err) = handle_connection(stream, llama_port).await {
+                        if let Err(err) = handle_connection(stream, llama_port, &node).await {
                             tracing::debug!("backend proxy request failed: {err}");
                         }
                         });
@@ -78,8 +83,30 @@ pub(crate) async fn start_backend_proxy(llama_port: u16) -> Result<BackendProxyH
     })
 }
 
-async fn handle_connection(mut stream: TcpStream, llama_port: u16) -> Result<()> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    llama_port: u16,
+    node: &mesh::Node,
+) -> Result<()> {
     let _ = stream.set_nodelay(true);
+
+    // Backpressure gate: reject before touching llama-server.
+    // This fires for ALL traffic (local ingress + remote tunnel) since
+    // both paths converge on this backend proxy.
+    if node.is_overloaded() {
+        let current = node.inflight_requests();
+        tracing::warn!("Backpressure: rejecting request at backend proxy (inflight={current})");
+        let msg = r#"{"error":{"message":"server overloaded — too many inflight requests","type":"overloaded","code":429}}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            msg.len(),
+            msg
+        );
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
     let request = match transport::read_http_request(&mut stream).await {
         Ok(request) => request,
         Err(err) => {
@@ -172,7 +199,14 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
         let (upstream_port, request_rx) = start_recording_upstream(upstream_response).await;
 
-        let proxy = start_backend_proxy(upstream_port).await.unwrap();
+        let proxy = start_backend_proxy(
+            upstream_port,
+            crate::mesh::Node::new_for_tests(crate::mesh::NodeRole::Worker)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         let proxy_port = proxy.port();
 
         let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
@@ -204,7 +238,14 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
         let upstream_port = start_dummy_upstream(upstream_response).await;
 
-        let proxy = start_backend_proxy(upstream_port).await.unwrap();
+        let proxy = start_backend_proxy(
+            upstream_port,
+            crate::mesh::Node::new_for_tests(crate::mesh::NodeRole::Worker)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         let proxy_port = proxy.port();
 
         // Confirm proxy accepts connections before shutdown.
@@ -228,7 +269,14 @@ mod tests {
     async fn test_backend_proxy_shutdown_aborts_inflight_connections() {
         let upstream_port = start_stalled_upstream().await;
 
-        let proxy = start_backend_proxy(upstream_port).await.unwrap();
+        let proxy = start_backend_proxy(
+            upstream_port,
+            crate::mesh::Node::new_for_tests(crate::mesh::NodeRole::Worker)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         let proxy_port = proxy.port();
 
         let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
@@ -267,7 +315,14 @@ mod tests {
             // listener dropped — port freed
         };
 
-        let proxy = start_backend_proxy(dead_port).await.unwrap();
+        let proxy = start_backend_proxy(
+            dead_port,
+            crate::mesh::Node::new_for_tests(crate::mesh::NodeRole::Worker)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         let proxy_port = proxy.port();
 
         let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
