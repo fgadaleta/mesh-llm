@@ -4,6 +4,8 @@
 
 ![Mesh LLM](mesh.png)
 
+
+
 Mesh LLM lets you pool spare GPU capacity across machines and expose the result as one OpenAI-compatible API.
 
 If a model fits on one machine, it runs there. If it does not, Mesh LLM automatically spreads the work across the mesh:
