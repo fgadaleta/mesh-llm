@@ -278,6 +278,26 @@ impl AffinityRouter {
         let mut state = self.inner.lock().unwrap();
         state.remove_auto_key(session_key);
     }
+
+    /// Like `lookup_auto_model` but returns `None` if the cached model is
+    /// currently in TTFB backoff. This unsticks sessions from drowning
+    /// models so the router reclassifies and picks a responsive one.
+    pub fn lookup_auto_model_if_responsive(
+        &self,
+        session_key: u64,
+        tracker: &ModelLatencyTracker,
+    ) -> Option<String> {
+        let model = self.lookup_auto_model(session_key)?;
+        if tracker.is_slow(&model, TTFB_SLOW_THRESHOLD) {
+            tracing::debug!(
+                "auto: cached model {model} is in TTFB backoff, forgetting session {session_key:016x}"
+            );
+            self.forget_auto_model(session_key);
+            None
+        } else {
+            Some(model)
+        }
+    }
 }
 
 /// Compute the session-level key used to cache an auto-routed model choice.
@@ -939,5 +959,293 @@ mod tests {
             affinity.lookup_auto_model(7),
             Some("chat-model".to_string())
         );
+    }
+}
+
+// ── TTFB latency tracking ───────────────────────────────────────────
+
+/// How many recent TTFB samples to keep per model.
+const TTFB_RING_SIZE: usize = 8;
+
+/// Default threshold: a model whose recent median TTFB exceeds this is
+/// considered "slow" and will be deprioritized by auto routing.
+pub const TTFB_SLOW_THRESHOLD: Duration = Duration::from_secs(15);
+
+/// First-auto timeout for small prompts with no TTFB history. A healthy
+/// model answers a short prompt in 1-2s, so 15s is generous while still
+/// catching a drowning host quickly.
+pub const FIRST_AUTO_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Floor for proportional timeouts when we have TTFB history.
+pub const TTFB_TIMEOUT_FLOOR: Duration = Duration::from_secs(10);
+
+/// Estimated prompt token threshold below which we use the tight
+/// first-auto timeout. Above this, the model may legitimately need more
+/// prefill time.
+pub const SMALL_PROMPT_TOKENS: u32 = 1024;
+
+/// TTFB multiplier for computing proportional timeouts from history.
+pub const TTFB_TIMEOUT_MULTIPLIER: u32 = 3;
+
+/// Per-model ring buffer of recent TTFB (time-to-first-byte) samples.
+///
+/// Used by auto routing to detect slow/overloaded models and route
+/// around them. Each node tracks its own experience — nothing is
+/// gossiped.
+#[derive(Debug)]
+struct ModelTtfbRing {
+    samples: VecDeque<Duration>,
+}
+
+impl ModelTtfbRing {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(TTFB_RING_SIZE),
+        }
+    }
+
+    fn push(&mut self, ttfb: Duration) {
+        if self.samples.len() >= TTFB_RING_SIZE {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(ttfb);
+    }
+
+    /// Median of recorded samples. Returns None if empty.
+    fn median(&self) -> Option<Duration> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<Duration> = self.samples.iter().copied().collect();
+        sorted.sort();
+        Some(sorted[sorted.len() / 2])
+    }
+
+    fn is_slow(&self, threshold: Duration) -> bool {
+        self.median().map_or(false, |m| m >= threshold)
+    }
+}
+
+/// Tracks per-model TTFB for backoff-aware routing.
+///
+/// Thread-safe (behind `Arc<Mutex<…>>`). Typically owned by the same
+/// scope that owns the `AffinityRouter` and passed to the proxy and
+/// router layers.
+#[derive(Clone, Debug)]
+pub struct ModelLatencyTracker {
+    inner: Arc<Mutex<HashMap<String, ModelTtfbRing>>>,
+}
+
+impl ModelLatencyTracker {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Record a TTFB sample for `model`.
+    pub fn record(&self, model: &str, ttfb: Duration) {
+        let mut map = self.inner.lock().unwrap();
+        map.entry(model.to_string())
+            .or_insert_with(ModelTtfbRing::new)
+            .push(ttfb);
+    }
+
+    /// True if the model's recent median TTFB exceeds `threshold`.
+    pub fn is_slow(&self, model: &str, threshold: Duration) -> bool {
+        let map = self.inner.lock().unwrap();
+        map.get(model).map_or(false, |ring| ring.is_slow(threshold))
+    }
+
+    /// Return the recent median TTFB for a model, if any samples exist.
+    pub fn median_ttfb(&self, model: &str) -> Option<Duration> {
+        let map = self.inner.lock().unwrap();
+        map.get(model).and_then(|ring| ring.median())
+    }
+
+    /// Compute an appropriate first-byte timeout for a request.
+    ///
+    /// - No history + small prompt → tight `FIRST_AUTO_TIMEOUT` (15s)
+    /// - No history + large prompt → the caller's `default_timeout`
+    /// - Has history → `TTFB_TIMEOUT_MULTIPLIER × median`, floored at
+    ///   `TTFB_TIMEOUT_FLOOR`, capped at `default_timeout`
+    pub fn first_byte_timeout(
+        &self,
+        model: &str,
+        estimated_prompt_tokens: Option<u32>,
+        default_timeout: Duration,
+    ) -> Duration {
+        match self.median_ttfb(model) {
+            Some(median) => {
+                let proportional = median * TTFB_TIMEOUT_MULTIPLIER;
+                proportional.max(TTFB_TIMEOUT_FLOOR).min(default_timeout)
+            }
+            None => {
+                // No history: tight timeout for small prompts, default for large ones.
+                let small = estimated_prompt_tokens.map_or(true, |t| t < SMALL_PROMPT_TOKENS);
+                if small {
+                    FIRST_AUTO_TIMEOUT
+                } else {
+                    default_timeout
+                }
+            }
+        }
+    }
+}
+
+/// List of model names currently in TTFB backoff. Used by the router to
+/// filter candidates without passing the full tracker through the
+/// classification API.
+pub fn slow_models(tracker: &ModelLatencyTracker, models: &[&str]) -> Vec<String> {
+    models
+        .iter()
+        .filter(|name| tracker.is_slow(name, TTFB_SLOW_THRESHOLD))
+        .map(|name| name.to_string())
+        .collect()
+}
+
+// ── TTFB tracker tests ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod ttfb_tests {
+    use super::*;
+
+    #[test]
+    fn records_and_reports_median() {
+        let tracker = ModelLatencyTracker::new();
+        tracker.record("model-a", Duration::from_secs(10));
+        tracker.record("model-a", Duration::from_secs(50));
+        tracker.record("model-a", Duration::from_secs(30));
+        // sorted: [10, 30, 50] → median = 30
+        assert_eq!(
+            tracker.median_ttfb("model-a"),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn is_slow_above_threshold() {
+        let tracker = ModelLatencyTracker::new();
+        tracker.record("slow", Duration::from_secs(45));
+        tracker.record("slow", Duration::from_secs(50));
+        tracker.record("fast", Duration::from_secs(2));
+        tracker.record("fast", Duration::from_secs(3));
+
+        assert!(tracker.is_slow("slow", TTFB_SLOW_THRESHOLD));
+        assert!(!tracker.is_slow("fast", TTFB_SLOW_THRESHOLD));
+    }
+
+    #[test]
+    fn backoff_decays_with_fast_samples() {
+        let tracker = ModelLatencyTracker::new();
+        // Start slow
+        tracker.record("model", Duration::from_secs(45));
+        tracker.record("model", Duration::from_secs(50));
+        assert!(tracker.is_slow("model", TTFB_SLOW_THRESHOLD));
+
+        // Fast samples push out the slow ones over time
+        for _ in 0..7 {
+            tracker.record("model", Duration::from_secs(2));
+        }
+        assert!(!tracker.is_slow("model", TTFB_SLOW_THRESHOLD));
+    }
+
+    #[test]
+    fn unknown_model_not_slow() {
+        let tracker = ModelLatencyTracker::new();
+        assert!(!tracker.is_slow("never-seen", TTFB_SLOW_THRESHOLD));
+    }
+
+    #[test]
+    fn ring_buffer_evicts_oldest() {
+        let tracker = ModelLatencyTracker::new();
+        // Fill the ring with slow samples
+        for _ in 0..TTFB_RING_SIZE {
+            tracker.record("model", Duration::from_secs(60));
+        }
+        assert!(tracker.is_slow("model", TTFB_SLOW_THRESHOLD));
+
+        // Now push TTFB_RING_SIZE fast samples to fully evict the slow ones
+        for _ in 0..TTFB_RING_SIZE {
+            tracker.record("model", Duration::from_secs(1));
+        }
+        assert!(!tracker.is_slow("model", TTFB_SLOW_THRESHOLD));
+    }
+
+    #[test]
+    fn first_byte_timeout_no_history_small_prompt() {
+        let tracker = ModelLatencyTracker::new();
+        let default = Duration::from_secs(300);
+        let timeout = tracker.first_byte_timeout("model", Some(100), default);
+        assert_eq!(timeout, FIRST_AUTO_TIMEOUT);
+    }
+
+    #[test]
+    fn first_byte_timeout_no_history_large_prompt() {
+        let tracker = ModelLatencyTracker::new();
+        let default = Duration::from_secs(300);
+        let timeout = tracker.first_byte_timeout("model", Some(5000), default);
+        assert_eq!(timeout, default);
+    }
+
+    #[test]
+    fn first_byte_timeout_with_history_proportional() {
+        let tracker = ModelLatencyTracker::new();
+        tracker.record("model", Duration::from_secs(5));
+        tracker.record("model", Duration::from_secs(5));
+        let default = Duration::from_secs(300);
+        let timeout = tracker.first_byte_timeout("model", Some(100), default);
+        // 3 × 5s = 15s, above floor of 10s, below cap of 300s
+        assert_eq!(timeout, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn first_byte_timeout_respects_floor() {
+        let tracker = ModelLatencyTracker::new();
+        tracker.record("model", Duration::from_secs(1));
+        let default = Duration::from_secs(300);
+        let timeout = tracker.first_byte_timeout("model", Some(100), default);
+        // 3 × 1s = 3s, but floor is 10s
+        assert_eq!(timeout, TTFB_TIMEOUT_FLOOR);
+    }
+
+    #[test]
+    fn first_byte_timeout_capped_at_default() {
+        let tracker = ModelLatencyTracker::new();
+        tracker.record("model", Duration::from_secs(200));
+        let default = Duration::from_secs(300);
+        let timeout = tracker.first_byte_timeout("model", Some(100), default);
+        // 3 × 200s = 600s, capped at 300s
+        assert_eq!(timeout, default);
+    }
+
+    #[test]
+    fn slow_models_filters_correctly() {
+        let tracker = ModelLatencyTracker::new();
+        tracker.record("MiniMax", Duration::from_secs(45));
+        tracker.record("GLM", Duration::from_secs(2));
+        tracker.record("Qwen", Duration::from_secs(3));
+
+        let names = vec!["MiniMax", "GLM", "Qwen"];
+        let slow = slow_models(&tracker, &names);
+        assert_eq!(slow, vec!["MiniMax".to_string()]);
+    }
+
+    #[test]
+    fn auto_model_lookup_respects_backoff() {
+        let affinity = AffinityRouter::new();
+        let tracker = ModelLatencyTracker::new();
+        affinity.remember_auto_model(0xDEAD, "slow-model");
+        tracker.record("slow-model", Duration::from_secs(45));
+
+        // lookup_auto_model_if_responsive should return None for slow model
+        let result = affinity.lookup_auto_model_if_responsive(0xDEAD, &tracker);
+        assert!(result.is_none());
+
+        // But a fast model should still be returned
+        affinity.remember_auto_model(0xBEEF, "fast-model");
+        tracker.record("fast-model", Duration::from_secs(2));
+        let result = affinity.lookup_auto_model_if_responsive(0xBEEF, &tracker);
+        assert_eq!(result, Some("fast-model".to_string()));
     }
 }

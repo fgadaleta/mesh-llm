@@ -99,9 +99,14 @@ pub enum PipelineProxyResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RouteAttemptResult {
-    Delivered { status_code: u16 },
+    Delivered {
+        status_code: u16,
+    },
     RetryableUnavailable,
     RetryableContextOverflow,
+    /// Host returned 429 because it is at its backpressure cap.
+    /// The request was never forwarded to llama-server.
+    RetryableOverloaded,
     ClientDisconnected,
 }
 
@@ -110,6 +115,7 @@ fn route_attempt_result_label(result: &RouteAttemptResult) -> &'static str {
         RouteAttemptResult::Delivered { .. } => "delivered",
         RouteAttemptResult::RetryableUnavailable => "retryable_unavailable",
         RouteAttemptResult::RetryableContextOverflow => "retryable_context_overflow",
+        RouteAttemptResult::RetryableOverloaded => "retryable_overloaded",
         RouteAttemptResult::ClientDisconnected => "client_disconnected",
     }
 }
@@ -163,6 +169,10 @@ struct ResponseProbe {
     header_end: usize,
     status_code: u16,
     retryable_context_overflow: bool,
+    /// True when the host returned 429 with "server overloaded" —
+    /// the backpressure gate fired and the request was never forwarded
+    /// to llama-server. Clients should try the next host.
+    retryable_overloaded: bool,
 }
 
 #[derive(Debug)]
@@ -940,6 +950,18 @@ fn is_retryable_context_overflow_response(body: &[u8]) -> bool {
     mentions_context && mentions_limit
 }
 
+/// Detect a 429 response that came from the mesh backpressure gate (as
+/// opposed to a generic rate-limit from an external API). The gate uses
+/// the phrase "server overloaded" which is unique to mesh-llm.
+fn is_retryable_overloaded_response(body: &[u8]) -> bool {
+    let text = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| response_message_text(&json))
+        .unwrap_or_else(|| String::from_utf8_lossy(body).to_string())
+        .to_ascii_lowercase();
+    text.contains("server overloaded")
+}
+
 async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
     tcp_stream: &mut TcpStream,
     reader: &mut R,
@@ -1298,7 +1320,7 @@ async fn probe_http_response_with_timeout<R: AsyncRead + Unpin>(
         }
     };
 
-    let preview_len = if parsed.status_code == 400 {
+    let preview_len = if parsed.status_code == 400 || parsed.status_code == 429 {
         parsed
             .content_length
             .map(|value| value.min(MAX_RESPONSE_BODY_PREVIEW_BYTES))
@@ -1310,11 +1332,17 @@ async fn probe_http_response_with_timeout<R: AsyncRead + Unpin>(
         read_response_chunk(reader, &mut buffered).await?;
     }
 
+    let body_preview = if preview_len > 0 {
+        &buffered[parsed.header_end..parsed.header_end + preview_len]
+    } else {
+        &[]
+    };
     let retryable_context_overflow = parsed.status_code == 400
-        && preview_len > 0
-        && is_retryable_context_overflow_response(
-            &buffered[parsed.header_end..parsed.header_end + preview_len],
-        );
+        && !body_preview.is_empty()
+        && is_retryable_context_overflow_response(body_preview);
+    let retryable_overloaded = parsed.status_code == 429
+        && !body_preview.is_empty()
+        && is_retryable_overloaded_response(body_preview);
     tracing::debug!(
         status_code = parsed.status_code,
         header_bytes = parsed.header_end,
@@ -1327,6 +1355,7 @@ async fn probe_http_response_with_timeout<R: AsyncRead + Unpin>(
         header_end: parsed.header_end,
         status_code: parsed.status_code,
         retryable_context_overflow,
+        retryable_overloaded,
     })
 }
 
@@ -1436,6 +1465,10 @@ async fn relay_probed_response<R: AsyncRead + Unpin>(
     if retry_context_overflow && probe.retryable_context_overflow {
         return Ok(RouteAttemptResult::RetryableContextOverflow);
     }
+    // Backpressure: remote host is overloaded — try next host.
+    if probe.retryable_overloaded {
+        return Ok(RouteAttemptResult::RetryableOverloaded);
+    }
     if !(200..300).contains(&probe.status_code) {
         return relay_error_response(tcp_stream, reader, probe).await;
     }
@@ -1458,6 +1491,24 @@ async fn route_local_attempt(
     retry_context_overflow: bool,
     response_adapter: ResponseAdapter,
 ) -> RouteAttemptResult {
+    // ── Backpressure gate ───────────────────────────────────────────
+    // If the local backend is already at capacity, reject immediately
+    // instead of piling into llama-server's unbounded deferred queue.
+    if node.is_overloaded() {
+        let current = node.inflight_requests();
+        tracing::warn!(
+            "Backpressure: rejecting request (inflight={current}), local backend overloaded"
+        );
+        let msg = r#"{"error":{"message":"server overloaded — too many inflight requests","type":"overloaded","code":429}}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            msg.len(),
+            msg
+        );
+        let _ = tcp_stream.write_all(response.as_bytes()).await;
+        return RouteAttemptResult::RetryableOverloaded;
+    }
+
     match TcpStream::connect(format!("127.0.0.1:{port}")).await {
         Ok(mut upstream) => {
             let _inflight = node.begin_inflight_request();
@@ -1517,6 +1568,27 @@ async fn route_remote_attempt(
     retry_context_overflow: bool,
     response_adapter: ResponseAdapter,
 ) -> RouteAttemptResult {
+    route_remote_attempt_with_timeout(
+        node,
+        tcp_stream,
+        host_id,
+        prefetched,
+        retry_context_overflow,
+        response_adapter,
+        None,
+    )
+    .await
+}
+
+async fn route_remote_attempt_with_timeout(
+    node: &mesh::Node,
+    tcp_stream: &mut TcpStream,
+    host_id: iroh::EndpointId,
+    prefetched: &[u8],
+    retry_context_overflow: bool,
+    response_adapter: ResponseAdapter,
+    custom_timeout: Option<Duration>,
+) -> RouteAttemptResult {
     match node.open_http_tunnel(host_id).await {
         Ok((mut quic_send, mut quic_recv)) => {
             if let Err(err) = quic_send.write_all(prefetched).await {
@@ -1526,7 +1598,12 @@ async fn route_remote_attempt(
                 );
                 return RouteAttemptResult::RetryableUnavailable;
             }
-            match probe_http_response(&mut quic_recv).await {
+            let probe_result = if let Some(timeout) = custom_timeout {
+                probe_http_response_with_timeout(&mut quic_recv, timeout).await
+            } else {
+                probe_http_response(&mut quic_recv).await
+            };
+            match probe_result {
                 Ok(probe) => {
                     let status_code = probe.status_code;
                     match relay_probed_response(
@@ -1760,6 +1837,7 @@ pub async fn handle_mesh_request(
     tcp_stream: TcpStream,
     track_demand: bool,
     affinity: AffinityRouter,
+    ttfb_tracker: crate::network::affinity::ModelLatencyTracker,
 ) {
     let mut tcp_stream = tcp_stream;
     let plugin_manager = node.plugin_manager().await;
@@ -1802,88 +1880,97 @@ pub async fn handle_mesh_request(
         } else {
             None
         };
-    let routed_model =
-        if request.model_name.is_none() || request.model_name.as_deref() == Some("auto") {
-            request.ensure_body_json();
-            if let Some(body_json) = request.body_json.as_ref() {
-                // Try the sticky-auto cache first. If we have a remembered
-                // model for this session AND the mesh still has a host
-                // serving it, use that pick and skip classification.
-                let cached = if let Some(key) = auto_session_key {
-                    if let Some(model) = affinity.lookup_auto_model(key) {
-                        if !node.hosts_for_model(&model).await.is_empty() {
-                            tracing::debug!(
-                                "auto: reusing cached model {model} for session {key:016x}"
-                            );
-                            Some(model)
-                        } else {
-                            // The model we picked last time is no longer
-                            // served anywhere. Drop the entry so we
-                            // reclassify and cache a fresh choice.
-                            tracing::debug!(
-                                "auto: cached model {model} no longer served, reclassifying"
-                            );
-                            affinity.forget_auto_model(key);
-                            None
-                        }
+    let routed_model = if request.model_name.is_none()
+        || request.model_name.as_deref() == Some("auto")
+    {
+        request.ensure_body_json();
+        if let Some(body_json) = request.body_json.as_ref() {
+            // Try the sticky-auto cache first. If we have a remembered
+            // model for this session AND the mesh still has a host
+            // serving it, use that pick and skip classification.
+            let cached = if let Some(key) = auto_session_key {
+                // Use backoff-aware lookup: if the cached model is in
+                // TTFB backoff, forget it and reclassify.
+                if let Some(model) = affinity.lookup_auto_model_if_responsive(key, &ttfb_tracker) {
+                    if !node.hosts_for_model(&model).await.is_empty() {
+                        tracing::debug!(
+                            "auto: reusing cached model {model} for session {key:016x}"
+                        );
+                        Some(model)
                     } else {
+                        // The model we picked last time is no longer
+                        // served anywhere. Drop the entry so we
+                        // reclassify and cache a fresh choice.
+                        tracing::debug!(
+                            "auto: cached model {model} no longer served, reclassifying"
+                        );
+                        affinity.forget_auto_model(key);
                         None
                     }
                 } else {
                     None
-                };
-
-                if let Some(name) = cached {
-                    Some(name)
-                } else {
-                    let cl = router::classify(&body_json);
-                    let served = node.models_being_served().await;
-                    let media = router::media_requirements(body_json);
-                    let with_caps: Vec<(&str, f64, crate::models::ModelCapabilities)> = served
-                        .iter()
-                        .map(|name| {
-                            let caps = crate::models::installed_model_capabilities(name);
-                            (name.as_str(), 0.0, caps)
-                        })
-                        .collect();
-                    let available: Vec<(&str, f64, crate::models::ModelCapabilities)> = with_caps
-                        .iter()
-                        .filter(|(_, _, caps)| {
-                            (!media.needs_vision || caps.vision_label().is_some())
-                                && (!media.needs_audio || caps.audio_label().is_some())
-                        })
-                        .cloned()
-                        .collect();
-                    let available = if available.is_empty() {
-                        with_caps
-                    } else {
-                        available
-                    };
-                    let picked = router::pick_model_classified(&cl, &available);
-                    if let Some(name) = picked {
-                        tracing::info!(
-                            "router: {:?}/{:?} tools={} media={} → {name}",
-                            cl.category,
-                            cl.complexity,
-                            cl.needs_tools,
-                            cl.has_media_inputs
-                        );
-                        let chosen = name.to_string();
-                        if let Some(key) = auto_session_key {
-                            affinity.remember_auto_model(key, &chosen);
-                        }
-                        Some(chosen)
-                    } else {
-                        None
-                    }
                 }
             } else {
                 None
+            };
+
+            if let Some(name) = cached {
+                Some(name)
+            } else {
+                let cl = router::classify(&body_json);
+                let served = node.models_being_served().await;
+                let media = router::media_requirements(body_json);
+                let with_caps: Vec<(&str, f64, crate::models::ModelCapabilities)> = served
+                    .iter()
+                    .map(|name| {
+                        let caps = crate::models::installed_model_capabilities(name);
+                        (name.as_str(), 0.0, caps)
+                    })
+                    .collect();
+                let available: Vec<(&str, f64, crate::models::ModelCapabilities)> = with_caps
+                    .iter()
+                    .filter(|(_, _, caps)| {
+                        (!media.needs_vision || caps.vision_label().is_some())
+                            && (!media.needs_audio || caps.audio_label().is_some())
+                    })
+                    .cloned()
+                    .collect();
+                let available = if available.is_empty() {
+                    with_caps
+                } else {
+                    available
+                };
+                // Compute slow-model list from TTFB tracker for backoff
+                let model_names: Vec<&str> = available.iter().map(|(n, _, _)| *n).collect();
+                let slow = crate::network::affinity::slow_models(&ttfb_tracker, &model_names);
+                let picked = router::pick_model_classified_with_backoff(&cl, &available, &slow);
+                if let Some(name) = picked {
+                    tracing::info!(
+                        "router: {:?}/{:?} tools={} media={} slow={:?} → {name}",
+                        cl.category,
+                        cl.complexity,
+                        cl.needs_tools,
+                        cl.has_media_inputs,
+                        slow
+                    );
+                    let chosen = name.to_string();
+                    if let Some(key) = auto_session_key {
+                        affinity.remember_auto_model(key, &chosen);
+                    }
+                    Some(chosen)
+                } else {
+                    None
+                }
             }
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
     let effective_model = routed_model.or(request.model_name.clone());
+    let is_auto = request.model_name.is_none() || request.model_name.as_deref() == Some("auto");
+    let route_started = Instant::now();
 
     // Enable mesh hooks for auto-routed requests. When the smart router
     // picks the model, hooks allow the local model to consult peers during
@@ -1982,6 +2069,18 @@ pub async fn handle_mesh_request(
         target_hosts
     };
 
+    // For auto-routed requests, compute an adaptive first-byte timeout
+    // from TTFB history so we bail early on drowning hosts.
+    let auto_timeout = if is_auto {
+        effective_model.as_deref().map(|name| {
+            let est_tokens =
+                request_budget_tokens_from_parts(request.body_len_bytes, request.completion_tokens);
+            ttfb_tracker.first_byte_timeout(name, est_tokens, response_first_byte_timeout())
+        })
+    } else {
+        None
+    };
+
     // Try each host in order — if tunnel fails, retry with next.
     // On first failure, trigger background gossip refresh so future requests
     // have a fresh routing table (doesn't block the retry loop).
@@ -1990,17 +2089,25 @@ pub async fn handle_mesh_request(
     let total_targets = target_hosts.len();
     for (idx, target_host) in target_hosts.iter().enumerate() {
         let retry_context_overflow = idx + 1 < total_targets;
-        match route_remote_attempt(
+        match route_remote_attempt_with_timeout(
             &node,
             &mut tcp_stream,
             *target_host,
             &request.raw,
             retry_context_overflow,
             request.response_adapter,
+            auto_timeout,
         )
         .await
         {
             RouteAttemptResult::Delivered { status_code } => {
+                // Record TTFB for auto-routed requests so the tracker
+                // learns which models are responsive.
+                if is_auto {
+                    if let Some(ref name) = effective_model {
+                        ttfb_tracker.record(name, route_started.elapsed());
+                    }
+                }
                 if should_learn_affinity(status_code) {
                     if let (Some(name), Some(prefix_hash)) =
                         (effective_model.as_ref(), prepared.learn_prefix_hash)
@@ -2037,6 +2144,23 @@ pub async fn handle_mesh_request(
                 }
                 tracing::warn!(
                     "Host {} rejected request with context overflow-style 400, trying next",
+                    target_host.fmt_short()
+                );
+                last_retryable = true;
+            }
+            RouteAttemptResult::RetryableOverloaded => {
+                if let (Some(name), Some(prefix_hash), Some(cached_target)) = (
+                    effective_model.as_ref(),
+                    prepared.learn_prefix_hash,
+                    prepared.cached_target.as_ref(),
+                ) {
+                    let failed = election::InferenceTarget::Remote(*target_host);
+                    if cached_target == &failed {
+                        affinity.forget_target(name, prefix_hash, &failed);
+                    }
+                }
+                tracing::warn!(
+                    "Host {} is overloaded (429), trying next",
                     target_host.fmt_short()
                 );
                 last_retryable = true;
@@ -2079,6 +2203,13 @@ pub async fn handle_mesh_request(
     // All hosts failed
     if last_retryable {
         tracing::warn!("All hosts failed for model {:?}", effective_model);
+        // Record a slow TTFB so auto routing learns to avoid this model.
+        // The full elapsed time captures the cumulative timeout/failure.
+        if is_auto {
+            if let Some(ref name) = effective_model {
+                ttfb_tracker.record(name, route_started.elapsed());
+            }
+        }
         // Every host serving the cached auto-model was unreachable or
         // returned a retryable error. The memo is worthless — drop it so
         // the next request reclassifies against whatever the mesh looks
@@ -2248,6 +2379,17 @@ pub async fn route_model_request(
                 }
                 tracing::warn!("Target {target:?} rejected request with context overflow-style 400, trying next");
             }
+            RouteAttemptResult::RetryableOverloaded => {
+                if let (Some(prefix_hash), Some(cached_target)) = (
+                    selection.learn_prefix_hash,
+                    selection.cached_target.as_ref(),
+                ) {
+                    if cached_target == &target {
+                        affinity.forget_target(model, prefix_hash, &target);
+                    }
+                }
+                tracing::warn!("Target {target:?} overloaded (429), trying next");
+            }
             RouteAttemptResult::RetryableUnavailable => {
                 if let (Some(prefix_hash), Some(cached_target)) = (
                     selection.learn_prefix_hash,
@@ -2371,7 +2513,7 @@ pub async fn route_moe_request(
             RouteAttemptResult::RetryableContextOverflow => {
                 tracing::warn!("MoE target {target:?} rejected request with context overflow-style 400, trying next");
             }
-            RouteAttemptResult::RetryableUnavailable => {
+            RouteAttemptResult::RetryableUnavailable | RouteAttemptResult::RetryableOverloaded => {
                 if let election::InferenceTarget::MoeRemote(peer_id) = &target {
                     node.handle_peer_death(*peer_id).await;
                 }
@@ -2446,7 +2588,9 @@ pub async fn route_to_target(
     );
     match result {
         RouteAttemptResult::Delivered { .. } => true,
-        RouteAttemptResult::RetryableContextOverflow | RouteAttemptResult::RetryableUnavailable => {
+        RouteAttemptResult::RetryableContextOverflow
+        | RouteAttemptResult::RetryableUnavailable
+        | RouteAttemptResult::RetryableOverloaded => {
             if let Some(moe_host_id) = moe_remote_id {
                 node.handle_peer_death(moe_host_id).await;
             }
@@ -2487,9 +2631,9 @@ pub async fn route_http_endpoint_request(
     );
     match result {
         RouteAttemptResult::Delivered { .. } => true,
-        RouteAttemptResult::RetryableContextOverflow | RouteAttemptResult::RetryableUnavailable => {
-            false
-        }
+        RouteAttemptResult::RetryableContextOverflow
+        | RouteAttemptResult::RetryableUnavailable
+        | RouteAttemptResult::RetryableOverloaded => false,
         RouteAttemptResult::ClientDisconnected => true,
     }
 }

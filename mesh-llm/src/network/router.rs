@@ -428,9 +428,25 @@ fn message_text(msg: &Value) -> String {
 ///
 /// Falls back to all models if the filter matches nothing.
 /// Among candidates, pick randomly to spread load.
+///
+/// `slow_models` (optional): model names currently in TTFB backoff.
+/// These are deprioritized — moved behind responsive models in the
+/// selection order. If ALL candidates are slow the filter is ignored
+/// (graceful degradation).
 pub fn pick_model_classified<'a>(
     classification: &Classification,
     available_models: &[(&'a str, f64, crate::models::ModelCapabilities)],
+) -> Option<&'a str> {
+    pick_model_classified_with_backoff(classification, available_models, &[])
+}
+
+/// Like [`pick_model_classified`] but accepts a list of model names that
+/// are currently in TTFB backoff. Slow models are demoted to the end of
+/// the candidate list so responsive models are tried first.
+pub fn pick_model_classified_with_backoff<'a>(
+    classification: &Classification,
+    available_models: &[(&'a str, f64, crate::models::ModelCapabilities)],
+    slow_model_names: &[String],
 ) -> Option<&'a str> {
     use crate::models::CapabilityLevel;
 
@@ -483,6 +499,27 @@ pub fn pick_model_classified<'a>(
         .subsec_nanos() as u64;
     shuffle_in_place(&mut big, nanos);
     shuffle_in_place(&mut small, nanos.wrapping_add(0x9E37_79B9_7F4A_7C15));
+
+    // TTFB backoff: if some models are slow, partition each tier into
+    // responsive-first, slow-last. If ALL candidates in a tier are slow,
+    // keep them all (graceful degradation).
+    let demote_slow = |tier: &mut Vec<&(&'a str, f64, crate::models::ModelCapabilities)>| {
+        if slow_model_names.is_empty() || tier.is_empty() {
+            return;
+        }
+        let (responsive, slow): (Vec<_>, Vec<_>) = tier
+            .drain(..)
+            .partition(|(name, _, _)| !slow_model_names.iter().any(|s| s == name));
+        if responsive.is_empty() {
+            // All slow — keep original order (graceful degradation)
+            *tier = slow;
+        } else {
+            tier.extend(responsive);
+            tier.extend(slow);
+        }
+    };
+    demote_slow(&mut big);
+    demote_slow(&mut small);
 
     big.into_iter().chain(small).next().map(|&(n, _, _)| n)
 }
@@ -1031,5 +1068,84 @@ mod tests {
             seen.len() >= 3,
             "expected spread across big-tier models, only saw {seen:?}"
         );
+    }
+
+    // ── Backoff-aware model selection tests ─────────────────────────
+
+    fn caps_default() -> crate::models::ModelCapabilities {
+        crate::models::installed_model_capabilities("unknown-model")
+    }
+
+    #[test]
+    fn pick_model_demotes_slow_model_when_alternatives_exist() {
+        let cl = Classification {
+            category: Category::Chat,
+            complexity: Complexity::Moderate,
+            needs_tools: false,
+            has_media_inputs: false,
+        };
+        let available = vec![
+            ("MiniMax-M2.5", 0.0, caps_default()),
+            ("GLM-4.7-Flash", 0.0, caps_default()),
+        ];
+        let slow = vec!["MiniMax-M2.5".to_string()];
+
+        // Over many picks, MiniMax should never be first (GLM is always preferred)
+        for _ in 0..50 {
+            let picked = pick_model_classified_with_backoff(&cl, &available, &slow);
+            assert_eq!(picked, Some("GLM-4.7-Flash"));
+        }
+    }
+
+    #[test]
+    fn pick_model_uses_slow_model_when_only_option() {
+        let cl = Classification {
+            category: Category::Chat,
+            complexity: Complexity::Moderate,
+            needs_tools: false,
+            has_media_inputs: false,
+        };
+        let available = vec![("MiniMax-M2.5", 0.0, caps_default())];
+        let slow = vec!["MiniMax-M2.5".to_string()];
+
+        let picked = pick_model_classified_with_backoff(&cl, &available, &slow);
+        assert_eq!(picked, Some("MiniMax-M2.5"));
+    }
+
+    #[test]
+    fn pick_model_all_slow_still_picks() {
+        let cl = Classification {
+            category: Category::Chat,
+            complexity: Complexity::Moderate,
+            needs_tools: false,
+            has_media_inputs: false,
+        };
+        let available = vec![
+            ("MiniMax-M2.5", 0.0, caps_default()),
+            ("GLM-4.7-Flash", 0.0, caps_default()),
+        ];
+        let slow = vec!["MiniMax-M2.5".to_string(), "GLM-4.7-Flash".to_string()];
+
+        // Graceful degradation: all slow → still picks one
+        let picked = pick_model_classified_with_backoff(&cl, &available, &slow);
+        assert!(picked.is_some());
+    }
+
+    #[test]
+    fn pick_model_empty_slow_list_behaves_like_original() {
+        let cl = Classification {
+            category: Category::Chat,
+            complexity: Complexity::Moderate,
+            needs_tools: false,
+            has_media_inputs: false,
+        };
+        let available = vec![
+            ("MiniMax-M2.5", 0.0, caps_default()),
+            ("GLM-4.7-Flash", 0.0, caps_default()),
+        ];
+        let slow: Vec<String> = vec![];
+
+        let picked = pick_model_classified_with_backoff(&cl, &available, &slow);
+        assert!(picked.is_some());
     }
 }

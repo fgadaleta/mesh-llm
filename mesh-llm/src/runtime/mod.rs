@@ -1615,6 +1615,7 @@ async fn run_auto(
     }
 
     let affinity_router = affinity::AffinityRouter::new();
+    let ttfb_tracker = affinity::ModelLatencyTracker::new();
 
     // Start bootstrap proxy if joining an existing mesh.
     // This gives instant API access via tunnel while our GPU loads.
@@ -1624,8 +1625,17 @@ async fn run_auto(
         let boot_node = node.clone();
         let boot_port = api_port;
         let boot_affinity = affinity_router.clone();
+        let boot_tracker = ttfb_tracker.clone();
         tokio::spawn(async move {
-            bootstrap_proxy(boot_node, boot_port, stop_rx, cli.listen_all, boot_affinity).await;
+            bootstrap_proxy(
+                boot_node,
+                boot_port,
+                stop_rx,
+                cli.listen_all,
+                boot_affinity,
+                boot_tracker,
+            )
+            .await;
         });
         Some(stop_tx)
     } else {
@@ -1794,6 +1804,7 @@ async fn run_auto(
     let proxy_node = node.clone();
     let proxy_rx = target_rx.clone();
     let proxy_affinity = affinity_router.clone();
+    let proxy_tracker = ttfb_tracker.clone();
     let api_control_tx = control_tx.clone();
     tokio::spawn(async move {
         api_proxy(
@@ -1804,6 +1815,7 @@ async fn run_auto(
             existing_listener,
             cli.listen_all,
             proxy_affinity,
+            proxy_tracker,
         )
         .await;
     });
@@ -1945,6 +1957,10 @@ async fn run_auto(
                 });
                 if llama_ready {
                     let n = node_for_cb.clone();
+                    // Set backpressure gate: n_parallel (4, our fork default) + 1.
+                    // This allows at most 1 request queued behind the active slots
+                    // before returning 429 to callers.
+                    n.set_max_inflight(5);
                     tokio::spawn(async move { n.set_llama_ready(true).await; });
                 }
                 if is_host && llama_ready {
@@ -2399,6 +2415,7 @@ async fn run_passive(
 ) -> Result<Option<String>> {
     let local_port = cli.port;
     let affinity_router = affinity::AffinityRouter::new();
+    let ttfb_tracker = affinity::ModelLatencyTracker::new();
     node.set_display_name(node_display_name(cli, &node)).await;
 
     // Nostr publishing (if --publish, for standby GPU nodes advertising capacity)
@@ -2536,8 +2553,9 @@ async fn run_passive(
                 tracing::info!("Connection from {addr}");
                 let node = node.clone();
                 let affinity = affinity_router.clone();
+                let tracker = ttfb_tracker.clone();
                 tokio::spawn(crate::network::proxy::handle_mesh_request(
-                    node, tcp_stream, true, affinity,
+                    node, tcp_stream, true, affinity, tracker,
                 ));
             }
             Some(model_name) = promote_rx.recv() => {

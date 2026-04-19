@@ -989,6 +989,11 @@ pub struct Node {
     pub peer_change_rx: watch::Receiver<usize>,
     inflight_requests: Arc<std::sync::atomic::AtomicUsize>,
     inflight_change_tx: watch::Sender<u64>,
+    /// Maximum inflight requests before the backpressure gate rejects
+    /// with 429. Set to `n_parallel + 1` at launch so there is at most
+    /// one queued request per slot-pipeline gap. `0` means unlimited
+    /// (client nodes, or before the value is set).
+    max_inflight: Arc<std::sync::atomic::AtomicUsize>,
     tunnel_tx: tokio::sync::mpsc::Sender<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)>,
     tunnel_http_tx:
         tokio::sync::mpsc::Sender<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)>,
@@ -1159,6 +1164,28 @@ impl Node {
 
     pub fn inflight_change_rx(&self) -> watch::Receiver<u64> {
         self.inflight_change_tx.subscribe()
+    }
+
+    /// Set the backpressure cap. Called once at launch when the host
+    /// knows its `n_parallel` slot count. Typical value: `n_parallel + 1`.
+    pub fn set_max_inflight(&self, max: usize) {
+        self.max_inflight
+            .store(max, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("Backpressure gate: max_inflight = {max}");
+    }
+
+    /// Returns true if the current inflight count is at or above the
+    /// backpressure cap. Always returns false if no cap has been set
+    /// (cap == 0, e.g. client nodes).
+    pub fn is_overloaded(&self) -> bool {
+        let max = self.max_inflight.load(std::sync::atomic::Ordering::Relaxed);
+        if max == 0 {
+            return false;
+        }
+        let current = self
+            .inflight_requests
+            .load(std::sync::atomic::Ordering::Relaxed);
+        current >= max
     }
 
     pub async fn owner_summary(&self) -> OwnershipSummary {
@@ -1363,6 +1390,7 @@ impl Node {
             peer_change_rx,
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             inflight_change_tx,
+            max_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tunnel_tx,
             tunnel_http_tx,
             plugin_manager: Arc::new(Mutex::new(None)),
@@ -1461,6 +1489,7 @@ impl Node {
             peer_change_rx,
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             inflight_change_tx,
+            max_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tunnel_tx,
             tunnel_http_tx,
             plugin_manager: Arc::new(Mutex::new(None)),

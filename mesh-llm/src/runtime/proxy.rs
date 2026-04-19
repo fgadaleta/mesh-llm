@@ -11,6 +11,7 @@ pub(super) async fn api_proxy(
     existing_listener: Option<tokio::net::TcpListener>,
     listen_all: bool,
     affinity: affinity::AffinityRouter,
+    ttfb_tracker: affinity::ModelLatencyTracker,
 ) {
     crate::network::openai::ingress::api_proxy(
         node,
@@ -20,6 +21,7 @@ pub(super) async fn api_proxy(
         existing_listener,
         listen_all,
         affinity,
+        ttfb_tracker,
     )
     .await;
 }
@@ -30,9 +32,17 @@ pub(super) async fn bootstrap_proxy(
     stop_rx: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<tokio::net::TcpListener>>,
     listen_all: bool,
     affinity: affinity::AffinityRouter,
+    ttfb_tracker: affinity::ModelLatencyTracker,
 ) {
-    crate::network::openai::ingress::bootstrap_proxy(node, port, stop_rx, listen_all, affinity)
-        .await;
+    crate::network::openai::ingress::bootstrap_proxy(
+        node,
+        port,
+        stop_rx,
+        listen_all,
+        affinity,
+        ttfb_tracker,
+    )
+    .await;
 }
 
 #[cfg(test)]
