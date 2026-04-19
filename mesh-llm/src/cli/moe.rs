@@ -77,6 +77,9 @@ pub(crate) struct HfJobArgs {
     /// Submit this MoE publish run to Hugging Face Jobs instead of running locally.
     #[arg(long)]
     pub(crate) hf_job: bool,
+    /// Confirm and submit the Hugging Face Job after showing the dry-run plan.
+    #[arg(long)]
+    pub(crate) hf_confirm: bool,
     /// HF Jobs hardware flavor, e.g. cpu-xl, cpu-performance, l40sx1.
     #[arg(long, default_value = "cpu-xl")]
     pub(crate) hf_job_flavor: String,

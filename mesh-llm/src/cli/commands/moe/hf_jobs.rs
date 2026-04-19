@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
+use hf_hub::{RepoInfo, RepoInfoParams, RepoType};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::cli::moe::{HfJobArgs, HfJobReleaseTarget};
 use crate::inference::launch::BinaryFlavor;
@@ -15,6 +17,8 @@ const CUDA_JOB_IMAGE: &str = "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel";
 const ROCM_JOB_IMAGE: &str = "rocm/pytorch:rocm6.3_ubuntu24.04_py3.12_pytorch_release_2.4.0";
 const VULKAN_JOB_IMAGE: &str = "ghcr.io/astral-sh/uv:python3.12-bookworm";
 const HF_JOB_WRAPPER_TEMPLATE: &str = include_str!("hf_job_wrapper.sh");
+const DEFAULT_HF_JOB_FLAVOR: &str = "cpu-xl";
+const DEFAULT_HF_JOB_TIMEOUT: &str = "1h";
 
 pub(crate) async fn submit_publish_job(
     model_spec: &str,
@@ -27,6 +31,7 @@ pub(crate) async fn submit_publish_job(
         model_ref: identity.distribution_ref(),
         catalog_repo: catalog_repo.to_string(),
         package_namespace: package_namespace.map(ToOwned::to_owned),
+        hf_confirm: options.hf_confirm,
         flavor: options.hf_job_flavor.clone(),
         timeout: options.hf_job_timeout.clone(),
         job_namespace: options.hf_job_namespace.clone(),
@@ -48,6 +53,7 @@ struct JobSubmissionSpec {
     model_ref: String,
     catalog_repo: String,
     package_namespace: Option<String>,
+    hf_confirm: bool,
     flavor: String,
     timeout: String,
     job_namespace: Option<String>,
@@ -126,6 +132,20 @@ struct PricingEstimate {
     max_cost_usd: f64,
 }
 
+#[derive(Clone, Debug)]
+struct JobExecutionPlan {
+    namespace: String,
+    release_url: String,
+    flavor: String,
+    timeout_seconds: u64,
+    minimum_timeout_seconds: u64,
+    release_target: HfJobReleaseTarget,
+    pricing: PricingEstimate,
+    auto_selected_hardware: bool,
+    timeout_bumped_to_minimum: bool,
+    model_size_bytes: u64,
+}
+
 async fn submit_job(spec: JobSubmissionSpec) -> Result<()> {
     let token = models::hf_token_override().ok_or_else(|| {
         anyhow::anyhow!(
@@ -137,38 +157,31 @@ async fn submit_job(spec: JobSubmissionSpec) -> Result<()> {
         Some(namespace) => namespace,
         None => resolve_namespace(&endpoint, &token).await?,
     };
-
-    let release_url = release_download_url(
-        &spec.release_repo,
-        &spec.release_tag,
-        &release_asset_name(&spec.release_tag, spec.release_target),
-    );
-    let timeout_seconds = parse_timeout_seconds(&spec.timeout)?;
-    let pricing = fetch_pricing_estimate(&endpoint, &spec.flavor, timeout_seconds).await?;
+    let plan = build_job_execution_plan(&endpoint, &spec, &namespace).await?;
     let script = remote_bash_script(&spec);
     let payload = json!({
-        "dockerImage": job_image(spec.release_target),
+        "dockerImage": job_image(plan.release_target),
         "command": ["bash", "-lc", script],
         "arguments": [],
         "environment": {
-            "MESH_LLM_RELEASE_URL": release_url,
+            "MESH_LLM_RELEASE_URL": plan.release_url,
             "MODEL_REF": spec.model_ref,
             "SOURCE_REPO": spec.source_repo,
             "SOURCE_REVISION": spec.source_revision,
             "SOURCE_FILE": spec.source_file,
             "CATALOG_REPO": spec.catalog_repo,
-            "HF_JOB_FLAVOR": pricing.flavor.name,
-            "HF_JOB_FLAVOR_PRETTY": pricing.flavor.pretty_name(),
-            "HF_JOB_UNIT_COST_USD": format!("{:.6}", pricing.unit_cost_usd),
-            "HF_JOB_UNIT_LABEL": pricing.flavor.unit_label(),
-            "HF_JOB_TIMEOUT_SECONDS": timeout_seconds.to_string(),
-            "HF_JOB_MAX_COST_USD": format!("{:.2}", pricing.max_cost_usd),
+            "HF_JOB_FLAVOR": plan.pricing.flavor.name,
+            "HF_JOB_FLAVOR_PRETTY": plan.pricing.flavor.pretty_name(),
+            "HF_JOB_UNIT_COST_USD": format!("{:.6}", plan.pricing.unit_cost_usd),
+            "HF_JOB_UNIT_LABEL": plan.pricing.flavor.unit_label(),
+            "HF_JOB_TIMEOUT_SECONDS": plan.timeout_seconds.to_string(),
+            "HF_JOB_MAX_COST_USD": format!("{:.2}", plan.pricing.max_cost_usd),
         },
         "secrets": {
             "HF_TOKEN": token,
         },
-        "flavor": spec.flavor,
-        "timeoutSeconds": timeout_seconds,
+        "flavor": plan.flavor,
+        "timeoutSeconds": plan.timeout_seconds,
         "labels": {
             "app": "mesh-llm",
             "workflow": "moe-publish",
@@ -179,25 +192,23 @@ async fn submit_job(spec: JobSubmissionSpec) -> Result<()> {
         }
     });
 
+    print_job_plan(&spec, &plan, false);
+    if !spec.hf_confirm {
+        println!("🧪 Dry run only");
+        println!("   rerun with `--hf-confirm` to submit this Hugging Face Job");
+        return Ok(());
+    }
+
     println!("☁️ Hugging Face Job submission");
     println!("📦 Model: {}", spec.model_ref);
     println!("📤 Workflow: moe publish");
-    println!("🗂️ Catalog: {}", spec.catalog_repo);
-    if let Some(package_namespace) = &spec.package_namespace {
-        println!("📦 Package namespace: {}", package_namespace);
-    }
-    println!("🖥️ Flavor: {}", spec.flavor);
-    println!("⏱️ Timeout: {}", spec.timeout);
-    println!("📥 Release: {} {}", spec.release_repo, spec.release_tag);
-    println!(
-        "💵 Pricing: {} @ ${:.6}/{}",
-        pricing.flavor.pretty_name(),
-        pricing.unit_cost_usd,
-        pricing.flavor.unit_label()
-    );
-    println!("🧮 Max cost: ${:.2} USD", pricing.max_cost_usd);
+    println!("✅ Confirmation received; submitting remote job");
 
-    let url = format!("{}/api/jobs/{}", endpoint.trim_end_matches('/'), namespace);
+    let url = format!(
+        "{}/api/jobs/{}",
+        endpoint.trim_end_matches('/'),
+        plan.namespace
+    );
     let response = reqwest::Client::new()
         .post(&url)
         .bearer_auth(&token)
@@ -224,6 +235,208 @@ async fn submit_job(spec: JobSubmissionSpec) -> Result<()> {
         job.id
     );
     Ok(())
+}
+
+async fn build_job_execution_plan(
+    endpoint: &str,
+    spec: &JobSubmissionSpec,
+    namespace: &str,
+) -> Result<JobExecutionPlan> {
+    let model_size_bytes =
+        resolve_model_size_bytes(&spec.source_repo, &spec.source_revision, &spec.source_file)
+            .await
+            .unwrap_or(0);
+    let auto_selected_hardware = spec.flavor == DEFAULT_HF_JOB_FLAVOR
+        && spec.timeout == DEFAULT_HF_JOB_TIMEOUT
+        && spec.release_target == HfJobReleaseTarget::Cpu;
+    let (release_target, flavor, minimum_timeout_seconds) = if auto_selected_hardware {
+        recommend_hf_job_resources(model_size_bytes)
+    } else {
+        (
+            spec.release_target,
+            spec.flavor.clone(),
+            recommended_min_timeout_seconds(model_size_bytes, spec.release_target),
+        )
+    };
+    let requested_timeout_seconds = parse_timeout_seconds(&spec.timeout)?;
+    let timeout_seconds = requested_timeout_seconds.max(minimum_timeout_seconds);
+    let timeout_bumped_to_minimum = timeout_seconds != requested_timeout_seconds;
+    let pricing = fetch_pricing_estimate(endpoint, &flavor, timeout_seconds).await?;
+    let release_url = release_download_url(
+        &spec.release_repo,
+        &spec.release_tag,
+        &release_asset_name(&spec.release_tag, release_target),
+    );
+    Ok(JobExecutionPlan {
+        namespace: namespace.to_string(),
+        release_url,
+        flavor,
+        timeout_seconds,
+        minimum_timeout_seconds,
+        release_target,
+        pricing,
+        auto_selected_hardware,
+        timeout_bumped_to_minimum,
+        model_size_bytes,
+    })
+}
+
+async fn resolve_model_size_bytes(
+    source_repo: &str,
+    source_revision: &str,
+    source_file: &str,
+) -> Result<u64> {
+    let local_path = crate::models::local::huggingface_snapshot_path(
+        source_repo,
+        RepoType::Model,
+        source_revision,
+    )
+    .join(source_file);
+    if let Ok(metadata) = std::fs::metadata(&local_path) {
+        return Ok(metadata.len());
+    }
+
+    let source_repo = source_repo.to_string();
+    let source_revision = source_revision.to_string();
+    let source_file = source_file.to_string();
+    crate::models::run_hf_blocking(move || {
+        let api = crate::models::build_hf_api(false)?;
+        let (owner, name) = source_repo
+            .split_once('/')
+            .unwrap_or(("", source_repo.as_str()));
+        let info = api
+            .model(owner, name)
+            .info(
+                &RepoInfoParams::builder()
+                    .revision(source_revision.clone())
+                    .build(),
+            )
+            .with_context(|| format!("Fetch Hugging Face repo {source_repo}@{source_revision}"))?;
+        let RepoInfo::Model(info) = info else {
+            bail!("Expected model repo info for {}", source_repo);
+        };
+        let size = info
+            .siblings
+            .unwrap_or_default()
+            .into_iter()
+            .find(|sibling| sibling.rfilename == source_file)
+            .and_then(|sibling| sibling.size)
+            .ok_or_else(|| anyhow::anyhow!("No size metadata found for {}", source_file))?;
+        Ok(size)
+    })
+}
+
+fn recommend_hf_job_resources(model_size_bytes: u64) -> (HfJobReleaseTarget, String, u64) {
+    let gib = model_size_bytes as f64 / 1024_f64.powi(3);
+    if gib <= 8.0 {
+        (HfJobReleaseTarget::Cpu, "cpu-xl".to_string(), 2 * 60 * 60)
+    } else if gib <= 16.0 {
+        (
+            HfJobReleaseTarget::Cuda,
+            "t4-medium".to_string(),
+            4 * 60 * 60,
+        )
+    } else if gib <= 28.0 {
+        (HfJobReleaseTarget::Cuda, "l40sx1".to_string(), 6 * 60 * 60)
+    } else if gib <= 48.0 {
+        (HfJobReleaseTarget::Cuda, "h200".to_string(), 8 * 60 * 60)
+    } else {
+        (HfJobReleaseTarget::Cuda, "h200x2".to_string(), 12 * 60 * 60)
+    }
+}
+
+fn recommended_min_timeout_seconds(
+    model_size_bytes: u64,
+    release_target: HfJobReleaseTarget,
+) -> u64 {
+    let gib = model_size_bytes as f64 / 1024_f64.powi(3);
+    match release_target {
+        HfJobReleaseTarget::Cpu => {
+            if gib <= 8.0 {
+                2 * 60 * 60
+            } else {
+                6 * 60 * 60
+            }
+        }
+        HfJobReleaseTarget::Cuda | HfJobReleaseTarget::Rocm | HfJobReleaseTarget::Vulkan => {
+            if gib <= 16.0 {
+                4 * 60 * 60
+            } else if gib <= 28.0 {
+                6 * 60 * 60
+            } else if gib <= 48.0 {
+                8 * 60 * 60
+            } else {
+                12 * 60 * 60
+            }
+        }
+    }
+}
+
+fn print_job_plan(spec: &JobSubmissionSpec, plan: &JobExecutionPlan, confirmed: bool) {
+    println!(
+        "☁️ Hugging Face Job {}",
+        if confirmed { "submission" } else { "dry run" }
+    );
+    println!("📦 Model: {}", spec.model_ref);
+    println!("📤 Workflow: moe publish");
+    println!("🗂️ Catalog: {}", spec.catalog_repo);
+    if let Some(package_namespace) = &spec.package_namespace {
+        println!("📦 Package namespace: {}", package_namespace);
+    }
+    if plan.model_size_bytes > 0 {
+        println!("📏 Model size: {:.1}GB", plan.model_size_bytes as f64 / 1e9);
+    }
+    println!(
+        "🖥️ Hardware: {} ({}, target={:?}){}",
+        plan.pricing.flavor.pretty_name(),
+        plan.flavor,
+        plan.release_target,
+        if plan.auto_selected_hardware {
+            " [auto]"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "⏱️ Minimum timeout: {}",
+        format_timeout(plan.minimum_timeout_seconds)
+    );
+    println!("⏱️ Requested timeout: {}", spec.timeout);
+    println!(
+        "⏱️ Effective timeout: {}{}",
+        format_timeout(plan.timeout_seconds),
+        if plan.timeout_bumped_to_minimum {
+            " (bumped to minimum)"
+        } else {
+            ""
+        }
+    );
+    println!("📥 Release: {} {}", spec.release_repo, spec.release_tag);
+    println!(
+        "💵 Pricing: {} @ ${:.6}/{}",
+        plan.pricing.flavor.pretty_name(),
+        plan.pricing.unit_cost_usd,
+        plan.pricing.flavor.unit_label()
+    );
+    println!("🧮 Max cost: ${:.2} USD", plan.pricing.max_cost_usd);
+}
+
+fn format_timeout(timeout_seconds: u64) -> String {
+    let duration = Duration::from_secs(timeout_seconds);
+    let hours = duration.as_secs() / 3600;
+    let minutes = (duration.as_secs() % 3600) / 60;
+    let seconds = duration.as_secs() % 60;
+    if hours > 0 && minutes > 0 {
+        format!("{hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h")
+    } else if minutes > 0 && seconds > 0 {
+        format!("{minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 async fn fetch_pricing_estimate(
@@ -498,6 +711,7 @@ mod tests {
             model_ref: "mesh/model:Q4".to_string(),
             catalog_repo: "meshllm/catalog".to_string(),
             package_namespace: Some("meshllm".to_string()),
+            hf_confirm: true,
             flavor: "cpu-xl".to_string(),
             timeout: "1h".to_string(),
             job_namespace: None,
@@ -513,5 +727,25 @@ mod tests {
         assert!(script.contains("__PUBLISH_COMMAND__") == false);
         assert!(script.contains("moe publish"));
         assert!(script.contains("--namespace"));
+    }
+
+    #[test]
+    fn recommend_hf_job_resources_uses_gpu_for_mid_sized_models() {
+        let (target, flavor, timeout) = recommend_hf_job_resources(22 * 1024 * 1024 * 1024);
+        assert_eq!(target, HfJobReleaseTarget::Cuda);
+        assert_eq!(flavor, "l40sx1");
+        assert_eq!(timeout, 6 * 60 * 60);
+    }
+
+    #[test]
+    fn recommended_min_timeout_scales_with_model_size() {
+        assert_eq!(
+            recommended_min_timeout_seconds(6 * 1024 * 1024 * 1024, HfJobReleaseTarget::Cpu),
+            2 * 60 * 60
+        );
+        assert_eq!(
+            recommended_min_timeout_seconds(22 * 1024 * 1024 * 1024, HfJobReleaseTarget::Cuda),
+            6 * 60 * 60
+        );
     }
 }

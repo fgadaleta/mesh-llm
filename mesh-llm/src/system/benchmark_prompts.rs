@@ -17,6 +17,7 @@ pub(crate) struct ImportPromptsArgs {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PromptImportSource {
     MtBench,
+    IfEval,
     Gsm8k,
     Humaneval,
 }
@@ -131,6 +132,34 @@ pub(crate) async fn import_prompt_corpus(args: ImportPromptsArgs) -> Result<()> 
         args.output.display()
     );
     Ok(())
+}
+
+pub(crate) async fn fetch_prompt_corpus(
+    source: PromptImportSource,
+    limit: usize,
+    max_tokens: Option<u32>,
+) -> Result<Vec<PromptCorpusEntry>> {
+    if limit == 0 {
+        bail!("prompt corpus limit must be at least 1");
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent(format!("mesh-llm/{}", crate::VERSION))
+        .build()
+        .context("Build prompt fetch HTTP client")?;
+
+    let source_spec = source.spec();
+    let (config, split) = resolve_split(&client, source_spec.dataset, source_spec).await?;
+    fetch_prompt_entries(
+        &client,
+        source,
+        source_spec.dataset,
+        &config,
+        &split,
+        limit,
+        max_tokens,
+    )
+    .await
 }
 
 pub(crate) fn load_prompt_corpus(path: &Path) -> Result<Vec<PromptCorpusEntry>> {
@@ -295,6 +324,7 @@ fn prompt_from_row(
 ) -> Result<PromptCorpusEntry> {
     match source {
         PromptImportSource::MtBench => mt_bench_prompt_from_row(row, max_tokens),
+        PromptImportSource::IfEval => ifeval_prompt_from_row(row, max_tokens),
         PromptImportSource::Gsm8k => gsm8k_prompt_from_row(row, max_tokens),
         PromptImportSource::Humaneval => humaneval_prompt_from_row(row, max_tokens),
     }
@@ -375,6 +405,43 @@ fn gsm8k_prompt_from_row(
     })
 }
 
+fn ifeval_prompt_from_row(
+    row: serde_json::Value,
+    max_tokens: Option<u32>,
+) -> Result<PromptCorpusEntry> {
+    #[derive(Deserialize)]
+    struct IfEvalRow {
+        key: u64,
+        prompt: String,
+        instruction_id_list: Vec<String>,
+    }
+
+    let row: IfEvalRow = serde_json::from_value(row).context("Parse IFEval row")?;
+    let category = row
+        .instruction_id_list
+        .first()
+        .and_then(|value| value.split(':').next())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("instruction_following")
+        .to_string();
+
+    Ok(PromptCorpusEntry {
+        id: format!("ifeval_{}", row.key),
+        source: "ifeval".to_string(),
+        category,
+        messages: vec![PromptMessage {
+            role: "user".to_string(),
+            content: row.prompt,
+        }],
+        grader: Some("instruction_following".to_string()),
+        reference_answer: None,
+        reference_rationale: None,
+        reference_tests: None,
+        entry_point: None,
+        max_tokens,
+    })
+}
+
 fn humaneval_prompt_from_row(
     row: serde_json::Value,
     max_tokens: Option<u32>,
@@ -424,10 +491,28 @@ struct DatasetSpec {
 }
 
 impl PromptImportSource {
+    pub(crate) fn short_name(self) -> &'static str {
+        match self {
+            Self::MtBench => "mt_bench",
+            Self::IfEval => "ifeval",
+            Self::Gsm8k => "gsm8k",
+            Self::Humaneval => "humaneval",
+        }
+    }
+
+    pub(crate) fn dataset_name(self) -> &'static str {
+        self.spec().dataset
+    }
+
     fn spec(self) -> DatasetSpec {
         match self {
             Self::MtBench => DatasetSpec {
                 dataset: "HuggingFaceH4/mt_bench_prompts",
+                config: "default",
+                split: "train",
+            },
+            Self::IfEval => DatasetSpec {
+                dataset: "google/IFEval",
                 config: "default",
                 split: "train",
             },
@@ -510,5 +595,23 @@ mod tests {
 
         assert_eq!(entry.reference_answer.as_deref(), Some("4"));
         assert_eq!(entry.grader.as_deref(), Some("exact_match"));
+    }
+
+    #[test]
+    fn ifeval_prompt_uses_instruction_prefix_as_category() {
+        let entry = ifeval_prompt_from_row(
+            serde_json::json!({
+                "key": 1000,
+                "prompt": "Do not use any commas.",
+                "instruction_id_list": ["punctuation:no_comma", "length_constraints:number_words"]
+            }),
+            Some(64),
+        )
+        .expect("ifeval entry");
+
+        assert_eq!(entry.id, "ifeval_1000");
+        assert_eq!(entry.source, "ifeval");
+        assert_eq!(entry.category, "punctuation");
+        assert_eq!(entry.grader.as_deref(), Some("instruction_following"));
     }
 }

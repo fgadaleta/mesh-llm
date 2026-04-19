@@ -273,6 +273,10 @@ pub fn package_cache_meshllm_path(model_path: &Path) -> PathBuf {
     package_cache_root_dir(model_path).join("meshllm.json")
 }
 
+pub fn package_cache_readme_path(model_path: &Path) -> PathBuf {
+    package_cache_root_dir(model_path).join("README.md")
+}
+
 pub fn package_cache_ranking_path(model_path: &Path) -> PathBuf {
     package_cache_variant_dir(model_path).join("ranking.csv")
 }
@@ -287,6 +291,10 @@ pub fn package_cache_manifest_path(model_path: &Path) -> PathBuf {
 
 pub fn package_cache_run_log_path(model_path: &Path) -> PathBuf {
     package_cache_variant_dir(model_path).join("run.log")
+}
+
+pub fn package_cache_temp_root(model_path: &Path) -> PathBuf {
+    package_cache_variant_dir(model_path).join(".tmp")
 }
 
 pub fn component_cache_dir(model_path: &Path) -> PathBuf {

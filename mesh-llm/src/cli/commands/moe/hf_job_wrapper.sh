@@ -40,7 +40,7 @@ Path(".bundle-root").write_text(str(bundle_root))
 PY
 
 cd "$(cat "$workdir/.bundle-root")"
-chmod +x ./mesh-llm ./llama-moe-analyze
+chmod +x ./mesh-llm ./llama-server ./llama-moe-analyze ./llama-moe-components
 export PATH="$PWD:$PATH"
 cuda_lib_paths=(
   "$PWD"
@@ -64,7 +64,9 @@ export LD_LIBRARY_PATH="$(IFS=:; printf '%s' "${ld_parts[*]}")"
 
 echo "🔍 Verifying bundled binaries"
 ./mesh-llm --version
+./llama-server --help >/dev/null
 ./llama-moe-analyze --help >/dev/null
+./llama-moe-components --help >/dev/null
 echo "✅ Bundle verification complete"
 
 echo "📥 Installing Hugging Face CLI"

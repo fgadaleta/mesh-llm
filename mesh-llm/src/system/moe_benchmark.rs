@@ -1,15 +1,38 @@
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::net::TcpListener;
+use tokio::process::{Child, Command as TokioCommand};
+use tokio::task::JoinSet;
 
 use crate::inference::moe;
 use crate::models::{self, catalog};
 use crate::network::router;
-use crate::system::benchmark_prompts::{self, PromptCorpusEntry, PromptCorpusSummary};
+use crate::system::benchmark_prompts::{
+    self, PromptCorpusEntry, PromptCorpusSummary, PromptImportSource,
+};
+use crate::system::moe_planner;
+
+const PACKAGE_BENCHMARK_VERSION: u32 = 2;
+const PACKAGE_BENCHMARK_MAX_TOKENS: u32 = 128;
+const PACKAGE_BENCHMARK_CONTEXT_SIZE: u32 = 4096;
+const PACKAGE_BENCHMARK_GPU_LAYERS: u32 = 99;
+const PACKAGE_BENCHMARK_QUALITY_FLOOR: f64 = 0.95;
+const PACKAGE_BENCHMARK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const PACKAGE_BENCHMARK_HEALTH_TIMEOUT: Duration = Duration::from_secs(600);
+const PACKAGE_BENCHMARK_ASSEMBLY_CONCURRENCY_CAP: usize = 4;
+const PACKAGE_BENCHMARK_REQUEST_CONCURRENCY_CAP: usize = 4;
+const PACKAGE_BENCHMARK_MT_BENCH_LIMIT: usize = 80;
+const PACKAGE_BENCHMARK_IFEVAL_LIMIT: usize = 128;
+const PACKAGE_BENCHMARK_GSM8K_LIMIT: usize = 128;
+const PACKAGE_BENCHMARK_HUMANEVAL_LIMIT: usize = 164;
 
 #[derive(Clone, Debug)]
 pub(crate) struct MoeRankingBenchmarkArgs {
@@ -188,6 +211,128 @@ struct MoeModelMatrixReport {
     models: Vec<MoeModelMatrixModelReport>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct PackageCalibrationBenchmarkReport {
+    version: u32,
+    corpora: Vec<PackageCalibrationCorpus>,
+    baseline: &'static str,
+    metric: &'static str,
+    quality_floor: f64,
+    candidates: Vec<PackageCalibrationCandidateReport>,
+    recommended_min_experts_per_node: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct PackageCalibrationCorpus {
+    source: &'static str,
+    dataset: &'static str,
+    prompt_count: usize,
+    max_tokens: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PackageCalibrationBaselineCache {
+    version: u32,
+    dataset: String,
+    prompt_hash: String,
+    max_tokens: u32,
+    context_size: u32,
+    n_gpu_layers: u32,
+    outputs: Vec<String>,
+}
+
+struct LoadedCalibrationCorpus {
+    source: PromptImportSource,
+    prompts: Vec<PromptCorpusEntry>,
+    baseline_outputs: Vec<String>,
+}
+
+struct LocalServerRunner {
+    base_url: String,
+    model_path: PathBuf,
+    log_path: PathBuf,
+    child: Child,
+}
+
+#[derive(Debug, Serialize)]
+struct PackageCalibrationCandidateReport {
+    min_experts_per_node: u32,
+    node_count: usize,
+    mean_score: f64,
+    worst_node_score: f64,
+    node_scores: Vec<f64>,
+    corpora: Vec<PackageCalibrationCandidateCorpusReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct PackageCalibrationCandidateCorpusReport {
+    source: &'static str,
+    dataset: &'static str,
+    prompt_count: usize,
+    mean_score: f64,
+    worst_node_score: f64,
+    node_scores: Vec<f64>,
+}
+
+#[derive(Clone, Copy)]
+struct PackageCalibrationCorpusSpec {
+    source: PromptImportSource,
+    limit: usize,
+}
+
+struct CleanupDir {
+    path: PathBuf,
+}
+
+impl CleanupDir {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for CleanupDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn create_package_temp_dir(model_path: &Path, prefix: &str) -> Result<CleanupDir> {
+    let temp_root = moe::package_cache_temp_root(model_path);
+    fs::create_dir_all(&temp_root)
+        .with_context(|| format!("Create benchmark temp root {}", temp_root.display()))?;
+    let path = temp_root.join(format!(
+        "{prefix}{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&path).with_context(|| format!("Create temp dir {}", path.display()))?;
+    Ok(CleanupDir { path })
+}
+
+fn package_benchmark_corpus_specs() -> &'static [PackageCalibrationCorpusSpec] {
+    &[
+        PackageCalibrationCorpusSpec {
+            source: PromptImportSource::MtBench,
+            limit: PACKAGE_BENCHMARK_MT_BENCH_LIMIT,
+        },
+        PackageCalibrationCorpusSpec {
+            source: PromptImportSource::IfEval,
+            limit: PACKAGE_BENCHMARK_IFEVAL_LIMIT,
+        },
+        PackageCalibrationCorpusSpec {
+            source: PromptImportSource::Gsm8k,
+            limit: PACKAGE_BENCHMARK_GSM8K_LIMIT,
+        },
+        PackageCalibrationCorpusSpec {
+            source: PromptImportSource::Humaneval,
+            limit: PACKAGE_BENCHMARK_HUMANEVAL_LIMIT,
+        },
+    ]
+}
+
 pub(crate) async fn run_moe_ranking_benchmark(args: MoeRankingBenchmarkArgs) -> Result<()> {
     validate_nodes(args.nodes)?;
     if args.variants.is_empty() {
@@ -288,6 +433,295 @@ pub(crate) async fn run_moe_model_matrix_benchmark(
         "MoE model matrix benchmark",
     )?;
     Ok(())
+}
+
+pub(crate) async fn run_local_package_calibration_benchmark(
+    model: &moe_planner::MoeModelContext,
+    ranking: &moe_planner::ResolvedRanking,
+    bin_dir: &Path,
+) -> Result<PackageCalibrationBenchmarkReport> {
+    let benchmark_started = Instant::now();
+    let ranking_vec = moe::load_cached_ranking(&ranking.path).ok_or_else(|| {
+        anyhow!(
+            "cached ranking not found for calibration benchmark: {}",
+            ranking.path.display()
+        )
+    })?;
+    let server_bin = resolve_llama_server_binary()?;
+    let backend_label = if PACKAGE_BENCHMARK_GPU_LAYERS == 0 {
+        "cpu"
+    } else if cfg!(target_os = "macos") {
+        "metal"
+    } else {
+        "gpu"
+    };
+    let baseline_request_concurrency = benchmark_request_concurrency(model.total_model_bytes);
+    eprintln!("🧪 Package calibration benchmark");
+    eprintln!("   phase: benchmark calibration");
+    let corpora =
+        load_package_benchmark_corpora(&server_bin, model, baseline_request_concurrency).await?;
+    if corpora.is_empty() {
+        bail!("package calibration suite was empty");
+    }
+    eprintln!(
+        "   corpora: {}",
+        corpora
+            .iter()
+            .map(|corpus| format!("{}({})", corpus.source.short_name(), corpus.prompts.len()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    eprintln!(
+        "   runner: warm llama-server via {} ({backend_label}, -ngl {})",
+        server_bin.display(),
+        PACKAGE_BENCHMARK_GPU_LAYERS
+    );
+    eprintln!("   baseline request workers: {baseline_request_concurrency}");
+    eprintln!("   model: {}", model.path.display());
+    eprintln!("   ranking: {}", ranking.path.display());
+    eprintln!("   max tokens: {}", PACKAGE_BENCHMARK_MAX_TOKENS);
+    eprintln!("   request mode: deterministic raw completions (temperature 0, seed 0)");
+    eprintln!(
+        "   candidates: {}",
+        package_benchmark_candidates(model)
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let candidate_min_experts = package_benchmark_candidates(model);
+    let temp_root = create_package_temp_dir(&model.path, "benchmark-calibration-")?;
+
+    let mut candidates = Vec::new();
+    for (candidate_index, min_experts) in candidate_min_experts.iter().copied().enumerate() {
+        let candidate_started = Instant::now();
+        let node_count = ((model.expert_count as f64) / (min_experts as f64))
+            .ceil()
+            .max(1.0) as usize;
+        eprintln!(
+            "   candidate {}/{}: min_experts_per_node={} -> {} node(s)",
+            candidate_index + 1,
+            candidate_min_experts.len(),
+            min_experts,
+            node_count
+        );
+        let assignments =
+            moe::compute_assignments_with_overlap(&ranking_vec, node_count, min_experts, 1);
+        let assembly_concurrency = benchmark_assembly_concurrency(
+            temp_root.path(),
+            model.total_model_bytes,
+            assignments.len(),
+        );
+        eprintln!(
+            "     assembly workers: {} for {} node shard(s)",
+            assembly_concurrency,
+            assignments.len()
+        );
+        let mut node_scores = vec![0.0; assignments.len()];
+        let mut corpus_node_scores = corpora
+            .iter()
+            .map(|_| vec![0.0; assignments.len()])
+            .collect::<Vec<_>>();
+        let mut next_index = 0usize;
+        let mut join_set = JoinSet::new();
+
+        while next_index < assignments.len() && join_set.len() < assembly_concurrency {
+            queue_candidate_shard_assembly(
+                &mut join_set,
+                bin_dir,
+                model,
+                temp_root.path(),
+                min_experts,
+                &assignments,
+                next_index,
+            );
+            next_index += 1;
+        }
+
+        while let Some(joined) = join_set.join_next().await {
+            let node_started = Instant::now();
+            let (node_index, shard_path) = joined.context("Join shard assembly task")??;
+            eprintln!(
+                "     assembled node {}/{} -> {}",
+                node_index + 1,
+                assignments.len(),
+                shard_path.display()
+            );
+
+            while next_index < assignments.len() && join_set.len() < assembly_concurrency {
+                queue_candidate_shard_assembly(
+                    &mut join_set,
+                    bin_dir,
+                    model,
+                    temp_root.path(),
+                    min_experts,
+                    &assignments,
+                    next_index,
+                );
+                next_index += 1;
+            }
+
+            let runner_label = format!(
+                "candidate min_experts={} node {}/{}",
+                min_experts,
+                node_index + 1,
+                assignments.len()
+            );
+            let request_concurrency = benchmark_request_concurrency(
+                fs::metadata(&shard_path).map(|m| m.len()).unwrap_or(0),
+            );
+            eprintln!(
+                "     request workers: {} for node {}/{}",
+                request_concurrency,
+                node_index + 1,
+                assignments.len()
+            );
+            let runner = start_local_server_runner(
+                &server_bin,
+                &shard_path,
+                PACKAGE_BENCHMARK_CONTEXT_SIZE,
+                PACKAGE_BENCHMARK_GPU_LAYERS,
+                &runner_label,
+                temp_root.path(),
+            )
+            .await?;
+            let mut all_prompt_scores = Vec::new();
+            let mut node_result = Ok(());
+            for (corpus_index, corpus) in corpora.iter().enumerate() {
+                let corpus_started = Instant::now();
+                eprintln!(
+                    "       corpus {}/{}: {} ({})",
+                    corpus_index + 1,
+                    corpora.len(),
+                    corpus.source.dataset_name(),
+                    corpus.prompts.len()
+                );
+                match evaluate_prompts_with_server(
+                    &runner,
+                    &corpus.prompts,
+                    &format!("{runner_label} [{}]", corpus.source.short_name()),
+                    request_concurrency,
+                )
+                .await
+                {
+                    Ok(candidate_outputs) => {
+                        let prompt_scores = candidate_outputs
+                            .iter()
+                            .zip(&corpus.baseline_outputs)
+                            .map(|(candidate, baseline)| token_dice_similarity(baseline, candidate))
+                            .collect::<Vec<_>>();
+                        let corpus_mean = mean_score(&prompt_scores);
+                        corpus_node_scores[corpus_index][node_index] = corpus_mean;
+                        all_prompt_scores.extend(prompt_scores);
+                        eprintln!(
+                            "       corpus result: {} mean={:.3} elapsed={:.1}s",
+                            corpus.source.short_name(),
+                            corpus_mean,
+                            corpus_started.elapsed().as_secs_f64()
+                        );
+                    }
+                    Err(err) => {
+                        node_result = Err(err);
+                        break;
+                    }
+                }
+            }
+            runner.shutdown().await;
+            node_result?;
+            node_scores[node_index] = mean_score(&all_prompt_scores);
+            eprintln!(
+                "     node result: {}/{} mean={:.3} elapsed={:.1}s",
+                node_index + 1,
+                assignments.len(),
+                node_scores[node_index],
+                node_started.elapsed().as_secs_f64()
+            );
+        }
+
+        let candidate_mean_score = mean_score(&node_scores);
+        let worst_node_score = node_scores.iter().copied().fold(1.0_f64, f64::min);
+        let corpus_reports = corpora
+            .iter()
+            .enumerate()
+            .map(|(corpus_index, corpus)| {
+                let node_scores = corpus_node_scores[corpus_index].clone();
+                let corpus_mean_score = mean_score(&node_scores);
+                let worst_node_score = node_scores.iter().copied().fold(1.0_f64, f64::min);
+                PackageCalibrationCandidateCorpusReport {
+                    source: corpus.source.short_name(),
+                    dataset: corpus.source.dataset_name(),
+                    prompt_count: corpus.prompts.len(),
+                    mean_score: corpus_mean_score,
+                    worst_node_score,
+                    node_scores,
+                }
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "   result: min_experts_per_node={} mean={:.3} worst={:.3} elapsed={:.1}s",
+            min_experts,
+            candidate_mean_score,
+            worst_node_score,
+            candidate_started.elapsed().as_secs_f64()
+        );
+        candidates.push(PackageCalibrationCandidateReport {
+            min_experts_per_node: min_experts,
+            node_count,
+            mean_score: candidate_mean_score,
+            worst_node_score,
+            node_scores,
+            corpora: corpus_reports,
+        });
+    }
+
+    let recommended_min_experts_per_node = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .corpora
+                .iter()
+                .all(|corpus| corpus.worst_node_score >= PACKAGE_BENCHMARK_QUALITY_FLOOR)
+        })
+        .map(|candidate| candidate.min_experts_per_node)
+        .min()
+        .or_else(|| {
+            candidates
+                .iter()
+                .max_by(|a, b| {
+                    a.worst_node_score
+                        .partial_cmp(&b.worst_node_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.min_experts_per_node.cmp(&b.min_experts_per_node))
+                })
+                .map(|candidate| candidate.min_experts_per_node)
+        })
+        .unwrap_or(model.min_experts_per_node);
+    eprintln!(
+        "🧪 Recommended min_experts_per_node: {}",
+        recommended_min_experts_per_node
+    );
+    eprintln!(
+        "🧪 Benchmark calibration completed in {:.1}s",
+        benchmark_started.elapsed().as_secs_f64()
+    );
+
+    Ok(PackageCalibrationBenchmarkReport {
+        version: PACKAGE_BENCHMARK_VERSION,
+        corpora: corpora
+            .iter()
+            .map(|corpus| PackageCalibrationCorpus {
+                source: corpus.source.short_name(),
+                dataset: corpus.source.dataset_name(),
+                prompt_count: corpus.prompts.len(),
+                max_tokens: PACKAGE_BENCHMARK_MAX_TOKENS,
+            })
+            .collect(),
+        baseline: "full-model",
+        metric: "token_dice_similarity",
+        quality_floor: PACKAGE_BENCHMARK_QUALITY_FLOOR,
+        candidates,
+        recommended_min_experts_per_node,
+    })
 }
 
 fn build_ranking_report(
@@ -531,6 +965,20 @@ fn load_or_default_prompts(prompt_corpus: Option<&PromptCorpusSummary>) -> Resul
     Ok(prompts.into_iter().map(render_prompt).collect())
 }
 
+pub(crate) fn package_benchmark_is_current(analysis_path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(analysis_path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    value
+        .get("benchmark")
+        .and_then(|benchmark| benchmark.get("version"))
+        .and_then(|version| version.as_u64())
+        == Some(PACKAGE_BENCHMARK_VERSION as u64)
+}
+
 fn render_prompt(entry: PromptCorpusEntry) -> String {
     let mut rendered = String::new();
     for message in entry.messages {
@@ -542,6 +990,737 @@ fn render_prompt(entry: PromptCorpusEntry) -> String {
         );
     }
     rendered.trim().to_string()
+}
+
+fn package_benchmark_candidates(model: &moe_planner::MoeModelContext) -> Vec<u32> {
+    let mut candidates = BTreeSet::from([32_u32, 40, 48, 56, 64, model.min_experts_per_node]);
+    candidates.retain(|value| *value >= model.used_expert_count && *value <= model.expert_count);
+    if candidates.is_empty() {
+        candidates.insert(model.min_experts_per_node.max(model.used_expert_count));
+    }
+    candidates.into_iter().collect()
+}
+
+fn baseline_cache_path(model_path: &Path, source: PromptImportSource) -> PathBuf {
+    moe::package_cache_variant_dir(model_path)
+        .join("benchmark-baselines")
+        .join(format!("{}.json", source.short_name()))
+}
+
+fn prompt_corpus_hash(prompts: &[PromptCorpusEntry]) -> Result<String> {
+    let bytes =
+        serde_json::to_vec(prompts).context("Serialize prompt corpus for benchmark hash")?;
+    Ok(hex::encode(sha2::Sha256::digest(bytes)))
+}
+
+fn load_baseline_cache(
+    model_path: &Path,
+    source: PromptImportSource,
+    dataset: &str,
+    prompts: &[PromptCorpusEntry],
+) -> Result<Option<PackageCalibrationBaselineCache>> {
+    let cache_path = baseline_cache_path(model_path, source);
+    let Ok(content) = fs::read_to_string(&cache_path) else {
+        return Ok(None);
+    };
+    let cache: PackageCalibrationBaselineCache = serde_json::from_str(&content)
+        .with_context(|| format!("Parse {}", cache_path.display()))?;
+    if cache.version != PACKAGE_BENCHMARK_VERSION
+        || cache.dataset != dataset
+        || cache.prompt_hash != prompt_corpus_hash(prompts)?
+        || cache.max_tokens != PACKAGE_BENCHMARK_MAX_TOKENS
+        || cache.context_size != PACKAGE_BENCHMARK_CONTEXT_SIZE
+        || cache.n_gpu_layers != PACKAGE_BENCHMARK_GPU_LAYERS
+        || cache.outputs.len() != prompts.len()
+    {
+        return Ok(None);
+    }
+    Ok(Some(cache))
+}
+
+fn save_baseline_cache(
+    model_path: &Path,
+    source: PromptImportSource,
+    dataset: &str,
+    prompts: &[PromptCorpusEntry],
+    outputs: &[String],
+) -> Result<()> {
+    let cache = PackageCalibrationBaselineCache {
+        version: PACKAGE_BENCHMARK_VERSION,
+        dataset: dataset.to_string(),
+        prompt_hash: prompt_corpus_hash(prompts)?,
+        max_tokens: PACKAGE_BENCHMARK_MAX_TOKENS,
+        context_size: PACKAGE_BENCHMARK_CONTEXT_SIZE,
+        n_gpu_layers: PACKAGE_BENCHMARK_GPU_LAYERS,
+        outputs: outputs.to_vec(),
+    };
+    let path = baseline_cache_path(model_path, source);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_string_pretty(&cache)? + "\n")
+        .with_context(|| format!("Write {}", path.display()))?;
+    Ok(())
+}
+
+async fn load_or_create_baseline_outputs(
+    server_bin: &Path,
+    model: &moe_planner::MoeModelContext,
+    source: PromptImportSource,
+    prompts: &[PromptCorpusEntry],
+    request_concurrency: usize,
+) -> Result<Vec<String>> {
+    let baseline_started = Instant::now();
+    let dataset = source.dataset_name();
+    if let Some(cache) = load_baseline_cache(&model.path, source, dataset, prompts)? {
+        eprintln!(
+            "   baseline cache ({}): reusing {} outputs from {} ({:.1}s)",
+            source.short_name(),
+            cache.outputs.len(),
+            baseline_cache_path(&model.path, source).display(),
+            baseline_started.elapsed().as_secs_f64()
+        );
+        return Ok(cache.outputs);
+    }
+
+    eprintln!("   baseline cache ({}): none", source.short_name());
+    let temp_root = create_package_temp_dir(&model.path, "benchmark-baseline-")?;
+    let runner = start_local_server_runner(
+        server_bin,
+        &model.path,
+        PACKAGE_BENCHMARK_CONTEXT_SIZE,
+        PACKAGE_BENCHMARK_GPU_LAYERS,
+        "baseline",
+        temp_root.path(),
+    )
+    .await?;
+    let outputs =
+        evaluate_prompts_with_server(&runner, prompts, "baseline", request_concurrency).await;
+    runner.shutdown().await;
+    let outputs = outputs?;
+    save_baseline_cache(&model.path, source, dataset, prompts, &outputs)?;
+    eprintln!(
+        "   baseline cache ({}): wrote {} ({:.1}s)",
+        source.short_name(),
+        baseline_cache_path(&model.path, source).display(),
+        baseline_started.elapsed().as_secs_f64()
+    );
+    Ok(outputs)
+}
+
+async fn load_package_benchmark_corpora(
+    server_bin: &Path,
+    model: &moe_planner::MoeModelContext,
+    request_concurrency: usize,
+) -> Result<Vec<LoadedCalibrationCorpus>> {
+    let mut corpora = Vec::new();
+    for spec in package_benchmark_corpus_specs() {
+        let corpus_started = Instant::now();
+        let prompts = benchmark_prompts::fetch_prompt_corpus(
+            spec.source,
+            spec.limit,
+            Some(PACKAGE_BENCHMARK_MAX_TOKENS),
+        )
+        .await
+        .with_context(|| format!("Fetch prompt corpus {}", spec.source.dataset_name()))?;
+        eprintln!(
+            "   corpus: {} ({}) prompts={}",
+            spec.source.dataset_name(),
+            spec.source.short_name(),
+            prompts.len()
+        );
+        let baseline_outputs = load_or_create_baseline_outputs(
+            server_bin,
+            model,
+            spec.source,
+            &prompts,
+            request_concurrency,
+        )
+        .await?;
+        eprintln!(
+            "   corpus ready: {} ({}) baseline={} elapsed={:.1}s",
+            spec.source.dataset_name(),
+            spec.source.short_name(),
+            baseline_outputs.len(),
+            corpus_started.elapsed().as_secs_f64()
+        );
+        corpora.push(LoadedCalibrationCorpus {
+            source: spec.source,
+            prompts,
+            baseline_outputs,
+        });
+    }
+    Ok(corpora)
+}
+
+fn queue_candidate_shard_assembly(
+    join_set: &mut JoinSet<Result<(usize, PathBuf)>>,
+    bin_dir: &Path,
+    model: &moe_planner::MoeModelContext,
+    temp_root: &Path,
+    min_experts: u32,
+    assignments: &[moe::NodeAssignment],
+    node_index: usize,
+) {
+    let experts = assignments[node_index].experts.clone();
+    let bin_dir = bin_dir.to_path_buf();
+    let model_path = model.path.clone();
+    let expert_count = model.expert_count;
+    let temp_root = temp_root.to_path_buf();
+    let shard_path = temp_root.join(format!("min-{}-node-{}.gguf", min_experts, node_index));
+    eprintln!(
+        "     queue assemble node {}/{} -> {}",
+        node_index + 1,
+        assignments.len(),
+        shard_path.display()
+    );
+    join_set.spawn_blocking(move || -> Result<(usize, PathBuf)> {
+        let (trunk_path, expert_paths) =
+            moe::ensure_local_component_cache(&bin_dir, &model_path, &experts, expert_count)?;
+        moe::run_assemble_from_components(&bin_dir, &trunk_path, &expert_paths, &shard_path)?;
+        Ok((node_index, shard_path))
+    });
+}
+
+fn benchmark_prompt_label(prompt: &PromptCorpusEntry) -> String {
+    let line = prompt
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .find(|content| !content.trim().is_empty())
+        .unwrap_or(prompt.id.as_str())
+        .trim();
+    let compact = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let preview = chars.by_ref().take(72).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn resolve_llama_server_binary() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("Failed to determine own binary path")?;
+    let bin_dir = exe
+        .parent()
+        .ok_or_else(|| anyhow!("Current executable has no parent directory"))?;
+    let candidates = [
+        bin_dir.join("llama-server"),
+        bin_dir.join("../llama.cpp/build/bin/llama-server"),
+        bin_dir.join("../../llama.cpp/build/bin/llama-server"),
+        bin_dir.join("../../../llama.cpp/build/bin/llama-server"),
+    ];
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate.canonicalize().unwrap_or(candidate));
+        }
+    }
+    bail!(
+        "llama-server not found next to {} or nearby llama.cpp/build/bin directories",
+        bin_dir.display()
+    )
+}
+
+async fn start_local_server_runner(
+    server_bin: &Path,
+    model_path: &Path,
+    context_size: u32,
+    n_gpu_layers: u32,
+    label: &str,
+    temp_root: &Path,
+) -> Result<LocalServerRunner> {
+    let temp_id = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let log_root = temp_root.join("runner-logs");
+    fs::create_dir_all(&log_root)
+        .with_context(|| format!("Create benchmark runner log dir {}", log_root.display()))?;
+    let stdout_path = log_root.join(format!("mesh-llm-benchmark-server-{temp_id}.stdout"));
+    let stderr_path = log_root.join(format!("mesh-llm-benchmark-server-{temp_id}.stderr"));
+    let stdout_file =
+        File::create(&stdout_path).with_context(|| format!("Create {}", stdout_path.display()))?;
+    let stderr_file =
+        File::create(&stderr_path).with_context(|| format!("Create {}", stderr_path.display()))?;
+    let model_label = model_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| model_path.to_string_lossy().into_owned());
+    let port = find_free_port().await?;
+    let base_url = format!("http://127.0.0.1:{port}");
+    eprintln!("       ▶ start {label} runner on {base_url} using {model_label}");
+    let args = vec![
+        "-m".to_string(),
+        model_path.to_string_lossy().to_string(),
+        "-ngl".to_string(),
+        n_gpu_layers.to_string(),
+        "--no-jinja".to_string(),
+        "--reasoning-format".to_string(),
+        "none".to_string(),
+        "--reasoning".to_string(),
+        "off".to_string(),
+        "-fa".to_string(),
+        "on".to_string(),
+        "-fit".to_string(),
+        "off".to_string(),
+        "--no-mmap".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "-c".to_string(),
+        context_size.to_string(),
+    ];
+    let mut child = TokioCommand::new(server_bin)
+        .args(&args)
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| {
+            format!(
+                "Start {} for {}",
+                server_bin.display(),
+                model_path.display()
+            )
+        })?;
+
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().with_context(|| {
+            format!("Poll {} for {}", server_bin.display(), model_path.display())
+        })? {
+            let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+            if !status.success() {
+                bail!(
+                    "llama-server failed for {} during {}: {}",
+                    model_path.display(),
+                    label,
+                    stderr
+                );
+            }
+            bail!(
+                "llama-server exited before becoming healthy for {} during {}",
+                model_path.display(),
+                label
+            );
+        }
+
+        if reqwest_health_check(&format!("{base_url}/health")).await {
+            eprintln!(
+                "       ✓ {label} runner ready in {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+            return Ok(LocalServerRunner {
+                base_url,
+                model_path: model_path.to_path_buf(),
+                log_path: stderr_path,
+                child,
+            });
+        }
+        if started.elapsed() >= PACKAGE_BENCHMARK_HEALTH_TIMEOUT {
+            bail!(
+                "llama-server health check timed out for {} during {} (log: {})",
+                model_path.display(),
+                label,
+                stderr_path.display()
+            );
+        }
+        tokio::time::sleep(PACKAGE_BENCHMARK_HEARTBEAT_INTERVAL).await;
+        eprintln!(
+            "       … waiting for {label} runner ({:.0}s elapsed)",
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+impl LocalServerRunner {
+    async fn shutdown(mut self) {
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
+}
+
+async fn evaluate_prompts_with_server(
+    runner: &LocalServerRunner,
+    prompts: &[PromptCorpusEntry],
+    phase_label: &str,
+    request_concurrency: usize,
+) -> Result<Vec<String>> {
+    let phase_started = Instant::now();
+    let mut outputs: Vec<Option<String>> = vec![None; prompts.len()];
+    let mut next_index = 0usize;
+    let mut completed = 0usize;
+    let mut join_set = JoinSet::new();
+
+    while completed < prompts.len() {
+        while next_index < prompts.len() && join_set.len() < request_concurrency {
+            let prompt = prompts[next_index].clone();
+            let request_label = format!(
+                "{} prompt {}/{}",
+                phase_label,
+                next_index + 1,
+                prompts.len()
+            );
+            eprintln!(
+                "       ▶ {request_label}: {}",
+                benchmark_prompt_label(&prompt)
+            );
+            let base_url = runner.base_url.clone();
+            let model_path = runner.model_path.clone();
+            join_set.spawn(async move {
+                let prompt_started = Instant::now();
+                let output = request_server_completion(&base_url, &prompt, &request_label).await;
+                (
+                    next_index,
+                    output,
+                    request_label,
+                    model_path,
+                    prompt_started.elapsed(),
+                )
+            });
+            next_index += 1;
+        }
+
+        let Some(result) = join_set.join_next().await else {
+            break;
+        };
+        let (index, output, request_label, model_path, elapsed) =
+            result.context("Join benchmark request task")?;
+        let output = output.with_context(|| {
+            format!(
+                "Benchmark request failed for {} (log: {})",
+                model_path.display(),
+                runner.log_path.display()
+            )
+        })?;
+        eprintln!(
+            "       ✓ {request_label} completed in {:.1}s",
+            elapsed.as_secs_f64()
+        );
+        outputs[index] = Some(output);
+        completed += 1;
+        eprintln!("       progress: {completed}/{} prompt(s)", prompts.len());
+    }
+
+    let outputs = outputs
+        .into_iter()
+        .map(|value| value.ok_or_else(|| anyhow!("missing benchmark output")))
+        .collect::<Result<Vec<_>>>()?;
+    eprintln!(
+        "       ✓ {phase_label} completed in {:.1}s",
+        phase_started.elapsed().as_secs_f64()
+    );
+    Ok(outputs)
+}
+
+async fn request_server_completion(
+    base_url: &str,
+    prompt: &PromptCorpusEntry,
+    step_label: &str,
+) -> Result<String> {
+    let client = reqwest::Client::new();
+    let start = Instant::now();
+    let rendered_prompt = render_benchmark_completion_prompt(prompt);
+    let response = client
+        .post(format!("{base_url}/completion"))
+        .json(&json!({
+            "prompt": rendered_prompt,
+            "n_predict": PACKAGE_BENCHMARK_MAX_TOKENS,
+            "chat_format": 0,
+            "reasoning_format": "none",
+            "temperature": 0,
+            "top_p": 1,
+            "seed": 0,
+            "stream": false
+        }))
+        .send()
+        .await
+        .with_context(|| format!("Send benchmark request for {step_label}"))?;
+
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .with_context(|| format!("Parse benchmark response for {step_label}"))?;
+    if !status.is_success() {
+        if benchmark_response_is_parser_failure(&body) {
+            eprintln!(
+                "       ⚠ {step_label} triggered llama-server parse failure after {:.1}s; scoring as empty output",
+                start.elapsed().as_secs_f64()
+            );
+            return Ok(String::new());
+        }
+        bail!("server returned {} for {}: {}", status, step_label, body);
+    }
+    let content = extract_benchmark_response_text(&body);
+    if content.is_empty() && !benchmark_response_has_completion_payload(&body) {
+        bail!(
+            "empty completion for {} after {:.1}s: {}",
+            step_label,
+            start.elapsed().as_secs_f64(),
+            body
+        );
+    }
+    if content.is_empty() {
+        eprintln!(
+            "       ⚠ {step_label} returned only whitespace after {:.1}s; scoring as empty output",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    Ok(content)
+}
+
+fn extract_benchmark_response_text(body: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(text) = body.get("content").and_then(|value| value.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    if let Some(text) = body
+        .pointer("/choices/0/text")
+        .and_then(|value| value.as_str())
+    {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    if let Some(content) = body.pointer("/choices/0/message/content") {
+        match content {
+            serde_json::Value::String(text) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed.to_string());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            parts.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(reasoning) = body
+        .pointer("/choices/0/message/reasoning_content")
+        .and_then(|value| value.as_str())
+    {
+        let trimmed = reasoning.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    parts.join("\n\n")
+}
+
+fn benchmark_response_has_completion_payload(body: &serde_json::Value) -> bool {
+    body.get("content").is_some()
+        || body.pointer("/choices/0/text").is_some()
+        || body.pointer("/choices/0/message/content").is_some()
+        || body
+            .pointer("/choices/0/message/reasoning_content")
+            .is_some()
+}
+
+fn benchmark_response_is_parser_failure(body: &serde_json::Value) -> bool {
+    body.pointer("/error/message")
+        .and_then(|value| value.as_str())
+        .map(|message| message.contains("Failed to parse input"))
+        .unwrap_or(false)
+}
+
+fn render_benchmark_completion_prompt(prompt: &PromptCorpusEntry) -> String {
+    let mut rendered = String::new();
+    for message in &prompt.messages {
+        let _ = writeln!(
+            rendered,
+            "{}: {}\n",
+            capitalize_role(&message.role),
+            message.content.trim()
+        );
+    }
+    rendered.push_str("Assistant:");
+    rendered
+}
+
+async fn find_free_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn benchmark_assembly_concurrency(temp_root: &Path, model_bytes: u64, shard_count: usize) -> usize {
+    if let Ok(raw) = std::env::var("MESH_LLM_MOE_ASSEMBLY_CONCURRENCY") {
+        if let Ok(parsed) = raw.trim().parse::<usize>() {
+            return parsed.max(1).min(shard_count.max(1));
+        }
+    }
+
+    let cpu_slots = match std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+    {
+        0..=8 => 1,
+        9..=16 => 2,
+        17..=32 => 3,
+        _ => 4,
+    };
+
+    let per_assembly_budget = model_bytes.saturating_mul(2).max(8 * 1024 * 1024 * 1024);
+    let disk_slots = free_disk_space(temp_root)
+        .map(|free| (free / per_assembly_budget) as usize)
+        .unwrap_or(PACKAGE_BENCHMARK_ASSEMBLY_CONCURRENCY_CAP)
+        .max(1);
+
+    cpu_slots
+        .min(disk_slots)
+        .min(PACKAGE_BENCHMARK_ASSEMBLY_CONCURRENCY_CAP)
+        .min(shard_count.max(1))
+        .max(1)
+}
+
+fn benchmark_request_concurrency(model_bytes: u64) -> usize {
+    if let Ok(raw) = std::env::var("MESH_LLM_MOE_REQUEST_CONCURRENCY") {
+        if let Ok(parsed) = raw.trim().parse::<usize>() {
+            return parsed.max(1).min(PACKAGE_BENCHMARK_REQUEST_CONCURRENCY_CAP);
+        }
+    }
+
+    let cpu_slots = match std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+    {
+        0..=8 => 1,
+        9..=16 => 2,
+        17..=32 => 3,
+        _ => 4,
+    };
+
+    let model_slots = if model_bytes >= 40 * 1024 * 1024 * 1024 {
+        1
+    } else if model_bytes >= 20 * 1024 * 1024 * 1024 {
+        2
+    } else if model_bytes >= 10 * 1024 * 1024 * 1024 {
+        3
+    } else {
+        4
+    };
+
+    cpu_slots
+        .min(model_slots)
+        .min(PACKAGE_BENCHMARK_REQUEST_CONCURRENCY_CAP)
+        .max(1)
+}
+
+fn free_disk_space(path: &Path) -> Option<u64> {
+    let mut check = path.to_path_buf();
+    loop {
+        if check.exists() {
+            break;
+        }
+        if !check.pop() {
+            return None;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(check.as_os_str().as_bytes()).ok()?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+        if ret == 0 {
+            Some(stat.f_bavail as u64 * stat.f_frsize)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+async fn reqwest_health_check(url: &str) -> bool {
+    reqwest::Client::new()
+        .get(url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+}
+
+fn tokenize_similarity_text(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn token_dice_similarity(left: &str, right: &str) -> f64 {
+    let left_tokens = tokenize_similarity_text(left);
+    let right_tokens = tokenize_similarity_text(right);
+    if left_tokens.is_empty() && right_tokens.is_empty() {
+        return 1.0;
+    }
+    let mut left_counts = HashMap::new();
+    let mut right_counts = HashMap::new();
+    for token in left_tokens {
+        *left_counts.entry(token).or_insert(0usize) += 1;
+    }
+    for token in right_tokens {
+        *right_counts.entry(token).or_insert(0usize) += 1;
+    }
+    let overlap = left_counts
+        .iter()
+        .map(|(token, left_count)| {
+            right_counts
+                .get(token)
+                .map(|right_count| (*left_count).min(*right_count))
+                .unwrap_or(0)
+        })
+        .sum::<usize>();
+    let total = left_counts.values().sum::<usize>() + right_counts.values().sum::<usize>();
+    if total == 0 {
+        1.0
+    } else {
+        (2.0 * overlap as f64) / total as f64
+    }
+}
+
+fn mean_score(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
 }
 
 fn capitalize_role(role: &str) -> String {
@@ -867,19 +2046,13 @@ fn run_micro_experiment(
 ) -> Result<MicroAnalyzeExperimentReport> {
     let selected_prompts = prompts.iter().take(config.prompt_count).collect::<Vec<_>>();
     let start = Instant::now();
-    let temp_root = std::env::temp_dir().join(format!(
-        "mesh-llm-micro-analyze-{}-{}",
-        std::process::id(),
-        start.elapsed().as_nanos()
-    ));
-    std::fs::create_dir_all(&temp_root)
-        .with_context(|| format!("Create temp dir {}", temp_root.display()))?;
+    let temp_root = create_package_temp_dir(&model.path, "micro-analyze-")?;
 
     let mut mass_by_expert: BTreeMap<u32, f64> = BTreeMap::new();
     let mut selection_count_by_expert: BTreeMap<u32, u64> = BTreeMap::new();
 
     for (idx, prompt) in selected_prompts.iter().enumerate() {
-        let output_path = temp_root.join(format!("prompt-{idx}.csv"));
+        let output_path = temp_root.path().join(format!("prompt-{idx}.csv"));
         run_micro_analyze_export(
             model,
             prompt,
@@ -927,7 +2100,6 @@ fn run_micro_experiment(
         .map(|entry| entry.expert_id)
         .collect::<Vec<_>>();
     let elapsed = start.elapsed();
-    let _ = std::fs::remove_dir_all(&temp_root);
 
     Ok(MicroAnalyzeExperimentReport {
         name: config.name.to_string(),
