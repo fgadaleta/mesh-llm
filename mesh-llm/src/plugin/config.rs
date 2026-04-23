@@ -223,7 +223,12 @@ pub fn blackboard_plugin_spec() -> Result<ExternalPluginSpec> {
     Ok(ExternalPluginSpec {
         name: BLACKBOARD_PLUGIN_ID.to_string(),
         command,
-        args: vec!["--plugin".into(), BLACKBOARD_PLUGIN_ID.into()],
+        args: vec![
+            "--log-format".into(),
+            "json".into(),
+            "--plugin".into(),
+            BLACKBOARD_PLUGIN_ID.into(),
+        ],
     })
 }
 
@@ -235,7 +240,12 @@ pub fn blobstore_plugin_spec() -> Result<ExternalPluginSpec> {
     Ok(ExternalPluginSpec {
         name: BLOBSTORE_PLUGIN_ID.to_string(),
         command,
-        args: vec!["--plugin".into(), BLOBSTORE_PLUGIN_ID.into()],
+        args: vec![
+            "--log-format".into(),
+            "json".into(),
+            "--plugin".into(),
+            BLOBSTORE_PLUGIN_ID.into(),
+        ],
     })
 }
 
@@ -247,7 +257,12 @@ pub fn lemonade_plugin_spec() -> Result<ExternalPluginSpec> {
     Ok(ExternalPluginSpec {
         name: LEMONADE_PLUGIN_ID.to_string(),
         command,
-        args: vec!["--plugin".into(), LEMONADE_PLUGIN_ID.into()],
+        args: vec![
+            "--log-format".into(),
+            "json".into(),
+            "--plugin".into(),
+            LEMONADE_PLUGIN_ID.into(),
+        ],
     })
 }
 
@@ -532,9 +547,14 @@ model = "Qwen3-8B-Q4_K_M"
 
     #[test]
     fn gpu_parallel_unwrap_or_default_is_4() {
-        let values = [None, Some(1usize), Some(8usize), Some(64usize)];
-        let resolved: Vec<_> = values.into_iter().map(|value| value.unwrap_or(4)).collect();
-        assert_eq!(resolved, vec![4, 1, 8, 64]);
+        fn parsed_parallel(value: Option<usize>) -> usize {
+            value.unwrap_or(4)
+        }
+
+        assert_eq!(parsed_parallel(None), 4);
+        assert_eq!(parsed_parallel(Some(1)), 1);
+        assert_eq!(parsed_parallel(Some(8)), 8);
+        assert_eq!(parsed_parallel(Some(64)), 64);
     }
 
     #[test]
