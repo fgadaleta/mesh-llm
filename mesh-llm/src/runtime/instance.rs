@@ -230,6 +230,10 @@ impl Drop for PidfileGuard {
 /// 3. The platform home directory from [`dirs::home_dir`]
 /// 4. [`anyhow::bail!`] - at least one of the above must be set
 pub fn runtime_root() -> Result<PathBuf> {
+    runtime_root_with_home(dirs::home_dir())
+}
+
+fn runtime_root_with_home(home: Option<PathBuf>) -> Result<PathBuf> {
     // 1. Explicit override — always wins (also used by tests to avoid touching ~)
     if let Ok(root) = std::env::var("MESH_LLM_RUNTIME_ROOT") {
         return Ok(PathBuf::from(root));
@@ -242,7 +246,7 @@ pub fn runtime_root() -> Result<PathBuf> {
 
     // 3. Platform home directory. On Windows this can be available even when
     // HOME is unset in the launching shell.
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = home {
         return Ok(home.join(".mesh-llm").join("runtime"));
     }
 
@@ -1634,17 +1638,14 @@ mod tests {
         assert_eq!(root, home.join(".mesh-llm").join("runtime"));
     }
 
-    #[cfg(not(windows))]
     #[test]
     #[serial]
     fn runtime_root_bails_when_unset() {
-        // dirs 6.x only checks the HOME env var — no passwd fallback — so
-        // removing HOME is sufficient to make dirs::home_dir() return None.
         let _g_mesh = EnvGuard::save_and_remove("MESH_LLM_RUNTIME_ROOT");
         let _g_xdg = EnvGuard::save_and_remove("XDG_RUNTIME_DIR");
         let _g_home = EnvGuard::save_and_remove("HOME");
 
-        let result = runtime_root();
+        let result = runtime_root_with_home(None);
         assert!(
             result.is_err(),
             "runtime_root must bail when no path source is set"
