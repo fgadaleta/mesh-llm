@@ -590,19 +590,61 @@ switch ($backendName) {
 }
 
 Invoke-InRepo {
+    $llamaRepo = "https://github.com/Mesh-LLM/llama.cpp.git"
+    $llamaPinSha = $env:MESH_LLM_LLAMA_PIN_SHA
+    $llamaPinFile = Join-Path $repoRoot "LLAMA_CPP_SHA"
+    if (-not $llamaPinSha -and (Test-Path $llamaPinFile)) {
+        $llamaPinSha = (Get-Content -Path $llamaPinFile -Raw).Trim()
+    }
+
     if (-not (Test-Path $llamaDir)) {
-        Write-Host "Cloning michaelneale/llama.cpp (upstream-latest branch)..."
-        Invoke-NativeCommand "git" @("clone", "-b", "upstream-latest", "https://github.com/michaelneale/llama.cpp.git", $llamaDir)
+        if ($llamaPinSha) {
+            Write-Host "Cloning Mesh-LLM/llama.cpp pinned to $llamaPinSha..."
+            Invoke-NativeCommand "git" @("clone", "-b", "master", "--depth", "1", $llamaRepo, $llamaDir)
+            Push-Location $llamaDir
+            try {
+                if (-not (Test-CommandSuccess "git" @("cat-file", "-e", "${llamaPinSha}^{commit}"))) {
+                    Write-Host "Pinned SHA not on master tip, fetching explicitly..."
+                    Invoke-NativeCommand "git" @("fetch", "--depth", "1", "origin", $llamaPinSha)
+                }
+                Invoke-NativeCommand "git" @("checkout", "--detach", $llamaPinSha)
+            } finally {
+                Pop-Location
+            }
+        } else {
+            Write-Host "Cloning Mesh-LLM/llama.cpp (master)..."
+            Invoke-NativeCommand "git" @("clone", "-b", "master", $llamaRepo, $llamaDir)
+        }
     } else {
         Push-Location $llamaDir
         try {
-            $currentBranch = (& git branch --show-current).Trim()
-            if ($currentBranch -ne "upstream-latest") {
-                Write-Host "Switching llama.cpp from '$currentBranch' to upstream-latest..."
-                Invoke-NativeCommand "git" @("checkout", "upstream-latest")
+            if (Test-CommandSuccess "git" @("remote", "get-url", "origin")) {
+                Invoke-NativeCommand "git" @("remote", "set-url", "origin", $llamaRepo)
+            } else {
+                Invoke-NativeCommand "git" @("remote", "add", "origin", $llamaRepo)
             }
-            Write-Host "Pulling latest upstream-latest from origin..."
-            Invoke-NativeCommand "git" @("pull", "--ff-only", "origin", "upstream-latest")
+
+            if ($llamaPinSha) {
+                if (-not (Test-CommandSuccess "git" @("cat-file", "-e", "${llamaPinSha}^{commit}"))) {
+                    Write-Host "Fetching pinned llama.cpp SHA $llamaPinSha..."
+                    Invoke-NativeCommand "git" @("fetch", "--depth", "1", "origin", $llamaPinSha)
+                }
+                $currentSha = (& git rev-parse HEAD).Trim()
+                if ($currentSha -ne $llamaPinSha) {
+                    Write-Host "Checking out pinned llama.cpp SHA $llamaPinSha (was $currentSha)..."
+                    Invoke-NativeCommand "git" @("checkout", "--detach", $llamaPinSha)
+                } else {
+                    Write-Host "llama.cpp already at pinned SHA $llamaPinSha, no checkout needed"
+                }
+            } else {
+                $currentBranch = (& git branch --show-current).Trim()
+                if ($currentBranch -ne "master") {
+                    Write-Host "Switching llama.cpp from '$currentBranch' to master..."
+                    Invoke-NativeCommand "git" @("checkout", "master")
+                }
+                Write-Host "Pulling latest master from origin..."
+                Invoke-NativeCommand "git" @("pull", "--ff-only", "origin", "master")
+            }
         } finally {
             Pop-Location
         }
@@ -612,6 +654,7 @@ Invoke-InRepo {
         "-B", $buildDir,
         "-S", $llamaDir,
         "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_CXX_FLAGS=/DPATH_MAX=4096",
         "-DGGML_RPC=ON",
         "-DGGML_METAL=OFF",
         "-DGGML_CUDA=OFF",

@@ -983,7 +983,9 @@ pub(crate) enum ProcessSignal {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SignalOutcome {
     Sent,
+    #[cfg(not(windows))]
     AlreadyDead,
+    #[cfg(not(windows))]
     Skipped,
     Failed,
 }
@@ -1018,6 +1020,7 @@ fn send_signal_if_matches(
 
     #[cfg(windows)]
     {
+        let _ = expected_start_time;
         tracing::debug!(
             pid,
             expected_comm,
@@ -1085,10 +1088,13 @@ pub(crate) fn terminate_process_blocking(
         ProcessSignal::Terminate,
     ) {
         SignalOutcome::Sent => {}
+        #[cfg(not(windows))]
         SignalOutcome::AlreadyDead => return true,
         // Identity mismatch: the PID belongs to a different process; do not
         // claim a successful stop.
-        SignalOutcome::Skipped | SignalOutcome::Failed => return false,
+        #[cfg(not(windows))]
+        SignalOutcome::Skipped => return false,
+        SignalOutcome::Failed => return false,
     }
 
     for _ in 0..20 {
@@ -1100,10 +1106,12 @@ pub(crate) fn terminate_process_blocking(
         }
     }
 
-    matches!(
-        send_signal_if_matches(pid, expected_comm, expected_start_time, ProcessSignal::Kill),
-        SignalOutcome::Sent | SignalOutcome::AlreadyDead
-    )
+    match send_signal_if_matches(pid, expected_comm, expected_start_time, ProcessSignal::Kill) {
+        SignalOutcome::Sent => true,
+        #[cfg(not(windows))]
+        SignalOutcome::AlreadyDead => true,
+        _ => false,
+    }
 }
 
 async fn terminate_process_with_wait(
@@ -1120,7 +1128,9 @@ async fn terminate_process_with_wait(
         ProcessSignal::Terminate,
     ) {
         SignalOutcome::Sent => {}
-        SignalOutcome::AlreadyDead | SignalOutcome::Skipped | SignalOutcome::Failed => return,
+        #[cfg(not(windows))]
+        SignalOutcome::AlreadyDead | SignalOutcome::Skipped => return,
+        SignalOutcome::Failed => return,
     }
 
     for _ in 0..attempts {
