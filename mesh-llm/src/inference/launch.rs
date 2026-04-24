@@ -211,6 +211,78 @@ fn resolve_binary_path(
     }
 }
 
+fn child_library_search_paths(binary_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(parent) = binary_path.parent() {
+        paths.push(parent.to_path_buf());
+    }
+    paths.extend(platform_runtime_library_paths());
+    paths
+}
+
+#[cfg(windows)]
+fn platform_runtime_library_paths() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(cuda_path) = std::env::var_os("CUDA_PATH").filter(|value| !value.is_empty()) {
+        roots.push(PathBuf::from(cuda_path));
+    }
+    if let Some(program_files) = std::env::var_os("ProgramFiles").filter(|value| !value.is_empty())
+    {
+        let toolkit_root = PathBuf::from(program_files)
+            .join("NVIDIA GPU Computing Toolkit")
+            .join("CUDA");
+        if let Ok(entries) = std::fs::read_dir(toolkit_root) {
+            let mut discovered = entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| match entry.file_type() {
+                    Ok(file_type) if file_type.is_dir() => Some(entry.path()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            discovered.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+            roots.extend(discovered);
+        }
+    }
+
+    let mut paths = Vec::new();
+    for root in roots {
+        paths.push(root.join("bin"));
+        paths.push(root.join("bin").join("x64"));
+    }
+    paths
+}
+
+#[cfg(not(windows))]
+fn platform_runtime_library_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+fn prepend_child_library_paths(command: &mut Command, binary_path: &Path) {
+    let mut paths = child_library_search_paths(binary_path);
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+
+    paths.retain(|path| path.exists());
+    dedup_paths(&mut paths);
+
+    if let Ok(joined) = std::env::join_paths(paths) {
+        command.env("PATH", joined);
+    }
+}
+
+fn dedup_paths(paths: &mut Vec<PathBuf>) {
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|path| {
+        let key = path.to_string_lossy();
+        #[cfg(windows)]
+        let key = key.to_ascii_lowercase();
+        #[cfg(not(windows))]
+        let key = key.to_string();
+        seen.insert(key)
+    });
+}
+
 #[derive(Debug)]
 pub struct InferenceServerHandle {
     pid: u32,
@@ -808,7 +880,8 @@ pub async fn start_rpc_server(
         );
     }
 
-    let mut child = Command::new(&rpc_server.path)
+    let mut command = Command::new(&rpc_server.path);
+    command
         .args(&args)
         .env("MESH_LLM_OWNER_PID", std::process::id().to_string())
         .env(
@@ -816,14 +889,15 @@ pub async fn start_rpc_server(
             runtime.dir().to_string_lossy().to_string(),
         )
         .stdout(std::process::Stdio::from(rpc_log_file))
-        .stderr(std::process::Stdio::from(rpc_log_file2))
-        .spawn()
-        .with_context(|| {
-            format!(
-                "Failed to start rpc-server at {}",
-                rpc_server.path.display()
-            )
-        })?;
+        .stderr(std::process::Stdio::from(rpc_log_file2));
+    prepend_child_library_paths(&mut command, &rpc_server.path);
+
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "Failed to start rpc-server at {}",
+            rpc_server.path.display()
+        )
+    })?;
 
     let pid = child.id().context("rpc-server did not expose a PID")?;
     if pid == 0 {
@@ -909,7 +983,9 @@ pub(crate) enum ProcessSignal {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SignalOutcome {
     Sent,
+    #[cfg(not(windows))]
     AlreadyDead,
+    #[cfg(not(windows))]
     Skipped,
     Failed,
 }
@@ -944,6 +1020,7 @@ fn send_signal_if_matches(
 
     #[cfg(windows)]
     {
+        let _ = expected_start_time;
         tracing::debug!(
             pid,
             expected_comm,
@@ -1011,10 +1088,13 @@ pub(crate) fn terminate_process_blocking(
         ProcessSignal::Terminate,
     ) {
         SignalOutcome::Sent => {}
+        #[cfg(not(windows))]
         SignalOutcome::AlreadyDead => return true,
         // Identity mismatch: the PID belongs to a different process; do not
         // claim a successful stop.
-        SignalOutcome::Skipped | SignalOutcome::Failed => return false,
+        #[cfg(not(windows))]
+        SignalOutcome::Skipped => return false,
+        SignalOutcome::Failed => return false,
     }
 
     for _ in 0..20 {
@@ -1026,10 +1106,12 @@ pub(crate) fn terminate_process_blocking(
         }
     }
 
-    matches!(
-        send_signal_if_matches(pid, expected_comm, expected_start_time, ProcessSignal::Kill),
-        SignalOutcome::Sent | SignalOutcome::AlreadyDead
-    )
+    match send_signal_if_matches(pid, expected_comm, expected_start_time, ProcessSignal::Kill) {
+        SignalOutcome::Sent => true,
+        #[cfg(not(windows))]
+        SignalOutcome::AlreadyDead => true,
+        _ => false,
+    }
 }
 
 async fn terminate_process_with_wait(
@@ -1046,7 +1128,9 @@ async fn terminate_process_with_wait(
         ProcessSignal::Terminate,
     ) {
         SignalOutcome::Sent => {}
-        SignalOutcome::AlreadyDead | SignalOutcome::Skipped | SignalOutcome::Failed => return,
+        #[cfg(not(windows))]
+        SignalOutcome::AlreadyDead | SignalOutcome::Skipped => return,
+        SignalOutcome::Failed => return,
     }
 
     for _ in 0..attempts {
@@ -1324,7 +1408,8 @@ pub async fn start_llama_server(
             tracing::warn!("mmproj not found at {}, skipping vision", proj.display());
         }
     }
-    let mut child = Command::new(&llama_server.path)
+    let mut command = Command::new(&llama_server.path);
+    command
         .args(&args)
         .env("MESH_LLM_OWNER_PID", std::process::id().to_string())
         .env(
@@ -1332,14 +1417,15 @@ pub async fn start_llama_server(
             runtime.dir().to_string_lossy().to_string(),
         )
         .stdout(std::process::Stdio::from(log_file))
-        .stderr(std::process::Stdio::from(log_file2))
-        .spawn()
-        .with_context(|| {
-            format!(
-                "Failed to start llama-server at {}",
-                llama_server.path.display()
-            )
-        })?;
+        .stderr(std::process::Stdio::from(log_file2));
+    prepend_child_library_paths(&mut command, &llama_server.path);
+
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "Failed to start llama-server at {}",
+            llama_server.path.display()
+        )
+    })?;
 
     // Wait for health check — scale timeout by model size so large MoE shards
     // don't hit a fixed ceiling. 120s per GB gives plenty of headroom for slow
