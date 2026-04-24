@@ -404,38 +404,35 @@ fn cached_repo_files(repo: &CachedRepo) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
 
+    let mut snapshot_entries = Vec::new();
+    for entry in
+        std::fs::read_dir(&snapshots_dir).with_context(|| format!("Read {}", snapshots_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        snapshot_entries.push((entry.file_name().to_string_lossy().to_string(), entry.path()));
+    }
+
     let mut snapshot_roots = Vec::new();
     let exact = snapshots_dir.join(&repo.local_revision);
     if exact.is_dir() {
         snapshot_roots.push(exact);
     } else {
-        let mut prefix_matches = Vec::new();
-        for entry in
-            std::fs::read_dir(&snapshots_dir).with_context(|| format!("Read {}", snapshots_dir.display()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&repo.local_revision) || repo.local_revision.starts_with(&name) {
-                prefix_matches.push(entry.path());
-            }
-        }
+        let mut prefix_matches: Vec<PathBuf> = snapshot_entries
+            .iter()
+            .filter(|(name, _)| {
+                name.starts_with(&repo.local_revision) || repo.local_revision.starts_with(name)
+            })
+            .map(|(_, path)| path.clone())
+            .collect();
         prefix_matches.sort();
         snapshot_roots.extend(prefix_matches);
     }
 
     if snapshot_roots.is_empty() {
-        let mut all = Vec::new();
-        for entry in
-            std::fs::read_dir(&snapshots_dir).with_context(|| format!("Read {}", snapshots_dir.display()))?
-        {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                all.push(entry.path());
-            }
-        }
+        let mut all: Vec<PathBuf> = snapshot_entries.into_iter().map(|(_, path)| path).collect();
         all.sort();
         snapshot_roots = all;
     }
