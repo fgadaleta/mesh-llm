@@ -129,7 +129,7 @@ Every node gets an OpenAI-compatible API at `http://localhost:9337/v1`. Distribu
 - **MoE model too big?** → expert parallelism — experts split across nodes, zero cross-node traffic
 
 If a node has enough VRAM, it always runs the full model. Splitting only happens when it has to.
-Currently using a lightly forked version of llama.cpp (see the Justfile for where it pulls branch from).
+Currently using upstream llama.cpp with a pinned Mesh-LLM patch queue; see [mesh-llm/docs/LLAMA_CPP_FORK.md](mesh-llm/docs/LLAMA_CPP_FORK.md).
 
 **Pipeline parallelism** — for dense models that don't fit on one machine, layers are distributed across nodes proportional to VRAM. llama-server runs on the highest-VRAM node and coordinates via RPC. Each rpc-server loads only its assigned layers from local disk. Latency-aware: peers are selected by lowest RTT first, with an 80ms hard cap — high-latency nodes stay in the mesh as API clients but don't participate in splits.
 
@@ -536,7 +536,8 @@ You can also try the hosted demo:
 - [CONTRIBUTING.md](CONTRIBUTING.md) for local development and build workflows
 - [PLUGINS.md](PLUGINS.md) for the plugin system and blackboard internals
 - [mesh-llm/docs/VIRTUAL_LLM.md](mesh-llm/docs/VIRTUAL_LLM.md) for inter-model collaboration design
-- [mesh-llm/docs/LLAMA_CPP_FORK.md](mesh-llm/docs/LLAMA_CPP_FORK.md) for llama.cpp fork maintenance
+- [mesh-llm/docs/LLAMA_CPP_FORK.md](mesh-llm/docs/LLAMA_CPP_FORK.md) for llama.cpp patch queue maintenance
+- [mesh-llm/docs/LLAMA_STAGE_INTEGRATION_PLAN.md](mesh-llm/docs/LLAMA_STAGE_INTEGRATION_PLAN.md) for the planned llama-stage-runtime integration
 - [mesh-llm/README.md](mesh-llm/README.md) for Rust crate structure
 - [ROADMAP.md](ROADMAP.md) for future work
 

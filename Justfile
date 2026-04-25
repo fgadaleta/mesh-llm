@@ -1,6 +1,6 @@
 # Distributed LLM Inference — build & run tasks
 
-llama_dir := "llama.cpp"
+llama_dir := env("MESH_LLM_LLAMA_DIR", ".deps/llama.cpp")
 build_dir := llama_dir / "build"
 mesh_dir := "mesh-llm"
 ui_dir := mesh_dir / "ui"
@@ -332,11 +332,11 @@ test port="9337":
 
 # Optional SDK compatibility smoke: 2 mesh nodes + 1 lite client.
 compat-smoke model mmproj="":
-    scripts/ci-compat-smoke.sh "target/release/mesh-llm" "llama.cpp/build/bin" "{{ model }}" "{{ mmproj }}"
+    scripts/ci-compat-smoke.sh "target/release/mesh-llm" "{{ build_dir }}/bin" "{{ model }}" "{{ mmproj }}"
 
 # Direct splitter smoke for the MoE families we actively use.
 moe-split-smoke families="all":
-    scripts/moe-split-smoke.sh "llama.cpp/build/bin" {{ families }}
+    scripts/moe-split-smoke.sh "{{ build_dir }}/bin" {{ families }}
 
 # Validate an already-running MoE deployment end-to-end through one API/console pair.
 moe-live-smoke model api_url console_url expected_nodes="2" timeout="120":
@@ -346,9 +346,9 @@ moe-live-smoke model api_url console_url expected_nodes="2" timeout="120":
 bench-prefix-affinity:
     @scripts/benchmark-prefix-affinity.sh
 
-# Show our custom commits on top of upstream llama.cpp
+# Show the local llama.cpp patch queue
 diff:
-    cd {{ llama_dir }} && git log --oneline --ancestry-path $(git merge-base HEAD upstream/master 2>/dev/null || echo HEAD~8)..HEAD
+    ls -1 third_party/llama.cpp/patches
 
 # Build the client-only Docker image (no GPU, no llama.cpp)
 [unix]

@@ -1,0 +1,803 @@
+From a36af408887cb0c12b1d685ba19d3af6d50043f1 Mon Sep 17 00:00:00 2001
+From: Michael Neale <michael.neale@gmail.com>
+Date: Sat, 28 Feb 2026 08:54:14 -0500
+Subject: [PATCH 04/15] MoE Phase 1: expert mask routing + analysis tool
+
+Phase 1a: moe-analyze tool
+- Intercepts ffn_moe_probs via eval callback to observe router decisions
+- Computes per-expert gate mass, selection counts, concentration stats
+- Simulates group masking across different group counts (2/4/8) with replicas
+- Result: 99.3% routing mass capture even at 8 groups (16 experts/group)
+
+Phase 1b: expert masking during inference
+- llama_model_set_expert_mask() public API to set/clear expert masks at runtime
+- llm_graph_input_expert_mask input class with set_input pattern
+- Mask applied in build_moe_ffn() as -inf additive bias before argsort_top_k
+- Shared mask tensor across all MoE layers (created lazily on first layer)
+- expert_mask_enabled + fixed-size bool array in hparams (trivially copyable)
+
+Phase 1b results on Qwen3-30B-A3B (128 experts, top-8, 4 groups of 32):
+- Best group: -0.105 avg logprob delta (nearly lossless)
+- Worst group: -2.292 avg logprob delta (significant degradation)
+- Key finding: routing mass capture != quality preservation
+- Validates probe-based session placement approach
+---
+ common/common.h                   |   3 +
+ include/llama.h                   |   6 +
+ src/llama-graph.cpp               |  36 ++
+ src/llama-graph.h                 |  15 +
+ src/llama-hparams.h               |   6 +
+ src/llama-model.cpp               |  16 +
+ tools/CMakeLists.txt              |   1 +
+ tools/moe-analyze/CMakeLists.txt  |   5 +
+ tools/moe-analyze/moe-analyze.cpp | 577 ++++++++++++++++++++++++++++++
+ 9 files changed, 665 insertions(+)
+ create mode 100644 tools/moe-analyze/CMakeLists.txt
+ create mode 100644 tools/moe-analyze/moe-analyze.cpp
+
+diff --git a/common/common.h b/common/common.h
+index 020b6a721..b4df2c859 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -439,6 +439,9 @@ struct common_params {
+     bool    fit_params         = true; // whether to fit unset model/context parameters to free device memory
+     int32_t fit_params_min_ctx = 4096; // minimum context size to set when trying to reduce memory use
+ 
++    // MoE expert mask: comma-separated list of allowed expert IDs (empty = all allowed)
++    std::string expert_mask_str;
++
+     // margin per device in bytes for fitting parameters to free memory:
+     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
+ 
+diff --git a/include/llama.h b/include/llama.h
+index ac267b508..885b76e61 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -623,6 +623,12 @@ extern "C" {
+     // Returns the total number of parameters in the model
+     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
+ 
++    // Set MoE expert mask for distributed inference with masked expert groups.
++    // mask is an array of n_expert bools: true = expert allowed, false = masked out.
++    // Pass nullptr to clear the mask (all experts allowed).
++    // Returns 0 on success, -1 if n_mask doesn't match model's expert count.
++    LLAMA_API int32_t llama_model_set_expert_mask(struct llama_model * model, const bool * mask, int32_t n_mask);
++
+     // Returns true if the model contains an encoder that requires llama_encode() call
+     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8e2b6ab8e..4b4b0c866 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -769,6 +769,22 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
+     }
+ }
+ 
++void llm_graph_input_expert_mask::set_input(const llama_ubatch * /*ubatch*/) {
++    if (!expert_mask_tensor) return;
++
++    const int n_expert = (int)expert_mask_tensor->ne[0];
++    std::vector<float> mask_data(n_expert, 0.0f);
++    for (int e = 0; e < n_expert; e++) {
++        mask_data[e] = hp.expert_mask[e] ? 0.0f : -INFINITY;
++    }
++    ggml_backend_tensor_set(expert_mask_tensor, mask_data.data(), 0, n_expert * sizeof(float));
++}
++
++bool llm_graph_input_expert_mask::can_reuse(const llm_graph_params & params) {
++    // mask is static, reusable if enabled state matches
++    return params.hparams.expert_mask_enabled == hp.expert_mask_enabled;
++}
++
+ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
+     if (samplers.size() != params.samplers.size()) {
+         return false;
+@@ -1370,6 +1386,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(selection_probs, "ffn_moe_probs_masked", il);
+     }
+ 
++    // apply external expert mask for distributed MoE (masked expert groups)
++    if (hparams.expert_mask_enabled) {
++        // create mask tensor lazily (shared across all MoE layers)
++        if (!expert_mask_tensor) {
++            auto inp = std::make_unique<llm_graph_input_expert_mask>(hparams);
++
++            expert_mask_tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_expert);
++            ggml_set_name(expert_mask_tensor, "expert_mask");
++            ggml_set_input(expert_mask_tensor);
++
++            inp->expert_mask_tensor = expert_mask_tensor;
++            res->add_input(std::move(inp));
++        }
++
++        // Broadcast-add mask to selection_probs [n_expert, n_tokens]
++        ggml_tensor * emask_2d = ggml_reshape_2d(ctx0, expert_mask_tensor, n_expert, 1);
++        selection_probs = ggml_add(ctx0, selection_probs, ggml_repeat(ctx0, emask_2d, selection_probs));
++        cb(selection_probs, "ffn_moe_probs_expert_masked", il);
++    }
++
+     // select experts
+     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+     cb(selected_experts->src[0], "ffn_moe_argsort", il);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 29e78451f..da996af2e 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -499,6 +499,18 @@ public:
+     const llama_memory_hybrid_iswa_context * mctx;
+ };
+ 
++// MoE expert mask for distributed inference with masked expert groups
++class llm_graph_input_expert_mask : public llm_graph_input_i {
++public:
++    llm_graph_input_expert_mask(const llama_hparams & hp) : hp(hp) {}
++    virtual ~llm_graph_input_expert_mask() = default;
++
++    void set_input(const llama_ubatch * ubatch) override;
++    bool can_reuse(const llm_graph_params & params) override;
++
++    ggml_tensor * expert_mask_tensor = nullptr; // F32 [n_expert], 0.0 or -inf
++    const llama_hparams & hp;
++};
+ class llm_graph_input_sampling : public llm_graph_input_i {
+ public:
+     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
+@@ -761,6 +773,9 @@ struct llm_graph_context {
+     ggml_context * ctx0 = nullptr;
+     ggml_cgraph  * gf   = nullptr;
+ 
++    // cached expert mask tensor (shared across MoE layers, created lazily)
++    mutable ggml_tensor * expert_mask_tensor = nullptr;
++
+     llm_graph_context(const llm_graph_params & params);
+     virtual ~llm_graph_context() = default;
+ 
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index c2000c77c..c591186c3 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -92,6 +92,12 @@ struct llama_hparams {
+     uint32_t moe_latent_size      = 0;
+     uint32_t nextn_predict_layers = 0;
+ 
++    // MoE expert mask for distributed inference with masked expert groups.
++    // If expert_mask_enabled, only experts with mask bit set are eligible for routing.
++    // Masked-out experts get -inf selection probs before top-k.
++    bool expert_mask_enabled = false;
++    bool expert_mask[LLAMA_MAX_EXPERTS] = {}; // true = allowed. only used when expert_mask_enabled.
++
+     float f_norm_eps;
+     float f_norm_rms_eps;
+     float f_norm_group_eps;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index ae2410a42..660965167 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -9637,6 +9637,22 @@ uint64_t llama_model_n_params(const llama_model * model) {
+     return model->n_elements();
+ }
+ 
++int32_t llama_model_set_expert_mask(llama_model * model, const bool * mask, int32_t n_mask) {
++    if (mask == nullptr) {
++        model->hparams.expert_mask_enabled = false;
++        memset(model->hparams.expert_mask, 0, sizeof(model->hparams.expert_mask));
++        return 0;
++    }
++    if ((uint32_t)n_mask != model->hparams.n_expert) {
++        return -1;
++    }
++    model->hparams.expert_mask_enabled = true;
++    for (int i = 0; i < n_mask; i++) {
++        model->hparams.expert_mask[i] = mask[i];
++    }
++    return 0;
++}
++
+ bool llama_model_has_encoder(const llama_model * model) {
+     switch (model->arch) {
+         case LLM_ARCH_T5:        return true;
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index b433c91d8..1da901e1f 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -39,4 +39,5 @@ else()
+     endif()
+     add_subdirectory(fit-params)
+     add_subdirectory(results)
++    add_subdirectory(moe-analyze)
+ endif()
+diff --git a/tools/moe-analyze/CMakeLists.txt b/tools/moe-analyze/CMakeLists.txt
+new file mode 100644
+index 000000000..2b9ac1804
+--- /dev/null
++++ b/tools/moe-analyze/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TARGET llama-moe-analyze)
++add_executable(${TARGET} moe-analyze.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/tools/moe-analyze/moe-analyze.cpp b/tools/moe-analyze/moe-analyze.cpp
+new file mode 100644
+index 000000000..d80b4bcbd
+--- /dev/null
++++ b/tools/moe-analyze/moe-analyze.cpp
+@@ -0,0 +1,577 @@
++// MoE Expert Routing Analyzer
++//
++// Loads an MoE model, runs prompts, and collects expert routing statistics
++// using the eval callback to observe ffn_moe_probs tensors.
++//
++// This answers: "If I restrict routing to a subset of experts, how much
++// router probability mass do I lose?" — the key question for distributed
++// MoE with masked expert groups.
++
++#include "arg.h"
++#include "common.h"
++#include "log.h"
++#include "llama.h"
++#include "ggml.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <map>
++#include <algorithm>
++#include <numeric>
++#include <set>
++#include <fstream>
++
++// ---- data structures ----
++
++struct expert_stats {
++    // per-expert counters across all layers and tokens
++    std::vector<double> total_mass;     // [n_expert] sum of gate probs
++    std::vector<int64_t> selection_count; // [n_expert] times in top-k
++    int64_t total_tokens = 0;
++    int64_t total_moe_layers_seen = 0;
++};
++
++struct layer_snapshot {
++    int layer_id;
++    int n_expert;
++    int n_tokens;
++    std::vector<float> probs; // [n_expert * n_tokens], row-major
++};
++
++struct callback_data {
++    std::vector<uint8_t> buf;           // scratch for GPU->CPU copy
++    std::vector<layer_snapshot> snapshots;
++    int n_expert = 0;
++    int n_expert_used = 0;
++    int max_layers_to_log = 6;         // only log first N MoE layers (low bias)
++    int layers_seen_this_eval = 0;
++    bool collect = true;
++};
++
++// ---- eval callback: intercept ffn_moe_probs ----
++
++static bool moe_callback(struct ggml_tensor * t, bool ask, void * user_data) {
++    auto * cb = (callback_data *) user_data;
++
++    if (!cb->collect) return false;
++
++    // we only care about ffn_moe_probs (the router output before masking/top-k)
++    if (ask) {
++        if (strstr(t->name, "ffn_moe_probs") != nullptr
++            && strstr(t->name, "masked") == nullptr
++            && strstr(t->name, "biased") == nullptr) {
++            return true;
++        }
++        return false;
++    }
++
++    // data retrieval phase
++    if (strstr(t->name, "ffn_moe_probs") == nullptr) return true;
++    if (strstr(t->name, "masked") != nullptr || strstr(t->name, "biased") != nullptr) return true;
++
++    // parse layer id from name: "ffn_moe_probs-L" where L is the layer
++    int layer_id = -1;
++    const char * dash = strrchr(t->name, '-');
++    if (dash) layer_id = atoi(dash + 1);
++
++    if (layer_id >= cb->max_layers_to_log) return true;
++
++    cb->layers_seen_this_eval++;
++
++    // tensor shape: [n_expert, n_tokens]
++    int n_expert = (int)t->ne[0];
++    int n_tokens = (int)t->ne[1];
++    cb->n_expert = n_expert;
++
++    // copy data from GPU if needed
++    const bool is_host = ggml_backend_buffer_is_host(t->buffer);
++    float * data_ptr;
++    if (!is_host) {
++        size_t n_bytes = ggml_nbytes(t);
++        cb->buf.resize(n_bytes);
++        ggml_backend_tensor_get(t, cb->buf.data(), 0, n_bytes);
++        data_ptr = (float *)cb->buf.data();
++    } else {
++        data_ptr = (float *)t->data;
++    }
++
++    // store snapshot
++    layer_snapshot snap;
++    snap.layer_id = layer_id;
++    snap.n_expert = n_expert;
++    snap.n_tokens = n_tokens;
++    snap.probs.assign(data_ptr, data_ptr + n_expert * n_tokens);
++    cb->snapshots.push_back(std::move(snap));
++
++    return true;
++}
++
++// ---- analysis functions ----
++
++struct group_score {
++    int group_id;
++    double mass_captured;   // sum of top-k probs within group (incl replicated)
++    double mass_total;      // total prob mass in group
++};
++
++// Given a set of replicated expert IDs, compute group capture ratio
++// where each group gets its own experts PLUS the replicated set
++static double compute_group_capture_with_replicas(
++    const float * probs, int n_expert, int top_k,
++    int group_id, int experts_per_group,
++    const std::set<int> & replicated
++) {
++    // collect probs for experts in this group + replicated
++    std::vector<float> eligible_probs;
++    for (int e = group_id * experts_per_group;
++         e < (group_id + 1) * experts_per_group && e < n_expert; e++) {
++        eligible_probs.push_back(probs[e]);
++    }
++    for (int r : replicated) {
++        // don't double-count if already in group
++        if (r >= group_id * experts_per_group && r < (group_id + 1) * experts_per_group) continue;
++        if (r >= 0 && r < n_expert) {
++            eligible_probs.push_back(probs[r]);
++        }
++    }
++    std::sort(eligible_probs.begin(), eligible_probs.end(), std::greater<float>());
++    double captured = 0;
++    for (int i = 0; i < top_k && i < (int)eligible_probs.size(); i++) {
++        captured += eligible_probs[i];
++    }
++    return captured;
++}
++
++// For a given snapshot (one layer, one or more tokens), compute:
++// - per-expert mass
++// - group scores for different group assignments
++static void analyze_snapshot(
++    const layer_snapshot & snap,
++    int n_groups,
++    int top_k,
++    expert_stats & stats,
++    std::vector<std::vector<group_score>> & group_results  // [token][group]
++) {
++    int n_exp = snap.n_expert;
++
++    for (int tok = 0; tok < snap.n_tokens; tok++) {
++        const float * p = snap.probs.data() + tok * n_exp;
++
++        // accumulate per-expert stats
++        for (int e = 0; e < n_exp; e++) {
++            stats.total_mass[e] += p[e];
++        }
++
++        // find global top-k
++        std::vector<int> sorted_idx(n_exp);
++        std::iota(sorted_idx.begin(), sorted_idx.end(), 0);
++        std::sort(sorted_idx.begin(), sorted_idx.end(),
++            [&](int a, int b) { return p[a] > p[b]; });
++
++        for (int i = 0; i < top_k && i < n_exp; i++) {
++            stats.selection_count[sorted_idx[i]]++;
++        }
++        stats.total_tokens++;
++
++        // compute group scores
++        int experts_per_group = n_exp / n_groups;
++        std::vector<group_score> scores(n_groups);
++
++        for (int g = 0; g < n_groups; g++) {
++            scores[g].group_id = g;
++            scores[g].mass_total = 0;
++            scores[g].mass_captured = 0;
++
++            // collect probs for experts in this group
++            std::vector<float> group_probs;
++            for (int e = g * experts_per_group; e < (g + 1) * experts_per_group && e < n_exp; e++) {
++                group_probs.push_back(p[e]);
++                scores[g].mass_total += p[e];
++            }
++
++            // sort descending and take top-k
++            std::sort(group_probs.begin(), group_probs.end(), std::greater<float>());
++            for (int i = 0; i < top_k && i < (int)group_probs.size(); i++) {
++                scores[g].mass_captured += group_probs[i];
++            }
++        }
++
++        group_results.push_back(std::move(scores));
++    }
++
++    stats.total_moe_layers_seen++;
++}
++
++// ---- prompts ----
++
++static std::vector<std::string> get_test_prompts() {
++    return {
++        // code
++        "<|im_start|>user\nWrite a Python function to find the nth Fibonacci number using dynamic programming.<|im_end|>\n<|im_start|>assistant\n",
++        "<|im_start|>user\nWrite a Rust function that reads a CSV file and returns a Vec of structs.<|im_end|>\n<|im_start|>assistant\n",
++        "<|im_start|>user\nExplain how a B-tree index works in a database.<|im_end|>\n<|im_start|>assistant\n",
++        // reasoning
++        "<|im_start|>user\nIf all roses are flowers and some flowers fade quickly, can we conclude that some roses fade quickly?<|im_end|>\n<|im_start|>assistant\n",
++        "<|im_start|>user\nA train travels 120km in 2 hours. It then speeds up and covers the next 180km in 2 hours. What is the average speed for the whole journey?<|im_end|>\n<|im_start|>assistant\n",
++        // chat
++        "<|im_start|>user\nHello! What's the best way to learn a new language?<|im_end|>\n<|im_start|>assistant\n",
++        "<|im_start|>user\nTell me a joke about programmers.<|im_end|>\n<|im_start|>assistant\n",
++        // instruction
++        "<|im_start|>user\nSummarize the key differences between TCP and UDP in 3 bullet points.<|im_end|>\n<|im_start|>assistant\n",
++        "<|im_start|>user\nTranslate 'The weather is beautiful today' to French, Spanish, and German.<|im_end|>\n<|im_start|>assistant\n",
++        "<|im_start|>user\nList 5 healthy breakfast options with brief descriptions.<|im_end|>\n<|im_start|>assistant\n",
++    };
++}
++
++// ---- main ----
++
++int main(int argc, char ** argv) {
++    common_params params;
++
++    params.prompt = ""; // will be set per-prompt
++    params.n_predict = 32;
++
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
++        return 1;
++    }
++
++    common_init();
++    llama_backend_init();
++    llama_numa_init(params.numa);
++
++    // setup callback
++    callback_data cb_data;
++    params.cb_eval = moe_callback;
++    params.cb_eval_user_data = &cb_data;
++    params.warmup = false;
++
++    // load model
++    auto llama_init = common_init_from_params(params);
++    auto * model = llama_init->model();
++    auto * ctx   = llama_init->context();
++
++    if (!model || !ctx) {
++        LOG_ERR("Failed to load model\n");
++        return 1;
++    }
++
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    const bool add_bos = llama_vocab_get_add_bos(vocab);
++
++    // get model info from metadata
++    int n_expert = 0;
++    int n_expert_used = 0;
++    {
++        int n_meta = llama_model_meta_count(model);
++        for (int i = 0; i < n_meta; i++) {
++            char key[256], val[256];
++            llama_model_meta_key_by_index(model, i, key, sizeof(key));
++            llama_model_meta_val_str_by_index(model, i, val, sizeof(val));
++            if (strstr(key, "expert_count") && !strstr(key, "used") && !strstr(key, "shared")) {
++                n_expert = atoi(val);
++            }
++            if (strstr(key, "expert_used_count")) {
++                n_expert_used = atoi(val);
++            }
++        }
++    }
++
++    LOG_INF("\n=== MoE Expert Routing Analysis ===\n");
++    LOG_INF("Model experts: %d, used per token: %d\n", n_expert, n_expert_used);
++
++    if (n_expert == 0) {
++        LOG_ERR("Model is not MoE (n_expert=0). Nothing to analyze.\n");
++        return 1;
++    }
++
++    cb_data.n_expert = n_expert;
++    cb_data.n_expert_used = n_expert_used;
++
++    // run prompts and collect routing data
++    auto prompts = get_test_prompts();
++    expert_stats stats;
++    stats.total_mass.resize(n_expert, 0.0);
++    stats.selection_count.resize(n_expert, 0);
++
++    // group analysis: try 2, 3, 4, 8 groups
++    std::vector<int> group_configs = {2, 3, 4, 8};
++
++    // keep all snapshots for final analysis
++    std::vector<layer_snapshot> all_snapshots;
++
++    int n_gen = params.n_predict;
++    LOG_INF("Running %zu prompts, generating %d tokens each\n", prompts.size(), n_gen);
++    LOG_INF("Logging first %d MoE layers per eval\n\n", cb_data.max_layers_to_log);
++
++    for (size_t pi = 0; pi < prompts.size(); pi++) {
++        LOG_INF("Prompt %zu/%zu: %.60s...\n", pi+1, prompts.size(), prompts[pi].c_str());
++
++        // tokenize
++        std::vector<llama_token> tokens = common_tokenize(ctx, prompts[pi], add_bos);
++
++        // clear KV cache
++        llama_memory_clear(llama_get_memory(ctx), true);
++
++        // reset callback state
++        cb_data.snapshots.clear();
++        cb_data.layers_seen_this_eval = 0;
++        cb_data.collect = true;
++
++        // prefill
++        if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
++            LOG_ERR("  prefill failed\n");
++            continue;
++        }
++
++        // generate tokens
++        for (int i = 0; i < n_gen; i++) {
++            // sample next token (greedy)
++            const float * logits = llama_get_logits_ith(ctx, -1);
++            llama_token next = 0;
++            float max_logit = -INFINITY;
++            int n_vocab = llama_vocab_n_tokens(vocab);
++            for (int v = 0; v < n_vocab; v++) {
++                if (logits[v] > max_logit) {
++                    max_logit = logits[v];
++                    next = v;
++                }
++            }
++
++            if (llama_vocab_is_eog(vocab, next)) break;
++
++            cb_data.layers_seen_this_eval = 0;
++            if (llama_decode(ctx, llama_batch_get_one(&next, 1))) {
++                LOG_ERR("  decode failed at token %d\n", i);
++                break;
++            }
++        }
++
++        // accumulate stats from collected snapshots
++        for (auto & snap : cb_data.snapshots) {
++            std::vector<std::vector<group_score>> dummy_results;
++            analyze_snapshot(snap, 1, n_expert_used, stats, dummy_results);
++        }
++
++        // keep snapshots for group analysis
++        all_snapshots.insert(all_snapshots.end(),
++            std::make_move_iterator(cb_data.snapshots.begin()),
++            std::make_move_iterator(cb_data.snapshots.end()));
++
++        LOG_INF("  collected %zu layer snapshots (total: %zu)\n",
++            cb_data.snapshots.size() - 0, all_snapshots.size());
++    }
++
++    // ---- print results ----
++
++    LOG_INF("\n=== Expert Popularity (gate mass, summed across all tokens & logged layers) ===\n");
++    {
++        // sort experts by total mass
++        std::vector<int> sorted_exp(n_expert);
++        std::iota(sorted_exp.begin(), sorted_exp.end(), 0);
++        std::sort(sorted_exp.begin(), sorted_exp.end(),
++            [&](int a, int b) { return stats.total_mass[a] > stats.total_mass[b]; });
++
++        double total = 0;
++        for (int e = 0; e < n_expert; e++) total += stats.total_mass[e];
++
++        LOG_INF("Total tokens × layers: %lld\n", (long long)stats.total_tokens);
++        LOG_INF("\nTop 20 experts by gate mass:\n");
++        LOG_INF("  %-8s  %-12s  %-8s  %-10s\n", "Expert", "Mass", "Mass%", "Selected");
++        for (int i = 0; i < std::min(20, n_expert); i++) {
++            int e = sorted_exp[i];
++            LOG_INF("  %-8d  %-12.4f  %-8.2f  %-10lld\n",
++                e, stats.total_mass[e],
++                100.0 * stats.total_mass[e] / total,
++                (long long)stats.selection_count[e]);
++        }
++
++        // concentration: top-N experts capture X% of mass
++        double cumulative = 0;
++        LOG_INF("\nConcentration:\n");
++        for (int n : {4, 8, 16, 32, 64}) {
++            if (n > n_expert) break;
++            cumulative = 0;
++            for (int i = 0; i < n; i++) cumulative += stats.total_mass[sorted_exp[i]];
++            LOG_INF("  Top %3d experts: %.1f%% of total gate mass\n", n, 100.0 * cumulative / total);
++        }
++    }
++
++    // identify hot experts for replication analysis
++    std::vector<int> hot_experts(n_expert);
++    std::iota(hot_experts.begin(), hot_experts.end(), 0);
++    std::sort(hot_experts.begin(), hot_experts.end(),
++        [&](int a, int b) { return stats.total_mass[a] > stats.total_mass[b]; });
++
++    LOG_INF("\n=== Group Masking Analysis (best-group capture ratio) ===\n");
++    LOG_INF("For each group count, what fraction of the unrestricted top-%d mass\n", n_expert_used);
++    LOG_INF("is captured by the best single group?\n\n");
++
++    // compute with replicated experts too
++    std::vector<int> replica_counts = {0, 1, 2, 4, 8};
++
++    LOG_INF("  %-8s  %-8s  %-10s  %-10s  %-10s  %-10s  %-10s\n",
++        "Groups", "Replicas", "Exp/Grp", "Mean", "P25", "P50", "P5");
++
++    for (int ng : group_configs) {
++        if (n_expert % ng != 0) continue;
++        int epg = n_expert / ng;
++
++        for (int nr : replica_counts) {
++            if (nr > n_expert / 2) continue;  // don't replicate more than half
++
++            // build replicated set from top hot experts
++            std::set<int> replicated;
++            for (int i = 0; i < nr; i++) {
++                replicated.insert(hot_experts[i]);
++            }
++
++            // re-analyze all snapshots with this config
++            std::vector<double> ratios;
++
++            for (auto & snap : all_snapshots) {
++                for (int tok = 0; tok < snap.n_tokens; tok++) {
++                    const float * p = snap.probs.data() + tok * snap.n_expert;
++
++                    // baseline: unrestricted top-k mass
++                    std::vector<float> all_probs(p, p + snap.n_expert);
++                    std::sort(all_probs.begin(), all_probs.end(), std::greater<float>());
++                    double baseline = 0;
++                    for (int i = 0; i < n_expert_used && i < (int)all_probs.size(); i++) {
++                        baseline += all_probs[i];
++                    }
++
++                    // find best group
++                    double best_group = 0;
++                    for (int g = 0; g < ng; g++) {
++                        double cap = compute_group_capture_with_replicas(
++                            p, snap.n_expert, n_expert_used, g, epg, replicated);
++                        best_group = std::max(best_group, cap);
++                    }
++
++                    if (baseline > 1e-9) {
++                        ratios.push_back(best_group / baseline);
++                    }
++                }
++            }
++
++            if (ratios.empty()) continue;
++            std::sort(ratios.begin(), ratios.end());
++            double mean = std::accumulate(ratios.begin(), ratios.end(), 0.0) / ratios.size();
++            double p5  = ratios[std::max(0, (int)(0.05 * ratios.size()))];
++            double p25 = ratios[std::max(0, (int)(0.25 * ratios.size()))];
++            double p50 = ratios[std::max(0, (int)(0.50 * ratios.size()))];
++
++            LOG_INF("  %-8d  %-8d  %-10d  %-10.3f  %-10.3f  %-10.3f  %-10.3f\n",
++                ng, nr, epg, mean, p25, p50, p5);
++        }
++        LOG_INF("\n");
++    }
++
++    LOG_INF("=== Interpretation ===\n");
++    LOG_INF("Mean close to 1.0 = masking barely hurts (best group captures most of top-k mass)\n");
++    LOG_INF("Mean < 0.7 = significant quality risk from group restriction\n");
++    LOG_INF("P5 close to 1.0 = even worst-case tokens are OK\n");
++    LOG_INF("P5 < 0.5 = some tokens will be badly served by any single group\n\n");
++
++    // ---- Phase 1b: actual masked generation quality comparison ----
++    LOG_INF("=== Phase 1b: Masked Generation Quality (logprob comparison) ===\n");
++
++    // test with 4 groups (32 experts each for 128-expert models)
++    int test_groups = 4;
++    if (n_expert % test_groups != 0) test_groups = 2;
++    int test_epg = n_expert / test_groups;
++
++    LOG_INF("Testing %d groups (%d experts/group) vs baseline (all %d experts)\n", test_groups, test_epg, n_expert);
++    LOG_INF("Using first 5 prompts, generating %d tokens each\n\n", n_gen);
++
++    cb_data.collect = false; // stop collecting routing data
++
++    auto run_generation = [&](const std::string & /*label*/, int prompt_count) -> std::vector<double> {
++        std::vector<double> avg_logprobs;
++        for (int pi = 0; pi < prompt_count && pi < (int)prompts.size(); pi++) {
++            std::vector<llama_token> tokens = common_tokenize(ctx, prompts[pi], add_bos);
++            llama_memory_clear(llama_get_memory(ctx), true);
++
++            if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) continue;
++
++            double sum_logprob = 0;
++            int gen_count = 0;
++            for (int i = 0; i < n_gen; i++) {
++                const float * logits = llama_get_logits_ith(ctx, -1);
++                int n_vocab_val = llama_vocab_n_tokens(vocab);
++
++                // find argmax and compute logprob
++                llama_token next = 0;
++                float max_logit = -INFINITY;
++                for (int v = 0; v < n_vocab_val; v++) {
++                    if (logits[v] > max_logit) { max_logit = logits[v]; next = v; }
++                }
++                if (llama_vocab_is_eog(vocab, next)) break;
++
++                // compute log softmax for the chosen token
++                float log_sum_exp = 0;
++                float max_l = max_logit;
++                for (int v = 0; v < n_vocab_val; v++) {
++                    log_sum_exp += expf(logits[v] - max_l);
++                }
++                float logprob = max_logit - max_l - logf(log_sum_exp);
++                sum_logprob += logprob;
++                gen_count++;
++
++                if (llama_decode(ctx, llama_batch_get_one(&next, 1))) break;
++            }
++            if (gen_count > 0) {
++                avg_logprobs.push_back(sum_logprob / gen_count);
++            }
++        }
++        return avg_logprobs;
++    };
++
++    // baseline: no mask
++    llama_model_set_expert_mask(const_cast<llama_model *>(llama_get_model(ctx)), nullptr, 0);
++    auto baseline_lp = run_generation("baseline", 5);
++
++    // masked: test each group
++    for (int g = 0; g < test_groups; g++) {
++        bool mask[512] = {};
++        for (int e = g * test_epg; e < (g + 1) * test_epg && e < n_expert; e++) {
++            mask[e] = true;
++        }
++        // also include top-2 hot experts as replicas
++        mask[hot_experts[0]] = true;
++        mask[hot_experts[1]] = true;
++
++        llama_model_set_expert_mask(
++            const_cast<llama_model *>(llama_get_model(ctx)),
++            mask, n_expert);
++
++        auto masked_lp = run_generation("group_" + std::to_string(g), 5);
++
++        // compute delta
++        double delta_sum = 0;
++        int delta_count = 0;
++        for (int i = 0; i < (int)std::min(baseline_lp.size(), masked_lp.size()); i++) {
++            delta_sum += (masked_lp[i] - baseline_lp[i]);
++            delta_count++;
++        }
++
++        if (delta_count > 0) {
++            LOG_INF("  Group %d (experts %d-%d + 2 hot replicas): avg logprob delta = %+.4f\n",
++                g, g * test_epg, (g+1) * test_epg - 1, delta_sum / delta_count);
++        }
++    }
++
++    // clear mask
++    llama_model_set_expert_mask(const_cast<llama_model *>(llama_get_model(ctx)), nullptr, 0);
++
++    LOG_INF("\n=== Interpretation (logprob delta) ===\n");
++    LOG_INF("Delta near 0.0 = masking barely affects generation quality\n");
++    LOG_INF("Delta < -0.1 = noticeable quality loss\n");
++    LOG_INF("Delta < -0.5 = significant degradation\n\n");
++
++    llama_backend_free();
++    return 0;
++}
