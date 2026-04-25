@@ -26,6 +26,13 @@ async fn make_test_node(role: super::NodeRole) -> Result<Node> {
     let (inflight_change_tx, _) = watch::channel(0u64);
     let (tunnel_tx, _tunnel_rx) = tokio::sync::mpsc::channel(8);
     let (tunnel_http_tx, _tunnel_http_rx) = tokio::sync::mpsc::channel(8);
+    let runtime_data_producer = crate::runtime_data::RuntimeDataCollector::new().producer(
+        crate::runtime_data::RuntimeDataSource {
+            scope: "routing",
+            plugin_data_key: None,
+            plugin_endpoint_key: None,
+        },
+    );
 
     let node = Node {
         endpoint,
@@ -62,6 +69,7 @@ async fn make_test_node(role: super::NodeRole) -> Result<Node> {
         inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         inflight_change_tx,
         routing_metrics: crate::network::metrics::RoutingMetrics::default(),
+        runtime_data_producer,
         tunnel_tx,
         tunnel_http_tx,
         plugin_manager: Arc::new(Mutex::new(None)),
@@ -3187,6 +3195,13 @@ async fn make_test_node_with_owner(
         TrustPolicy::Off,
         current_time_unix_ms(),
     );
+    let runtime_data_producer = crate::runtime_data::RuntimeDataCollector::new().producer(
+        crate::runtime_data::RuntimeDataSource {
+            scope: "routing",
+            plugin_data_key: None,
+            plugin_endpoint_key: None,
+        },
+    );
 
     let node = Node {
         endpoint,
@@ -3223,6 +3238,7 @@ async fn make_test_node_with_owner(
         inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         inflight_change_tx,
         routing_metrics: crate::network::metrics::RoutingMetrics::default(),
+        runtime_data_producer,
         tunnel_tx,
         tunnel_http_tx,
         plugin_manager: Arc::new(Mutex::new(None)),
