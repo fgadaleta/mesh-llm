@@ -314,6 +314,14 @@ auto: build
 
 # ── Utilities ──────────────────────────────────────────────────
 
+# Update both tracked llama.cpp pin files from the prepared checkout.
+llama-update-pin:
+    scripts/update-llama-pin.sh
+
+# Render a Markdown summary for a llama.cpp upstream pin change.
+llama-summary old new:
+    scripts/summarize-llama-upstream.sh "{{ old }}" "{{ new }}"
+
 # Clean UI build artifacts (node_modules, dist). Fixes stale npm state.
 [unix]
 clean-ui:
