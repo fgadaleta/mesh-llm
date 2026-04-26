@@ -314,14 +314,6 @@ auto: build
 
 # ── Utilities ──────────────────────────────────────────────────
 
-# Prepare the pinned llama.cpp checkout and apply the Mesh-LLM patch queue.
-llama-prepare:
-    scripts/prepare-llama.sh pinned
-
-# Prepare the latest llama.cpp upstream checkout without moving the pin.
-llama-prepare-latest:
-    scripts/prepare-llama.sh latest
-
 # Update both tracked llama.cpp pin files from the prepared checkout.
 llama-update-pin:
     scripts/update-llama-pin.sh
