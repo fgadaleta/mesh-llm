@@ -10,7 +10,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptDir ".."))
 $llamaDir = if ($env:MESH_LLM_LLAMA_DIR) { $env:MESH_LLM_LLAMA_DIR } else { Join-Path $repoRoot ".deps\llama.cpp" }
 $buildDir = Join-Path $llamaDir "build"
-$meshUiDir = Join-Path $repoRoot "mesh-llm\ui"
+$meshUiDir = Join-Path $repoRoot "crates\mesh-llm\ui"
 $compilerLauncherArgs = @()
 $compilerCacheBin = $null
 
@@ -601,6 +601,12 @@ function Copy-DevRuntimeBinaries {
     $sourceBinDir = Join-Path $BuildDir "bin"
     $targetDir = Join-Path $RepoRoot "target\release"
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+    Remove-Item -LiteralPath (Join-Path $targetDir "rpc-server.exe") -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $targetDir "llama-server.exe") -Force -ErrorAction SilentlyContinue
+    foreach ($pattern in @("rpc-server-*.exe", "llama-server-*.exe")) {
+        Get-ChildItem -Path (Join-Path $targetDir $pattern) -File -ErrorAction SilentlyContinue |
+            Remove-Item -Force
+    }
 
     $flavoredCopies = @(
         @{ Source = "rpc-server.exe"; Target = "rpc-server-$BackendName.exe" },
