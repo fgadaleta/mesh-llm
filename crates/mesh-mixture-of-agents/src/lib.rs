@@ -541,7 +541,26 @@ fn error_response(message: &str, code: &str) -> Value {
             "message": { "role": "assistant", "content": message },
             "finish_reason": "error"
         }],
-        "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+        "usage": usage_for_content(message)
+    })
+}
+
+/// Estimate `completion_tokens` from output chars (OpenAI's ~chars/4 rule).
+/// Returns at least 1 for non-empty so UI tok/s never divides by zero.
+fn estimate_completion_tokens(content: &str) -> u64 {
+    if content.is_empty() {
+        return 0;
+    }
+    let chars = content.chars().count() as u64;
+    chars.div_ceil(4).max(1)
+}
+
+fn usage_for_content(content: &str) -> Value {
+    let completion = estimate_completion_tokens(content);
+    json!({
+        "prompt_tokens": 0,
+        "completion_tokens": completion,
+        "total_tokens": completion,
     })
 }
 
@@ -561,7 +580,7 @@ fn chat_response(content: &str) -> Value {
             "message": { "role": "assistant", "content": content },
             "finish_reason": "stop"
         }],
-        "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+        "usage": usage_for_content(content)
     })
 }
 
@@ -595,6 +614,9 @@ fn tool_call_response(name: &str, arguments: &Value) -> Value {
         _ => "{}".to_string(),
     };
 
+    // For tool-call responses, the user-visible output is the
+    // arguments JSON, not free-form text. Use it as the basis of the
+    // token estimate so callers still see a non-zero count.
     json!({
         "id": format!("chatcmpl-moa-{}", short_id()),
         "object": "chat.completion",
@@ -612,7 +634,7 @@ fn tool_call_response(name: &str, arguments: &Value) -> Value {
             },
             "finish_reason": "tool_calls"
         }],
-        "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+        "usage": usage_for_content(&args_str)
     })
 }
 
@@ -706,5 +728,57 @@ mod response_builder_tests {
             .and_then(|v| v.as_str())
             .expect("arguments is string");
         assert_eq!(args_str, "{}");
+    }
+
+    // Regression for #637.
+
+    #[test]
+    fn estimate_completion_tokens_returns_zero_for_empty_content() {
+        assert_eq!(estimate_completion_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_completion_tokens_returns_at_least_one_for_non_empty() {
+        assert_eq!(estimate_completion_tokens("a"), 1);
+    }
+
+    #[test]
+    fn estimate_completion_tokens_is_roughly_chars_over_four() {
+        assert_eq!(estimate_completion_tokens("sixteen chars!!!"), 4);
+        assert_eq!(estimate_completion_tokens(&"x".repeat(40)), 10);
+    }
+
+    #[test]
+    fn chat_response_reports_non_zero_completion_tokens() {
+        let resp = chat_response("Hi there! How can I help you today?");
+        let tokens = resp
+            .pointer("/usage/completion_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .expect("completion_tokens is u64");
+        assert!(tokens > 0);
+        assert_eq!(
+            resp.pointer("/usage/total_tokens").and_then(|v| v.as_u64()),
+            Some(tokens),
+        );
+    }
+
+    #[test]
+    fn tool_call_response_reports_non_zero_completion_tokens() {
+        let resp = tool_call_response("read_file", &serde_json::json!({"path": "/etc/hostname"}));
+        let tokens = resp
+            .pointer("/usage/completion_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .expect("completion_tokens is u64");
+        assert!(tokens > 0);
+    }
+
+    #[test]
+    fn error_response_reports_message_based_completion_tokens() {
+        let resp = error_response("All MoA workers failed", MOA_ERR_ALL_WORKERS_FAILED);
+        let tokens = resp
+            .pointer("/usage/completion_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .expect("completion_tokens is u64");
+        assert!(tokens > 0);
     }
 }
