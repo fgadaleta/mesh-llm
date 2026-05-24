@@ -34,6 +34,13 @@ For development from a local checkout, build the native artifact first:
 
 That generates `sdk/swift/Generated/MeshLLMFFI.xcframework`, which the root
 Swift package picks up automatically for the real UniFFI-backed implementation.
+The macOS framework slice must already use the versioned `Versions/A` bundle
+layout before it is passed to `xcodebuild -create-xcframework`; `xcodebuild`
+wraps the input framework but does not fix a flat macOS bundle.
+Release tags must contain a `Package.swift` whose remote XCFramework URL and
+checksum have already been prepared with
+`scripts/prepare-swift-package-release.sh`; SwiftPM reads the manifest from the
+tag and cannot use values generated later by release CI.
 
 Normal SDK builds and tests require the UniFFI-backed XCFramework. The package
 does not ship a pure Swift fallback because the SDK must exercise the native
@@ -160,10 +167,12 @@ If your app qualifies for an exemption (e.g., uses only standard encryption), yo
 
 ### Privacy Manifest
 
-The MeshLLM XCFramework includes a `PrivacyInfo.xcprivacy` manifest declaring:
+The MeshLLM FFI XCFramework includes a `PrivacyInfo.xcprivacy` manifest in each
+framework slice declaring:
 - `NSPrivacyTracking = false` (no tracking)
 - No data collection
-- No required-reason API usage
+- Required-reason API declarations for native file metadata, disk-capacity,
+  and elapsed-time APIs used by the embedded runtime
 
 This manifest is embedded inside each `.framework` bundle in the XCFramework, satisfying Apple's requirement since Spring 2024.
 
@@ -176,7 +185,8 @@ For iOS, network access is allowed by default. No special entitlements needed.
 ### App Store Submission Checklist
 
 - [ ] Set `ITSAppUsesNonExemptEncryption` in `Info.plist`
-- [ ] Verify `PrivacyInfo.xcprivacy` is embedded in XCFramework (run `find MeshLLM.xcframework -name PrivacyInfo.xcprivacy`)
+- [ ] Verify `PrivacyInfo.xcprivacy` is embedded in XCFramework (run `find MeshLLMFFI.xcframework -name PrivacyInfo.xcprivacy`)
+- [ ] Run `scripts/verify-swift-release-artifact.sh dist/MeshLLMFFI.xcframework.zip`
 - [ ] No subprocess spawning (mesh-llm SDK never calls `Process()`)
 - [ ] No filesystem access for credentials (pass keys via constructor)
 - [ ] Implement `reconnect()` in `UIApplication.willEnterForegroundNotification` observer

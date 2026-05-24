@@ -31,9 +31,11 @@ ditto -c -k --sequesterRsrc --keepParent \
     "$ARTIFACT_PATH"
 
 CHECKSUM="$(swift package compute-checksum "$ARTIFACT_PATH")"
+"$REPO_ROOT/scripts/verify-swift-release-artifact.sh" "$ARTIFACT_PATH"
 
 perl -0pi -e 's#let remoteFFIXCFrameworkURL = ".*"#let remoteFFIXCFrameworkURL = "'"$ARTIFACT_URL"'"#' "$PACKAGE_SWIFT"
 perl -0pi -e 's#let remoteFFIXCFrameworkChecksum = ".*"#let remoteFFIXCFrameworkChecksum = "'"$CHECKSUM"'"#' "$PACKAGE_SWIFT"
+"$REPO_ROOT/scripts/verify-swift-package-manifest.sh" "$TAG" "$ARTIFACT_PATH" "$PACKAGE_SWIFT"
 
 echo "Prepared SwiftPM artifact:"
 echo "  tag: $TAG"
