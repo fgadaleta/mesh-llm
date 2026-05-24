@@ -204,7 +204,7 @@ skippy-wan-lab-build-bins:
     cargo build --release --locked -p skippy-server -p skippy-prompt -p metrics-server -p skippy-model-package
 
 # Generate a reproducible benchmark corpus for skippy bench tooling.
-bench-corpus tier="smoke" *ARGS:
+bench-corpus tier="smoke" *ARGS="":
     scripts/generate-bench-corpus.py "{{ tier }}" {{ ARGS }}
 
 # Run skippy family certification checks.
@@ -221,7 +221,7 @@ skippy-openai-smoke *ARGS:
     just with-lld scripts/skippy-openai-smoke.sh {{ ARGS }}
 
 # Run the skippy benchmark/debug telemetry collector.
-metrics-server db="/tmp/mesh-metrics.duckdb" http_addr="127.0.0.1:18080" otlp_addr="127.0.0.1:14317" *ARGS: metrics-server-build
+metrics-server db="/tmp/mesh-metrics.duckdb" http_addr="127.0.0.1:18080" otlp_addr="127.0.0.1:14317" *ARGS="": metrics-server-build
     target/debug/metrics-server serve --db "{{ db }}" --http-addr "{{ http_addr }}" --otlp-grpc-addr "{{ otlp_addr }}" {{ ARGS }}
 
 # Download the default model (GLM-4.7-Flash Q4_K_M, 17GB)
