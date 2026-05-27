@@ -8,12 +8,13 @@ TARGET_DIR="$REPO_ROOT/target"
 XCFRAMEWORK_DIR="$SWIFT_DIR/Generated"
 FRAMEWORK_NAME="MeshLLMFFI"
 GENERATED_SWIFT="$SWIFT_DIR/Sources/MeshLLM/Generated/mesh_ffi.swift"
+RUST_FEATURES="host,embedded-runtime"
 
 echo "Building $FRAMEWORK_NAME XCFramework..."
 echo "Repo root: $REPO_ROOT"
 
-if ! cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"mesh-api-ffi"'; then
-  echo "ERROR: mesh-api-ffi crate not found. Ensure the workspace is configured."
+if ! cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"mesh-llm-ffi"'; then
+  echo "ERROR: mesh-llm-ffi crate not found. Ensure the workspace is configured."
   exit 1
 fi
 
@@ -28,6 +29,10 @@ rustup target add \
   2>/dev/null || true
 
 "$SWIFT_DIR/scripts/generate-swift-bindings.sh"
+IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-16.0}"
+MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+export -n IPHONEOS_DEPLOYMENT_TARGET MACOSX_DEPLOYMENT_TARGET 2>/dev/null || true
+"$REPO_ROOT/scripts/prepare-llama.sh" "${MESH_LLM_LLAMA_PIN_SHA:-pinned}"
 
 # Resolve stable rustc from rustup (avoids Homebrew rustc shadowing)
 RUSTUP_RUSTC="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc"
@@ -38,36 +43,97 @@ if [ ! -x "$RUSTUP_RUSTC" ]; then
 fi
 echo "Using rustc: $RUSTUP_RUSTC"
 
+build_llama_for_target() {
+  local RUST_TARGET="$1"
+  local SDK="$2"
+  local ARCH="$3"
+  local PLATFORM_NAME="$4"
+  shift 4
+
+  local LLAMA_BUILD_DIR="$REPO_ROOT/.deps/llama-build/build-stage-abi-$RUST_TARGET-metal"
+  echo "Building llama.cpp ABI for $PLATFORM_NAME ($RUST_TARGET)..."
+  LLAMA_STAGE_BACKEND=metal \
+  LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
+  "$REPO_ROOT/scripts/build-llama.sh" \
+    -DCMAKE_OSX_SYSROOT="$SDK" \
+    -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$IPHONEOS_DEPLOYMENT_TARGET" \
+    "$@"
+}
+
+build_rust_target() {
+  local RUST_TARGET="$1"
+  local PLATFORM_NAME="$2"
+  local LLAMA_BUILD_DIR="$REPO_ROOT/.deps/llama-build/build-stage-abi-$RUST_TARGET-metal"
+
+  echo "Building for $RUST_TARGET ($PLATFORM_NAME)..."
+  local -a CARGO_ENV=(
+    "RUSTC=$RUSTUP_RUSTC"
+    "LLAMA_STAGE_BACKEND=metal"
+    "LLAMA_STAGE_BUILD_DIR=$LLAMA_BUILD_DIR"
+  )
+
+  case "$RUST_TARGET" in
+    *-apple-darwin)
+      CARGO_ENV+=("MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET")
+      ;;
+    *-apple-ios*)
+      CARGO_ENV+=("IPHONEOS_DEPLOYMENT_TARGET=$IPHONEOS_DEPLOYMENT_TARGET")
+      ;;
+  esac
+
+  env "${CARGO_ENV[@]}" \
+    cargo build --release -p mesh-llm-ffi --target "$RUST_TARGET" --no-default-features --features "$RUST_FEATURES"
+}
+
+build_apple_target() {
+  local RUST_TARGET="$1"
+  local SDK="$2"
+  local ARCH="$3"
+  local PLATFORM_NAME="$4"
+  shift 4
+
+  build_llama_for_target "$RUST_TARGET" "$SDK" "$ARCH" "$PLATFORM_NAME" "$@"
+  build_rust_target "$RUST_TARGET" "$PLATFORM_NAME"
+}
+
 echo "Building for aarch64-apple-ios..."
-RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target aarch64-apple-ios --no-default-features
+build_apple_target aarch64-apple-ios iphoneos arm64 iOS -DCMAKE_SYSTEM_NAME=iOS -DGGML_BLAS=OFF
 
 echo "Building for aarch64-apple-ios-sim..."
-RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target aarch64-apple-ios-sim --no-default-features
+build_apple_target aarch64-apple-ios-sim iphonesimulator arm64 "iOS simulator" -DCMAKE_SYSTEM_NAME=iOS -DGGML_BLAS=OFF
 
 echo "Building for x86_64-apple-ios..."
-RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target x86_64-apple-ios --no-default-features
+build_apple_target x86_64-apple-ios iphonesimulator x86_64 "iOS simulator" -DCMAKE_SYSTEM_NAME=iOS -DGGML_BLAS=OFF
 
 echo "Building for aarch64-apple-ios-macabi (Mac Catalyst)..."
-RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target aarch64-apple-ios-macabi --no-default-features
+build_apple_target aarch64-apple-ios-macabi macosx arm64 "Mac Catalyst" \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DGGML_BLAS=OFF \
+  -DCMAKE_C_FLAGS=-target\ arm64-apple-ios16.0-macabi \
+  -DCMAKE_CXX_FLAGS=-target\ arm64-apple-ios16.0-macabi \
+  -DCMAKE_EXE_LINKER_FLAGS=-target\ arm64-apple-ios16.0-macabi \
+  -DCMAKE_SHARED_LINKER_FLAGS=-target\ arm64-apple-ios16.0-macabi \
+  -DCMAKE_MODULE_LINKER_FLAGS=-target\ arm64-apple-ios16.0-macabi
 
 echo "Building for x86_64-apple-ios-macabi (Mac Catalyst)..."
-RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target x86_64-apple-ios-macabi --no-default-features
+build_apple_target x86_64-apple-ios-macabi macosx x86_64 "Mac Catalyst" \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DGGML_BLAS=OFF \
+  -DCMAKE_C_FLAGS=-target\ x86_64-apple-ios16.0-macabi \
+  -DCMAKE_CXX_FLAGS=-target\ x86_64-apple-ios16.0-macabi \
+  -DCMAKE_EXE_LINKER_FLAGS=-target\ x86_64-apple-ios16.0-macabi \
+  -DCMAKE_SHARED_LINKER_FLAGS=-target\ x86_64-apple-ios16.0-macabi \
+  -DCMAKE_MODULE_LINKER_FLAGS=-target\ x86_64-apple-ios16.0-macabi
 
 echo "Building for aarch64-apple-darwin (macOS)..."
-RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target aarch64-apple-darwin --no-default-features
+build_apple_target aarch64-apple-darwin macosx arm64 macOS -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
 
 echo "Building for x86_64-apple-darwin (macOS)..."
-RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target x86_64-apple-darwin --no-default-features
+build_apple_target x86_64-apple-darwin macosx x86_64 macOS -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
 
 echo "Syncing UniFFI API checksums into generated Swift bindings..."
-python3 - "$TARGET_DIR/aarch64-apple-darwin/release/libmesh_ffi.a" "$GENERATED_SWIFT" <<'PY'
+python3 - "$TARGET_DIR/aarch64-apple-darwin/release/libmeshllm_ffi.a" "$GENERATED_SWIFT" <<'PY'
 import pathlib
 import re
 import subprocess
@@ -84,7 +150,7 @@ disassembly = subprocess.run(
 ).stdout
 
 pattern = re.compile(
-    r"_uniffi_mesh_ffi_(checksum_[A-Za-z0-9_]+):\n[0-9a-f]+\s+mov\s+w0, #0x([0-9a-f]+)\n[0-9a-f]+\s+ret",
+    r"_uniffi_meshllm_ffi_(checksum_[A-Za-z0-9_]+):\n[0-9a-f]+\s+mov\s+w0, #0x([0-9a-f]+)\n[0-9a-f]+\s+ret",
     re.MULTILINE,
 )
 checksums = {name: int(value, 16) for name, value in pattern.findall(disassembly)}
@@ -105,47 +171,89 @@ PY
 echo "Creating fat library for iOS simulator..."
 mkdir -p "$TARGET_DIR/ios-sim-fat"
 lipo -create \
-  "$TARGET_DIR/aarch64-apple-ios-sim/release/libmesh_ffi.a" \
-  "$TARGET_DIR/x86_64-apple-ios/release/libmesh_ffi.a" \
-  -output "$TARGET_DIR/ios-sim-fat/libmesh_ffi.a"
+  "$TARGET_DIR/aarch64-apple-ios-sim/release/libmeshllm_ffi.a" \
+  "$TARGET_DIR/x86_64-apple-ios/release/libmeshllm_ffi.a" \
+  -output "$TARGET_DIR/ios-sim-fat/libmeshllm_ffi.a"
 
 echo "Creating fat library for macOS..."
 mkdir -p "$TARGET_DIR/macos-fat"
 lipo -create \
-  "$TARGET_DIR/aarch64-apple-darwin/release/libmesh_ffi.a" \
-  "$TARGET_DIR/x86_64-apple-darwin/release/libmesh_ffi.a" \
-  -output "$TARGET_DIR/macos-fat/libmesh_ffi.a"
+  "$TARGET_DIR/aarch64-apple-darwin/release/libmeshllm_ffi.a" \
+  "$TARGET_DIR/x86_64-apple-darwin/release/libmeshllm_ffi.a" \
+  -output "$TARGET_DIR/macos-fat/libmeshllm_ffi.a"
 
 echo "Creating fat library for Mac Catalyst..."
 mkdir -p "$TARGET_DIR/ios-macabi-fat"
 lipo -create \
-  "$TARGET_DIR/aarch64-apple-ios-macabi/release/libmesh_ffi.a" \
-  "$TARGET_DIR/x86_64-apple-ios-macabi/release/libmesh_ffi.a" \
-  -output "$TARGET_DIR/ios-macabi-fat/libmesh_ffi.a"
+  "$TARGET_DIR/aarch64-apple-ios-macabi/release/libmeshllm_ffi.a" \
+  "$TARGET_DIR/x86_64-apple-ios-macabi/release/libmeshllm_ffi.a" \
+  -output "$TARGET_DIR/ios-macabi-fat/libmeshllm_ffi.a"
 
 create_framework() {
   local ARCH="$1"
   local LIB_PATH="$2"
   local FRAMEWORK_DIR="$TARGET_DIR/frameworks/$ARCH/$FRAMEWORK_NAME.framework"
 
-  mkdir -p "$FRAMEWORK_DIR/Headers"
-  mkdir -p "$FRAMEWORK_DIR/Modules"
+  if [ "$ARCH" = "macos" ]; then
+    # macOS requires a versioned bundle layout (Versions/A/); flat bundles are
+    # rejected by the macOS dynamic linker and cause xcframework load failures.
+    local VERSION_DIR="$FRAMEWORK_DIR/Versions/A"
+    mkdir -p "$VERSION_DIR/Headers"
+    mkdir -p "$VERSION_DIR/Modules"
+    mkdir -p "$VERSION_DIR/Resources"
 
-  # Copy static library as the framework binary (no extension)
-  cp "$LIB_PATH" "$FRAMEWORK_DIR/$FRAMEWORK_NAME"
-  cp "$FFI_DIR/MeshLLMFFI.h" "$FRAMEWORK_DIR/Headers/MeshLLMFFI.h"
-  cp "$FFI_DIR/MeshLLMFFI.modulemap" "$FRAMEWORK_DIR/Modules/module.modulemap"
+    cp "$LIB_PATH" "$VERSION_DIR/$FRAMEWORK_NAME"
+    cp "$FFI_DIR/MeshLLMFFI.h" "$VERSION_DIR/Headers/MeshLLMFFI.h"
+    cp "$FFI_DIR/MeshLLMFFI.modulemap" "$VERSION_DIR/Modules/module.modulemap"
 
-  # Embed PrivacyInfo.xcprivacy (required for App Store submission)
-  if [ -f "$SWIFT_DIR/PrivacyInfo.xcprivacy" ]; then
-    cp "$SWIFT_DIR/PrivacyInfo.xcprivacy" "$FRAMEWORK_DIR/PrivacyInfo.xcprivacy"
-    echo "  Embedded PrivacyInfo.xcprivacy in $ARCH framework"
+    if [ -f "$SWIFT_DIR/PrivacyInfo.xcprivacy" ]; then
+      cp "$SWIFT_DIR/PrivacyInfo.xcprivacy" "$VERSION_DIR/Resources/PrivacyInfo.xcprivacy"
+      echo "  Embedded PrivacyInfo.xcprivacy in $ARCH framework"
+    else
+      echo "WARNING: PrivacyInfo.xcprivacy not found at $SWIFT_DIR/PrivacyInfo.xcprivacy"
+    fi
+
+    cat > "$VERSION_DIR/Resources/Info.plist" << 'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>ai.meshllm.MeshLLMFFI</string>
+    <key>CFBundleName</key>
+    <string>MeshLLMFFI</string>
+    <key>CFBundlePackageType</key>
+    <string>FMWK</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>MinimumOSVersion</key>
+    <string>13.0</string>
+</dict>
+</plist>
+PLIST
+
+    ln -sfh A                          "$FRAMEWORK_DIR/Versions/Current"
+    ln -sfh "Versions/Current/$FRAMEWORK_NAME" "$FRAMEWORK_DIR/$FRAMEWORK_NAME"
+    ln -sfh "Versions/Current/Headers"         "$FRAMEWORK_DIR/Headers"
+    ln -sfh "Versions/Current/Modules"         "$FRAMEWORK_DIR/Modules"
+    ln -sfh "Versions/Current/Resources"       "$FRAMEWORK_DIR/Resources"
   else
-    echo "WARNING: PrivacyInfo.xcprivacy not found at $SWIFT_DIR/PrivacyInfo.xcprivacy"
-  fi
+    # iOS, simulator, and Mac Catalyst use flat (non-versioned) framework layout
+    mkdir -p "$FRAMEWORK_DIR/Headers"
+    mkdir -p "$FRAMEWORK_DIR/Modules"
 
-  # Minimal Info.plist (required by xcodebuild -create-xcframework)
-  cat > "$FRAMEWORK_DIR/Info.plist" << 'PLIST'
+    cp "$LIB_PATH" "$FRAMEWORK_DIR/$FRAMEWORK_NAME"
+    cp "$FFI_DIR/MeshLLMFFI.h" "$FRAMEWORK_DIR/Headers/MeshLLMFFI.h"
+    cp "$FFI_DIR/MeshLLMFFI.modulemap" "$FRAMEWORK_DIR/Modules/module.modulemap"
+
+    if [ -f "$SWIFT_DIR/PrivacyInfo.xcprivacy" ]; then
+      cp "$SWIFT_DIR/PrivacyInfo.xcprivacy" "$FRAMEWORK_DIR/PrivacyInfo.xcprivacy"
+      echo "  Embedded PrivacyInfo.xcprivacy in $ARCH framework"
+    else
+      echo "WARNING: PrivacyInfo.xcprivacy not found at $SWIFT_DIR/PrivacyInfo.xcprivacy"
+    fi
+
+    cat > "$FRAMEWORK_DIR/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -163,15 +271,16 @@ create_framework() {
 </dict>
 </plist>
 PLIST
+  fi
 
   echo "  Created framework bundle for $ARCH"
 }
 
 echo "Assembling framework bundles..."
-create_framework "ios"     "$TARGET_DIR/aarch64-apple-ios/release/libmesh_ffi.a"
-create_framework "ios-sim" "$TARGET_DIR/ios-sim-fat/libmesh_ffi.a"
-create_framework "ios-macabi" "$TARGET_DIR/ios-macabi-fat/libmesh_ffi.a"
-create_framework "macos"   "$TARGET_DIR/macos-fat/libmesh_ffi.a"
+create_framework "ios"     "$TARGET_DIR/aarch64-apple-ios/release/libmeshllm_ffi.a"
+create_framework "ios-sim" "$TARGET_DIR/ios-sim-fat/libmeshllm_ffi.a"
+create_framework "ios-macabi" "$TARGET_DIR/ios-macabi-fat/libmeshllm_ffi.a"
+create_framework "macos"   "$TARGET_DIR/macos-fat/libmeshllm_ffi.a"
 
 echo "Creating XCFramework..."
 rm -rf "$XCFRAMEWORK_DIR/$FRAMEWORK_NAME.xcframework"
@@ -179,93 +288,17 @@ mkdir -p "$XCFRAMEWORK_DIR"
 
 XCFW_OUT="$XCFRAMEWORK_DIR/$FRAMEWORK_NAME.xcframework"
 
+if ! command -v xcodebuild >/dev/null 2>&1; then
+  echo "ERROR: xcodebuild is required to create the Swift SDK XCFramework." >&2
+  exit 1
+fi
+
 xcodebuild -create-xcframework \
   -framework "$TARGET_DIR/frameworks/ios/$FRAMEWORK_NAME.framework" \
   -framework "$TARGET_DIR/frameworks/ios-sim/$FRAMEWORK_NAME.framework" \
   -framework "$TARGET_DIR/frameworks/ios-macabi/$FRAMEWORK_NAME.framework" \
   -framework "$TARGET_DIR/frameworks/macos/$FRAMEWORK_NAME.framework" \
-  -output "$XCFW_OUT" 2>/dev/null || true
-
-if [ ! -d "$XCFW_OUT" ]; then
-  echo "xcodebuild unavailable or failed; assembling XCFramework manually..."
-  mkdir -p "$XCFW_OUT/ios-arm64/$FRAMEWORK_NAME.framework"
-  mkdir -p "$XCFW_OUT/ios-arm64_x86_64-simulator/$FRAMEWORK_NAME.framework"
-  mkdir -p "$XCFW_OUT/ios-arm64_x86_64-maccatalyst/$FRAMEWORK_NAME.framework"
-  mkdir -p "$XCFW_OUT/macos-arm64_x86_64/$FRAMEWORK_NAME.framework"
-
-  cp -R "$TARGET_DIR/frameworks/ios/$FRAMEWORK_NAME.framework/"     "$XCFW_OUT/ios-arm64/$FRAMEWORK_NAME.framework/"
-  cp -R "$TARGET_DIR/frameworks/ios-sim/$FRAMEWORK_NAME.framework/" "$XCFW_OUT/ios-arm64_x86_64-simulator/$FRAMEWORK_NAME.framework/"
-  cp -R "$TARGET_DIR/frameworks/ios-macabi/$FRAMEWORK_NAME.framework/" "$XCFW_OUT/ios-arm64_x86_64-maccatalyst/$FRAMEWORK_NAME.framework/"
-  cp -R "$TARGET_DIR/frameworks/macos/$FRAMEWORK_NAME.framework/"   "$XCFW_OUT/macos-arm64_x86_64/$FRAMEWORK_NAME.framework/"
-
-  cat > "$XCFW_OUT/Info.plist" << 'XCINFO'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>AvailableLibraries</key>
-    <array>
-        <dict>
-            <key>BinaryPath</key>
-            <string>MeshLLMFFI.framework/MeshLLMFFI</string>
-            <key>LibraryIdentifier</key>
-            <string>ios-arm64</string>
-            <key>LibraryPath</key>
-            <string>MeshLLMFFI.framework</string>
-            <key>SupportedArchitectures</key>
-            <array><string>arm64</string></array>
-            <key>SupportedPlatform</key>
-            <string>ios</string>
-        </dict>
-        <dict>
-            <key>BinaryPath</key>
-            <string>MeshLLMFFI.framework/MeshLLMFFI</string>
-            <key>LibraryIdentifier</key>
-            <string>ios-arm64_x86_64-simulator</string>
-            <key>LibraryPath</key>
-            <string>MeshLLMFFI.framework</string>
-            <key>SupportedArchitectures</key>
-            <array><string>arm64</string><string>x86_64</string></array>
-            <key>SupportedPlatform</key>
-            <string>ios</string>
-            <key>SupportedPlatformVariant</key>
-            <string>simulator</string>
-        </dict>
-        <dict>
-            <key>BinaryPath</key>
-            <string>MeshLLMFFI.framework/MeshLLMFFI</string>
-            <key>LibraryIdentifier</key>
-            <string>ios-arm64_x86_64-maccatalyst</string>
-            <key>LibraryPath</key>
-            <string>MeshLLMFFI.framework</string>
-            <key>SupportedArchitectures</key>
-            <array><string>arm64</string><string>x86_64</string></array>
-            <key>SupportedPlatform</key>
-            <string>ios</string>
-            <key>SupportedPlatformVariant</key>
-            <string>maccatalyst</string>
-        </dict>
-        <dict>
-            <key>BinaryPath</key>
-            <string>MeshLLMFFI.framework/MeshLLMFFI</string>
-            <key>LibraryIdentifier</key>
-            <string>macos-arm64_x86_64</string>
-            <key>LibraryPath</key>
-            <string>MeshLLMFFI.framework</string>
-            <key>SupportedArchitectures</key>
-            <array><string>arm64</string><string>x86_64</string></array>
-            <key>SupportedPlatform</key>
-            <string>macos</string>
-        </dict>
-    </array>
-    <key>CFBundlePackageType</key>
-    <string>XFWK</string>
-    <key>XCFrameworkFormatVersion</key>
-    <string>1.0</string>
-</dict>
-</plist>
-XCINFO
-fi
+  -output "$XCFW_OUT"
 
 echo ""
 echo "XCFramework created at: $XCFW_OUT"

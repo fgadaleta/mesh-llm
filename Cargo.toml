@@ -1,19 +1,24 @@
 [workspace]
 members = [
     "crates/mesh-llm",
+    "crates/mesh-llm-config",
     "crates/mesh-llm-gpu-bench",
     "crates/mesh-llm-host-runtime",
     "crates/mesh-llm-identity",
     "crates/mesh-llm-protocol",
     "crates/mesh-llm-routing",
+    "crates/mesh-llm-guardrails",
     "crates/mesh-llm-system",
     "crates/mesh-llm-types",
+    "crates/mesh-llm-console-server",
     "crates/mesh-llm-ui",
     "crates/mesh-llm-plugin",
     "crates/mesh-client",
-    "crates/mesh-api",
-    "crates/mesh-host-core",
-    "crates/mesh-api-ffi",
+    "crates/mesh-llm-api-client",
+    "crates/mesh-llm-api-server",
+    "crates/mesh-llm-node",
+    "crates/mesh-llm-ffi",
+    "crates/mesh-llm-nodejs",
     "crates/mesh-llm-test-harness",
     "crates/model-ref",
     "crates/model-artifact",
@@ -45,9 +50,9 @@ default-members = [
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
-version = "0.66.0"
+version = "0.68.0"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -56,6 +61,9 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+
+[patch.crates-io]
+hf-hub = { git = "https://github.com/Mesh-LLM/hf-hub", branch = "mesh-llm" }
 
 [workspace.lints.clippy]
 cognitive_complexity = "warn"

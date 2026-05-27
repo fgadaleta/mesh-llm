@@ -1,120 +1,25 @@
 use super::{
-    PluginSummary, BLACKBOARD_PLUGIN_ID, BLOBSTORE_PLUGIN_ID, FLASH_MOE_PLUGIN_ID,
-    OPENAI_ENDPOINT_PLUGIN_ID, TELEMETRY_PLUGIN_ID,
+    BLOBSTORE_PLUGIN_ID, FLASH_MOE_PLUGIN_ID, OPENAI_ENDPOINT_PLUGIN_ID, PluginSummary,
+    TELEMETRY_PLUGIN_ID,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+#[allow(unused_imports)]
+pub use mesh_llm_config::{
+    AdvancedConfig, AdvancedServerConfig, BoolOrAuto, BoolOrString, ConfigEditor, ConfigStore,
+    FlashAttentionType, GpuAssignment, GpuConfig, HardwareConfig, IntegerOrString,
+    LocalServingNodeConfig, MeshConfig, ModelConfigDefaults, ModelConfigEditor, ModelConfigEntry,
+    ModelDefaultsEditor, ModelFitConfig, ModelRuntimeKind, MultimodalConfig, OwnerControlConfig,
+    PluginConfigEditor, PluginConfigEntry, PrefixCacheConfig, ReasoningBudget, ReasoningEnabled,
+    RequestDefaultsConfig, ReservedObjectConfig, SkippyConfig, SpeculativeConfig,
+    StringOrStringList, TelemetryConfig, TelemetryMetricsConfig, TensorSplitConfig,
+    ThroughputConfig, config_path, config_to_toml, load_config, parse_config_toml, validate_config,
+};
 use mesh_llm_plugin::MeshVisibility;
-use serde::{Deserialize, Serialize};
-use skippy_protocol::FlashAttentionType;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 const FLASH_MOE_INSTALL_HINT: &str = "Install Flash-MoE separately and set \
                                      `command` to its infer binary, or set \
                                      `url` to an already-running Flash-MoE /v1 endpoint.";
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct MeshConfig {
-    #[serde(default)]
-    pub version: Option<u32>,
-    #[serde(default)]
-    pub gpu: GpuConfig,
-    #[serde(default)]
-    pub owner_control: OwnerControlConfig,
-    #[serde(default)]
-    pub telemetry: TelemetryConfig,
-    #[serde(default)]
-    pub models: Vec<ModelConfigEntry>,
-    #[serde(rename = "plugin", default)]
-    pub plugins: Vec<PluginConfigEntry>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct OwnerControlConfig {
-    #[serde(default)]
-    pub bind: Option<std::net::SocketAddr>,
-    #[serde(default)]
-    pub advertise_addr: Option<std::net::SocketAddr>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct GpuConfig {
-    #[serde(default)]
-    pub assignment: GpuAssignment,
-    #[serde(default)]
-    pub parallel: Option<usize>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum GpuAssignment {
-    #[default]
-    Auto,
-    Pinned,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ModelConfigEntry {
-    pub model: String,
-    #[serde(default)]
-    pub mmproj: Option<String>,
-    #[serde(default)]
-    pub ctx_size: Option<u32>,
-    #[serde(default)]
-    pub gpu_id: Option<String>,
-    #[serde(default)]
-    pub parallel: Option<usize>,
-    #[serde(default)]
-    pub cache_type_k: Option<String>,
-    #[serde(default)]
-    pub cache_type_v: Option<String>,
-    #[serde(default)]
-    pub batch: Option<u32>,
-    #[serde(default)]
-    pub ubatch: Option<u32>,
-    #[serde(default)]
-    pub flash_attention: Option<FlashAttentionType>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct TelemetryConfig {
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub service_name: Option<String>,
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    #[serde(default)]
-    pub export_interval_secs: Option<u64>,
-    #[serde(default)]
-    pub queue_size: Option<usize>,
-    #[serde(default)]
-    pub prompt_shape_metrics: bool,
-    #[serde(default)]
-    pub metrics: TelemetryMetricsConfig,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct TelemetryMetricsConfig {
-    #[serde(default)]
-    pub endpoint: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PluginConfigEntry {
-    pub name: String,
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Base URL for inference endpoint plugins (e.g. http://localhost:8000/v1).
-    #[serde(default)]
-    pub url: Option<String>,
-}
 
 #[derive(Clone, Debug)]
 pub struct ResolvedPlugins {
@@ -138,143 +43,6 @@ pub struct PluginHostMode {
     pub mesh_visibility: MeshVisibility,
 }
 
-pub fn config_path(override_path: Option<&Path>) -> Result<PathBuf> {
-    if let Some(path) = override_path {
-        return Ok(path.to_path_buf());
-    }
-    if let Ok(path) = std::env::var("MESH_LLM_CONFIG") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = dirs::home_dir().context("Cannot determine home directory")?;
-    Ok(home.join(".mesh-llm").join("config.toml"))
-}
-
-pub fn load_config(override_path: Option<&Path>) -> Result<MeshConfig> {
-    let path = config_path(override_path)?;
-    if !path.exists() {
-        return Ok(MeshConfig::default());
-    }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read config {}", path.display()))?;
-    let config: MeshConfig = toml::from_str(&raw)
-        .with_context(|| format!("Failed to parse config {}", path.display()))?;
-    validate_config(&config).with_context(|| format!("Invalid config {}", path.display()))?;
-    Ok(config)
-}
-
-pub(crate) fn validate_config(config: &MeshConfig) -> Result<()> {
-    if let Some(version) = config.version {
-        if version != 1 {
-            bail!("unsupported config version {version}; expected version = 1");
-        }
-    }
-    if let Some(bind) = config.owner_control.bind {
-        if bind.port() == 0 && !bind.ip().is_loopback() {
-            bail!(
-                "owner_control.bind must use a concrete port when binding a non-loopback address"
-            );
-        }
-    }
-    if let Some(advertise_addr) = config.owner_control.advertise_addr {
-        if advertise_addr.port() == 0 {
-            bail!("owner_control.advertise_addr must use a concrete port");
-        }
-        if advertise_addr.ip().is_unspecified() {
-            bail!("owner_control.advertise_addr must not use an unspecified IP address");
-        }
-    }
-    if let Some(parallel) = config.gpu.parallel {
-        if parallel < 1 {
-            bail!("gpu.parallel must be at least 1, got {parallel}");
-        }
-    }
-    validate_telemetry_config(&config.telemetry)?;
-    for (index, model) in config.models.iter().enumerate() {
-        if model.model.trim().is_empty() {
-            bail!("models[{index}].model must not be empty");
-        }
-        if let Some(mmproj) = &model.mmproj {
-            if mmproj.trim().is_empty() {
-                bail!("models[{index}].mmproj must not be empty when set");
-            }
-        }
-        if let Some(parallel) = model.parallel {
-            if parallel < 1 {
-                bail!("models[{index}].parallel must be at least 1, got {parallel}");
-            }
-        }
-        if let Some(cache_type_k) = &model.cache_type_k {
-            if cache_type_k.trim().is_empty() {
-                bail!("models[{index}].cache_type_k must not be empty when set");
-            }
-        }
-        if let Some(cache_type_v) = &model.cache_type_v {
-            if cache_type_v.trim().is_empty() {
-                bail!("models[{index}].cache_type_v must not be empty when set");
-            }
-        }
-        if model.batch == Some(0) {
-            bail!("models[{index}].batch must be at least 1 when set");
-        }
-        if model.ubatch == Some(0) {
-            bail!("models[{index}].ubatch must be at least 1 when set");
-        }
-        match config.gpu.assignment {
-            GpuAssignment::Auto => {
-                if model.gpu_id.is_some() {
-                    bail!("models[{index}].gpu_id must not be set when gpu.assignment = \"auto\"");
-                }
-            }
-            GpuAssignment::Pinned => match &model.gpu_id {
-                Some(gpu_id) if !gpu_id.trim().is_empty() => {}
-                _ => {
-                    bail!(
-                        "models[{index}].gpu_id must be set to a non-empty value when gpu.assignment = \"pinned\""
-                    );
-                }
-            },
-        }
-    }
-    Ok(())
-}
-
-fn validate_telemetry_config(config: &TelemetryConfig) -> Result<()> {
-    if let Some(service_name) = &config.service_name {
-        if service_name.trim().is_empty() {
-            bail!("telemetry.service_name must not be empty when set");
-        }
-    }
-    if let Some(endpoint) = &config.endpoint {
-        if endpoint.trim().is_empty() {
-            bail!("telemetry.endpoint must not be empty when set");
-        }
-    }
-    if let Some(endpoint) = &config.metrics.endpoint {
-        if endpoint.trim().is_empty() {
-            bail!("telemetry.metrics.endpoint must not be empty when set");
-        }
-    }
-    for key in config.headers.keys() {
-        if key.trim().is_empty() {
-            bail!("telemetry.headers keys must not be empty");
-        }
-    }
-    if let Some(export_interval_secs) = config.export_interval_secs {
-        if export_interval_secs < 1 {
-            bail!("telemetry.export_interval_secs must be at least 1");
-        }
-    }
-    if let Some(queue_size) = config.queue_size {
-        if queue_size < 1 {
-            bail!("telemetry.queue_size must be at least 1");
-        }
-    }
-    if config.prompt_shape_metrics {
-        bail!("telemetry.prompt_shape_metrics is not supported yet and must remain false");
-    }
-    Ok(())
-}
-
 pub(crate) fn telemetry_plugin_enabled(config: &MeshConfig) -> bool {
     config
         .plugins
@@ -288,7 +56,6 @@ pub fn resolve_plugins(config: &MeshConfig, _host_mode: PluginHostMode) -> Resul
     let mut externals = Vec::new();
     let inactive = Vec::new();
     let mut names = BTreeMap::<String, ()>::new();
-    let mut blackboard_enabled = true;
     let mut blobstore_enabled = true;
     let mut openai_endpoint_enabled = false;
     let mut openai_endpoint_url: Option<String> = None;
@@ -299,16 +66,6 @@ pub fn resolve_plugins(config: &MeshConfig, _host_mode: PluginHostMode) -> Resul
             bail!("Duplicate plugin entry '{}'", entry.name);
         }
         let enabled = entry.enabled.unwrap_or(true);
-        if entry.name == BLACKBOARD_PLUGIN_ID {
-            if entry.command.is_some() || !entry.args.is_empty() || entry.url.is_some() {
-                bail!(
-                    "Plugin '{}' is served by mesh-llm itself; only `enabled` may be set",
-                    BLACKBOARD_PLUGIN_ID
-                );
-            }
-            blackboard_enabled = enabled;
-            continue;
-        }
         if entry.name == BLOBSTORE_PLUGIN_ID {
             if entry.command.is_some() || !entry.args.is_empty() || entry.url.is_some() {
                 bail!(
@@ -365,12 +122,8 @@ pub fn resolve_plugins(config: &MeshConfig, _host_mode: PluginHostMode) -> Resul
         });
     }
 
-    if blackboard_enabled {
-        externals.insert(0, blackboard_plugin_spec()?);
-    }
     if telemetry_enabled {
-        let insert_at = usize::from(blackboard_enabled).min(externals.len());
-        externals.insert(insert_at, telemetry_plugin_spec()?);
+        externals.insert(0, telemetry_plugin_spec()?);
     }
     if openai_endpoint_enabled {
         let mut spec = openai_endpoint_plugin_spec()?;
@@ -387,25 +140,6 @@ pub fn resolve_plugins(config: &MeshConfig, _host_mode: PluginHostMode) -> Resul
     Ok(ResolvedPlugins {
         externals,
         inactive,
-    })
-}
-
-pub fn blackboard_plugin_spec() -> Result<ExternalPluginSpec> {
-    let command = std::env::current_exe()
-        .context("Cannot determine mesh-llm executable path")?
-        .display()
-        .to_string();
-    Ok(ExternalPluginSpec {
-        name: BLACKBOARD_PLUGIN_ID.to_string(),
-        command,
-        args: vec![
-            "--log-format".into(),
-            "json".into(),
-            "--plugin".into(),
-            BLACKBOARD_PLUGIN_ID.into(),
-        ],
-        url: None,
-        env: BTreeMap::new(),
     })
 }
 
@@ -538,9 +272,67 @@ pub fn telemetry_plugin_spec() -> Result<ExternalPluginSpec> {
     })
 }
 
+pub fn bundled_cli_plugin_spec(_name: &str) -> Result<Option<ExternalPluginSpec>> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    const FULL_SURFACE_VALID_FIXTURE: &str =
+        include_str!("../../tests/fixtures/skippy_full_surface_valid.toml");
+    const FULL_SURFACE_INVALID_FIXTURE: &str =
+        include_str!("../../tests/fixtures/skippy_full_surface_invalid.toml");
+
+    fn documented_matrix_key_paths() -> BTreeSet<String> {
+        let matrix = include_str!("../../../../docs/skippy/CONFIGURATION.md");
+        matrix
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .filter_map(|line| {
+                let columns: Vec<_> = line.split('|').map(str::trim).collect();
+                columns.get(3).copied()
+            })
+            .filter(|cell| cell.contains('`'))
+            .flat_map(|cell| {
+                cell.split("<br>")
+                    .filter_map(|part| {
+                        let trimmed = part.trim();
+                        trimmed
+                            .strip_prefix('`')
+                            .and_then(|value| value.strip_suffix('`'))
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn test_model(name: &str) -> ModelConfigEntry {
+        ModelConfigEntry {
+            model: name.into(),
+            mmproj: None,
+            ctx_size: None,
+            gpu_id: None,
+            parallel: None,
+            cache_type_k: None,
+            cache_type_v: None,
+            batch: None,
+            ubatch: None,
+            flash_attention: None,
+            model_fit: None,
+            hardware: None,
+            throughput: None,
+            skippy: None,
+            speculative: None,
+            request_defaults: None,
+            multimodal: None,
+            advanced: None,
+            gpu_id_from_legacy_shim: false,
+        }
+    }
 
     #[test]
     fn parse_unified_config_keeps_plugins_and_models() {
@@ -691,9 +483,10 @@ advertise_addr = "0.0.0.0:18443"
         .unwrap();
 
         let err = validate_config(&config).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("owner_control.advertise_addr must not use an unspecified IP address"));
+        assert!(
+            err.to_string()
+                .contains("owner_control.advertise_addr must not use an unspecified IP address")
+        );
     }
 
     #[test]
@@ -707,9 +500,10 @@ advertise_addr = "127.0.0.1:0"
         .unwrap();
 
         let err = validate_config(&config).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("owner_control.advertise_addr must use a concrete port"));
+        assert!(
+            err.to_string()
+                .contains("owner_control.advertise_addr must use a concrete port")
+        );
     }
 
     #[test]
@@ -777,25 +571,61 @@ ctx_size = 8192
                 assignment: GpuAssignment::Pinned,
                 parallel: None,
             },
-            models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
-                parallel: None,
-                cache_type_k: None,
-                cache_type_v: None,
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
-            }],
+            models: vec![test_model("Qwen3-8B-Q4_K_M")],
             ..MeshConfig::default()
         };
 
         let err = validate_config(&config).unwrap_err();
         assert!(err.to_string().contains(
-            "models[0].gpu_id must be set to a non-empty value when gpu.assignment = \"pinned\""
+            "models[0].hardware.device must be set to a non-empty value when gpu.assignment = \"pinned\""
         ));
+    }
+
+    #[test]
+    fn pinned_gpu_config_accepts_defaults_hardware_device_for_models() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[gpu]
+assignment = "pinned"
+
+[defaults.hardware]
+device = "CUDA0"
+
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+"#,
+        )
+        .unwrap();
+
+        validate_config(&config).unwrap();
+        assert!(config.models[0].hardware.is_none());
+    }
+
+    #[test]
+    fn pinned_gpu_config_allows_defaults_hardware_without_device_when_models_pin_devices() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[gpu]
+assignment = "pinned"
+
+[defaults.hardware]
+gpu_layers = "auto"
+
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+
+[models.hardware]
+device = "CUDA1"
+"#,
+        )
+        .unwrap();
+
+        validate_config(&config).unwrap();
+        assert_eq!(config.models[0].gpu_id.as_deref(), Some("CUDA1"));
     }
 
     #[test]
@@ -806,24 +636,38 @@ ctx_size = 8192
                 parallel: None,
             },
             models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
                 gpu_id: Some("  \t  ".into()),
-                parallel: None,
-                cache_type_k: None,
-                cache_type_v: None,
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
+                gpu_id_from_legacy_shim: true,
+                ..test_model("Qwen3-8B-Q4_K_M")
             }],
             ..MeshConfig::default()
         };
 
         let err = validate_config(&config).unwrap_err();
-        assert!(err.to_string().contains(
-            "models[0].gpu_id must be set to a non-empty value when gpu.assignment = \"pinned\""
-        ));
+        assert!(
+            err.to_string()
+                .contains("models[0].hardware.device must not be empty when set")
+        );
+    }
+
+    #[test]
+    fn hardware_gpu_layers_rejects_i32_overflow() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+
+[models.hardware]
+gpu_layers = 2147483648
+"#,
+        )
+        .unwrap();
+
+        let err = validate_config(&config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "models[0].hardware.gpu_layers must be at most 2147483647"
+        );
     }
 
     #[test]
@@ -834,24 +678,19 @@ ctx_size = 8192
                 parallel: None,
             },
             models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
                 gpu_id: Some("pci:0000:65:00.0".into()),
-                parallel: None,
-                cache_type_k: None,
-                cache_type_v: None,
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
+                gpu_id_from_legacy_shim: true,
+                ..test_model("Qwen3-8B-Q4_K_M")
             }],
             ..MeshConfig::default()
         };
 
         let err = validate_config(&config).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("models[0].gpu_id must not be set when gpu.assignment = \"auto\""));
+        assert!(
+            err.to_string().contains(
+                "models[0].hardware.device must not be set when gpu.assignment = \"auto\""
+            )
+        );
     }
 
     #[test]
@@ -922,18 +761,7 @@ model = "Qwen3-8B-Q4_K_M"
                 assignment: GpuAssignment::Auto,
                 parallel: Some(0),
             },
-            models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
-                parallel: None,
-                cache_type_k: None,
-                cache_type_v: None,
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
-            }],
+            models: vec![test_model("Qwen3-8B-Q4_K_M")],
             ..MeshConfig::default()
         };
 
@@ -952,18 +780,7 @@ model = "Qwen3-8B-Q4_K_M"
                 assignment: GpuAssignment::Auto,
                 parallel: Some(1),
             },
-            models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
-                parallel: None,
-                cache_type_k: None,
-                cache_type_v: None,
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
-            }],
+            models: vec![test_model("Qwen3-8B-Q4_K_M")],
             ..MeshConfig::default()
         };
 
@@ -977,18 +794,7 @@ model = "Qwen3-8B-Q4_K_M"
                 assignment: GpuAssignment::Auto,
                 parallel: None,
             },
-            models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
-                parallel: None,
-                cache_type_k: None,
-                cache_type_v: None,
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
-            }],
+            models: vec![test_model("Qwen3-8B-Q4_K_M")],
             ..MeshConfig::default()
         };
 
@@ -1002,18 +808,7 @@ model = "Qwen3-8B-Q4_K_M"
                 assignment: GpuAssignment::Auto,
                 parallel: Some(64),
             },
-            models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
-                parallel: None,
-                cache_type_k: None,
-                cache_type_v: None,
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
-            }],
+            models: vec![test_model("Qwen3-8B-Q4_K_M")],
             ..MeshConfig::default()
         };
 
@@ -1036,16 +831,8 @@ model = "Qwen3-8B-Q4_K_M"
     fn per_model_parallel_valid_value_accepted() {
         let config = MeshConfig {
             models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
                 parallel: Some(8),
-                cache_type_k: None,
-                cache_type_v: None,
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
+                ..test_model("Qwen3-8B-Q4_K_M")
             }],
             ..MeshConfig::default()
         };
@@ -1056,23 +843,15 @@ model = "Qwen3-8B-Q4_K_M"
     fn per_model_parallel_zero_rejected() {
         let config = MeshConfig {
             models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
                 parallel: Some(0),
-                cache_type_k: None,
-                cache_type_v: None,
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
+                ..test_model("Qwen3-8B-Q4_K_M")
             }],
             ..MeshConfig::default()
         };
         let err = validate_config(&config).unwrap_err();
         assert!(
             err.to_string()
-                .contains("models[0].parallel must be at least 1"),
+                .contains("models[0].throughput.parallel must be at least 1"),
             "unexpected error: {err}"
         );
     }
@@ -1080,18 +859,7 @@ model = "Qwen3-8B-Q4_K_M"
     #[test]
     fn per_model_parallel_none_accepted() {
         let config = MeshConfig {
-            models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
-                parallel: None,
-                cache_type_k: None,
-                cache_type_v: None,
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
-            }],
+            models: vec![test_model("Qwen3-8B-Q4_K_M")],
             ..MeshConfig::default()
         };
         validate_config(&config).unwrap();
@@ -1131,95 +899,580 @@ flash_attention = "enabled"
     fn model_cache_type_k_empty_rejected() {
         let config = MeshConfig {
             models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
-                parallel: None,
                 cache_type_k: Some("   ".into()),
-                cache_type_v: None,
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
+                ..test_model("Qwen3-8B-Q4_K_M")
             }],
             ..MeshConfig::default()
         };
 
         let err = validate_config(&config).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("models[0].cache_type_k must not be empty when set"));
+        assert!(
+            err.to_string()
+                .contains("models[0].model_fit.cache_type_k must not be empty when set")
+        );
     }
 
     #[test]
     fn model_cache_type_v_empty_rejected() {
         let config = MeshConfig {
             models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
-                parallel: None,
-                cache_type_k: None,
                 cache_type_v: Some("   ".into()),
-                batch: None,
-                ubatch: None,
-                flash_attention: None,
+                ..test_model("Qwen3-8B-Q4_K_M")
             }],
             ..MeshConfig::default()
         };
 
         let err = validate_config(&config).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("models[0].cache_type_v must not be empty when set"));
+        assert!(
+            err.to_string()
+                .contains("models[0].model_fit.cache_type_v must not be empty when set")
+        );
     }
 
     #[test]
     fn model_batch_zero_rejected() {
         let config = MeshConfig {
             models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
-                parallel: None,
-                cache_type_k: None,
-                cache_type_v: None,
                 batch: Some(0),
-                ubatch: None,
-                flash_attention: None,
+                ..test_model("Qwen3-8B-Q4_K_M")
             }],
             ..MeshConfig::default()
         };
 
         let err = validate_config(&config).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("models[0].batch must be at least 1 when set"));
+        assert!(
+            err.to_string()
+                .contains("models[0].model_fit.batch must be at least 1 when set")
+        );
     }
 
     #[test]
     fn model_ubatch_zero_rejected() {
         let config = MeshConfig {
             models: vec![ModelConfigEntry {
-                model: "Qwen3-8B-Q4_K_M".into(),
-                mmproj: None,
-                ctx_size: None,
-                gpu_id: None,
-                parallel: None,
-                cache_type_k: None,
-                cache_type_v: None,
-                batch: None,
                 ubatch: Some(0),
-                flash_attention: None,
+                ..test_model("Qwen3-8B-Q4_K_M")
             }],
             ..MeshConfig::default()
         };
 
         let err = validate_config(&config).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("models[0].ubatch must be at least 1 when set"));
+        assert!(
+            err.to_string()
+                .contains("models[0].model_fit.ubatch must be at least 1 when set")
+        );
+    }
+
+    #[test]
+    fn defaults_nested_sections_preserve_existing_behavior_when_omitted() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[gpu]
+assignment = "auto"
+
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+ctx_size = 8192
+parallel = 4
+"#,
+        )
+        .unwrap();
+
+        validate_config(&config).unwrap();
+        assert!(config.defaults.is_none());
+        assert_eq!(config.models[0].ctx_size, Some(8192));
+        assert_eq!(config.models[0].parallel, Some(4));
+        assert_eq!(
+            config.models[0].model_fit.as_ref().and_then(|v| v.ctx_size),
+            Some(8192)
+        );
+        assert_eq!(
+            config.models[0]
+                .throughput
+                .as_ref()
+                .and_then(|v| v.parallel),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn nested_defaults_parse_representative_sections() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[defaults.model_fit]
+ctx_size = 4096
+kv_cache_policy = "balanced"
+
+[defaults.hardware]
+model_runtime = "cuda"
+
+[defaults.throughput]
+parallel = 2
+
+[defaults.skippy]
+activation_wire_dtype = "f16"
+
+[defaults.speculative]
+mode = "ngram"
+
+[defaults.request_defaults]
+temperature = 0.2
+
+[defaults.multimodal]
+image_max_tokens = 4096
+
+[defaults.advanced.server]
+alias = "qwen-local"
+
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+"#,
+        )
+        .unwrap();
+
+        validate_config(&config).unwrap();
+        let defaults = config.defaults.expect("defaults should parse");
+        assert_eq!(defaults.model_fit.and_then(|v| v.ctx_size), Some(4096));
+        assert_eq!(
+            defaults.hardware.and_then(|v| v.model_runtime),
+            Some(ModelRuntimeKind::Cuda)
+        );
+        assert_eq!(defaults.throughput.and_then(|v| v.parallel), Some(2));
+        assert_eq!(
+            defaults.skippy.and_then(|v| v.activation_wire_dtype),
+            Some("f16".into())
+        );
+        assert_eq!(
+            defaults.speculative.and_then(|v| v.mode),
+            Some("ngram".into())
+        );
+    }
+
+    #[test]
+    fn canonical_plan_example_auto_sentinels_parse_and_validate() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[gpu]
+assignment = "auto"
+
+[defaults.model_fit]
+ctx_size = 8192
+batch = 512
+ubatch = 128
+kv_cache_policy = "auto"
+cache_type_k = "auto"
+cache_type_v = "auto"
+kv_offload = "auto"
+kv_unified = "auto"
+cache_ram_mib = 0
+cache_idle_slots = 0
+prompt_cache = "auto"
+context_shift = "auto"
+
+[defaults.hardware]
+model_runtime = "auto"
+device = "auto"
+gpu_layers = "auto"
+tensor_split = []
+split_mode = "auto"
+main_gpu = 0
+placement = "auto"
+safety_margin_gb = 2.0
+mmap = "auto"
+mlock = false
+direct_io = false
+warmup = "auto"
+
+[defaults.throughput]
+parallel = 1
+continuous_batching = "auto"
+threads = 0
+threads_batch = 0
+tuning_profile = "balanced"
+numa = "auto"
+cpu_affinity = []
+
+[defaults.skippy]
+activation_wire_dtype = "auto"
+prefill_chunking = "auto"
+prefill_chunk_size = 0
+binary_stage_transport = "auto"
+
+[defaults.speculative]
+mode = "auto"
+draft_selection_policy = "auto"
+pairing_fault = "warn_disable"
+draft_max_tokens = 16
+draft_min_tokens = 0
+draft_acceptance_threshold = 0.0
+
+[defaults.request_defaults]
+temperature = 0.8
+top_p = 0.95
+top_k = 40
+min_p = 0.0
+repeat_penalty = 1.0
+repeat_last_n = 64
+reasoning_format = "auto"
+reasoning_budget = "auto"
+
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+ctx_size = 8192
+
+[models.model_fit]
+ctx_size = 16384
+cache_type_k = "q8_0"
+cache_type_v = "q8_0"
+
+[models.hardware]
+gpu_layers = 99
+device = "cuda:0"
+"#,
+        )
+        .unwrap();
+
+        validate_config(&config).unwrap();
+        let defaults = config.defaults.as_ref().expect("defaults should parse");
+        assert!(matches!(
+            defaults.model_fit.as_ref().and_then(|v| v.kv_unified.as_ref()),
+            Some(BoolOrAuto::String(value)) if value == "auto"
+        ));
+        assert!(matches!(
+            defaults.hardware.as_ref().and_then(|v| v.gpu_layers.as_ref()),
+            Some(IntegerOrString::String(value)) if value == "auto"
+        ));
+        assert!(matches!(
+            defaults.hardware.as_ref().and_then(|v| v.tensor_split.as_ref()),
+            Some(TensorSplitConfig::Ratios(values)) if values.is_empty()
+        ));
+        assert!(matches!(
+            defaults.request_defaults.as_ref().and_then(|v| v.reasoning_budget.as_ref()),
+            Some(ReasoningBudget::String(value)) if value == "auto"
+        ));
+        assert_eq!(config.models[0].ctx_size, Some(16384));
+        assert_eq!(config.models[0].gpu_id.as_deref(), Some("cuda:0"));
+    }
+
+    #[test]
+    fn legacy_flat_fields_normalize_into_nested_sections() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+ctx_size = 8192
+gpu_id = "pci:0000:65:00.0"
+parallel = 6
+cache_type_k = "q8_0"
+cache_type_v = "q4_0"
+batch = 1024
+ubatch = 256
+flash_attention = "enabled"
+mmproj = "projector.gguf"
+"#,
+        )
+        .unwrap();
+
+        let model = &config.models[0];
+        assert_eq!(
+            model.model_fit.as_ref().and_then(|v| v.ctx_size),
+            Some(8192)
+        );
+        assert_eq!(
+            model.hardware.as_ref().and_then(|v| v.device.as_deref()),
+            Some("pci:0000:65:00.0")
+        );
+        assert_eq!(model.throughput.as_ref().and_then(|v| v.parallel), Some(6));
+        assert_eq!(
+            model
+                .model_fit
+                .as_ref()
+                .and_then(|v| v.cache_type_k.as_deref()),
+            Some("q8_0")
+        );
+        assert_eq!(model.model_fit.as_ref().and_then(|v| v.batch), Some(1024));
+        assert_eq!(
+            model.multimodal.as_ref().and_then(|v| v.mmproj.as_deref()),
+            Some("projector.gguf")
+        );
+    }
+
+    #[test]
+    fn nested_values_override_legacy_shims() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[gpu]
+assignment = "pinned"
+
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+ctx_size = 4096
+gpu_id = "legacy-gpu"
+parallel = 2
+batch = 256
+mmproj = "legacy.gguf"
+
+[models.model_fit]
+ctx_size = 8192
+batch = 1024
+
+[models.hardware]
+device = "nested-gpu"
+
+[models.throughput]
+parallel = 8
+
+[models.multimodal]
+mmproj = "nested.gguf"
+"#,
+        )
+        .unwrap();
+
+        validate_config(&config).unwrap();
+        let model = &config.models[0];
+        assert_eq!(model.ctx_size, Some(8192));
+        assert_eq!(model.batch, Some(1024));
+        assert_eq!(model.gpu_id.as_deref(), Some("nested-gpu"));
+        assert_eq!(model.parallel, Some(8));
+        assert_eq!(model.mmproj.as_deref(), Some("nested.gguf"));
+    }
+
+    #[test]
+    fn invalid_model_fit_batch_path_is_stable() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+
+[models.model_fit]
+batch = 0
+"#,
+        )
+        .unwrap();
+
+        let err = validate_config(&config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "models[0].model_fit.batch must be at least 1 when set"
+        );
+    }
+
+    #[test]
+    fn invalid_split_mode_path_is_stable() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+
+[models.hardware]
+split_mode = "diagonal"
+"#,
+        )
+        .unwrap();
+
+        let err = validate_config(&config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "models[0].hardware.split_mode must be one of: auto, none, layer, row"
+        );
+    }
+
+    #[test]
+    fn invalid_reasoning_format_path_is_stable() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+
+[models.request_defaults]
+reasoning_format = "mystery"
+"#,
+        )
+        .unwrap();
+
+        let err = validate_config(&config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "models[0].request_defaults.reasoning_format must be one of: auto, none, deepseek, deepseek-legacy, hidden"
+        );
+    }
+
+    #[test]
+    fn deepseek_legacy_reasoning_format_is_accepted() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+
+[models.request_defaults]
+reasoning_format = "deepseek-legacy"
+"#,
+        )
+        .unwrap();
+
+        validate_config(&config).expect("deepseek-legacy should remain accepted");
+    }
+
+    #[test]
+    fn invalid_speculative_draft_requires_policy_path_is_stable() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+
+[models.speculative]
+mode = "draft"
+"#,
+        )
+        .unwrap();
+
+        let err = validate_config(&config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "models[0].speculative.draft_selection_policy must be set when models[0].speculative.mode = \"draft\" and no explicit draft model source is configured"
+        );
+    }
+
+    #[test]
+    fn invalid_mmproj_conflict_is_rejected() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[[models]]
+model = "Qwen3-8B-Q4_K_M"
+
+[models.hardware]
+mmproj = "hardware.gguf"
+
+[models.multimodal]
+mmproj = "multimodal.gguf"
+"#,
+        )
+        .unwrap();
+
+        let err = validate_config(&config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "models[0].multimodal.mmproj must match models[0].hardware.mmproj when both are set"
+        );
+    }
+
+    #[test]
+    fn integrated_full_surface_fixture_parses_validates_and_tracks_docs() {
+        let config: MeshConfig = toml::from_str(FULL_SURFACE_VALID_FIXTURE).unwrap();
+
+        validate_config(&config).unwrap();
+        assert_eq!(config.models.len(), 2);
+        assert_eq!(
+            config.owner_control.bind,
+            Some("127.0.0.1:7447".parse().unwrap())
+        );
+        assert_eq!(
+            config.owner_control.advertise_addr,
+            Some("203.0.113.10:18443".parse().unwrap())
+        );
+
+        let defaults = config.defaults.as_ref().expect("defaults should parse");
+        assert_eq!(
+            defaults.model_fit.as_ref().and_then(|fit| fit.ctx_size),
+            Some(8192)
+        );
+        assert_eq!(
+            defaults
+                .request_defaults
+                .as_ref()
+                .and_then(|request_defaults| request_defaults.temperature),
+            Some(0.2)
+        );
+
+        let explicit = &config.models[0];
+        assert_eq!(explicit.model, "Qwen/Qwen3-0.6B:Q4_K_M");
+        assert_eq!(
+            explicit.model_fit.as_ref().and_then(|fit| fit.ctx_size),
+            Some(16384)
+        );
+        assert_eq!(
+            explicit
+                .hardware
+                .as_ref()
+                .and_then(|hardware| hardware.stage_layer_start),
+            Some(12)
+        );
+        assert_eq!(
+            explicit
+                .skippy
+                .as_ref()
+                .and_then(|skippy| skippy.prefill_chunk_schedule.as_deref()),
+            Some("128,256,384")
+        );
+
+        let omitted = &config.models[1];
+        assert_eq!(omitted.model, "ggml-org/gemma-3-270m-it-GGUF:Q8_0");
+        assert!(
+            omitted.model_fit.is_none(),
+            "omitted per-model model_fit should stay absent"
+        );
+        assert!(
+            omitted.request_defaults.is_none(),
+            "omitted per-model request defaults should stay absent"
+        );
+
+        let matrix = include_str!("../../../../docs/skippy/CONFIGURATION.md");
+        let matrix_keys = documented_matrix_key_paths();
+        assert!(
+            matrix_keys.len() >= 100,
+            "expected a substantial canonical key-path set, found {}",
+            matrix_keys.len()
+        );
+        for key in [
+            "model_fit.ctx_size",
+            "model_fit.prefix_cache.max_entries",
+            "hardware.stage_layer_start",
+            "hardware.stage_layer_end",
+            "skippy.prefill_chunk_schedule",
+            "speculative.draft_gpu_layers",
+            "request_defaults.reasoning_budget",
+            "multimodal.mmproj",
+            "advanced.server.alias",
+        ] {
+            assert!(matrix.contains(key), "missing matrix doc entry {key}");
+        }
+
+        let docs_readme = include_str!("../../../../docs/README.md");
+        let usage = include_str!("../../../../docs/USAGE.md");
+        let cli = include_str!("../../../../docs/CLI.md");
+        assert!(docs_readme.contains("[skippy/CONFIGURATION.md](skippy/CONFIGURATION.md)"));
+        assert!(usage.contains("request payload values still win"));
+        assert!(cli.contains("Request defaults only fill absent or null request fields"));
+        assert!(cli.contains("Staged-only controls stay staged-only."));
+    }
+
+    #[test]
+    fn integrated_invalid_fixture_reports_batch_then_pinned_device_paths() {
+        let invalid: MeshConfig = toml::from_str(FULL_SURFACE_INVALID_FIXTURE).unwrap();
+        let batch_error = validate_config(&invalid).unwrap_err().to_string();
+        assert_eq!(
+            batch_error,
+            "models[0].model_fit.batch must be at least 1 when set"
+        );
+
+        let repaired_batch = FULL_SURFACE_INVALID_FIXTURE.replace("batch = 0", "batch = 64");
+        let repaired_batch =
+            repaired_batch.replace("[defaults.hardware]\ndevice = \"CUDA0\"\n\n", "");
+        let repaired: MeshConfig = toml::from_str(&repaired_batch).unwrap();
+        let pinned_error = validate_config(&repaired).unwrap_err().to_string();
+        assert_eq!(
+            pinned_error,
+            "models[0].hardware.device must be set to a non-empty value when gpu.assignment = \"pinned\""
+        );
     }
 }

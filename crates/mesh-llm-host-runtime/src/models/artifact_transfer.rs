@@ -4,7 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -178,21 +178,21 @@ pub(crate) fn required_stage_package_artifacts(
             .pointer("/shared/metadata")
             .context("manifest missing shared metadata")?,
     )?;
-    if selection.include_embeddings {
-        if let Some(embeddings) = manifest.pointer("/shared/embeddings") {
-            push_manifest_artifact(
-                &mut out,
-                &mut seen,
-                package_ref,
-                manifest_sha256,
-                embeddings,
-            )?;
-        }
+    if selection.include_embeddings
+        && let Some(embeddings) = manifest.pointer("/shared/embeddings")
+    {
+        push_manifest_artifact(
+            &mut out,
+            &mut seen,
+            package_ref,
+            manifest_sha256,
+            embeddings,
+        )?;
     }
-    if selection.include_output {
-        if let Some(output) = manifest.pointer("/shared/output") {
-            push_manifest_artifact(&mut out, &mut seen, package_ref, manifest_sha256, output)?;
-        }
+    if selection.include_output
+        && let Some(output) = manifest.pointer("/shared/output")
+    {
+        push_manifest_artifact(&mut out, &mut seen, package_ref, manifest_sha256, output)?;
     }
     if let Some(layers) = manifest.get("layers").and_then(Value::as_array) {
         for (index, layer) in layers.iter().enumerate() {
@@ -205,17 +205,11 @@ pub(crate) fn required_stage_package_artifacts(
             }
         }
     }
-    if selection.include_projectors {
-        if let Some(projectors) = manifest.get("projectors").and_then(Value::as_array) {
-            for projector in projectors {
-                push_manifest_artifact(
-                    &mut out,
-                    &mut seen,
-                    package_ref,
-                    manifest_sha256,
-                    projector,
-                )?;
-            }
+    if selection.include_projectors
+        && let Some(projectors) = manifest.get("projectors").and_then(Value::as_array)
+    {
+        for projector in projectors {
+            push_manifest_artifact(&mut out, &mut seen, package_ref, manifest_sha256, projector)?;
         }
     }
     Ok(out)
@@ -250,15 +244,13 @@ pub(crate) fn local_artifact_satisfies(
     if !metadata.is_file() {
         return Ok(false);
     }
-    if let Some(expected_size) = request.expected_size {
-        if metadata.len() != expected_size {
-            return Ok(false);
-        }
+    if let Some(expected_size) = request.expected_size
+        && metadata.len() != expected_size
+    {
+        return Ok(false);
     }
-    if verify_sha {
-        if let Some(expected_sha) = request.expected_sha256.as_deref() {
-            return Ok(file_sha256_hex(&path)?.eq_ignore_ascii_case(expected_sha));
-        }
+    if verify_sha && let Some(expected_sha) = request.expected_sha256.as_deref() {
+        return Ok(file_sha256_hex(&path)?.eq_ignore_ascii_case(expected_sha));
     }
     Ok(true)
 }
@@ -337,6 +329,11 @@ pub(crate) fn servable_artifact_from_request(
         metadata.len() == declared.artifact_bytes,
         "cached artifact size mismatch"
     );
+    let actual_sha = file_sha256_hex(&path)?;
+    anyhow::ensure!(
+        actual_sha.eq_ignore_ascii_case(&declared.sha256),
+        "cached artifact sha256 mismatch"
+    );
     Ok(ServableArtifact {
         path,
         size: declared.artifact_bytes,
@@ -370,22 +367,30 @@ fn parse_hf_package_ref(package_ref: &str) -> Result<HfPackageRef> {
     let rest = package_ref
         .strip_prefix("hf://")
         .context("artifact transfer only supports hf:// package refs")?;
-    let (repo, revision) = if let Some((repo, revision)) = rest.split_once('@') {
-        (repo, revision)
-    } else if let Some(index) = rest.rfind(':') {
-        (&rest[..index], &rest[index + 1..])
-    } else {
-        (rest, "main")
-    };
+    let (repo, revision) = rest
+        .split_once('@')
+        .context("artifact transfer requires an explicit immutable hf://namespace/repo@revision")?;
     anyhow::ensure!(
         repo.split('/').count() == 2 && !repo.contains(':') && !repo.contains('@'),
         "HF package repo id must look like namespace/repo"
     );
-    anyhow::ensure!(!revision.trim().is_empty(), "HF package revision is empty");
+    let revision = revision.trim();
+    anyhow::ensure!(!revision.is_empty(), "HF package revision is empty");
+    anyhow::ensure!(
+        is_immutable_revision_hint(revision),
+        "artifact transfer requires an immutable HF package revision"
+    );
     Ok(HfPackageRef {
         repo: repo.to_string(),
         revision: revision.to_string(),
     })
+}
+
+fn is_immutable_revision_hint(revision: &str) -> bool {
+    !matches!(
+        revision.trim().to_ascii_lowercase().as_str(),
+        "main" | "master" | "latest" | "dev" | "develop" | "development"
+    )
 }
 
 fn hf_repo_cache_root(repo: &str) -> PathBuf {
@@ -517,9 +522,11 @@ mod tests {
 
     fn restore_env(key: &str, previous: Option<OsString>) {
         if let Some(value) = previous {
-            std::env::set_var(key, value);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var(key, value) };
         } else {
-            std::env::remove_var(key);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var(key) };
         }
     }
 
@@ -608,19 +615,23 @@ mod tests {
     fn artifact_transfer_policy_defaults_to_disabled_and_supports_opt_in_modes() {
         let prev = std::env::var_os("MESH_LLM_ARTIFACT_TRANSFER");
 
-        std::env::remove_var("MESH_LLM_ARTIFACT_TRANSFER");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("MESH_LLM_ARTIFACT_TRANSFER") };
         assert_eq!(artifact_transfer_mode(), ArtifactTransferMode::Disabled);
         assert!(!artifact_transfer_enabled());
 
-        std::env::set_var("MESH_LLM_ARTIFACT_TRANSFER", "off");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("MESH_LLM_ARTIFACT_TRANSFER", "off") };
         assert_eq!(artifact_transfer_mode(), ArtifactTransferMode::Disabled);
         assert!(!artifact_transfer_enabled());
 
-        std::env::set_var("MESH_LLM_ARTIFACT_TRANSFER", "trusted");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("MESH_LLM_ARTIFACT_TRANSFER", "trusted") };
         assert_eq!(artifact_transfer_mode(), ArtifactTransferMode::TrustedOnly);
         assert!(artifact_transfer_enabled());
 
-        std::env::set_var("MESH_LLM_ARTIFACT_TRANSFER", "1");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("MESH_LLM_ARTIFACT_TRANSFER", "1") };
         assert_eq!(artifact_transfer_mode(), ArtifactTransferMode::Open);
         assert!(artifact_transfer_enabled());
 
@@ -631,7 +642,8 @@ mod tests {
     #[serial]
     fn artifact_transfer_default_policy_does_not_advertise_or_serve_public_mesh() {
         let prev = std::env::var_os("MESH_LLM_ARTIFACT_TRANSFER");
-        std::env::remove_var("MESH_LLM_ARTIFACT_TRANSFER");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("MESH_LLM_ARTIFACT_TRANSFER") };
 
         let unsigned = crate::crypto::OwnershipSummary::default();
         let trust_store = crate::crypto::TrustStore::default();
@@ -650,7 +662,8 @@ mod tests {
     #[serial]
     fn artifact_transfer_trusted_policy_requires_owned_or_allowlisted_peer() {
         let prev = std::env::var_os("MESH_LLM_ARTIFACT_TRANSFER");
-        std::env::set_var("MESH_LLM_ARTIFACT_TRANSFER", "trusted");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("MESH_LLM_ARTIFACT_TRANSFER", "trusted") };
 
         let local = verified_owner("owner-a");
         let same_owner_peer = verified_owner("owner-a");
@@ -683,7 +696,8 @@ mod tests {
     #[serial]
     fn artifact_transfer_open_policy_is_explicit_public_mesh_opt_in() {
         let prev = std::env::var_os("MESH_LLM_ARTIFACT_TRANSFER");
-        std::env::set_var("MESH_LLM_ARTIFACT_TRANSFER", "open");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("MESH_LLM_ARTIFACT_TRANSFER", "open") };
 
         let unsigned = crate::crypto::OwnershipSummary::default();
         let trust_store = crate::crypto::TrustStore::default();
@@ -703,7 +717,8 @@ mod tests {
     fn required_stage_package_artifacts_include_stage_shared_and_projectors() {
         let prev = std::env::var_os("HF_HUB_CACHE");
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("HF_HUB_CACHE", temp.path());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", temp.path()) };
         let (package_dir, package_ref, manifest_sha) = write_package_fixture(temp.path());
 
         let artifacts = required_stage_package_artifacts(
@@ -741,7 +756,8 @@ mod tests {
     fn required_stage_package_artifacts_rejects_oversize_manifest() {
         let prev = std::env::var_os("HF_HUB_CACHE");
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("HF_HUB_CACHE", temp.path());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", temp.path()) };
         let (package_dir, package_ref, manifest_sha) = write_package_fixture(temp.path());
         let manifest = fs::OpenOptions::new()
             .write(true)
@@ -750,19 +766,21 @@ mod tests {
             .unwrap();
         manifest.set_len(MAX_PACKAGE_MANIFEST_BYTES + 1).unwrap();
 
-        assert!(required_stage_package_artifacts(
-            &package_dir,
-            &package_ref,
-            &manifest_sha,
-            StageArtifactSelection {
-                layer_start: 0,
-                layer_end: 1,
-                include_embeddings: true,
-                include_output: false,
-                include_projectors: false,
-            },
-        )
-        .is_err());
+        assert!(
+            required_stage_package_artifacts(
+                &package_dir,
+                &package_ref,
+                &manifest_sha,
+                StageArtifactSelection {
+                    layer_start: 0,
+                    layer_end: 1,
+                    include_embeddings: true,
+                    include_output: false,
+                    include_projectors: false,
+                },
+            )
+            .is_err()
+        );
 
         restore_env("HF_HUB_CACHE", prev);
     }
@@ -772,11 +790,12 @@ mod tests {
     fn servable_artifact_requires_manifest_declared_path_and_matching_sha() {
         let prev = std::env::var_os("HF_HUB_CACHE");
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("HF_HUB_CACHE", temp.path());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", temp.path()) };
         let (_package_dir, package_ref, manifest_sha) = write_package_fixture(temp.path());
 
         let request = skippy_protocol::proto::stage::StageArtifactTransferRequest {
-            gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+            r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
             requester_id: vec![1; 32],
             topology_id: "topology-a".to_string(),
             run_id: "run-a".to_string(),
@@ -800,6 +819,59 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn servable_artifact_rejects_same_size_corrupt_cached_bytes() {
+        let prev = std::env::var_os("HF_HUB_CACHE");
+        let temp = tempfile::tempdir().unwrap();
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", temp.path()) };
+        let (package_dir, package_ref, manifest_sha) = write_package_fixture(temp.path());
+        fs::write(package_dir.join("layers/layer-000.gguf"), b"corrupt!").unwrap();
+
+        let request = skippy_protocol::proto::stage::StageArtifactTransferRequest {
+            r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+            requester_id: vec![1; 32],
+            topology_id: "topology-a".to_string(),
+            run_id: "run-a".to_string(),
+            stage_id: "stage-0".to_string(),
+            package_ref,
+            manifest_sha256: manifest_sha,
+            relative_path: "layers/layer-000.gguf".to_string(),
+            offset: 0,
+            expected_size: Some(8),
+            expected_sha256: Some(sha256_hex(b"layer000")),
+        };
+
+        let error = servable_artifact_from_request(&request).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cached artifact sha256 mismatch"),
+            "unexpected error: {error}"
+        );
+
+        restore_env("HF_HUB_CACHE", prev);
+    }
+
+    #[test]
+    fn peer_artifact_transfer_requires_explicit_non_mutable_revision() {
+        for package_ref in [
+            "hf://meshllm/demo-layers",
+            "hf://meshllm/demo-layers:abc123",
+            "hf://meshllm/demo-layers@main",
+            "hf://meshllm/demo-layers@master",
+            "hf://meshllm/demo-layers@latest",
+        ] {
+            assert!(
+                package_cache_dir_for_ref(package_ref).is_err(),
+                "{package_ref} must not be eligible for peer transfer"
+            );
+        }
+
+        assert!(package_cache_dir_for_ref("hf://meshllm/demo-layers@abc123").is_ok());
+    }
+
+    #[test]
     #[cfg(unix)]
     #[serial]
     fn servable_artifact_rejects_symlink_escape_from_hf_repo_root() {
@@ -807,7 +879,8 @@ mod tests {
 
         let prev = std::env::var_os("HF_HUB_CACHE");
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("HF_HUB_CACHE", temp.path());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", temp.path()) };
         let (package_dir, package_ref, manifest_sha) = write_package_fixture(temp.path());
         fs::write(temp.path().join("outside.gguf"), b"outside!").unwrap();
         fs::remove_file(package_dir.join("layers/layer-000.gguf")).unwrap();
@@ -818,7 +891,7 @@ mod tests {
         .unwrap();
 
         let request = skippy_protocol::proto::stage::StageArtifactTransferRequest {
-            gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+            r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
             requester_id: vec![1; 32],
             topology_id: "topology-a".to_string(),
             run_id: "run-a".to_string(),
@@ -843,18 +916,21 @@ mod tests {
 
         let prev = std::env::var_os("HF_HUB_CACHE");
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("HF_HUB_CACHE", temp.path());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", temp.path()) };
         let (package_dir, package_ref, _manifest_sha) = write_package_fixture(temp.path());
         let outside = temp.path().join("outside");
         fs::create_dir(&outside).unwrap();
         fs::remove_dir_all(package_dir.join("layers")).unwrap();
         unix_fs::symlink(&outside, package_dir.join("layers")).unwrap();
 
-        assert!(ensure_local_artifact_install_parent(
-            &package_ref,
-            &package_dir.join("layers/layer-000.gguf")
-        )
-        .is_err());
+        assert!(
+            ensure_local_artifact_install_parent(
+                &package_ref,
+                &package_dir.join("layers/layer-000.gguf")
+            )
+            .is_err()
+        );
 
         restore_env("HF_HUB_CACHE", prev);
     }

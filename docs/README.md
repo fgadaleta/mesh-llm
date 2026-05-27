@@ -8,6 +8,7 @@ Use this hub to find project guides that are not owned by a single Rust crate.
 |---|---|
 | Install, run, service mode, model storage | [USAGE.md](USAGE.md) |
 | Private meshes, published meshes, public joining | [MESHES.md](MESHES.md) |
+| SDK usage, examples, errors, lifecycle, platform support | [SDK.md](SDK.md) |
 | Run big models with Skippy layer splits | [SKIPPY_SPLITS.md](SKIPPY_SPLITS.md) |
 | Contribute or publish layer package repositories | [LAYER_PACKAGE_REPOS.md](LAYER_PACKAGE_REPOS.md) |
 | Goose, Claude Code, OpenCode, Pi, curl, blackboard | [AGENTS.md](AGENTS.md) |
@@ -19,8 +20,10 @@ Use this hub to find project guides that are not owned by a single Rust crate.
 | Doc | What it covers |
 |---|---|
 | [skippy/FAMILY_STATUS.md](skippy/FAMILY_STATUS.md) | Certified family/split/wire-dtype status |
+| [skippy/NEW_MODEL_ONBOARDING.md](skippy/NEW_MODEL_ONBOARDING.md) | New-model split/certification intake checklist |
 | [skippy/FAMILY_CERTIFY.md](skippy/FAMILY_CERTIFY.md) | Certification workflow for new families |
 | [skippy/TOPOLOGY_PLANNER.md](skippy/TOPOLOGY_PLANNER.md) | Stage topology planning behavior |
+| [skippy/CONFIGURATION.md](skippy/CONFIGURATION.md) | Authoritative operator matrix for Skippy config keys and rejection boundaries |
 | [skippy/DATA_FLOW.md](skippy/DATA_FLOW.md) | Stage data flow and transport details |
 | [skippy/LLAMA_PARITY.md](skippy/LLAMA_PARITY.md) | Remaining llama.cpp parity queue |
 | [specs/layer-package-repos.md](specs/layer-package-repos.md) | Manifest schema and package artifact rules |
@@ -33,10 +36,12 @@ Use [SKIPPY_SPLITS.md](SKIPPY_SPLITS.md) for Skippy split-serving workflows.
 | Doc or directory | What belongs there |
 |---|---|
 | [BENCHMARKS.md](BENCHMARKS.md) | Current benchmark numbers and performance context |
+| [SWARM_CAPTURE.md](SWARM_CAPTURE.md) | Opt-in local debug capture for mesh membership and connection diagnostics |
 | [design/](design/) | Architecture notes, protocol design, testing playbooks, carried llama.cpp patch documentation |
 | [plugins/](plugins/) | Plugin architecture and implementation planning |
 | [plans/](plans/) | Narrow implementation plans that are not yet general design docs |
 | [specs/](specs/) | Focused behavior specs for individual features |
+| [design/OPENAI_GUARDRAILS.md](design/OPENAI_GUARDRAILS.md) | OpenAI guardrail rollout defaults, v1 limits, telemetry privacy, and evidence scaffolding |
 
 Per-crate docs stay with their crates. The main binary crate overview lives at
 [../crates/mesh-llm/README.md](../crates/mesh-llm/README.md), and the web

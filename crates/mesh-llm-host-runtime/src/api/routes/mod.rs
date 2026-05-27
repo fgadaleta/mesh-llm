@@ -5,46 +5,13 @@ mod model_interests;
 mod model_targets;
 mod objects;
 mod plugins;
-mod runtime;
+pub(crate) mod runtime;
 mod search;
 
 use super::MeshApi;
 use std::future::Future;
 use std::pin::Pin;
 use tokio::net::TcpStream;
-
-/// Legacy `/api/blackboard/*` routes are thin aliases onto the blackboard
-/// plugin's declared HTTP bindings at `/api/plugins/blackboard/http/*`.
-/// Rewrite the path and hand off to the plugin stapler.
-async fn dispatch_blackboard(
-    stream: &mut TcpStream,
-    state: &MeshApi,
-    method: &str,
-    path: &str,
-    path_only: &str,
-    body: &str,
-    raw_request: &[u8],
-) -> anyhow::Result<()> {
-    const PREFIX: &str = "/api/blackboard/";
-    const PLUGIN_PREFIX: &str = "/api/plugins/blackboard/http/";
-    let suffix = path_only.strip_prefix(PREFIX).unwrap_or("");
-    let new_path_only = format!("{PLUGIN_PREFIX}{suffix}");
-    let new_path = if let Some(query_start) = path.find('?') {
-        format!("{new_path_only}{}", &path[query_start..])
-    } else {
-        new_path_only.clone()
-    };
-    plugins::handle(
-        stream,
-        state,
-        method,
-        &new_path,
-        &new_path_only,
-        body,
-        raw_request,
-    )
-    .await
-}
 
 type DispatchRequestFn =
     for<'a> fn(
@@ -78,6 +45,7 @@ pub(super) const DISPATCH_REQUEST: DispatchRequestFn =
                 | ("POST", "/api/runtime/control/get-config")
                 | ("POST", "/api/runtime/control/refresh-inventory")
                 | ("POST", "/api/runtime/control/apply-config")
+                | ("POST", "/api/runtime/mesh-guardrails")
                 | ("POST", "/api/runtime/models")
                 | ("GET", "/api/events") => {
                     runtime::handle(stream, state, method, path_only, body).await?;
@@ -147,13 +115,6 @@ pub(super) const DISPATCH_REQUEST: DispatchRequestFn =
                         && matches!(m, "GET" | "POST" | "PUT" | "PATCH" | "DELETE") =>
                 {
                     plugins::handle(stream, state, method, path, path_only, body, raw_request)
-                        .await?;
-                    Ok(true)
-                }
-                ("GET", "/api/blackboard/feed")
-                | ("GET", "/api/blackboard/search")
-                | ("POST", "/api/blackboard/post") => {
-                    dispatch_blackboard(stream, state, method, path, path_only, body, raw_request)
                         .await?;
                     Ok(true)
                 }

@@ -143,7 +143,7 @@ pub struct MeshSubprotocol {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MeshSubprotocolOpen {
     #[prost(uint32, tag = "1")]
-    pub gen: u32,
+    pub r#gen: u32,
     /// e.g. "skippy-stage"
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
@@ -431,6 +431,9 @@ pub struct NodeConfigSnapshot {
     pub models: ::prost::alloc::vec::Vec<NodeModelEntry>,
     #[prost(message, repeated, tag = "4")]
     pub plugins: ::prost::alloc::vec::Vec<NodePluginEntry>,
+    /// canonical persisted config payload for additive owner-control roundtrip
+    #[prost(string, optional, tag = "5")]
+    pub config_toml: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NodeGpuConfig {

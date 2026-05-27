@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod api;
+mod capture;
 mod cli;
 pub mod crypto;
 mod inference;
@@ -14,11 +15,11 @@ mod runtime;
 mod runtime_data;
 mod system;
 
+pub mod sdk;
+
 pub mod proto {
     pub use mesh_llm_protocol::proto::*;
 }
-
-pub(crate) use plugins::blackboard;
 
 use anyhow::Result;
 use std::time::Duration;

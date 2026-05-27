@@ -12,8 +12,8 @@ GENERATED_SWIFT="$SWIFT_DIR/Sources/MeshLLM/Generated/mesh_ffi.swift"
 echo "Building host macOS $FRAMEWORK_NAME XCFramework..."
 echo "Repo root: $REPO_ROOT"
 
-if ! cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"mesh-api-ffi"'; then
-  echo "ERROR: mesh-api-ffi crate not found. Ensure the workspace is configured."
+if ! cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"name":"mesh-llm-ffi"'; then
+  echo "ERROR: mesh-llm-ffi crate not found. Ensure the workspace is configured."
   exit 1
 fi
 
@@ -21,13 +21,9 @@ HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in
   arm64|aarch64)
     RUST_TARGET="aarch64-apple-darwin"
-    XCFRAMEWORK_ID="macos-arm64"
-    SUPPORTED_ARCH="arm64"
     ;;
   x86_64)
     RUST_TARGET="x86_64-apple-darwin"
-    XCFRAMEWORK_ID="macos-x86_64"
-    SUPPORTED_ARCH="x86_64"
     ;;
   *)
     echo "Unsupported macOS host architecture: $HOST_ARCH" >&2
@@ -39,13 +35,24 @@ rustup target add "$RUST_TARGET" 2>/dev/null || true
 
 "$SWIFT_DIR/scripts/generate-swift-bindings.sh"
 
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+export LLAMA_STAGE_BACKEND="${LLAMA_STAGE_BACKEND:-metal}"
+export LLAMA_STAGE_BUILD_DIR="${LLAMA_STAGE_BUILD_DIR:-$REPO_ROOT/.deps/llama.cpp/build-stage-abi-metal}"
+
+echo "Preparing embedded llama.cpp ABI libraries..."
+"$REPO_ROOT/scripts/prepare-llama.sh" "${MESH_LLM_LLAMA_PIN_SHA:-pinned}"
+LLAMA_BUILD_DIR="$LLAMA_STAGE_BUILD_DIR" "$REPO_ROOT/scripts/build-llama.sh"
+
 RUSTUP_RUSTC="$(rustup run stable which rustc)"
 echo "Using rustc: $RUSTUP_RUSTC"
 echo "Building for $RUST_TARGET..."
+echo "macOS deployment target: $MACOSX_DEPLOYMENT_TARGET"
+echo "llama.cpp backend: $LLAMA_STAGE_BACKEND"
+echo "llama.cpp build dir: $LLAMA_STAGE_BUILD_DIR"
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-api-ffi --target "$RUST_TARGET" --no-default-features
+  cargo build --release -p mesh-llm-ffi --target "$RUST_TARGET" --no-default-features --features host,embedded-runtime
 
-LIB_PATH="$TARGET_DIR/$RUST_TARGET/release/libmesh_ffi.a"
+LIB_PATH="$TARGET_DIR/$RUST_TARGET/release/libmeshllm_ffi.a"
 
 echo "Syncing UniFFI API checksums into generated Swift bindings..."
 python3 - "$LIB_PATH" "$GENERATED_SWIFT" <<'PY'
@@ -65,7 +72,7 @@ disassembly = subprocess.run(
 ).stdout
 
 pattern = re.compile(
-    r"_uniffi_mesh_ffi_(checksum_[A-Za-z0-9_]+):\n[0-9a-f]+\s+mov\s+w0, #0x([0-9a-f]+)\n[0-9a-f]+\s+ret",
+    r"_uniffi_meshllm_ffi_(checksum_[A-Za-z0-9_]+):\n[0-9a-f]+\s+mov\s+w0, #0x([0-9a-f]+)\n[0-9a-f]+\s+ret",
     re.MULTILINE,
 )
 checksums = {name: int(value, 16) for name, value in pattern.findall(disassembly)}
@@ -85,21 +92,26 @@ PY
 
 FRAMEWORK_DIR="$TARGET_DIR/frameworks/macos-host/$FRAMEWORK_NAME.framework"
 rm -rf "$FRAMEWORK_DIR"
-mkdir -p "$FRAMEWORK_DIR/Headers"
-mkdir -p "$FRAMEWORK_DIR/Modules"
 
-cp "$LIB_PATH" "$FRAMEWORK_DIR/$FRAMEWORK_NAME"
-cp "$FFI_DIR/MeshLLMFFI.h" "$FRAMEWORK_DIR/Headers/MeshLLMFFI.h"
-cp "$FFI_DIR/MeshLLMFFI.modulemap" "$FRAMEWORK_DIR/Modules/module.modulemap"
+# macOS requires a versioned bundle layout (Versions/A/); flat bundles are
+# rejected by the macOS dynamic linker and cause xcframework load failures.
+VERSION_DIR="$FRAMEWORK_DIR/Versions/A"
+mkdir -p "$VERSION_DIR/Headers"
+mkdir -p "$VERSION_DIR/Modules"
+mkdir -p "$VERSION_DIR/Resources"
+
+cp "$LIB_PATH" "$VERSION_DIR/$FRAMEWORK_NAME"
+cp "$FFI_DIR/MeshLLMFFI.h" "$VERSION_DIR/Headers/MeshLLMFFI.h"
+cp "$FFI_DIR/MeshLLMFFI.modulemap" "$VERSION_DIR/Modules/module.modulemap"
 
 if [ -f "$SWIFT_DIR/PrivacyInfo.xcprivacy" ]; then
-  cp "$SWIFT_DIR/PrivacyInfo.xcprivacy" "$FRAMEWORK_DIR/PrivacyInfo.xcprivacy"
+  cp "$SWIFT_DIR/PrivacyInfo.xcprivacy" "$VERSION_DIR/Resources/PrivacyInfo.xcprivacy"
   echo "  Embedded PrivacyInfo.xcprivacy in host macOS framework"
 else
   echo "WARNING: PrivacyInfo.xcprivacy not found at $SWIFT_DIR/PrivacyInfo.xcprivacy"
 fi
 
-cat > "$FRAMEWORK_DIR/Info.plist" << 'PLIST'
+cat > "$VERSION_DIR/Resources/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -118,39 +130,24 @@ cat > "$FRAMEWORK_DIR/Info.plist" << 'PLIST'
 </plist>
 PLIST
 
+ln -sfh A                          "$FRAMEWORK_DIR/Versions/Current"
+ln -sfh "Versions/Current/$FRAMEWORK_NAME" "$FRAMEWORK_DIR/$FRAMEWORK_NAME"
+ln -sfh "Versions/Current/Headers"         "$FRAMEWORK_DIR/Headers"
+ln -sfh "Versions/Current/Modules"         "$FRAMEWORK_DIR/Modules"
+ln -sfh "Versions/Current/Resources"       "$FRAMEWORK_DIR/Resources"
+
 echo "Creating host macOS XCFramework..."
 XCFW_OUT="$XCFRAMEWORK_DIR/$FRAMEWORK_NAME.xcframework"
 rm -rf "$XCFW_OUT"
-mkdir -p "$XCFW_OUT/$XCFRAMEWORK_ID/$FRAMEWORK_NAME.framework"
-cp -R "$FRAMEWORK_DIR/" "$XCFW_OUT/$XCFRAMEWORK_ID/$FRAMEWORK_NAME.framework/"
 
-cat > "$XCFW_OUT/Info.plist" << XCINFO
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>AvailableLibraries</key>
-    <array>
-        <dict>
-            <key>BinaryPath</key>
-            <string>MeshLLMFFI.framework/MeshLLMFFI</string>
-            <key>LibraryIdentifier</key>
-            <string>$XCFRAMEWORK_ID</string>
-            <key>LibraryPath</key>
-            <string>MeshLLMFFI.framework</string>
-            <key>SupportedArchitectures</key>
-            <array><string>$SUPPORTED_ARCH</string></array>
-            <key>SupportedPlatform</key>
-            <string>macos</string>
-        </dict>
-    </array>
-    <key>CFBundlePackageType</key>
-    <string>XFWK</string>
-    <key>XCFrameworkFormatVersion</key>
-    <string>1.0</string>
-</dict>
-</plist>
-XCINFO
+if ! command -v xcodebuild >/dev/null 2>&1; then
+  echo "ERROR: xcodebuild is required to create the Swift SDK XCFramework." >&2
+  exit 1
+fi
+
+xcodebuild -create-xcframework \
+  -framework "$FRAMEWORK_DIR" \
+  -output "$XCFW_OUT"
 
 echo "XCFramework created at: $XCFW_OUT"
 

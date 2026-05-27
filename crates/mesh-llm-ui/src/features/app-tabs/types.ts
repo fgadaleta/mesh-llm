@@ -251,12 +251,30 @@ export type ConfigModel = {
   tags: string[]
 }
 export type ConfigAssign = { id: string; modelId: string; nodeId: string; containerIdx: number; ctx: number }
-export type ConfigurationDefaultsCategoryId = 'runtime' | 'memory' | 'speculative-decoding' | 'advanced'
+export type ConfigurationDefaultsCategoryId =
+  | 'runtime'
+  | 'memory'
+  | 'speculative-decoding'
+  | 'advanced'
+  | 'request-defaults'
+  | 'skippy-transport'
+  | 'multimodal'
+  | 'advanced-server'
+export type ConfigurationTomlSectionId =
+  | 'defaults.model_fit'
+  | 'defaults.hardware'
+  | 'defaults.throughput'
+  | 'defaults.skippy'
+  | 'defaults.speculative'
+  | 'defaults.request_defaults'
+  | 'defaults.multimodal'
+  | 'defaults.advanced.server'
 export type ConfigurationDefaultsCategory = {
   id: ConfigurationDefaultsCategoryId
   label: string
   summary: string
   help: string
+  tomlSection?: ConfigurationTomlSectionId
 }
 export type ConfigurationDefaultsChoice = { value: string; label: string; description?: string }
 export type ConfigurationDefaultsControl =
@@ -281,14 +299,22 @@ export type ConfigurationDefaultsSettingIcon =
   | 'shield'
   | 'cog'
   | 'filter'
+  | 'zap'
+  | 'image'
+  | 'server'
 export type ConfigurationDefaultsSetting = {
   id: string
   categoryId: ConfigurationDefaultsCategoryId
+  tomlSection?: ConfigurationTomlSectionId
+  tomlKey?: string
   icon: ConfigurationDefaultsSettingIcon
   label: string
   description: string
   inheritedLabel: string
   control: ConfigurationDefaultsControl
+  visibility?: 'standard' | 'advanced'
+  mutability?: 'runtime' | 'restart-required'
+  dependsOn?: { settingId: string; condition: (value: string) => boolean }
 }
 export type ConfigurationDefaultsPreviewItem = { label: string; value: string; meta?: string }
 export type ConfigurationDefaultsValues = Record<string, string>

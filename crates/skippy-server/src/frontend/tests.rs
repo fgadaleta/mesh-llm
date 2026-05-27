@@ -1,17 +1,22 @@
 use super::*;
+use async_trait::async_trait;
 use std::io::Cursor;
 use std::{
     env, fs,
     net::SocketAddr,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
-        Arc,
     },
     time::Duration,
 };
 
 use axum::{http::StatusCode, response::IntoResponse};
+use openai_frontend::{AssistantMessage, ChatCompletionChoice};
 use serde_json::json;
+use skippy_protocol::{
+    LoadMode, PeerConfig, SCHEMA_VERSION, StageKvCacheConfig, StageKvCacheMode, StageKvCachePayload,
+};
 use tokio::sync::Semaphore;
 
 const MM_MODEL_ENV: &str = "SKIPPY_MM_MODEL";
@@ -22,6 +27,156 @@ const MM_SPLIT_LAYER_ENV: &str = "SKIPPY_MM_SPLIT_LAYER";
 const MM_CTX_SIZE_ENV: &str = "SKIPPY_MM_CTX_SIZE";
 const MM_MAX_TOKENS_ENV: &str = "SKIPPY_MM_MAX_TOKENS";
 const MM_N_GPU_LAYERS_ENV: &str = "SKIPPY_MM_N_GPU_LAYERS";
+
+#[test]
+fn proactive_eviction_attrs_are_bounded_and_request_free() {
+    let attrs = proactive_eviction_attrs("error", Some("inactive_session"), 1024, 2, 768);
+
+    assert_eq!(
+        attrs.get("skippy.kv.decision"),
+        Some(&json!("proactive_eviction"))
+    );
+    assert_eq!(
+        attrs.get(attr_key::KV_PROACTIVE_EVICTION_STATUS),
+        Some(&json!("error"))
+    );
+    assert_eq!(
+        attrs.get(attr_key::KV_PROACTIVE_EVICTION_ERROR_KIND),
+        Some(&json!("inactive_session"))
+    );
+    assert_eq!(
+        attrs.get(attr_key::KV_PROACTIVE_EVICTION_TARGET_TOKENS),
+        Some(&json!(1024))
+    );
+    assert_eq!(
+        attrs.get(attr_key::KV_PROACTIVE_EVICTED_ENTRIES),
+        Some(&json!(2))
+    );
+    assert_eq!(
+        attrs.get(attr_key::KV_PROACTIVE_EVICTED_TOKENS),
+        Some(&json!(768))
+    );
+    assert!(!attrs.contains_key(attr_key::REQUEST_ID));
+    assert!(!attrs.contains_key(attr_key::SESSION_ID));
+    assert!(!attrs.contains_key("openai.prompt_cache_key"));
+    assert!(!attrs.contains_key("openai.prompt_cache_retention"));
+}
+
+fn prefix_cache_test_config() -> StageConfig {
+    StageConfig {
+        run_id: "run".to_string(),
+        topology_id: "topology".to_string(),
+        model_id: "org/model:Q4_K_M".to_string(),
+        package_ref: None,
+        manifest_sha256: None,
+        source_model_path: None,
+        source_model_sha256: None,
+        source_model_bytes: None,
+        materialized_path: None,
+        materialized_pinned: false,
+        model_path: None,
+        projector_path: None,
+        stage_id: "stage-0".to_string(),
+        stage_index: 0,
+        layer_start: 0,
+        layer_end: 4,
+        ctx_size: 8192,
+        lane_count: 2,
+        n_batch: None,
+        n_ubatch: None,
+        n_gpu_layers: 0,
+        cache_type_k: "f16".to_string(),
+        cache_type_v: "f16".to_string(),
+        flash_attn_type: Default::default(),
+        filter_tensors_on_load: false,
+        selected_device: None,
+        kv_cache: Some(StageKvCacheConfig {
+            mode: StageKvCacheMode::LookupRecord,
+            payload: StageKvCachePayload::ResidentKv,
+            max_entries: 8,
+            max_bytes: 0,
+            min_tokens: 256,
+            shared_prefix_stride_tokens: 128,
+            shared_prefix_record_limit: 2,
+        }),
+        load_mode: LoadMode::RuntimeSlice,
+        bind_addr: "127.0.0.1:0".to_string(),
+        upstream: None,
+        downstream: Some(PeerConfig {
+            stage_id: "stage-1".to_string(),
+            stage_index: 1,
+            endpoint: "127.0.0.1:0".to_string(),
+        }),
+    }
+}
+
+fn prefix_cache_test_base() -> MessageBase {
+    MessageBase {
+        schema_version: SCHEMA_VERSION,
+        run_id: "run".to_string(),
+        request_id: "request".to_string(),
+        session_id: "session".to_string(),
+        stage_id: "stage-0".to_string(),
+        stage_index: 0,
+        topology_id: "topology".to_string(),
+        model_id: Some("org/model:Q4_K_M".to_string()),
+        tokenizer_id: None,
+        chat_template_id: Some("template".to_string()),
+        seq: Some(1),
+    }
+}
+
+#[test]
+fn stage0_full_prefill_record_plan_includes_shared_prefix_candidate() {
+    let config = prefix_cache_test_config();
+    let kv = KvStageIntegration::from_config(&config)
+        .unwrap()
+        .expect("resident prefix cache enabled");
+    let base = prefix_cache_test_base();
+    let recorded_tokens = (0..2214).collect::<Vec<_>>();
+    let mut lookup_tokens = recorded_tokens.clone();
+    lookup_tokens.extend(100_000..100_017);
+
+    let record_plan = super::prefix_cache::stage0_full_prefill_record_identities(
+        &kv,
+        &config,
+        &base,
+        &recorded_tokens,
+    );
+    let lookup_plan = kv.lookup_identities(&config, &base, 0, &lookup_tokens);
+
+    let record_counts = record_plan
+        .iter()
+        .map(|identity| identity.identity.token_count)
+        .collect::<Vec<_>>();
+    let lookup_counts = lookup_plan
+        .iter()
+        .map(|identity| identity.identity.token_count)
+        .collect::<Vec<_>>();
+
+    assert_eq!(record_counts, vec![2214, 2176]);
+    assert!(lookup_counts.contains(&2176));
+
+    let recorded_shared = record_plan
+        .iter()
+        .find(|identity| identity.identity.token_count == 2176)
+        .expect("record plan should include shared grid prefix");
+    let lookup_shared = lookup_plan
+        .iter()
+        .find(|identity| identity.identity.token_count == 2176)
+        .expect("lookup plan should probe shared grid prefix");
+    let recorded_exact = record_plan
+        .iter()
+        .find(|identity| identity.identity.token_count == 2214)
+        .expect("record plan should keep exact first prompt");
+    let lookup_exact = lookup_plan
+        .iter()
+        .find(|identity| identity.identity.token_count == 2231)
+        .expect("lookup plan should probe exact second prompt");
+
+    assert_eq!(recorded_shared.page_id, lookup_shared.page_id);
+    assert_ne!(recorded_exact.page_id, lookup_exact.page_id);
+}
 
 struct MultimodalSmokeFixture {
     model_path: PathBuf,
@@ -39,8 +194,8 @@ fn multimodal_smoke_fixture() -> Result<Option<MultimodalSmokeFixture>> {
         Some(path) => PathBuf::from(path),
         None => {
             eprintln!(
-                    "skipping real multimodal smoke: set {MM_MODEL_ENV}, {MM_PROJECTOR_ENV}, and {MM_IMAGE_ENV}"
-                );
+                "skipping real multimodal smoke: set {MM_MODEL_ENV}, {MM_PROJECTOR_ENV}, and {MM_IMAGE_ENV}"
+            );
             return Ok(None);
         }
     };
@@ -147,6 +302,28 @@ fn infer_activation_width(path: &Path) -> Result<i32> {
 
 fn unsupported_code(error: OpenAiError) -> Option<String> {
     error.body().error.code
+}
+
+fn test_request_defaults() -> EmbeddedOpenAiRequestDefaults {
+    EmbeddedOpenAiRequestDefaults {
+        stop: Some(vec!["</stop>".to_string()]),
+        temperature: Some(0.2),
+        top_p: Some(0.9),
+        presence_penalty: Some(1.25),
+        frequency_penalty: Some(0.5),
+        seed: Some(77),
+        logit_bias: Some(std::collections::BTreeMap::from([
+            ("123".to_string(), json!(-50.0)),
+            ("456".to_string(), json!(12.5)),
+        ])),
+        top_k: Some(12),
+        min_p: Some(0.1),
+        repeat_penalty: Some(1.2),
+        repeat_last_n: Some(64),
+        reasoning_format: Some(EmbeddedReasoningFormat::Hidden),
+        reasoning_enabled: Some(EmbeddedReasoningEnabled::Enabled),
+        reasoning_budget: Some(EmbeddedReasoningBudget::Tokens(256)),
+    }
 }
 
 fn assert_generation_rate_limit(error: OpenAiError, message_fragment: &str) {
@@ -281,6 +458,259 @@ fn chat_runtime_feature_guard_rejects_structured_output() {
         unsupported_code(error),
         Some("unsupported_model_feature".to_string())
     );
+}
+
+#[derive(Default)]
+struct StructuredGuardrailRecordingBackend {
+    seen: Mutex<Option<ChatCompletionRequest>>,
+}
+
+#[async_trait]
+impl OpenAiBackend for StructuredGuardrailRecordingBackend {
+    async fn models(&self) -> OpenAiResult<Vec<ModelObject>> {
+        Ok(vec![ModelObject::new("test")])
+    }
+
+    async fn chat_completion(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> OpenAiResult<ChatCompletionResponse> {
+        ensure_chat_runtime_features_supported(&request)
+            .expect("guarded wrapper should downgrade backend-facing structured requests");
+        *self.seen.lock().unwrap() = Some(request);
+        Ok(ChatCompletionResponse {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion",
+            created: 123,
+            model: "test".to_string(),
+            choices: vec![ChatCompletionChoice {
+                index: 0,
+                message: AssistantMessage {
+                    role: "assistant",
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(json!([{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "_mesh_emit_structured",
+                            "arguments": "{\"answer\":\"ok\"}"
+                        }
+                    }])),
+                },
+                logprobs: None,
+                finish_reason: Some(FinishReason::ToolCalls),
+            }],
+            usage: Usage::new(1, 1),
+        })
+    }
+
+    async fn chat_completion_stream(
+        &self,
+        _request: ChatCompletionRequest,
+        _context: OpenAiRequestContext,
+    ) -> OpenAiResult<ChatCompletionStream> {
+        unreachable!("streaming is not used in this test")
+    }
+
+    async fn completion(&self, _request: CompletionRequest) -> OpenAiResult<CompletionResponse> {
+        unreachable!("completions are not used in this test")
+    }
+
+    async fn completion_stream(
+        &self,
+        _request: CompletionRequest,
+        _context: OpenAiRequestContext,
+    ) -> OpenAiResult<CompletionStream> {
+        unreachable!("completions are not used in this test")
+    }
+}
+
+#[tokio::test]
+async fn guarded_structured_output_is_not_rejected_by_runtime_feature_guard() {
+    let backend = Arc::new(StructuredGuardrailRecordingBackend::default());
+    let guardrails = OpenAiGuardrailsConfig {
+        target: OpenAiGuardrailsTarget::Skippy,
+        policy: GuardrailPolicy {
+            mode: GuardrailMode::Enforce,
+            apply_to_all_models: true,
+            ..GuardrailPolicy::default()
+        }
+        .into(),
+        compaction: None,
+    };
+    let guarded = guardrails.wrap_backend(backend.clone());
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let response = guarded.chat_completion(request).await.unwrap();
+    assert_eq!(
+        response.choices[0].message.content.as_deref(),
+        Some("{\"answer\":\"ok\"}")
+    );
+
+    let seen = backend.seen.lock().unwrap().clone().unwrap();
+    assert!(
+        seen.response_format.is_none(),
+        "guarded backend should clear backend-facing response_format"
+    );
+}
+
+#[tokio::test]
+async fn compaction_wraps_skippy_backend_even_when_guardrails_are_disabled() {
+    let backend = Arc::new(StructuredGuardrailRecordingBackend::default());
+    let guardrails = OpenAiGuardrailsConfig {
+        target: OpenAiGuardrailsTarget::Skippy,
+        policy: GuardrailPolicy::default().into(),
+        compaction: Some(CompactionConfig::default()),
+    };
+    let wrapped = guardrails.wrap_backend(backend.clone());
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [
+            {"role": "tool", "content": "stale tool result"},
+            {"role": "user", "content": "continue"}
+        ],
+        "mesh_compact": true
+    }))
+    .unwrap();
+
+    let _ = wrapped.chat_completion(request).await;
+
+    let seen = backend.seen.lock().unwrap().clone().unwrap();
+    assert_eq!(seen.messages[0].role, "system");
+    assert!(seen.messages.iter().all(|message| message.role != "tool"));
+}
+
+#[tokio::test]
+async fn disabled_skippy_guardrail_wrapper_can_be_enabled_live() {
+    let backend = Arc::new(StructuredGuardrailRecordingBackend::default());
+    let policy: openai_frontend::GuardrailPolicyHandle = GuardrailPolicy::default().into();
+    let guardrails = OpenAiGuardrailsConfig {
+        target: OpenAiGuardrailsTarget::Skippy,
+        policy: policy.clone(),
+        compaction: None,
+    };
+    let wrapped = guardrails.wrap_backend(backend.clone());
+    let request = tool_request();
+
+    wrapped.chat_completion(request.clone()).await.unwrap();
+    assert_eq!(
+        backend.seen.lock().unwrap().clone().unwrap().tools,
+        request.tools
+    );
+
+    policy.update(GuardrailPolicy {
+        mode: GuardrailMode::Enforce,
+        apply_to_all_models: true,
+        ..GuardrailPolicy::default()
+    });
+    let _ = wrapped.chat_completion(request).await;
+
+    let seen = backend.seen.lock().unwrap().clone().unwrap();
+    let tool_names = seen
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.as_array())
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool.get("function"))
+        .filter_map(|function| function.get("name"))
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"_mesh_respond"));
+    assert_eq!(guardrails.status().mode, "enforce");
+}
+
+#[tokio::test]
+async fn compaction_wraps_skippy_backend_with_runtime_context_limit() {
+    let backend = Arc::new(StructuredGuardrailRecordingBackend::default());
+    let guardrails = OpenAiGuardrailsConfig {
+        target: OpenAiGuardrailsTarget::Skippy,
+        policy: GuardrailPolicy::default().into(),
+        compaction: Some(CompactionConfig {
+            enabled: true,
+            ..CompactionConfig::default()
+        }),
+    };
+    let wrapped = guardrails.wrap_backend_with_context_limit(backend.clone(), Some(1));
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [
+            {"role": "tool", "content": "stale tool result"},
+            {"role": "user", "content": "continue"}
+        ]
+    }))
+    .unwrap();
+
+    wrapped.chat_completion(request).await.unwrap();
+
+    let seen = backend.seen.lock().unwrap().clone().unwrap();
+    assert_eq!(seen.messages[0].role, "system");
+    assert!(seen.messages.iter().all(|message| message.role != "tool"));
+}
+
+#[tokio::test]
+async fn compaction_and_guardrails_can_stack() {
+    let backend = Arc::new(StructuredGuardrailRecordingBackend::default());
+    let guardrails = OpenAiGuardrailsConfig {
+        target: OpenAiGuardrailsTarget::Skippy,
+        policy: GuardrailPolicy {
+            mode: GuardrailMode::Enforce,
+            apply_to_all_models: true,
+            ..GuardrailPolicy::default()
+        }
+        .into(),
+        compaction: Some(CompactionConfig::default()),
+    };
+    let wrapped = guardrails.wrap_backend(backend.clone());
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [
+            {"role": "tool", "content": "stale tool result"},
+            {"role": "user", "content": "continue"}
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "mesh_compact": true
+    }))
+    .unwrap();
+
+    let response = wrapped.chat_completion(request).await.unwrap();
+    assert_eq!(
+        response.choices[0].message.content.as_deref(),
+        Some("{\"answer\":\"ok\"}")
+    );
+
+    let seen = backend.seen.lock().unwrap().clone().unwrap();
+    assert!(seen.response_format.is_none());
+    assert_eq!(seen.messages[0].role, "system");
+    assert!(seen.messages.iter().all(|message| message.role != "tool"));
 }
 
 #[test]
@@ -613,6 +1043,7 @@ fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
         config,
         model_id: "mm-smoke".to_string(),
         default_max_tokens: 16,
+        request_defaults: EmbeddedOpenAiRequestDefaults::default(),
         ctx_size,
         mode: OpenAiBackendMode::LocalRuntime,
         draft: None,
@@ -786,6 +1217,7 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
         config: stage0_config.clone(),
         model_id: "mm-smoke".to_string(),
         default_max_tokens: 16,
+        request_defaults: EmbeddedOpenAiRequestDefaults::default(),
         ctx_size,
         mode: OpenAiBackendMode::EmbeddedStageZero {
             config: stage0_config,
@@ -1048,6 +1480,227 @@ fn extra_sampling_fields_are_enabled() {
 }
 
 #[test]
+fn request_defaults_fill_omitted_chat_fields_only() {
+    let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
+        "messages": [{"role": "user", "content": "hello"}]
+    }))
+    .unwrap();
+
+    apply_chat_request_defaults(&mut request, &test_request_defaults());
+
+    let sampling = chat_sampling_config(&request).unwrap();
+    assert_eq!(request.temperature, Some(0.2));
+    assert_eq!(request.top_p, Some(0.9));
+    assert_eq!(request.presence_penalty, Some(1.25));
+    assert_eq!(request.frequency_penalty, Some(0.5));
+    assert_eq!(request.seed, Some(77));
+    assert_eq!(request.logit_bias, test_request_defaults().logit_bias);
+    assert_eq!(
+        request.stop,
+        Some(openai_frontend::StopSequence::One("</stop>".to_string()))
+    );
+    assert_eq!(sampling.temperature, 0.2);
+    assert_eq!(sampling.top_p, 0.9);
+    assert_eq!(sampling.presence_penalty, 1.25);
+    assert_eq!(sampling.frequency_penalty, 0.5);
+    assert_eq!(sampling.seed, 77);
+    assert_eq!(sampling.top_k, 12);
+    assert_eq!(sampling.min_p, 0.1);
+    assert_eq!(sampling.repeat_penalty, 1.2);
+    assert_eq!(sampling.penalty_last_n, 64);
+    assert_eq!(sampling.logit_bias.len(), 2);
+    assert_eq!(
+        chat_template_options(&request).unwrap().enable_thinking,
+        Some(true)
+    );
+    assert_eq!(
+        request
+            .reasoning
+            .as_ref()
+            .and_then(|value| value.max_tokens),
+        Some(256)
+    );
+    assert_eq!(
+        GenerationTokenLimit::from_request(request.effective_max_tokens(), 64),
+        GenerationTokenLimit::Default(64)
+    );
+}
+
+#[test]
+fn request_defaults_fill_omitted_completion_fields_and_nulls() {
+    let mut request: CompletionRequest = serde_json::from_value(json!({
+        "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
+        "prompt": "hello",
+        "top_k": null,
+        "repeat_last_n": null,
+        "min_p": null
+    }))
+    .unwrap();
+
+    apply_completion_request_defaults(&mut request, &test_request_defaults());
+
+    let sampling = completion_sampling_config(&request).unwrap();
+    assert_eq!(request.temperature, Some(0.2));
+    assert_eq!(request.top_p, Some(0.9));
+    assert_eq!(request.presence_penalty, Some(1.25));
+    assert_eq!(request.frequency_penalty, Some(0.5));
+    assert_eq!(request.seed, Some(77));
+    assert_eq!(request.logit_bias, test_request_defaults().logit_bias);
+    assert_eq!(
+        request.stop,
+        Some(openai_frontend::StopSequence::One("</stop>".to_string()))
+    );
+    assert_eq!(sampling.seed, 77);
+    assert_eq!(sampling.presence_penalty, 1.25);
+    assert_eq!(sampling.frequency_penalty, 0.5);
+    assert_eq!(sampling.top_k, 12);
+    assert_eq!(sampling.min_p, 0.1);
+    assert_eq!(sampling.repeat_penalty, 1.2);
+    assert_eq!(sampling.penalty_last_n, 64);
+    assert_eq!(sampling.logit_bias.len(), 2);
+    assert_eq!(
+        GenerationTokenLimit::from_request(request.max_tokens, 48),
+        GenerationTokenLimit::Default(48)
+    );
+}
+
+#[test]
+fn explicit_chat_request_values_override_request_defaults() {
+    let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 32,
+        "temperature": 0.8,
+        "top_p": 0.7,
+        "presence_penalty": 0.1,
+        "frequency_penalty": 0.2,
+        "seed": 9,
+        "logit_bias": {"7": 1.0},
+        "stop": ["USER"],
+        "repetition_penalty": 1.8,
+        "repeat_last_n": 24,
+        "reasoning": {"enabled": false}
+    }))
+    .unwrap();
+
+    apply_chat_request_defaults(&mut request, &test_request_defaults());
+
+    let sampling = chat_sampling_config(&request).unwrap();
+    assert_eq!(request.temperature, Some(0.8));
+    assert_eq!(request.top_p, Some(0.7));
+    assert_eq!(request.presence_penalty, Some(0.1));
+    assert_eq!(request.frequency_penalty, Some(0.2));
+    assert_eq!(request.seed, Some(9));
+    assert_eq!(request.effective_max_tokens(), Some(32));
+    assert_eq!(
+        request.stop,
+        Some(openai_frontend::StopSequence::Many(vec![
+            "USER".to_string()
+        ]))
+    );
+    assert_eq!(sampling.top_p, 0.7);
+    assert_eq!(sampling.presence_penalty, 0.1);
+    assert_eq!(sampling.frequency_penalty, 0.2);
+    assert_eq!(sampling.seed, 9);
+    assert_eq!(sampling.repeat_penalty, 1.8);
+    assert_eq!(sampling.penalty_last_n, 24);
+    assert_eq!(sampling.logit_bias.len(), 1);
+    assert_eq!(
+        chat_template_options(&request).unwrap().enable_thinking,
+        Some(false)
+    );
+    assert_eq!(
+        GenerationTokenLimit::from_request(request.effective_max_tokens(), 64),
+        GenerationTokenLimit::Explicit(32)
+    );
+}
+
+#[test]
+fn explicit_completion_request_values_override_request_defaults() {
+    let mut request: CompletionRequest = serde_json::from_value(json!({
+        "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
+        "prompt": "hello",
+        "max_tokens": 12,
+        "temperature": 0.6,
+        "top_p": 0.4,
+        "presence_penalty": 0.25,
+        "frequency_penalty": 0.75,
+        "seed": 12,
+        "logit_bias": {"8": -3.0},
+        "stop": ["DONE"],
+        "repeat_penalty": 1.4,
+        "repeat_last_n": 16,
+        "reasoning": {"enabled": false}
+    }))
+    .unwrap();
+
+    apply_completion_request_defaults(&mut request, &test_request_defaults());
+
+    let sampling = completion_sampling_config(&request).unwrap();
+    assert_eq!(request.temperature, Some(0.6));
+    assert_eq!(request.top_p, Some(0.4));
+    assert_eq!(request.presence_penalty, Some(0.25));
+    assert_eq!(request.frequency_penalty, Some(0.75));
+    assert_eq!(request.seed, Some(12));
+    assert_eq!(request.max_tokens, Some(12));
+    assert_eq!(sampling.repeat_penalty, 1.4);
+    assert_eq!(sampling.penalty_last_n, 16);
+    assert_eq!(sampling.logit_bias.len(), 1);
+    assert_eq!(
+        GenerationTokenLimit::from_request(request.max_tokens, 48),
+        GenerationTokenLimit::Explicit(12)
+    );
+}
+
+#[test]
+fn request_defaults_do_not_make_structured_output_or_logprobs_executable() {
+    let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "answer", "schema": {"type": "object"}}
+        },
+        "logprobs": true,
+        "top_logprobs": 2
+    }))
+    .unwrap();
+
+    apply_chat_request_defaults(&mut request, &test_request_defaults());
+
+    let error = ensure_chat_runtime_features_supported(&request).unwrap_err();
+    assert_eq!(
+        unsupported_code(error),
+        Some("unsupported_model_feature".to_string())
+    );
+}
+
+#[test]
+fn deepseek_legacy_request_default_enables_chat_template_thinking() {
+    let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
+        "messages": [{"role": "user", "content": "hello"}]
+    }))
+    .unwrap();
+
+    let defaults = EmbeddedOpenAiRequestDefaults {
+        reasoning_format: Some(EmbeddedReasoningFormat::DeepseekLegacy),
+        ..EmbeddedOpenAiRequestDefaults::default()
+    };
+    apply_chat_request_defaults(&mut request, &defaults);
+
+    assert_eq!(
+        request.reasoning.as_ref().and_then(|value| value.enabled),
+        Some(true)
+    );
+    assert_eq!(
+        chat_template_options(&request).unwrap().enable_thinking,
+        Some(true)
+    );
+}
+
+#[test]
 fn canonical_reasoning_disabled_turns_off_chat_template_thinking() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
@@ -1066,6 +1719,19 @@ fn reasoning_effort_none_turns_off_chat_template_thinking() {
         "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
         "messages": [{"role": "user", "content": "hello"}],
         "reasoning": {"effort": "none"}
+    }))
+    .unwrap();
+
+    let options = chat_template_options(&request).unwrap();
+    assert_eq!(options.enable_thinking, Some(false));
+}
+
+#[test]
+fn top_level_reasoning_effort_none_turns_off_chat_template_thinking() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
+        "messages": [{"role": "user", "content": "hello"}],
+        "reasoning_effort": "none"
     }))
     .unwrap();
 

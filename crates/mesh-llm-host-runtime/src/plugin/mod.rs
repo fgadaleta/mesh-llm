@@ -8,7 +8,7 @@ mod transport;
 use crate::runtime_data::{
     PluginDataKey, PluginEndpointKey, RuntimeDataCollector, RuntimeDataSource,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 pub use mesh_llm_plugin::proto;
 use rmcp::model::ServerInfo;
 use rmcp::model::{
@@ -16,25 +16,33 @@ use rmcp::model::{
     ReadResourceRequestParams, ReadResourceResult,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use url::Url;
 
 #[allow(unused_imports)]
 pub use self::config::ExternalPluginSpec;
 #[allow(unused_imports)]
+pub(crate) use self::config::{
+    BoolOrAuto, HardwareConfig, IntegerOrString, ModelConfigDefaults, ModelFitConfig,
+    MultimodalConfig, ReasoningBudget, ReasoningEnabled, RequestDefaultsConfig, SkippyConfig,
+    SpeculativeConfig, StringOrStringList, ThroughputConfig,
+};
+#[allow(unused_imports)]
 pub use self::config::{
-    config_path, load_config, resolve_plugins, GpuAssignment, GpuConfig, MeshConfig,
-    ModelConfigEntry, PluginConfigEntry, PluginHostMode, ResolvedPlugins, TelemetryConfig,
-    TelemetryMetricsConfig,
+    ConfigEditor, ConfigStore, GpuAssignment, GpuConfig, LocalServingNodeConfig, MeshConfig,
+    ModelConfigEditor, ModelConfigEntry, ModelDefaultsEditor, ModelRuntimeKind, PluginConfigEditor,
+    PluginConfigEntry, PluginHostMode, ResolvedPlugins, TelemetryConfig, TelemetryMetricsConfig,
+    bundled_cli_plugin_spec, config_path, config_to_toml, load_config, parse_config_toml,
+    resolve_plugins,
 };
 pub(crate) use self::config::{telemetry_plugin_enabled, validate_config};
 use self::runtime::ExternalPlugin;
@@ -44,18 +52,15 @@ use self::support::{format_args_for_log, format_slice_for_log, format_tool_names
 use self::transport::unix_socket_path;
 #[cfg(all(test, windows))]
 use self::transport::windows_pipe_name;
-use self::transport::{connect_side_stream, make_instance_id, LocalStream};
+use self::transport::{LocalStream, connect_side_stream, make_instance_id};
 #[cfg(test)]
 use mesh_llm_plugin::MeshVisibility;
 
-pub const BLACKBOARD_PLUGIN_ID: &str = "blackboard";
 pub const BLOBSTORE_PLUGIN_ID: &str = "blobstore";
 pub const FLASH_MOE_PLUGIN_ID: &str = "flash-moe";
 pub const OPENAI_ENDPOINT_PLUGIN_ID: &str = "openai-endpoint";
 pub const TELEMETRY_PLUGIN_ID: &str = "telemetry";
 pub const TELEMETRY_CAPABILITY: &str = "telemetry.metrics.v1";
-#[allow(dead_code)]
-pub const BLACKBOARD_CAPABILITY: &str = "blackboard.v1";
 pub(crate) const PROTOCOL_VERSION: u32 = mesh_llm_plugin::PROTOCOL_VERSION;
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -697,6 +702,32 @@ impl PluginManager {
         plugin.call_tool(tool_name, arguments_json).await
     }
 
+    pub async fn call_tool_without_timeout(
+        &self,
+        plugin_name: &str,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> Result<ToolCallResult> {
+        if self.is_test_bridge_enabled(plugin_name) {
+            return self.call_tool(plugin_name, tool_name, arguments_json).await;
+        }
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin
+            .call_tool_without_timeout(tool_name, arguments_json)
+            .await
+    }
+
     pub async fn invoke_operation(
         &self,
         plugin_name: &str,
@@ -704,6 +735,16 @@ impl PluginManager {
         input_json: &str,
     ) -> Result<ToolCallResult> {
         self.call_tool(plugin_name, operation_name, input_json)
+            .await
+    }
+
+    pub async fn invoke_operation_without_timeout(
+        &self,
+        plugin_name: &str,
+        operation_name: &str,
+        input_json: &str,
+    ) -> Result<ToolCallResult> {
+        self.call_tool_without_timeout(plugin_name, operation_name, input_json)
             .await
     }
 
@@ -953,7 +994,12 @@ impl PluginManager {
         let input_json = serde_json::to_string(params)
             .with_context(|| format!("Serialize service params for plugin '{plugin_name}'"))?;
         let response = plugin
-            .invoke_service(kind, service_name, &input_json)
+            .invoke_service(
+                kind,
+                service_name,
+                &input_json,
+                Some(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS)),
+            )
             .await?;
         serde_json::from_str(&response.output_json).with_context(|| {
             format!(
@@ -1768,7 +1814,6 @@ fn endpoint_models_url(address: &str) -> Option<Url> {
 
 pub async fn run_plugin_process(name: String) -> Result<()> {
     match name.as_str() {
-        BLACKBOARD_PLUGIN_ID => crate::plugins::blackboard::run_plugin(name).await,
         BLOBSTORE_PLUGIN_ID => crate::plugins::blobstore::run_plugin(name).await,
         FLASH_MOE_PLUGIN_ID => crate::plugins::flash_moe::run_plugin(name).await,
         OPENAI_ENDPOINT_PLUGIN_ID => crate::plugins::openai_endpoint::run_plugin(name).await,
@@ -1782,8 +1827,8 @@ mod tests {
     use super::config::{MeshConfig, PluginConfigEntry};
     use super::*;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1819,31 +1864,34 @@ mod tests {
     }
 
     #[test]
-    fn resolves_default_blackboard_plugin() {
+    fn resolves_default_builtin_plugins() {
         let resolved = resolve_plugins(&MeshConfig::default(), private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 3);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
     #[test]
-    fn blackboard_can_be_disabled() {
+    fn external_plugin_can_be_configured() {
         let config = MeshConfig {
             plugins: vec![PluginConfigEntry {
-                name: BLACKBOARD_PLUGIN_ID.into(),
-                enabled: Some(false),
-                command: None,
-                args: Vec::new(),
+                name: "demo".into(),
+                enabled: Some(true),
+                command: Some("mesh-llm-plugin-demo".into()),
+                args: vec!["--stdio".into()],
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals.len(), 3);
         assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, "demo");
+        assert_eq!(resolved.externals[1].command, "mesh-llm-plugin-demo");
+        assert_eq!(resolved.externals[1].args, ["--stdio"]);
+        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
@@ -1857,26 +1905,27 @@ mod tests {
                 args: Vec::new(),
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 2);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 1);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
     #[test]
     fn telemetry_plugin_is_opt_out_builtin() {
         let resolved = resolve_plugins(&MeshConfig::default(), private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 3);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
-        assert!(resolved.externals[1].args.contains(&"--plugin".to_string()));
-        assert!(resolved.externals[1]
-            .args
-            .contains(&TELEMETRY_PLUGIN_ID.to_string()));
+        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        assert!(resolved.externals[0].args.contains(&"--plugin".to_string()));
+        assert!(
+            resolved.externals[0]
+                .args
+                .contains(&TELEMETRY_PLUGIN_ID.to_string())
+        );
 
         let config = MeshConfig {
             plugins: vec![PluginConfigEntry {
@@ -1886,13 +1935,13 @@ mod tests {
                 args: Vec::new(),
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
 
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 2);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 1);
+        assert_eq!(resolved.externals[0].name, BLOBSTORE_PLUGIN_ID);
     }
 
     #[test]
@@ -1905,6 +1954,7 @@ mod tests {
                 args: Vec::new(),
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
 
@@ -1922,15 +1972,15 @@ mod tests {
                 args: Vec::new(),
                 url: Some("http://gpu-box:8000/v1".into()),
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 4);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, OPENAI_ENDPOINT_PLUGIN_ID);
-        assert_eq!(resolved.externals[3].name, BLOBSTORE_PLUGIN_ID);
-        let spec = &resolved.externals[2];
+        assert_eq!(resolved.externals.len(), 3);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, OPENAI_ENDPOINT_PLUGIN_ID);
+        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
+        let spec = &resolved.externals[1];
         assert!(spec.args.contains(&"openai-endpoint".to_string()));
         assert_eq!(spec.url.as_deref(), Some("http://gpu-box:8000/v1"));
     }
@@ -1945,16 +1995,16 @@ mod tests {
                 args: Vec::new(),
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 4);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, OPENAI_ENDPOINT_PLUGIN_ID);
-        assert_eq!(resolved.externals[3].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 3);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, OPENAI_ENDPOINT_PLUGIN_ID);
+        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
         // Verify the spec args dispatch to the right plugin binary
-        let spec = &resolved.externals[2];
+        let spec = &resolved.externals[1];
         assert!(spec.args.contains(&"--plugin".to_string()));
         assert!(spec.args.contains(&"openai-endpoint".to_string()));
     }
@@ -1969,6 +2019,7 @@ mod tests {
                 args: Vec::new(),
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let result = resolve_plugins(&config, private_host_mode());
@@ -1995,12 +2046,11 @@ mod tests {
 
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
 
-        assert_eq!(resolved.externals.len(), 4);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, FLASH_MOE_PLUGIN_ID);
-        assert_eq!(resolved.externals[3].name, BLOBSTORE_PLUGIN_ID);
-        let spec = &resolved.externals[2];
+        assert_eq!(resolved.externals.len(), 3);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, FLASH_MOE_PLUGIN_ID);
+        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
+        let spec = &resolved.externals[1];
         assert!(spec.args.contains(&"--plugin".to_string()));
         assert!(spec.args.contains(&FLASH_MOE_PLUGIN_ID.to_string()));
         assert_eq!(
@@ -2082,7 +2132,7 @@ mod tests {
     }
 
     #[test]
-    fn blackboard_is_resolved_on_public_meshes() {
+    fn default_builtins_are_resolved_on_public_meshes() {
         let resolved = resolve_plugins(
             &MeshConfig::default(),
             PluginHostMode {
@@ -2090,10 +2140,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(resolved.externals.len(), 3);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
@@ -2107,14 +2156,14 @@ mod tests {
                 args: vec!["--flag".into()],
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 4);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, "demo");
-        assert_eq!(resolved.externals[3].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 3);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, "demo");
+        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
@@ -2124,9 +2173,11 @@ mod tests {
         let prefix = format!("p{}-", std::process::id());
         assert!(instance_id.starts_with(&prefix));
         assert_eq!(instance_id.len(), prefix.len() + 8);
-        assert!(instance_id[prefix.len()..]
-            .chars()
-            .all(|ch| ch.is_ascii_hexdigit()));
+        assert!(
+            instance_id[prefix.len()..]
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit())
+        );
     }
 
     #[cfg(unix)]
@@ -2330,11 +2381,13 @@ mod tests {
         assert!(!health.available);
         assert_eq!(health.state, "unhealthy");
         assert!(health.models.is_empty());
-        assert!(health
-            .detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("503 Service Unavailable"));
+        assert!(
+            health
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("503 Service Unavailable")
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
 
         handle.await.unwrap();

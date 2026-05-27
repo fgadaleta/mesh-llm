@@ -187,28 +187,27 @@ impl StageOpenAiBackend {
             lane_pool,
             ..
         } = self.mode.clone()
+            && config.downstream.is_some()
         {
-            if config.downstream.is_some() {
-                let lane_pool = lane_pool.ok_or_else(|| {
-                    OpenAiError::backend("embedded stage 0 has no downstream lane pool")
-                })?;
-                return self.generate_split_multimodal_text(
-                    SplitMultimodalGeneration {
-                        prompt,
-                        max_tokens,
-                        stop,
-                        sampling,
-                        cancellation,
-                        ids,
-                        config,
-                        wire_dtype,
-                        activation_width,
-                        downstream_wire_condition,
-                        lane_pool,
-                    },
-                    on_text_chunk,
-                );
-            }
+            let lane_pool = lane_pool.ok_or_else(|| {
+                OpenAiError::backend("embedded stage 0 has no downstream lane pool")
+            })?;
+            return self.generate_split_multimodal_text(
+                SplitMultimodalGeneration {
+                    prompt,
+                    max_tokens,
+                    stop,
+                    sampling,
+                    cancellation,
+                    ids,
+                    config,
+                    wire_dtype,
+                    activation_width,
+                    downstream_wire_condition,
+                    lane_pool,
+                },
+                on_text_chunk,
+            );
         }
 
         match &self.mode {
@@ -286,6 +285,52 @@ impl StageOpenAiBackend {
             (prefill, token_signal, signal_window)
         };
         let max_tokens = max_tokens.resolve(prefill.position as usize, self.ctx_size)?;
+
+        // Proactive eviction: free one native decode batch worth of resident
+        // prefix KV cells for grammar-triggered retries during the coming
+        // decode loop.
+        let mut proactive_eviction_status = "disabled";
+        let mut proactive_eviction_error_kind_attr = None;
+        let mut proactive_eviction_target_tokens = 0_u64;
+        let mut proactive_evicted_entries = 0_usize;
+        let mut proactive_evicted_tokens = 0_u64;
+        if let Some(kv) = self.kv.as_ref() {
+            match self.runtime.lock() {
+                Ok(mut runtime) => {
+                    match kv.evict_resident_prefix_for_decode_batch(&mut runtime, &session_id) {
+                        Ok(eviction) => {
+                            proactive_eviction_status = if eviction.evicted_entries > 0 {
+                                "evicted"
+                            } else {
+                                "noop"
+                            };
+                            proactive_eviction_target_tokens = eviction.target_tokens;
+                            proactive_evicted_entries = eviction.evicted_entries;
+                            proactive_evicted_tokens = eviction.evicted_tokens;
+                        }
+                        Err(error) => {
+                            proactive_eviction_status = "error";
+                            proactive_eviction_error_kind_attr =
+                                Some(proactive_eviction_error_kind(&error));
+                        }
+                    }
+                }
+                Err(_) => {
+                    proactive_eviction_status = "error";
+                    proactive_eviction_error_kind_attr = Some("runtime_lock_poisoned");
+                }
+            }
+        }
+        self.telemetry.emit(
+            "stage.openai_kv_record_decision",
+            proactive_eviction_attrs(
+                proactive_eviction_status,
+                proactive_eviction_error_kind_attr,
+                proactive_eviction_target_tokens,
+                proactive_evicted_entries,
+                proactive_evicted_tokens,
+            ),
+        );
 
         let mut collector =
             TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk);

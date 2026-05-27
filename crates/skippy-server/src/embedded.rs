@@ -9,12 +9,14 @@ use skippy_protocol::{StageConfig, StageTopology};
 use tokio::{sync::oneshot, task::JoinHandle};
 
 use crate::{
-    binary_transport::{serve_binary_stage_with_shutdown, BinaryStageOptions},
+    binary_transport::{BinaryStageOptions, serve_binary_stage_with_shutdown},
     config::validate_config,
-    frontend::{serve_embedded_openai_with_shutdown, EmbeddedOpenAiArgs},
-    http::{serve_stage_http_with_shutdown, StageHttpOptions},
-    runtime_state::{load_runtime, RuntimeSessionStats, RuntimeState},
-    telemetry::{lifecycle_attrs, now_unix_nanos, Telemetry, TelemetryLevel, TelemetryStats},
+    frontend::{EmbeddedOpenAiArgs, serve_embedded_openai_with_shutdown},
+    http::{StageHttpOptions, serve_stage_http_with_shutdown},
+    runtime_state::{
+        RuntimeLaunchOverrides, RuntimeSessionStats, RuntimeState, load_runtime_with_overrides,
+    },
+    telemetry::{Telemetry, TelemetryLevel, TelemetryStats, lifecycle_attrs, now_unix_nanos},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +60,8 @@ pub struct EmbeddedServerStatus {
 pub struct EmbeddedRuntimeOptions {
     pub config: StageConfig,
     pub topology: Option<StageTopology>,
+    pub n_threads: Option<usize>,
+    pub n_threads_batch: Option<usize>,
     pub metrics_otlp_grpc: Option<String>,
     pub telemetry_queue_capacity: usize,
     pub telemetry_level: TelemetryLevel,
@@ -92,8 +96,14 @@ impl SkippyRuntimeHandle {
             "stage.embedded_runtime_load_start",
             lifecycle_attrs(&options.config),
         );
-        let runtime = load_runtime(&options.config)?
-            .with_context(|| format!("stage {} requires model_path", options.config.stage_id))?;
+        let runtime = load_runtime_with_overrides(
+            &options.config,
+            &RuntimeLaunchOverrides {
+                n_threads: options.n_threads,
+                n_threads_batch: options.n_threads_batch,
+            },
+        )?
+        .with_context(|| format!("stage {} requires model_path", options.config.stage_id))?;
         telemetry.emit(
             "stage.embedded_runtime_ready",
             lifecycle_attrs(&options.config),

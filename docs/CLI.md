@@ -77,21 +77,39 @@ Runtime switches:
   multi-interface hosts where Docker/CNI bridge addresses overlap across nodes.
 - `--bind-port <PORT>`: bind mesh QUIC to a fixed UDP port, usually paired
   with `--bind-ip` for firewall or NAT rules.
+- `--swarm-capture <DIR>`: write passive local mesh membership and connection
+  diagnostics as JSONL. See [SWARM_CAPTURE.md](SWARM_CAPTURE.md) for the full
+  debug-capture workflow.
 - `--publish`: publish your mesh for discovery.
 - `--mesh-name <MESH_NAME>`: friendly mesh name in discovery.
 - `--region <REGION>`: region hint for discovery.
-- `--blackboard`: enable blackboard on public meshes. Private meshes enable
-  blackboard by default; public mesh posts are visible to all peers in that
-  mesh.
-- `--name <NAME>`: your blackboard display name.
+- `--name <NAME>`: display name for this node.
 - `--max-vram <MAX_VRAM>`: cap VRAM used for planning and fit decisions.
 - `--llama-flavor <LLAMA_FLAVOR>`: force backend binary flavor (`cpu|cuda|rocm|vulkan|metal`).
-- `--config <CONFIG>`: explicit config file path.
+- `--config <CONFIG>`: explicit config file path. The file applies on future
+  starts or owner-control reloads, not to already running sessions.
 - `--owner-key <OWNER_KEY>`: keystore used to attest this runtime node.
 - `--owner-required`: fail startup if owner attestation cannot be loaded.
 - `--node-label <NODE_LABEL>`: attach a human label to this runtime node certificate.
 - `--trust-policy <TRUST_POLICY>`: override peer ownership trust policy.
 - `--trust-owner <TRUST_OWNER>`: add trusted owner IDs on top of the local trust store.
+- `--mesh-guardrails <MODE>`: server-side mesh guardrail mode for hosted
+  Skippy backends (`disabled`, `metrics`, or `enforce`; default `disabled`).
+  This controls `GuardrailPolicy.mode`; request-level `mesh_guardrails` flags
+  cannot upgrade a disabled server.
+
+Config file semantics:
+
+- `mesh-llm serve` reads `~/.mesh-llm/config.toml` by default.
+- Precedence is request values, then per-model config, then `[defaults.*]`, then
+  family or topology policy, then built-in runtime defaults.
+- Request defaults only fill absent or null request fields at the OpenAI
+  frontend boundary. Explicit request values win, and the defaults never flow
+  into `StageConfig`, runtime load structs, protobuf, or lower runtime.
+- Staged-only controls stay staged-only. Activation wire dtype, prefill
+  controls, speculative draft controls, and manual stage layer ranges only
+  execute in staged mode.
+- Unsupported or deferred rows are documented as rejected, not silent no-ops.
 
 ## Commands
 
@@ -345,6 +363,40 @@ Switches:
 
 - `--port <PORT>`: target management/API port (default `3131`).
 
+### `runtime guardrails`
+
+Use this to switch mesh guardrail mode on a running local runtime without
+restarting it. The command updates the server-side shared guardrail policy used
+by hosted Skippy backends and future runtime-loaded/replacement models.
+
+Usage:
+
+```bash
+mesh-llm runtime guardrails --mode metrics --port 3131
+mesh-llm runtime guardrails --mode enforce --port 3131 --json
+```
+
+Switches:
+
+- `--mode <MODE>`: `disabled`, `metrics`, or `enforce`.
+- `--port <PORT>`: target management/API port (default `3131`).
+- `--json`: machine-readable response with `mode`, `updated_models`, and the
+  current `status` payload.
+
+Equivalent REST call:
+
+```bash
+curl -s -X POST localhost:3131/api/runtime/mesh-guardrails \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"metrics"}' | jq .
+```
+
+Verify the active posture through `/api/status`:
+
+```bash
+curl -s localhost:3131/api/status | jq '.runtime.openai_guardrails'
+```
+
 ### `discover`
 
 Use this to discover meshes via Nostr and optionally select one automatically.
@@ -395,15 +447,16 @@ Use this to stop local `mesh-llm` instances tracked in the runtime root.
 
 ### `blackboard`
 
-Use this to post/search/read shared mesh notes, or to run blackboard as MCP over stdio.
+Use this external plugin command to post/search/read shared mesh notes after
+installing and configuring the blackboard plugin.
 
 Usage:
 
 ```bash
+mesh-llm plugins install blackboard
 mesh-llm blackboard
 mesh-llm blackboard "STATUS: testing gguf resolution"
 mesh-llm blackboard --search "gemma"
-mesh-llm blackboard --mcp
 ```
 
 Switches:
@@ -413,7 +466,6 @@ Switches:
 - `--since <SINCE>`: last N hours.
 - `--limit <LIMIT>`: max rows (default `20`).
 - `--port <PORT>`: target management/API port (default `3131`).
-- `--mcp`: run as MCP server over stdio.
 
 ### `plugin`
 
@@ -422,7 +474,8 @@ Use this to inspect plugin status or run plugin compatibility shims.
 Subcommands:
 
 - `plugin list`: list auto-registered/configured plugins.
-- `plugin install <NAME>`: old install workflow shim.
+- `plugin install <NAME>`: compatibility shim for older install workflows.
+- `plugin mcp`: run configured plugin tools as an MCP server over stdio.
 
 
 ### `auth`

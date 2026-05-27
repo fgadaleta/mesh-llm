@@ -1,8 +1,8 @@
 use super::heartbeat::{
-    relay_reconnect_reason, should_remove_connection, HeartbeatFailurePolicy,
-    HomeRelayStatusTransition, RelayPathSnapshot, RelayPeerHealth, RelayPeerObservation,
-    RelayReconnectController, RelayReconnectReason, SelectedPathKind, RELAY_DEGRADED_RTT_MS,
+    HeartbeatFailurePolicy, HomeRelayStatusTransition, RELAY_DEGRADED_RTT_MS,
     RELAY_MISSING_GRACE_SECS, RELAY_ONLY_RECONNECT_SECS, RELAY_RECONNECT_COOLDOWN_SECS,
+    RelayPathSnapshot, RelayPeerHealth, RelayPeerObservation, RelayReconnectController,
+    RelayReconnectReason, SelectedPathKind, relay_reconnect_reason, should_remove_connection,
 };
 use super::*;
 use crate::api;
@@ -11,8 +11,18 @@ use crate::plugin;
 use crate::proto::node::{GossipFrame, NodeRole, PeerAnnouncement, RouteTableRequest};
 use serial_test::serial;
 use skippy_protocol::proto::stage as skippy_stage_proto;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::watch;
+
+/// Empty per-relay auth map for tests that don't exercise gated relays.
+///
+/// Bound to a local before being passed by reference so the borrow lives
+/// for the full duration of any async call — cleaner than `&HashMap::new()`
+/// at the call site, and future-proofs the call against the callee
+/// holding the reference across an internal `.await`.
+fn empty_relay_auths() -> HashMap<String, String> {
+    HashMap::new()
+}
 
 #[test]
 fn quic_bind_addr_uses_explicit_port_on_all_platforms() {
@@ -100,10 +110,12 @@ fn endpoint_addr_filter_for_bind_ip_keeps_selected_ip_relay_and_public_candidate
     assert!(!ip_addrs.contains("172.23.0.1:47916"));
     assert!(!ip_addrs.contains("100.107.22.123:47916"));
     assert!(!ip_addrs.contains("192.168.1.20:47916"));
-    assert!(filtered
-        .addrs
-        .iter()
-        .any(|addr| matches!(addr, iroh::TransportAddr::Relay(_))));
+    assert!(
+        filtered
+            .addrs
+            .iter()
+            .any(|addr| matches!(addr, iroh::TransportAddr::Relay(_)))
+    );
 }
 
 fn stage_load_request() -> crate::inference::skippy::StageLoadRequest {
@@ -212,6 +224,7 @@ async fn make_test_node(role: super::NodeRole) -> Result<Node> {
         inflight_change_tx,
         routing_metrics: crate::network::metrics::RoutingMetrics::default(),
         routing_telemetry: Arc::new(std::sync::Mutex::new(None)),
+        swarm_capture: Arc::new(std::sync::Mutex::new(None)),
         local_request_metrics: Arc::new(LocalRequestMetricsSampler::default()),
         runtime_data_producer,
         tunnel_tx,
@@ -254,8 +267,8 @@ async fn make_test_node(role: super::NodeRole) -> Result<Node> {
 }
 
 #[tokio::test]
-async fn set_serving_models_preserves_existing_known_descriptor_capabilities_when_adding_model(
-) -> Result<()> {
+async fn set_serving_models_preserves_existing_known_descriptor_capabilities_when_adding_model()
+-> Result<()> {
     let node = make_test_node(super::NodeRole::Worker).await?;
     let vision_model = "Qwen3VL-2B-Instruct-Q4_K_M".to_string();
     let text_model = "Qwen3-8B-Q4_K_M".to_string();
@@ -870,7 +883,7 @@ fn test_peer_announcement_backward_compat_no_bandwidth_field() {
 
 fn make_valid_gossip_frame() -> GossipFrame {
     GossipFrame {
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
         sender_id: vec![0u8; 32],
         peers: vec![PeerAnnouncement {
             endpoint_id: vec![0u8; 32],
@@ -922,7 +935,7 @@ fn control_frame_roundtrip() {
     let encoded = encode_control_frame(STREAM_GOSSIP, &frame);
     let decoded: GossipFrame = decode_control_frame(STREAM_GOSSIP, &encoded)
         .expect("valid gossip frame must decode successfully");
-    assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
+    assert_eq!(decoded.r#gen, NODE_PROTOCOL_GENERATION);
     assert_eq!(decoded.peers.len(), 1);
     assert_eq!(decoded.peers[0].endpoint_id, vec![0u8; 32]);
     assert_eq!(decoded.peers[0].role, NodeRole::Worker as i32);
@@ -1000,19 +1013,22 @@ struct EnvVarGuard {
 impl EnvVarGuard {
     fn set(key: &'static str, value: &std::path::Path) -> Self {
         let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(key, value) };
         Self { key, previous }
     }
 
     fn set_str(key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(key, value) };
         Self { key, previous }
     }
 
     fn unset(key: &'static str) -> Self {
         let previous = std::env::var_os(key);
-        std::env::remove_var(key);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(key) };
         Self { key, previous }
     }
 }
@@ -1020,9 +1036,11 @@ impl EnvVarGuard {
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         if let Some(value) = self.previous.take() {
-            std::env::set_var(self.key, value);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var(self.key, value) };
         } else {
-            std::env::remove_var(self.key);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var(self.key) };
         }
     }
 }
@@ -1121,7 +1139,8 @@ async fn control_plane_listener_starts_with_owner() -> anyhow::Result<()> {
     let (node, secret_key) = Node::new_for_tests_with_secret(super::NodeRole::Worker).await?;
     *node.owner_summary.lock().await = verified_owner_summary("owner-a");
 
-    node.maybe_start_control_listener(secret_key, None, None, None)
+    let auths = empty_relay_auths();
+    node.maybe_start_control_listener(secret_key, None, None, None, &auths)
         .await?;
 
     let endpoint = node
@@ -1146,7 +1165,8 @@ async fn control_plane_listener_uses_explicit_advertised_address() -> anyhow::Re
     *node.owner_summary.lock().await = verified_owner_summary("owner-a");
     let advertised_addr = std::net::SocketAddr::from(([203, 0, 113, 10], 18443));
 
-    node.maybe_start_control_listener(secret_key, None, Some(advertised_addr), None)
+    let auths = empty_relay_auths();
+    node.maybe_start_control_listener(secret_key, None, Some(advertised_addr), None, &auths)
         .await?;
 
     let endpoint = node
@@ -1156,9 +1176,11 @@ async fn control_plane_listener_uses_explicit_advertised_address() -> anyhow::Re
     let decoded = Node::decode_invite_token(&endpoint)?;
     assert_eq!(decoded.id, node.endpoint.id());
     assert_eq!(decoded.addrs.len(), 1);
-    assert!(decoded
-        .addrs
-        .contains(&iroh::TransportAddr::Ip(advertised_addr)));
+    assert!(
+        decoded
+            .addrs
+            .contains(&iroh::TransportAddr::Ip(advertised_addr))
+    );
 
     node.shutdown_control_listener().await;
     Ok(())
@@ -1168,11 +1190,13 @@ async fn control_plane_listener_uses_explicit_advertised_address() -> anyhow::Re
 async fn control_plane_listener_disabled_without_owner() -> anyhow::Result<()> {
     let (node, secret_key) = Node::new_for_tests_with_secret(super::NodeRole::Worker).await?;
 
+    let auths = empty_relay_auths();
     node.maybe_start_control_listener(
         secret_key,
         Some("127.0.0.1:7447".parse().unwrap()),
         None,
         None,
+        &auths,
     )
     .await?;
 
@@ -1184,7 +1208,8 @@ async fn control_plane_listener_disabled_without_owner() -> anyhow::Result<()> {
 async fn control_plane_listener_accepts_only_control_alpn() -> anyhow::Result<()> {
     let (node, secret_key) = Node::new_for_tests_with_secret(super::NodeRole::Worker).await?;
     *node.owner_summary.lock().await = verified_owner_summary("owner-a");
-    node.maybe_start_control_listener(secret_key, None, None, None)
+    let auths = empty_relay_auths();
+    node.maybe_start_control_listener(secret_key, None, None, None, &auths)
         .await?;
     let endpoint = Node::decode_invite_token(
         &node
@@ -1214,7 +1239,8 @@ async fn control_plane_listener_accepts_only_control_alpn() -> anyhow::Result<()
 async fn control_plane_endpoint_not_in_gossip_or_status() -> anyhow::Result<()> {
     let (node, secret_key) = Node::new_for_tests_with_secret(super::NodeRole::Worker).await?;
     *node.owner_summary.lock().await = verified_owner_summary("owner-a");
-    node.maybe_start_control_listener(secret_key, None, None, None)
+    let auths = empty_relay_auths();
+    node.maybe_start_control_listener(secret_key, None, None, None, &auths)
         .await?;
     let control_endpoint = node
         .control_endpoint()
@@ -1222,9 +1248,11 @@ async fn control_plane_endpoint_not_in_gossip_or_status() -> anyhow::Result<()> 
         .expect("verified owner should expose control endpoint");
 
     let announcements = node.collect_announcements().await;
-    assert!(announcements
-        .iter()
-        .all(|announcement| encode_endpoint_addr_token(&announcement.addr) != control_endpoint));
+    assert!(
+        announcements
+            .iter()
+            .all(|announcement| encode_endpoint_addr_token(&announcement.addr) != control_endpoint)
+    );
 
     let api = build_mesh_api_for_control_tests(node.clone()).await;
     api.set_control_bootstrap(api::ControlBootstrapPayload {
@@ -1232,6 +1260,9 @@ async fn control_plane_endpoint_not_in_gossip_or_status() -> anyhow::Result<()> 
         local_only: true,
         requires_explicit_remote_endpoint: true,
         endpoint: Some(control_endpoint.clone()),
+        disabled_reason: None,
+        message: None,
+        suggested_commands: None,
     })
     .await;
     let status_snapshot = api.status_snapshot_string().await;
@@ -1245,7 +1276,8 @@ async fn control_plane_endpoint_not_in_gossip_or_status() -> anyhow::Result<()> 
 async fn control_plane_listener_shutdown_stops_listener_task() -> anyhow::Result<()> {
     let (node, secret_key) = Node::new_for_tests_with_secret(super::NodeRole::Worker).await?;
     *node.owner_summary.lock().await = verified_owner_summary("owner-a");
-    node.maybe_start_control_listener(secret_key, None, None, None)
+    let auths = empty_relay_auths();
+    node.maybe_start_control_listener(secret_key, None, None, None, &auths)
         .await?;
     let endpoint = Node::decode_invite_token(
         &node
@@ -1286,7 +1318,7 @@ async fn control_plane_get_watch_apply_config() -> Result<()> {
     write_len_prefixed(
         &mut get_send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
                 request_id: 1,
@@ -1321,7 +1353,7 @@ async fn control_plane_get_watch_apply_config() -> Result<()> {
     write_len_prefixed(
         &mut watch_send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
                 request_id: 2,
@@ -1366,11 +1398,12 @@ async fn control_plane_get_watch_apply_config() -> Result<()> {
             mmproj_ref: None,
         }],
         plugins: vec![],
+        config_toml: None,
     };
     write_len_prefixed(
         &mut apply_send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
                 request_id: 3,
@@ -1416,7 +1449,7 @@ async fn control_plane_get_watch_apply_config() -> Result<()> {
     write_len_prefixed(
         &mut apply_send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
                 request_id: 4,
@@ -1470,7 +1503,7 @@ async fn control_plane_watch_observes_apply_revision() -> Result<()> {
     write_len_prefixed(
         &mut watch_send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
                 request_id: 10,
@@ -1504,7 +1537,7 @@ async fn control_plane_watch_observes_apply_revision() -> Result<()> {
     write_len_prefixed(
         &mut apply_send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
                 request_id: 11,
@@ -1521,6 +1554,7 @@ async fn control_plane_watch_observes_apply_revision() -> Result<()> {
                         }),
                         models: vec![],
                         plugins: vec![],
+                        config_toml: None,
                     }),
                 }),
                 refresh_inventory: None,
@@ -1578,7 +1612,7 @@ async fn control_plane_watch_without_snapshot_starts_with_accepted() -> Result<(
     write_len_prefixed(
         &mut watch_send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
                 request_id: 12,
@@ -1635,7 +1669,7 @@ async fn control_plane_watch_without_snapshot_observes_apply_revision() -> Resul
     write_len_prefixed(
         &mut watch_send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
                 request_id: 13,
@@ -1655,20 +1689,22 @@ async fn control_plane_watch_without_snapshot_observes_apply_revision() -> Resul
     )
     .await?;
     let accepted = read_owner_control_envelope(&mut watch_recv).await?;
-    assert!(accepted
-        .response
-        .expect("watch should return a response")
-        .watch_config
-        .expect("watch should return watch_config")
-        .accepted
-        .is_some());
+    assert!(
+        accepted
+            .response
+            .expect("watch should return a response")
+            .watch_config
+            .expect("watch should return watch_config")
+            .accepted
+            .is_some()
+    );
 
     let (_apply_endpoint, mut apply_send, mut apply_recv, apply_requester_id) =
         open_owner_control_stream(&server, &owner_keypair).await?;
     write_len_prefixed(
         &mut apply_send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
                 request_id: 14,
@@ -1685,6 +1721,7 @@ async fn control_plane_watch_without_snapshot_observes_apply_revision() -> Resul
                         }),
                         models: vec![],
                         plugins: vec![],
+                        config_toml: None,
                     }),
                 }),
                 refresh_inventory: None,
@@ -1742,7 +1779,7 @@ async fn control_plane_apply_rejects_stale_revision() -> Result<()> {
     let (_apply_endpoint, mut apply_send, mut apply_recv, apply_requester_id) =
         open_owner_control_stream(&server, &owner_keypair).await?;
     let apply_once = |request_id, expected_revision| crate::proto::node::OwnerControlEnvelope {
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
         handshake: None,
         request: Some(OwnerControlRequest {
             request_id,
@@ -1766,6 +1803,7 @@ async fn control_plane_apply_rejects_stale_revision() -> Result<()> {
                         mmproj_ref: None,
                     }],
                     plugins: vec![],
+                    config_toml: None,
                 }),
             }),
             refresh_inventory: None,
@@ -1802,6 +1840,79 @@ async fn control_plane_apply_rejects_stale_revision() -> Result<()> {
         hash_after_first
     );
     assert_ne!(initial_hash, hash_after_first);
+
+    server.shutdown_control_listener().await;
+    std::fs::remove_dir_all(&tmp).ok();
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_plane_apply_rejects_malformed_full_config_toml() -> Result<()> {
+    use crate::proto::node::{
+        NodeConfigSnapshot, NodeGpuConfig, OwnerControlErrorCode, OwnerControlRequest,
+    };
+
+    let owner_keypair = test_owner_keypair(0x97, 0x98);
+    let tmp = std::env::temp_dir().join(format!(
+        "mesh-llm-control-invalid-config-{}",
+        rand::random::<u64>()
+    ));
+    std::fs::create_dir_all(&tmp).ok();
+    let (server, _secret_key, _config_path) =
+        start_owner_control_test_server(&owner_keypair, &tmp).await?;
+
+    let initial_revision = { server.config_state.lock().await.revision() };
+    let initial_hash = { *server.config_state.lock().await.config_hash() };
+
+    let (_apply_endpoint, mut apply_send, mut apply_recv, apply_requester_id) =
+        open_owner_control_stream(&server, &owner_keypair).await?;
+    write_len_prefixed(
+        &mut apply_send,
+        &crate::proto::node::OwnerControlEnvelope {
+            r#gen: NODE_PROTOCOL_GENERATION,
+            handshake: None,
+            request: Some(OwnerControlRequest {
+                request_id: 22,
+                get_config: None,
+                watch_config: None,
+                apply_config: Some(crate::proto::node::OwnerControlApplyConfigRequest {
+                    requester_node_id: apply_requester_id.as_bytes().to_vec(),
+                    target_node_id: server.id().as_bytes().to_vec(),
+                    expected_revision: initial_revision,
+                    config: Some(NodeConfigSnapshot {
+                        version: 1,
+                        gpu: Some(NodeGpuConfig {
+                            assignment: crate::proto::node::GpuAssignment::Auto as i32,
+                        }),
+                        models: vec![],
+                        plugins: vec![],
+                        config_toml: Some("not valid toml = [".to_string()),
+                    }),
+                }),
+                refresh_inventory: None,
+            }),
+            response: None,
+            error: None,
+        }
+        .encode_to_vec(),
+    )
+    .await?;
+
+    let rejected = read_owner_control_envelope(&mut apply_recv).await?;
+    let error = rejected
+        .error
+        .expect("malformed full config should return an error envelope");
+    assert_eq!(error.code, OwnerControlErrorCode::BadRequest as i32);
+    assert_eq!(error.request_id, Some(22));
+    assert!(error.message.contains("invalid full config_toml payload"));
+    assert_eq!(
+        server.config_state.lock().await.revision(),
+        initial_revision
+    );
+    assert_eq!(
+        *server.config_state.lock().await.config_hash(),
+        initial_hash
+    );
 
     server.shutdown_control_listener().await;
     std::fs::remove_dir_all(&tmp).ok();
@@ -1889,7 +2000,7 @@ async fn control_plane_refresh_inventory() -> Result<()> {
     let (_refresh_endpoint, mut refresh_send, mut refresh_recv, requester_id) =
         open_owner_control_stream(&server, &owner_keypair).await?;
     let refresh_request = |request_id| crate::proto::node::OwnerControlEnvelope {
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
         handshake: None,
         request: Some(OwnerControlRequest {
             request_id,
@@ -1915,14 +2026,18 @@ async fn control_plane_refresh_inventory() -> Result<()> {
         .snapshot
         .expect("refresh should include a config snapshot");
     assert_eq!(first_snapshot.node_id, server.id().as_bytes().to_vec());
-    assert!(server
-        .available_models()
-        .await
-        .contains(&expected_model_ref));
+    assert!(
+        server
+            .available_models()
+            .await
+            .contains(&expected_model_ref)
+    );
     let inventory_snapshot = server.runtime_data_collector().local_inventory_snapshot();
-    assert!(inventory_snapshot
-        .model_names
-        .contains(&expected_inventory_name));
+    assert!(
+        inventory_snapshot
+            .model_names
+            .contains(&expected_inventory_name)
+    );
 
     write_len_prefixed(&mut refresh_send, &refresh_request(31).encode_to_vec()).await?;
     let second = read_owner_control_envelope(&mut refresh_recv).await?;
@@ -2039,7 +2154,7 @@ fn artifact_transfer_authorization_is_limited_to_stage_assignment() {
     };
     let request = |relative_path: &str, expected_size: u64, expected_sha256: String| {
         skippy_stage_proto::StageArtifactTransferRequest {
-            gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+            r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
             requester_id: stage0.as_bytes().to_vec(),
             topology_id: "topology-a".to_string(),
             run_id: "run-a".to_string(),
@@ -2054,44 +2169,52 @@ fn artifact_transfer_authorization_is_limited_to_stage_assignment() {
     };
 
     let layer0 = request("layers/layer-000.gguf", 8, sha256_hex(b"layer000"));
-    assert!(artifact_transfer_allowed_by_topology(
-        std::slice::from_ref(&topology),
-        stage0,
-        package.path(),
-        &layer0,
-    )
-    .unwrap());
+    assert!(
+        artifact_transfer_allowed_by_topology(
+            std::slice::from_ref(&topology),
+            stage0,
+            package.path(),
+            &layer0,
+        )
+        .unwrap()
+    );
 
     let mut wrong_topology = layer0.clone();
     wrong_topology.topology_id = "other-topology".to_string();
-    assert!(!artifact_transfer_allowed_by_topology(
-        std::slice::from_ref(&topology),
-        stage0,
-        package.path(),
-        &wrong_topology,
-    )
-    .unwrap());
+    assert!(
+        !artifact_transfer_allowed_by_topology(
+            std::slice::from_ref(&topology),
+            stage0,
+            package.path(),
+            &wrong_topology,
+        )
+        .unwrap()
+    );
 
     let layer1 = request("layers/layer-001.gguf", 8, sha256_hex(b"layer001"));
-    assert!(!artifact_transfer_allowed_by_topology(
-        std::slice::from_ref(&topology),
-        stage0,
-        package.path(),
-        &layer1,
-    )
-    .unwrap());
+    assert!(
+        !artifact_transfer_allowed_by_topology(
+            std::slice::from_ref(&topology),
+            stage0,
+            package.path(),
+            &layer1,
+        )
+        .unwrap()
+    );
 
     let projector = request("projectors/mmproj.gguf", 9, sha256_hex(b"projector"));
-    assert!(artifact_transfer_allowed_by_topology(
-        std::slice::from_ref(&topology),
-        stage0,
-        package.path(),
-        &projector,
-    )
-    .unwrap());
+    assert!(
+        artifact_transfer_allowed_by_topology(
+            std::slice::from_ref(&topology),
+            stage0,
+            package.path(),
+            &projector,
+        )
+        .unwrap()
+    );
 
     let manifest = skippy_stage_proto::StageArtifactTransferRequest {
-        gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+        r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
         requester_id: stage1.as_bytes().to_vec(),
         topology_id: "topology-a".to_string(),
         run_id: "run-a".to_string(),
@@ -2160,7 +2283,7 @@ async fn artifact_transfer_stream_serves_authorized_stage_artifact() -> Result<(
         .await;
 
     let request = skippy_stage_proto::StageArtifactTransferRequest {
-        gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+        r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
         requester_id: client_id.as_bytes().to_vec(),
         topology_id: "topology-artifact".to_string(),
         run_id: "run-artifact".to_string(),
@@ -2189,6 +2312,31 @@ async fn artifact_transfer_stream_serves_authorized_stage_artifact() -> Result<(
     recv.read_exact(&mut bytes).await?;
     assert_eq!(bytes, b"layer000");
 
+    let mut resume_request = request.clone();
+    resume_request.offset = 5;
+    let (mut resume_send, mut resume_recv) = client
+        .open_skippy_stage_mesh_stream(server_id, skippy_protocol::STAGE_STREAM_ARTIFACT_TRANSFER)
+        .await?;
+    write_len_prefixed(&mut resume_send, &resume_request.encode_to_vec()).await?;
+    resume_send.finish()?;
+    let resume_response_buf = read_len_prefixed(&mut resume_recv).await?;
+    let resume_response =
+        skippy_stage_proto::StageArtifactTransferResponse::decode(resume_response_buf.as_slice())?;
+    assert!(
+        resume_response.accepted,
+        "resume artifact response: {:?}",
+        resume_response.error
+    );
+    assert_eq!(resume_response.total_size, 8);
+    assert_eq!(
+        resume_response.sha256.as_deref(),
+        Some(expected_sha.as_str())
+    );
+    let mut resumed_bytes =
+        vec![0u8; (resume_response.total_size - resume_request.offset) as usize];
+    resume_recv.read_exact(&mut resumed_bytes).await?;
+    assert_eq!(resumed_bytes, b"000");
+
     let conn = client.stage_connection_to_peer(server_id).await?;
     let (mut legacy_send, mut legacy_recv) = conn.open_bi().await?;
     legacy_send
@@ -2213,6 +2361,85 @@ async fn artifact_transfer_stream_serves_authorized_stage_artifact() -> Result<(
     legacy_recv.read_exact(&mut legacy_bytes).await?;
     assert_eq!(legacy_bytes, b"layer000");
     assert!(package_dir.join("model-package.json").is_file());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn artifact_transfer_stream_rejects_corrupt_same_size_cached_artifact() -> Result<()> {
+    use crate::protocol::{read_len_prefixed, write_len_prefixed};
+    use base64::Engine as _;
+    use prost::Message as _;
+
+    let cache = tempfile::tempdir().unwrap();
+    let _cache_guard = EnvVarGuard::set("HF_HUB_CACHE", cache.path());
+    let _transfer_guard = EnvVarGuard::set_str("MESH_LLM_ARTIFACT_TRANSFER", "1");
+    let (package_dir, package_ref, manifest_sha256) =
+        write_hf_artifact_stream_package(cache.path());
+    std::fs::write(package_dir.join("layers/layer-000.gguf"), b"corrupt!").unwrap();
+    let server = make_test_node(super::NodeRole::Host { http_port: 9337 }).await?;
+    let client = make_test_node(super::NodeRole::Worker).await?;
+    server
+        .set_mesh_id("artifact-transfer-corrupt-mesh".to_string())
+        .await;
+    client
+        .set_mesh_id("artifact-transfer-corrupt-mesh".to_string())
+        .await;
+    server.start_accepting();
+    client.start_accepting();
+
+    let server_id = server.id();
+    let client_id = client.id();
+    let invite = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&server.endpoint.addr())?);
+    client.join(&invite).await?;
+    wait_for_peer(&client, server_id).await;
+    wait_for_peer(&server, client_id).await;
+    server
+        .record_stage_topology(StageTopologyInstance {
+            topology_id: "topology-artifact-corrupt".to_string(),
+            run_id: "run-artifact-corrupt".to_string(),
+            model_id: "model-artifact".to_string(),
+            package_ref: package_ref.clone(),
+            manifest_sha256: manifest_sha256.clone(),
+            stages: vec![StageAssignment {
+                stage_id: "stage-0".to_string(),
+                stage_index: 0,
+                node_id: client_id,
+                layer_start: 0,
+                layer_end: 1,
+                endpoint: StageEndpoint {
+                    bind_addr: String::new(),
+                },
+            }],
+        })
+        .await;
+
+    let request = skippy_stage_proto::StageArtifactTransferRequest {
+        r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+        requester_id: client_id.as_bytes().to_vec(),
+        topology_id: "topology-artifact-corrupt".to_string(),
+        run_id: "run-artifact-corrupt".to_string(),
+        stage_id: "stage-0".to_string(),
+        package_ref,
+        manifest_sha256,
+        relative_path: "layers/layer-000.gguf".to_string(),
+        offset: 0,
+        expected_size: Some(8),
+        expected_sha256: Some(sha256_hex(b"layer000")),
+    };
+
+    let (mut send, mut recv) = client
+        .open_skippy_stage_mesh_stream(server_id, skippy_protocol::STAGE_STREAM_ARTIFACT_TRANSFER)
+        .await?;
+    write_len_prefixed(&mut send, &request.encode_to_vec()).await?;
+    send.finish()?;
+    let response_buf = read_len_prefixed(&mut recv).await?;
+    let response =
+        skippy_stage_proto::StageArtifactTransferResponse::decode(response_buf.as_slice())?;
+    assert!(!response.accepted);
+    assert_eq!(response.error.as_deref(), Some("artifact unavailable"));
 
     Ok(())
 }
@@ -2268,7 +2495,7 @@ async fn artifact_transfer_stream_rejects_public_mesh_without_opt_in() -> Result
         .await;
 
     let request = skippy_stage_proto::StageArtifactTransferRequest {
-        gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+        r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
         requester_id: client_id.as_bytes().to_vec(),
         topology_id: "topology-artifact-disabled".to_string(),
         run_id: "run-artifact-disabled".to_string(),
@@ -2311,9 +2538,49 @@ async fn artifact_transfer_body_read_has_idle_timeout() {
     .await
     .expect_err("stalled body read must time out");
 
-    assert!(error
-        .to_string()
-        .contains("artifact transfer body read idle timeout"));
+    assert!(
+        error
+            .to_string()
+            .contains("artifact transfer body read idle timeout")
+    );
+}
+
+#[test]
+fn artifact_transfer_invalid_resume_offset_removes_preserved_partial() {
+    let temp = tempfile::tempdir().unwrap();
+    let partial = temp.path().join(".model-package.json.stale.part");
+    std::fs::write(&partial, b"stale manifest bytes").unwrap();
+    let mut guard = PartialArtifactGuard::preserve_on_error(partial.clone());
+    let response = skippy_stage_proto::StageArtifactTransferResponse {
+        r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+        accepted: false,
+        total_size: 8,
+        sha256: Some(sha256_hex(b"manifest")),
+        error: Some(ARTIFACT_TRANSFER_INVALID_OFFSET_ERROR.to_string()),
+    };
+
+    Node::remove_invalid_resume_partial(&mut guard, 128, &response);
+
+    assert!(!partial.exists());
+}
+
+#[test]
+fn artifact_transfer_smaller_resume_response_removes_preserved_partial() {
+    let temp = tempfile::tempdir().unwrap();
+    let partial = temp.path().join(".model-package.json.oversized.part");
+    std::fs::write(&partial, b"stale manifest bytes").unwrap();
+    let mut guard = PartialArtifactGuard::preserve_on_error(partial.clone());
+    let response = skippy_stage_proto::StageArtifactTransferResponse {
+        r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+        accepted: true,
+        total_size: 8,
+        sha256: Some(sha256_hex(b"manifest")),
+        error: None,
+    };
+
+    Node::remove_invalid_resume_partial(&mut guard, 128, &response);
+
+    assert!(!partial.exists());
 }
 
 #[test]
@@ -2664,7 +2931,11 @@ fn stale_dispatcher_cannot_remove_replacement_connection() {
 }
 
 #[test]
-fn relay_only_peers_get_extra_heartbeat_cycle() {
+fn relay_only_peers_get_extra_heartbeat_grace() {
+    // Relay-only peers get a higher failure threshold so transient
+    // relay path-renegotiation (which can spike RTT to 10s+) doesn't
+    // prematurely declare them dead and cause MoA reducer fallback.
+    // See heartbeat_failure_policy_for_peer for the rationale.
     let peer = make_test_peer_info(make_test_endpoint_id(12));
     let local_descriptors = vec![];
     let local_runtime = vec![];
@@ -2675,8 +2946,70 @@ fn relay_only_peers_get_extra_heartbeat_cycle() {
         policy,
         HeartbeatFailurePolicy {
             allow_recent_inbound_grace: true,
-            failure_threshold: 3,
-        }
+            failure_threshold: 5,
+        },
+        "relay-only peers must have a noticeably higher grace than direct \
+         (60s heartbeats × 5 = 5 min)"
+    );
+}
+
+#[test]
+fn is_relay_only_path_set_classifies_correctly() {
+    use crate::mesh::heartbeat::is_relay_only_path_set;
+    // Empty path set: be lenient (treat as relay-only). The connection
+    // is brand-new or mid-failure; we don't want to declare the peer
+    // dead prematurely.
+    assert!(
+        is_relay_only_path_set(std::iter::empty::<bool>()),
+        "empty path set must default to relay-only (lenient)"
+    );
+    // All paths are non-IP (relay): relay-only.
+    assert!(is_relay_only_path_set([false]));
+    assert!(is_relay_only_path_set([false, false, false]));
+    // Any IP path means NOT relay-only.
+    assert!(!is_relay_only_path_set([true]));
+    assert!(!is_relay_only_path_set([true, false]));
+    assert!(!is_relay_only_path_set([false, true]));
+    assert!(!is_relay_only_path_set([true, true, true]));
+}
+
+#[test]
+fn classify_relay_only_defaults_to_strict_when_no_connection() {
+    use crate::mesh::heartbeat::classify_relay_only_for_policy;
+    // No Connection object at all (cleanly closed, QUIC idle-expired,
+    // never opened): must default to STRICT, not lenient. Otherwise a
+    // previously-direct peer that simply disconnected would silently
+    // inherit the 5-min relay grace and keep stale model routes alive
+    // an extra 3 min beyond what direct policy intends.
+    assert!(
+        !classify_relay_only_for_policy(None),
+        "no Connection object must default to strict (not relay-only)"
+    );
+    // With a Connection: pass through whatever is_relay_only_connection
+    // observed (i.e., classify by the connection's actual paths).
+    assert!(
+        classify_relay_only_for_policy(Some(true)),
+        "a relay-only connection must keep its lenient classification"
+    );
+    assert!(
+        !classify_relay_only_for_policy(Some(false)),
+        "a connection with IP paths must remain strict (direct)"
+    );
+}
+
+#[test]
+fn direct_peers_use_strict_heartbeat_threshold() {
+    let peer = make_test_peer_info(make_test_endpoint_id(13));
+    let local_descriptors = vec![];
+    let local_runtime = vec![];
+
+    let policy =
+        heartbeat_failure_policy_for_peer(&local_descriptors, &local_runtime, &peer, false);
+
+    assert_eq!(
+        policy.failure_threshold, 2,
+        "direct paths stay at 2 misses — when the network is up at all, \
+         two consecutive cycles of silence is a real failure signal"
     );
 }
 
@@ -2698,7 +3031,7 @@ fn incoming_peer_promoted_after_valid_gossip() {
     let encoded = encode_control_frame(STREAM_GOSSIP, &frame);
     let decoded: GossipFrame = decode_control_frame(STREAM_GOSSIP, &encoded)
         .expect("valid gossip frame must decode successfully");
-    assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
+    assert_eq!(decoded.r#gen, NODE_PROTOCOL_GENERATION);
     assert!(!decoded.peers.is_empty());
 
     let peer_id = EndpointId::from(SecretKey::from_bytes(&[0xab; 32]).public());
@@ -2745,7 +3078,7 @@ fn incoming_peer_rejected_on_legacy_or_malformed_gossip() {
     );
 
     let bad_gen_frame = GossipFrame {
-        gen: 0,
+        r#gen: 0,
         sender_id: vec![],
         peers: vec![PeerAnnouncement {
             endpoint_id: vec![0u8; 32],
@@ -2828,17 +3161,17 @@ fn passive_route_table_request_does_not_admit_peer() {
 
     let valid_req = RouteTableRequest {
         requester_id: vec![0xef_u8; 32],
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
     };
     let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &valid_req);
     let decoded: RouteTableRequest = decode_control_frame(STREAM_ROUTE_REQUEST, &encoded)
         .expect("valid RouteTableRequest must decode successfully");
     assert_eq!(decoded.requester_id, vec![0xef_u8; 32]);
-    assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
+    assert_eq!(decoded.r#gen, NODE_PROTOCOL_GENERATION);
 
     let bad_req = RouteTableRequest {
         requester_id: vec![0u8; 16],
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
     };
     let encoded_bad = encode_control_frame(STREAM_ROUTE_REQUEST, &bad_req);
     let err = decode_control_frame::<RouteTableRequest>(STREAM_ROUTE_REQUEST, &encoded_bad)
@@ -2875,7 +3208,7 @@ fn control_frame_rejects_oversize_or_bad_generation() {
     );
 
     let bad_gen = GossipFrame {
-        gen: 99,
+        r#gen: 99,
         sender_id: vec![],
         peers: vec![PeerAnnouncement {
             endpoint_id: vec![0u8; 32],
@@ -2893,7 +3226,7 @@ fn control_frame_rejects_oversize_or_bad_generation() {
     );
 
     let bad_id = GossipFrame {
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
         sender_id: vec![0u8; 32],
         peers: vec![PeerAnnouncement {
             endpoint_id: vec![0u8; 16],
@@ -3176,7 +3509,7 @@ fn gossip_rejects_sender_id_mismatch_or_invalid_endpoint_len() {
     let peer_id_bytes = peer_id.as_bytes().to_vec();
 
     let invalid_sender_frame = GossipFrame {
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
         sender_id: vec![0u8; 16],
         peers: vec![PeerAnnouncement {
             endpoint_id: peer_id_bytes.clone(),
@@ -3195,7 +3528,7 @@ fn gossip_rejects_sender_id_mismatch_or_invalid_endpoint_len() {
 
     let impersonator_id = EndpointId::from(SecretKey::from_bytes(&[0xbb; 32]).public());
     let mismatch_frame = GossipFrame {
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
         sender_id: impersonator_id.as_bytes().to_vec(),
         peers: vec![PeerAnnouncement {
             endpoint_id: peer_id_bytes.clone(),
@@ -3212,7 +3545,7 @@ fn gossip_rejects_sender_id_mismatch_or_invalid_endpoint_len() {
     );
 
     let bad_endpoint_frame = GossipFrame {
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
         sender_id: peer_id_bytes.clone(),
         peers: vec![PeerAnnouncement {
             endpoint_id: vec![0u8; 20],
@@ -3603,13 +3936,13 @@ fn route_table_request_roundtrip() {
 
     let req = RouteTableRequest {
         requester_id: peer_bytes.clone(),
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
     };
     let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &req);
     let decoded: RouteTableRequest = decode_control_frame(STREAM_ROUTE_REQUEST, &encoded)
         .expect("valid RouteTableRequest must decode successfully");
     assert_eq!(decoded.requester_id, peer_bytes);
-    assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
+    assert_eq!(decoded.r#gen, NODE_PROTOCOL_GENERATION);
 
     let table = RouteTable {
         entries: vec![ProtoRouteEntry {
@@ -3617,12 +3950,12 @@ fn route_table_request_roundtrip() {
             model: "Qwen3-8B-Q4_K_M".to_string(),
         }],
         mesh_id: Some("test-mesh-0102030405060708".to_string()),
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
     };
     let encoded_table = encode_control_frame(STREAM_ROUTE_REQUEST, &table);
     let decoded_table: RouteTable = decode_control_frame(STREAM_ROUTE_REQUEST, &encoded_table)
         .expect("valid RouteTable must decode successfully");
-    assert_eq!(decoded_table.gen, NODE_PROTOCOL_GENERATION);
+    assert_eq!(decoded_table.r#gen, NODE_PROTOCOL_GENERATION);
     assert_eq!(decoded_table.entries.len(), 1);
     assert_eq!(decoded_table.entries[0].endpoint_id, peer_bytes);
     assert_eq!(decoded_table.entries[0].model, "Qwen3-8B-Q4_K_M");
@@ -3638,7 +3971,7 @@ fn route_table_request_roundtrip() {
     assert_eq!(local.mesh_id.as_deref(), Some("test-mesh-0102030405060708"));
 
     let round_tripped = routing_table_to_proto(&local);
-    assert_eq!(round_tripped.gen, NODE_PROTOCOL_GENERATION);
+    assert_eq!(round_tripped.r#gen, NODE_PROTOCOL_GENERATION);
     assert_eq!(round_tripped.entries.len(), 1);
     assert_eq!(round_tripped.entries[0].endpoint_id, peer_bytes);
     assert_eq!(round_tripped.entries[0].model, "Qwen3-8B-Q4_K_M");
@@ -3655,7 +3988,7 @@ fn proto_v1_route_table_rejects_bad_generation_or_legacy_payload() {
 
     let zero_gen_req = RouteTableRequest {
         requester_id: vec![0u8; 32],
-        gen: 0,
+        r#gen: 0,
     };
     let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &zero_gen_req);
     let err = decode_control_frame::<RouteTableRequest>(STREAM_ROUTE_REQUEST, &encoded)
@@ -3668,7 +4001,7 @@ fn proto_v1_route_table_rejects_bad_generation_or_legacy_payload() {
 
     let wrong_gen_req = RouteTableRequest {
         requester_id: vec![0u8; 32],
-        gen: 99,
+        r#gen: 99,
     };
     let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &wrong_gen_req);
     let err = decode_control_frame::<RouteTableRequest>(STREAM_ROUTE_REQUEST, &encoded)
@@ -3682,7 +4015,7 @@ fn proto_v1_route_table_rejects_bad_generation_or_legacy_payload() {
     let bad_gen_response = RouteTable {
         entries: vec![],
         mesh_id: None,
-        gen: 0,
+        r#gen: 0,
     };
     let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &bad_gen_response);
     let err = decode_control_frame::<RouteTable>(STREAM_ROUTE_REQUEST, &encoded)
@@ -3696,7 +4029,7 @@ fn proto_v1_route_table_rejects_bad_generation_or_legacy_payload() {
     let wrong_gen_response = RouteTable {
         entries: vec![],
         mesh_id: None,
-        gen: 42,
+        r#gen: 42,
     };
     let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &wrong_gen_response);
     let err = decode_control_frame::<RouteTable>(STREAM_ROUTE_REQUEST, &encoded)
@@ -3733,7 +4066,7 @@ fn peer_lifecycle_messages_roundtrip() {
 
     let leaving_msg = PeerLeaving {
         peer_id: leaving_id.as_bytes().to_vec(),
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
     };
     let encoded = encode_control_frame(STREAM_PEER_LEAVING, &leaving_msg);
     let decoded_leaving: PeerLeaving =
@@ -3764,7 +4097,7 @@ fn peer_lifecycle_messages_roundtrip() {
 
     let down_msg = PeerDown {
         peer_id: dead_id.as_bytes().to_vec(),
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
     };
     let encoded = encode_control_frame(STREAM_PEER_DOWN, &down_msg);
     let decoded_down: PeerDown =
@@ -3791,7 +4124,7 @@ fn peer_lifecycle_messages_roundtrip() {
         "dead peer must be removed from connections when confirmed unreachable"
     );
 
-    assert_eq!(decoded_down.gen, NODE_PROTOCOL_GENERATION);
+    assert_eq!(decoded_down.r#gen, NODE_PROTOCOL_GENERATION);
 }
 
 #[test]
@@ -3804,7 +4137,7 @@ fn peer_lifecycle_rejects_forged_sender_or_unverified_down() {
 
     let bad_gen_down = PeerDown {
         peer_id: valid_peer_bytes.clone(),
-        gen: 0,
+        r#gen: 0,
     };
     let encoded = encode_control_frame(STREAM_PEER_DOWN, &bad_gen_down);
     let err = decode_control_frame::<PeerDown>(STREAM_PEER_DOWN, &encoded)
@@ -3817,7 +4150,7 @@ fn peer_lifecycle_rejects_forged_sender_or_unverified_down() {
 
     let bad_gen_leaving = PeerLeaving {
         peer_id: valid_peer_bytes.clone(),
-        gen: 0,
+        r#gen: 0,
     };
     let encoded = encode_control_frame(STREAM_PEER_LEAVING, &bad_gen_leaving);
     let err = decode_control_frame::<PeerLeaving>(STREAM_PEER_LEAVING, &encoded)
@@ -3836,7 +4169,7 @@ fn peer_lifecycle_rejects_forged_sender_or_unverified_down() {
 
     let forged = PeerLeaving {
         peer_id: victim_id.as_bytes().to_vec(),
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
     };
     let encoded = encode_control_frame(STREAM_PEER_LEAVING, &forged);
     let decoded: PeerLeaving = decode_control_frame(STREAM_PEER_LEAVING, &encoded)
@@ -4170,7 +4503,7 @@ fn proto_v1_control_frames_reject_legacy_json_and_wrong_gen() {
 
     // All migrated streams must also reject gen=0 and gen=99 where gen is checked
     let bad_gen_gossip = GossipFrame {
-        gen: 0,
+        r#gen: 0,
         sender_id: vec![],
         peers: vec![PeerAnnouncement {
             endpoint_id: vec![0u8; 32],
@@ -4185,7 +4518,7 @@ fn proto_v1_control_frames_reject_legacy_json_and_wrong_gen() {
 
     let bad_gen_req = RouteTableRequest {
         requester_id: vec![0u8; 32],
-        gen: 0,
+        r#gen: 0,
     };
     let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &bad_gen_req);
     let err = decode_control_frame::<RouteTableRequest>(STREAM_ROUTE_REQUEST, &encoded)
@@ -4194,7 +4527,7 @@ fn proto_v1_control_frames_reject_legacy_json_and_wrong_gen() {
 
     let bad_gen_down = PeerDown {
         peer_id: vec![0u8; 32],
-        gen: 0,
+        r#gen: 0,
     };
     let encoded = encode_control_frame(STREAM_PEER_DOWN, &bad_gen_down);
     let err = decode_control_frame::<PeerDown>(STREAM_PEER_DOWN, &encoded)
@@ -4203,7 +4536,7 @@ fn proto_v1_control_frames_reject_legacy_json_and_wrong_gen() {
 
     let bad_gen_leaving = PeerLeaving {
         peer_id: vec![0u8; 32],
-        gen: 0,
+        r#gen: 0,
     };
     let encoded = encode_control_frame(STREAM_PEER_LEAVING, &bad_gen_leaving);
     let err = decode_control_frame::<PeerLeaving>(STREAM_PEER_LEAVING, &encoded)
@@ -4212,7 +4545,7 @@ fn proto_v1_control_frames_reject_legacy_json_and_wrong_gen() {
 
     // Wrong gen (e.g. 2) also rejected
     let wrong_gen_gossip = GossipFrame {
-        gen: 2,
+        r#gen: 2,
         sender_id: vec![0u8; 32],
         peers: vec![PeerAnnouncement {
             endpoint_id: vec![0u8; 32],
@@ -4261,7 +4594,7 @@ fn remote_model_scans_are_ignored_after_gossip() {
     model_sizes.insert("Llama-3.3-70B-Q4_K_M".to_string(), 42_000_000_000u64);
 
     let gossip_frame = GossipFrame {
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
         sender_id: peer_id.as_bytes().to_vec(),
         peers: vec![ProtoPA {
             endpoint_id: peer_id.as_bytes().to_vec(),
@@ -4280,7 +4613,7 @@ fn remote_model_scans_are_ignored_after_gossip() {
     let decoded: GossipFrame = decode_control_frame(STREAM_GOSSIP, &encoded)
         .expect("gossip frame with model scan metadata must decode successfully");
 
-    assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
+    assert_eq!(decoded.r#gen, NODE_PROTOCOL_GENERATION);
     assert_eq!(decoded.sender_id, peer_id.as_bytes());
     assert_eq!(decoded.peers.len(), 1);
     let wire_pa = &decoded.peers[0];
@@ -4340,7 +4673,7 @@ fn passive_client_route_table_models_and_mesh_id_populated() {
             },
         ],
         mesh_id: Some("cafebabe12345678".to_string()),
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
     };
 
     // Encode/decode via the same path as the live server
@@ -4348,7 +4681,7 @@ fn passive_client_route_table_models_and_mesh_id_populated() {
     let decoded: RouteTable = decode_control_frame(STREAM_ROUTE_REQUEST, &encoded)
         .expect("valid RouteTable must decode successfully for passive client");
 
-    assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
+    assert_eq!(decoded.r#gen, NODE_PROTOCOL_GENERATION);
     assert_eq!(decoded.entries.len(), 2);
     assert_eq!(decoded.mesh_id.as_deref(), Some("cafebabe12345678"));
 
@@ -4401,7 +4734,7 @@ fn passive_client_route_table_models_and_mesh_id_populated() {
     let stale_table = RouteTable {
         entries: vec![],
         mesh_id: None,
-        gen: 0,
+        r#gen: 0,
     };
     let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &stale_table);
     let err = decode_control_frame::<RouteTable>(STREAM_ROUTE_REQUEST, &encoded)
@@ -4442,7 +4775,7 @@ fn worker_only_legacy_models_are_excluded_from_http_routes() {
 #[test]
 fn canonical_demand_model_ref_uses_loaded_catalog_without_refreshing() {
     use crate::models::remote_catalog::{
-        set_catalog_entries_for_test, CatalogCurated, CatalogEntry, CatalogSource, CatalogVariant,
+        CatalogCurated, CatalogEntry, CatalogSource, CatalogVariant, set_catalog_entries_for_test,
     };
     use std::collections::HashMap;
 
@@ -4510,7 +4843,7 @@ fn dead_peer_cleanup_prevents_readmission() {
     // Receive valid PeerLeaving from the peer
     let leaving = PeerLeaving {
         peer_id: peer_id.as_bytes().to_vec(),
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
     };
     let encoded = encode_control_frame(STREAM_PEER_LEAVING, &leaving);
     let decoded: PeerLeaving =
@@ -4559,7 +4892,7 @@ fn dead_peer_cleanup_prevents_readmission() {
     // resolve_peer_leaving still succeeds structurally but cleanup is idempotent
     let leaving2 = PeerLeaving {
         peer_id: peer_id.as_bytes().to_vec(),
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
     };
     let encoded2 = encode_control_frame(STREAM_PEER_LEAVING, &leaving2);
     let decoded2: PeerLeaving = decode_control_frame(STREAM_PEER_LEAVING, &encoded2)
@@ -5074,7 +5407,7 @@ async fn open_owner_control_stream(
     write_len_prefixed(
         &mut send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: Some(crate::proto::node::OwnerControlHandshake {
                 ownership: Some(proto_signed_node_ownership(&ownership)),
             }),
@@ -5128,7 +5461,8 @@ async fn start_owner_control_test_server(
     *node.owner_attestation.lock().await = Some(ownership);
     *node.owner_summary.lock().await = owner_summary;
     *node.trust_store.lock().await = trust_store;
-    node.maybe_start_control_listener(secret_key.clone(), None, None, None)
+    let auths = empty_relay_auths();
+    node.maybe_start_control_listener(secret_key.clone(), None, None, None, &auths)
         .await?;
     Ok((node, secret_key, config_path))
 }
@@ -5177,17 +5511,19 @@ async fn control_plane_legacy_compat_new_client_prefers_control_alpn() -> Result
         .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
         .bind()
         .await?;
-    assert!(wrong_alpn_client
-        .connect(control_addr.clone(), ALPN_V1)
-        .await
-        .is_err());
+    assert!(
+        wrong_alpn_client
+            .connect(control_addr.clone(), ALPN_V1)
+            .await
+            .is_err()
+    );
 
     let (_endpoint, mut send, mut recv, requester_id) =
         open_owner_control_stream(&server, &owner_keypair).await?;
     write_len_prefixed(
         &mut send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(OwnerControlRequest {
                 request_id: 41,
@@ -5283,7 +5619,7 @@ async fn control_plane_validation_error_preserves_request_id() -> Result<()> {
     write_len_prefixed(
         &mut send,
         &crate::proto::node::OwnerControlEnvelope {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             handshake: None,
             request: Some(crate::proto::node::OwnerControlRequest {
                 request_id: 7,
@@ -5332,6 +5668,7 @@ fn pinned_gpu_runtime_push_rejects_invalid_pushed_pinned_config_before_apply() {
             batch: None,
             ubatch: None,
             flash_attention: None,
+            ..Default::default()
         }],
         ..crate::plugin::MeshConfig::default()
     };
@@ -5378,6 +5715,7 @@ fn pinned_gpu_runtime_push_accepts_valid_pushed_pinned_config() {
             batch: None,
             ubatch: None,
             flash_attention: None,
+            ..Default::default()
         }],
         ..crate::plugin::MeshConfig::default()
     };
@@ -5420,6 +5758,7 @@ fn pinned_gpu_runtime_push_rejects_resolved_gpu_without_backend_device() {
             batch: None,
             ubatch: None,
             flash_attention: None,
+            ..Default::default()
         }],
         ..crate::plugin::MeshConfig::default()
     };

@@ -4,65 +4,68 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use axum::{
+    Router,
     body::Body,
     extract::State,
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::Response,
-    Router,
 };
 use base64::Engine;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use openai_frontend::{
-    chat_mesh_hooks_enabled, inject_text_into_chat_messages, normalize_reasoning_template_options,
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStream,
-    ChatHookAction, ChatHookOutcome, CompletionChunk, CompletionRequest, CompletionResponse,
-    CompletionStream, FinishReason, GenerationHookSignals, MessageContent, MessageContentPart,
-    ModelId, ModelObject, OpenAiBackend, OpenAiError, OpenAiErrorKind, OpenAiHookPolicy,
-    OpenAiRequestContext, OpenAiResult, PrefillHookSignals, Usage,
+    ChatHookAction, ChatHookOutcome, CompactingOpenAiBackend, CompactionConfig, CompletionChunk,
+    CompletionRequest, CompletionResponse, CompletionStream, FinishReason, GenerationHookSignals,
+    GuardedOpenAiBackend, GuardrailMode, GuardrailPolicy, GuardrailPolicyHandle, MessageContent,
+    MessageContentPart, ModelId, ModelObject, OpenAiBackend, OpenAiError, OpenAiErrorKind,
+    OpenAiHookPolicy, OpenAiRequestContext, OpenAiResult, PrefillHookSignals, ReasoningEffort,
+    StreamingGuardrailMode, Usage, chat_mesh_hooks_enabled, inject_text_into_chat_messages,
+    normalize_reasoning_template_options,
 };
-use serde_json::{json, Value};
+use serde::Serialize;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use skippy_metrics::attr as attr_key;
 use skippy_protocol::binary::{
-    recv_ready, recv_reply, state_flags, write_stage_message, StageLogitBias as WireLogitBias,
-    StageReply, StageReplyStats, StageSamplingConfig as WireSamplingConfig, StageStateHeader,
-    StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind, LLAMA_TOKEN_NULL,
-    MAX_STAGE_LOGIT_BIAS,
+    LLAMA_TOKEN_NULL, MAX_STAGE_LOGIT_BIAS, StageLogitBias as WireLogitBias, StageReply,
+    StageReplyStats, StageSamplingConfig as WireSamplingConfig, StageStateHeader, StageWireMessage,
+    WireActivationDType, WireMessageKind, WireReplyKind, recv_ready, recv_reply, state_flags,
+    write_stage_message,
 };
-use skippy_protocol::{MessageBase, StageConfig, StageTopology, SCHEMA_VERSION};
+use skippy_protocol::{MessageBase, SCHEMA_VERSION, StageConfig, StageTopology};
 use skippy_runtime::{
     ActivationFrame, ChatTemplateJsonOptions, ChatTemplateOptions,
     FlashAttentionType as RuntimeFlashAttentionType, GenerationSignalWindow,
-    LogitBias as RuntimeLogitBias, MediaInput, ModelInfo, RuntimeConfig, RuntimeLoadMode,
-    SamplingConfig, StageModel, StageSession, TokenSignal, MAX_LOGIT_BIAS,
+    LogitBias as RuntimeLogitBias, MAX_LOGIT_BIAS, MediaInput, ModelInfo, RuntimeConfig,
+    RuntimeLoadMode, SamplingConfig, StageModel, StageSession, TokenSignal,
 };
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, OwnedSemaphorePermit, Semaphore, TryAcquireError},
+    sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc},
     task,
 };
 
 use crate::{
     binary_transport::{
-        connect_binary_downstream, forwarded_stage_message, forwarded_stage_message_timed,
-        run_binary_stage_message, write_stage_message_conditioned, WireCondition,
+        WireCondition, connect_binary_downstream, forwarded_stage_message,
+        forwarded_stage_message_timed, run_binary_stage_message, write_stage_message_conditioned,
     },
     cli::ServeOpenAiArgs,
     config::{load_json, validate_config},
     kv_integration::KvStageIntegration,
-    runtime_state::{load_runtime, RuntimeSessionStats, RuntimeState},
-    telemetry::{lifecycle_attrs, now_unix_nanos, Telemetry},
+    runtime_state::{RuntimeSessionStats, RuntimeState, load_runtime},
+    telemetry::{Telemetry, lifecycle_attrs, now_unix_nanos},
 };
 
 mod backend;
@@ -181,6 +184,7 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         telemetry: telemetry.clone(),
         model_id: model_id.clone(),
         default_max_tokens: args.default_max_tokens,
+        request_defaults: EmbeddedOpenAiRequestDefaults::default(),
         ctx_size,
         mode,
         draft: None,
@@ -211,6 +215,7 @@ pub struct EmbeddedOpenAiArgs {
     pub runtime: Arc<Mutex<RuntimeState>>,
     pub model_id: Option<String>,
     pub default_max_tokens: u32,
+    pub request_defaults: EmbeddedOpenAiRequestDefaults,
     pub generation_concurrency: usize,
     pub prefill_chunk_size: usize,
     pub prefill_chunk_policy: String,
@@ -229,6 +234,173 @@ pub struct EmbeddedOpenAiArgs {
     pub downstream_wire_condition: WireCondition,
     pub telemetry: Telemetry,
     pub hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
+    pub openai_guardrails: Option<OpenAiGuardrailsConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenAiGuardrailsTarget {
+    Skippy,
+}
+
+impl OpenAiGuardrailsTarget {
+    const fn as_status_label(self) -> &'static str {
+        match self {
+            Self::Skippy => "skippy",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenAiGuardrailsConfig {
+    pub target: OpenAiGuardrailsTarget,
+    pub policy: GuardrailPolicyHandle,
+    pub compaction: Option<CompactionConfig>,
+}
+
+impl OpenAiGuardrailsConfig {
+    pub fn disabled_for_skippy() -> Self {
+        Self {
+            target: OpenAiGuardrailsTarget::Skippy,
+            policy: GuardrailPolicyHandle::default(),
+            compaction: None,
+        }
+    }
+
+    pub fn status(&self) -> OpenAiGuardrailsStatus {
+        let policy = self.policy.snapshot();
+        OpenAiGuardrailsStatus {
+            mode: guardrail_mode_label(policy.mode),
+            target: self.target.as_status_label(),
+            streaming: streaming_mode_label(policy.streaming_mode),
+            retry_exhaustion: retry_exhaustion_label(&policy),
+            small_model_policy: small_model_policy_label(&policy),
+            small_param_threshold_b: policy.small_param_threshold_b,
+            max_tool_retries: policy.max_tool_retries,
+            max_structured_retries: policy.max_structured_retries,
+        }
+    }
+
+    fn should_wrap_guardrail_backend(&self) -> bool {
+        matches!(self.target, OpenAiGuardrailsTarget::Skippy)
+    }
+
+    #[cfg(test)]
+    fn wrap_backend(&self, backend: Arc<dyn OpenAiBackend>) -> Arc<dyn OpenAiBackend> {
+        self.wrap_backend_with_context_limit(backend, None)
+    }
+
+    fn wrap_backend_with_context_limit(
+        &self,
+        backend: Arc<dyn OpenAiBackend>,
+        context_limit_tokens: Option<usize>,
+    ) -> Arc<dyn OpenAiBackend> {
+        let backend = self.wrap_compacting_backend(backend, context_limit_tokens);
+        if self.should_wrap_guardrail_backend() {
+            Arc::new(GuardedOpenAiBackend::with_policy_handle(
+                backend,
+                self.policy.clone(),
+            ))
+        } else {
+            backend
+        }
+    }
+
+    fn wrap_compacting_backend(
+        &self,
+        backend: Arc<dyn OpenAiBackend>,
+        context_limit_tokens: Option<usize>,
+    ) -> Arc<dyn OpenAiBackend> {
+        let Some(mut compaction) = self.compaction else {
+            return backend;
+        };
+        if compaction.context_limit_tokens.is_none() {
+            compaction.context_limit_tokens = context_limit_tokens;
+        }
+        Arc::new(CompactingOpenAiBackend::new(backend, compaction))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct OpenAiGuardrailsStatus {
+    pub mode: &'static str,
+    pub target: &'static str,
+    pub streaming: &'static str,
+    pub retry_exhaustion: &'static str,
+    pub small_model_policy: &'static str,
+    pub small_param_threshold_b: f32,
+    pub max_tool_retries: u8,
+    pub max_structured_retries: u8,
+}
+
+fn guardrail_mode_label(mode: GuardrailMode) -> &'static str {
+    match mode {
+        GuardrailMode::Disabled => "disabled",
+        GuardrailMode::MetricsOnly => "metrics",
+        GuardrailMode::Enforce => "enforce",
+    }
+}
+
+fn streaming_mode_label(mode: StreamingGuardrailMode) -> &'static str {
+    match mode {
+        StreamingGuardrailMode::PassThrough => "pass_through",
+    }
+}
+
+fn retry_exhaustion_label(policy: &GuardrailPolicy) -> &'static str {
+    match format!("{:?}", policy.retry_exhaustion_mode).as_str() {
+        "Error" => "error",
+        "PassLastText" => "pass_last_text",
+        _ => "unknown",
+    }
+}
+
+fn small_model_policy_label(policy: &GuardrailPolicy) -> &'static str {
+    if policy.apply_to_all_models {
+        "all"
+    } else {
+        "small_models_only"
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmbeddedOpenAiRequestDefaults {
+    pub stop: Option<Vec<String>>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub seed: Option<u64>,
+    pub logit_bias: Option<BTreeMap<String, Value>>,
+    pub top_k: Option<i32>,
+    pub min_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub repeat_last_n: Option<i32>,
+    pub reasoning_format: Option<EmbeddedReasoningFormat>,
+    pub reasoning_enabled: Option<EmbeddedReasoningEnabled>,
+    pub reasoning_budget: Option<EmbeddedReasoningBudget>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedReasoningFormat {
+    Auto,
+    None,
+    Deepseek,
+    DeepseekLegacy,
+    Hidden,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedReasoningEnabled {
+    Auto,
+    Disabled,
+    Enabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedReasoningBudget {
+    Auto,
+    Tokens(u32),
+    Effort(ReasoningEffort),
 }
 
 pub async fn serve_embedded_openai(args: EmbeddedOpenAiArgs) -> Result<()> {
@@ -265,6 +437,7 @@ pub struct EmbeddedOpenAiBackend {
     pub backend: Arc<dyn OpenAiBackend>,
     pub model_id: String,
     pub generation_concurrency: usize,
+    pub openai_guardrails: Option<OpenAiGuardrailsStatus>,
 }
 
 pub fn embedded_openai_router(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenAiRouter> {
@@ -347,12 +520,13 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
     .context("prewarm embedded OpenAI runtime sessions")?;
     let kv = KvStageIntegration::from_config(&args.config)?.map(Arc::new);
     let ctx_size = usize::try_from(args.config.ctx_size).unwrap_or(usize::MAX);
-    let backend = Arc::new(StageOpenAiBackend {
+    let backend: Arc<dyn OpenAiBackend> = Arc::new(StageOpenAiBackend {
         runtime: args.runtime,
         config: args.config.clone(),
         telemetry: args.telemetry.clone(),
         model_id: model_id.clone(),
         default_max_tokens: args.default_max_tokens,
+        request_defaults: args.request_defaults,
         ctx_size,
         mode,
         draft,
@@ -364,11 +538,22 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         hook_policy: args.hook_policy,
         kv,
     });
+    let openai_guardrails = args
+        .openai_guardrails
+        .as_ref()
+        .map(OpenAiGuardrailsConfig::status);
+    let backend = args
+        .openai_guardrails
+        .as_ref()
+        .map_or(backend.clone(), |guardrails| {
+            guardrails.wrap_backend_with_context_limit(backend, Some(ctx_size))
+        });
 
     Ok(EmbeddedOpenAiBackend {
         backend,
         model_id,
         generation_concurrency: args.generation_concurrency,
+        openai_guardrails,
     })
 }
 
@@ -379,6 +564,7 @@ struct StageOpenAiBackend {
     telemetry: Telemetry,
     model_id: String,
     default_max_tokens: u32,
+    request_defaults: EmbeddedOpenAiRequestDefaults,
     ctx_size: usize,
     mode: OpenAiBackendMode,
     draft: Option<Arc<Mutex<DraftRunner>>>,
@@ -1588,11 +1774,12 @@ impl ChatOutputStreamParser {
         if let Some(delta) = suffix_delta(parsed.content.as_deref(), &mut self.emitted_content) {
             events.push(GenerationStreamEvent::Delta(delta));
         }
-        if !is_partial && !self.emitted_tool_calls {
-            if let Some(tool_calls) = parsed.tool_calls {
-                self.emitted_tool_calls = true;
-                events.push(GenerationStreamEvent::ToolCalls(tool_calls));
-            }
+        if !is_partial
+            && !self.emitted_tool_calls
+            && let Some(tool_calls) = parsed.tool_calls
+        {
+            self.emitted_tool_calls = true;
+            events.push(GenerationStreamEvent::ToolCalls(tool_calls));
         }
         Ok(events)
     }
@@ -1839,115 +2026,6 @@ impl GeneratedText {
         Usage::new(self.prompt_tokens, self.completion_tokens)
             .with_cached_tokens(self.cached_prompt_tokens)
     }
-}
-
-fn finish_reason_for_generation(exhausted_max_tokens: bool) -> FinishReason {
-    if exhausted_max_tokens {
-        FinishReason::Length
-    } else {
-        FinishReason::Stop
-    }
-}
-
-fn ensure_context_capacity(
-    prompt_token_count: usize,
-    max_tokens: u32,
-    ctx_size: usize,
-) -> OpenAiResult<()> {
-    let requested_tokens = prompt_token_count.saturating_add(max_tokens as usize);
-    if requested_tokens > ctx_size {
-        return Err(OpenAiError::context_length_exceeded(format!(
-            "requested prompt plus completion tokens ({requested_tokens}) exceed context window ({ctx_size})"
-        )));
-    }
-    Ok(())
-}
-
-fn context_budget_completion_tokens(
-    prompt_token_count: usize,
-    ctx_size: usize,
-) -> OpenAiResult<u32> {
-    if prompt_token_count > ctx_size {
-        return Err(OpenAiError::context_length_exceeded(format!(
-            "requested prompt tokens ({prompt_token_count}) exceed context window ({ctx_size})"
-        )));
-    }
-    Ok(ctx_size
-        .saturating_sub(prompt_token_count)
-        .min(u32::MAX as usize) as u32)
-}
-
-fn detokenize_bytes_with_runtime(
-    runtime: &Arc<Mutex<RuntimeState>>,
-    token_ids: &[i32],
-) -> OpenAiResult<Vec<u8>> {
-    let runtime = runtime
-        .lock()
-        .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-    runtime
-        .model
-        .detokenize_bytes(token_ids)
-        .map_err(openai_backend_error)
-}
-
-fn token_is_eog_with_runtime(
-    runtime: &Arc<Mutex<RuntimeState>>,
-    token_id: i32,
-) -> OpenAiResult<bool> {
-    let runtime = runtime
-        .lock()
-        .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-    runtime
-        .model
-        .token_is_eog(token_id)
-        .map_err(openai_backend_error)
-}
-
-fn ms_to_us(ms: f64) -> i64 {
-    (ms * 1000.0).round() as i64
-}
-
-fn us_to_ms(us: i64) -> f64 {
-    us as f64 / 1000.0
-}
-
-fn openai_backend_error(error: anyhow::Error) -> OpenAiError {
-    OpenAiError::backend(error.to_string())
-}
-
-fn openai_io_error(error: std::io::Error) -> OpenAiError {
-    OpenAiError::backend(error.to_string())
-}
-
-fn parse_wire_dtype(value: &str) -> Result<WireActivationDType> {
-    match value {
-        "fp32" | "f32" => Ok(WireActivationDType::F32),
-        "fp16" | "f16" => Ok(WireActivationDType::F16),
-        "q8" | "int8" | "i8" => Ok(WireActivationDType::Q8),
-        _ => bail!("unsupported activation wire dtype {value}"),
-    }
-}
-
-fn connect_endpoint_ready(endpoint: &str, timeout_secs: u64) -> Result<TcpStream> {
-    let endpoint = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
-    let attempts = timeout_secs.saturating_mul(2).max(1);
-    let mut last_error = None;
-    for _ in 0..attempts {
-        match TcpStream::connect(endpoint) {
-            Ok(mut stream) => {
-                stream.set_nodelay(true).ok();
-                match recv_ready(&mut stream) {
-                    Ok(()) => return Ok(stream),
-                    Err(error) => {
-                        last_error = Some(anyhow!(error).context("ready handshake failed"))
-                    }
-                }
-            }
-            Err(error) => last_error = Some(anyhow!(error).context("connect failed")),
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-    Err(last_error.unwrap_or_else(|| anyhow!("timed out")))
 }
 
 #[cfg(test)]

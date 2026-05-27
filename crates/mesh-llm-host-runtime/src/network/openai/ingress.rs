@@ -1,10 +1,11 @@
 use crate::api;
-use crate::cli::output::{emit_event, OutputEvent};
+use crate::cli::output::{OutputEvent, emit_event};
 use crate::inference::{election, pipeline};
 use crate::mesh;
 use crate::network::affinity;
 use crate::network::openai::transport as proxy;
 use crate::network::router;
+use mesh_llm_node::serving::{UnloadOptions, UnloadTarget};
 use mesh_mixture_of_agents as moa;
 
 enum AutoRouteResolution {
@@ -117,7 +118,8 @@ async fn handle_mesh_unload_request(
     if let Some(name) = request.model_name.as_ref() {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let _ = control_tx.send(api::RuntimeControlRequest::Unload {
-            target: name.clone(),
+            target: UnloadTarget::Model(name.clone()),
+            options: UnloadOptions::default(),
             resp: resp_tx,
         });
         send_runtime_control_response(
@@ -145,10 +147,10 @@ async fn handle_models_list_request(
 ) {
     let mut models = callable_models(targets);
     models.extend(node.models_being_served().await);
-    if let Some(plugin_manager) = plugin_manager {
-        if let Ok(mut external_models) = plugin_manager.inference_models().await {
-            models.append(&mut external_models);
-        }
+    if let Some(plugin_manager) = plugin_manager
+        && let Ok(mut external_models) = plugin_manager.inference_models().await
+    {
+        models.append(&mut external_models);
     }
     models.sort();
     models.dedup();
@@ -167,12 +169,12 @@ async fn collect_available_models_for_auto_route(
             available_models.push(name);
         }
     }
-    if let Some(plugin_manager) = plugin_manager {
-        if let Ok(external_models) = plugin_manager.inference_models().await {
-            for name in external_models {
-                if !available_models.iter().any(|existing| existing == &name) {
-                    available_models.push(name);
-                }
+    if let Some(plugin_manager) = plugin_manager
+        && let Ok(external_models) = plugin_manager.inference_models().await
+    {
+        for name in external_models {
+            if !available_models.iter().any(|existing| existing == &name) {
+                available_models.push(name);
             }
         }
     }

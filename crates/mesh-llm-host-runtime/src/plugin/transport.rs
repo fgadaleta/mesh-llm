@@ -1,6 +1,6 @@
 use super::runtime::PluginRuntime;
-use super::{proto, PluginMeshEvent, PluginRpcBridge, PluginSummary, PROTOCOL_VERSION};
-use anyhow::{anyhow, bail, Context, Result};
+use super::{PROTOCOL_VERSION, PluginMeshEvent, PluginRpcBridge, PluginSummary, proto};
+use anyhow::{Context, Result, anyhow, bail};
 use rand::RngExt;
 use rmcp::model::ErrorCode;
 use std::collections::HashMap;
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 pub(crate) enum LocalStream {
     #[cfg(unix)]
@@ -127,22 +127,27 @@ pub(crate) const CONNECTION_LOOP: ConnectionLoopFn =
             }
             .await;
 
-            if let Err(err) = result {
-                tracing::warn!(
-                    plugin = %plugin_name,
-                    error = %err,
-                    "Plugin connection closed"
-                );
-            }
-
-            {
+            let was_active_runtime = {
                 let mut runtime = runtime.lock().await;
                 if runtime.as_ref().map(|runtime| runtime.generation) == Some(generation) {
                     *runtime = None;
-                    let mut summary = summary.lock().await;
-                    summary.status = "stopped".into();
-                    summary.error = Some(format!("Plugin '{}' disconnected", plugin_name));
+                    true
+                } else {
+                    false
                 }
+            };
+
+            if was_active_runtime {
+                if let Err(err) = result {
+                    tracing::warn!(
+                        plugin = %plugin_name,
+                        error = %err,
+                        "Plugin connection closed"
+                    );
+                }
+                let mut summary = summary.lock().await;
+                summary.status = "stopped".into();
+                summary.error = Some(format!("Plugin '{}' disconnected", plugin_name));
             }
 
             let mut pending = pending.lock().await;

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::ResidentCacheConfig;
 
@@ -47,6 +47,36 @@ pub struct ResidentPrefixAllocation {
     pub seq_id: i32,
     pub evictions: Vec<ResidentPrefixEviction>,
     pub should_save: bool,
+    pub should_retain: bool,
+}
+
+impl ResidentPrefixAllocation {
+    fn existing(seq_id: i32) -> Self {
+        Self {
+            seq_id,
+            evictions: Vec::new(),
+            should_save: false,
+            should_retain: true,
+        }
+    }
+
+    fn new_record(seq_id: i32, evictions: Vec<ResidentPrefixEviction>) -> Self {
+        Self {
+            seq_id,
+            evictions,
+            should_save: true,
+            should_retain: true,
+        }
+    }
+
+    fn uncacheable() -> Self {
+        Self {
+            seq_id: -1,
+            evictions: Vec::new(),
+            should_save: false,
+            should_retain: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -124,21 +154,16 @@ impl ResidentPrefixCache {
         }
         self.clock = self.clock.saturating_add(1);
         if let Some(entry) = self.entries.get(page_id) {
-            return Ok(ResidentPrefixAllocation {
-                seq_id: entry.seq_id,
-                evictions: Vec::new(),
-                should_save: false,
-            });
+            return Ok(ResidentPrefixAllocation::existing(entry.seq_id));
+        }
+        if self.candidate_exceeds_single_record_budget(estimated_bytes, token_count) {
+            return Ok(ResidentPrefixAllocation::uncacheable());
         }
 
         let evictions =
             self.evict_until_room_for(estimated_bytes, token_count, &mut drop_evicted)?;
         let seq_id = self.next_sequence_id()?;
-        Ok(ResidentPrefixAllocation {
-            seq_id,
-            evictions,
-            should_save: true,
-        })
+        Ok(ResidentPrefixAllocation::new_record(seq_id, evictions))
     }
 
     pub fn commit_record(
@@ -167,6 +192,72 @@ impl ResidentPrefixCache {
                 borrowed: false,
             },
         );
+    }
+
+    /// Evict one LRU entry (the entry with the smallest `last_used`
+    /// that is not currently borrowed). Returns the evicted entry
+    /// metadata, or `None` if there is nothing to evict.
+    ///
+    /// This is the **proactive eviction** path: it runs outside the
+    /// normal `allocate_for_record` flow so that the decode loop can
+    /// free KV cells before grammar-triggered retries need them.
+    pub fn evict_one_lru_entry(
+        &mut self,
+        drop_evicted: &mut impl FnMut(i32) -> Result<()>,
+    ) -> Result<Option<ResidentPrefixEviction>> {
+        self.evict_lru_entry(drop_evicted)
+    }
+
+    /// Evict LRU entries until at least `min_tokens` have been released,
+    /// or until no non-borrowed entry remains. Returns the entries that
+    /// were actually evicted.
+    pub fn evict_lru_until_tokens(
+        &mut self,
+        min_tokens: u64,
+        drop_evicted: &mut impl FnMut(i32) -> Result<()>,
+    ) -> Result<Vec<ResidentPrefixEviction>> {
+        let mut evictions = Vec::new();
+        let mut evicted_tokens = 0_u64;
+        while evicted_tokens < min_tokens {
+            let Some(eviction) = self.evict_lru_entry(drop_evicted)? else {
+                break;
+            };
+            evicted_tokens = evicted_tokens.saturating_add(eviction.token_count);
+            evictions.push(eviction);
+        }
+        Ok(evictions)
+    }
+
+    fn evict_lru_entry(
+        &mut self,
+        drop_evicted: &mut impl FnMut(i32) -> Result<()>,
+    ) -> Result<Option<ResidentPrefixEviction>> {
+        let victim = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| !entry.borrowed)
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone());
+        let Some(victim) = victim else {
+            return Ok(None);
+        };
+        let entry = self
+            .entries
+            .get(&victim)
+            .expect("selected resident prefix victim should exist");
+        drop_evicted(entry.seq_id)?;
+        let entry = self
+            .entries
+            .remove(&victim)
+            .expect("selected resident prefix victim should still exist after native drop");
+        self.free_seq_ids.push(entry.seq_id);
+        self.resident_tokens = self.resident_tokens.saturating_sub(entry.token_count);
+        self.estimated_bytes = self.estimated_bytes.saturating_sub(entry.estimated_bytes);
+        Ok(Some(ResidentPrefixEviction {
+            page_id: victim,
+            seq_id: entry.seq_id,
+            token_count: entry.token_count,
+        }))
     }
 
     pub fn stats(&self) -> ResidentPrefixCacheStats {
@@ -202,28 +293,22 @@ impl ResidentPrefixCache {
             if !over_entries && !over_bytes && !over_tokens {
                 break;
             }
-            let Some(victim) = self
-                .entries
-                .iter()
-                .filter(|(_, entry)| !entry.borrowed)
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
-            else {
+            let Some(eviction) = self.evict_lru_entry(drop_evicted)? else {
                 bail!("resident prefix cache has no releasable entries");
             };
-            if let Some(entry) = self.entries.remove(&victim) {
-                drop_evicted(entry.seq_id)?;
-                self.free_seq_ids.push(entry.seq_id);
-                self.resident_tokens = self.resident_tokens.saturating_sub(entry.token_count);
-                self.estimated_bytes = self.estimated_bytes.saturating_sub(entry.estimated_bytes);
-                evictions.push(ResidentPrefixEviction {
-                    page_id: victim,
-                    seq_id: entry.seq_id,
-                    token_count: entry.token_count,
-                });
-            }
+            evictions.push(eviction);
         }
         Ok(evictions)
+    }
+
+    fn candidate_exceeds_single_record_budget(
+        &self,
+        estimated_bytes: u64,
+        token_count: u64,
+    ) -> bool {
+        let over_bytes = self.max_bytes > 0 && estimated_bytes > self.max_bytes;
+        let over_tokens = self.max_resident_tokens > 0 && token_count > self.max_resident_tokens;
+        over_bytes || over_tokens
     }
 
     fn next_sequence_id(&mut self) -> Result<i32> {
@@ -311,6 +396,29 @@ mod tests {
     }
 
     #[test]
+    fn oversized_resident_prefix_candidate_is_nonfatal() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 4096));
+        let small = cache
+            .allocate_for_record("small", 1000, 100, |_| Ok(()))
+            .unwrap();
+        cache.commit_record("small".to_string(), small.seq_id, 1000, 100);
+
+        let allocation = cache
+            .allocate_for_record("huge", 5000, 100, |_| {
+                panic!("oversized candidates should not evict existing entries")
+            })
+            .expect("oversized candidates should be treated as uncacheable, not fatal");
+
+        assert!(!allocation.should_save);
+        assert!(!allocation.should_retain);
+        assert!(allocation.evictions.is_empty());
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.resident_tokens, 1000);
+        assert!(cache.lookup("small").is_some());
+    }
+
+    #[test]
     fn small_ctx_smoke_test_scenario_records_without_eviction_loop() {
         // Regression for skippy-ci-smoke `prompt exact-prefix hit and
         // live-session reuse` (CI run 26193173851). The smoke test
@@ -361,5 +469,417 @@ mod tests {
         );
         assert_eq!(cache.stats().entries, 12);
         assert_eq!(cache.stats().resident_tokens, 120_000);
+    }
+
+    #[test]
+    fn evict_one_lru_evicts_least_recently_used() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        let mut dropped: Vec<i32> = Vec::new();
+
+        // Insert 3 entries.
+        for i in 0..3 {
+            let alloc = cache
+                .allocate_for_record(&format!("page-{i}"), 500, 100, |sid| {
+                    dropped.push(sid);
+                    Ok(())
+                })
+                .unwrap();
+            cache.commit_record(format!("page-{i}"), alloc.seq_id, 500, 100);
+        }
+        assert_eq!(cache.stats().entries, 3);
+        assert_eq!(cache.stats().resident_tokens, 1500);
+
+        // Touch page-1 and page-2 (LRU should now be page-0).
+        cache.lookup("page-1");
+        cache.lookup("page-2");
+
+        let evicted = cache
+            .evict_one_lru_entry(&mut |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap()
+            .expect("should have evicted one entry");
+
+        assert_eq!(evicted.page_id, "page-0", "LRU should be page-0");
+        assert_eq!(evicted.token_count, 500);
+        assert_eq!(cache.stats().entries, 2);
+        assert_eq!(cache.stats().resident_tokens, 1000);
+    }
+
+    #[test]
+    fn evict_one_lru_skips_borrowed_entries() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        let mut dropped: Vec<i32> = Vec::new();
+
+        let alloc0 = cache
+            .allocate_for_record("page-0", 500, 100, |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap();
+        cache.commit_record("page-0".to_string(), alloc0.seq_id, 500, 100);
+
+        let alloc1 = cache
+            .allocate_for_record("page-1", 500, 100, |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap();
+        cache.commit_record("page-1".to_string(), alloc1.seq_id, 500, 100);
+
+        // Borrow page-0 (the oldest entry).
+        cache.acquire("page-0");
+
+        let evicted = cache
+            .evict_one_lru_entry(&mut |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap()
+            .expect("should have evicted one entry");
+
+        // page-0 is borrowed, so LRU should skip it and evict page-1.
+        assert_eq!(evicted.page_id, "page-1", "should skip borrowed entry");
+        assert_eq!(cache.stats().entries, 1);
+    }
+
+    #[test]
+    fn evict_one_lru_empty_cache_returns_none() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        let result = cache.evict_one_lru_entry(&mut |_| Ok(())).unwrap();
+        assert!(result.is_none(), "empty cache should return None");
+    }
+
+    #[test]
+    fn evict_one_lru_all_borrowed_returns_none() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        let mut dropped: Vec<i32> = Vec::new();
+
+        let alloc = cache
+            .allocate_for_record("page-0", 500, 100, |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap();
+        cache.commit_record("page-0".to_string(), alloc.seq_id, 500, 100);
+        cache.acquire("page-0");
+
+        let result = cache.evict_one_lru_entry(&mut |_| Ok(())).unwrap();
+        assert!(
+            result.is_none(),
+            "cache with only borrowed entries should return None"
+        );
+        assert_eq!(cache.stats().entries, 1);
+    }
+
+    #[test]
+    fn evict_one_lru_multiple_calls_drain_all_non_borrowed() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        let mut dropped: Vec<i32> = Vec::new();
+
+        let mut seq_ids = Vec::new();
+        for i in 0..4 {
+            let alloc = cache
+                .allocate_for_record(&format!("page-{i}"), 300, 50, |_| Ok(()))
+                .unwrap();
+            seq_ids.push(alloc.seq_id);
+            cache.commit_record(format!("page-{i}"), alloc.seq_id, 300, 50);
+        }
+        assert_eq!(cache.stats().entries, 4);
+
+        // Touch two to shift LRU ordering.
+        cache.lookup("page-2");
+        cache.lookup("page-3");
+
+        cache.acquire("page-2");
+
+        let e1 = cache
+            .evict_one_lru_entry(&mut |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap()
+            .expect("first eviction");
+        assert_eq!(e1.page_id, "page-0");
+        assert_eq!(cache.stats().entries, 3);
+
+        let e2 = cache
+            .evict_one_lru_entry(&mut |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap()
+            .expect("second eviction");
+        assert_eq!(e2.page_id, "page-1");
+        assert_eq!(cache.stats().entries, 2);
+
+        let e3 = cache
+            .evict_one_lru_entry(&mut |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap()
+            .expect("third eviction");
+        assert_eq!(e3.page_id, "page-3");
+        assert_eq!(cache.stats().entries, 1);
+
+        let e4 = cache.evict_one_lru_entry(&mut |_| Ok(())).unwrap();
+        assert!(e4.is_none(), "only borrowed remains");
+        assert_eq!(cache.stats().entries, 1);
+
+        assert!(dropped.contains(&seq_ids[0]), "page-0 seq_id dropped");
+        assert!(dropped.contains(&seq_ids[1]), "page-1 seq_id dropped");
+        assert!(dropped.contains(&seq_ids[3]), "page-3 seq_id dropped");
+    }
+
+    #[test]
+    fn evict_one_lru_updates_internal_accounting() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        let alloc = cache
+            .allocate_for_record("page-0", 1000, 200, |_| Ok(()))
+            .unwrap();
+        cache.commit_record("page-0".to_string(), alloc.seq_id, 1000, 200);
+
+        assert_eq!(cache.stats().resident_tokens, 1000);
+        assert_eq!(cache.stats().estimated_bytes, 200);
+        assert_eq!(cache.stats().entries, 1);
+
+        let evicted = cache
+            .evict_one_lru_entry(&mut |_| Ok(()))
+            .unwrap()
+            .expect("should evict");
+
+        assert_eq!(cache.stats().resident_tokens, 0);
+        assert_eq!(cache.stats().estimated_bytes, 0);
+        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(evicted.token_count, 1000);
+        assert_eq!(evicted.seq_id, alloc.seq_id);
+        assert!(
+            cache.free_seq_ids.contains(&alloc.seq_id),
+            "evicted seq_id should be reusable"
+        );
+    }
+
+    #[test]
+    fn evict_one_lru_drop_failure_preserves_cache_state() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        let alloc = cache
+            .allocate_for_record("page-0", 1000, 200, |_| Ok(()))
+            .unwrap();
+        cache.commit_record("page-0".to_string(), alloc.seq_id, 1000, 200);
+
+        let error = cache.evict_one_lru_entry(&mut |_| Err(anyhow::anyhow!("native drop failed")));
+
+        assert!(error.is_err());
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(cache.stats().resident_tokens, 1000);
+        assert_eq!(cache.stats().estimated_bytes, 200);
+        assert!(cache.lookup("page-0").is_some());
+        assert!(cache.free_seq_ids.is_empty());
+    }
+
+    #[test]
+    fn allocate_for_record_drop_failure_preserves_existing_cache_state() {
+        let mut cache = ResidentPrefixCache::new(cfg(1, 0, 0));
+        let alloc = cache
+            .allocate_for_record("page-0", 1000, 200, |_| Ok(()))
+            .unwrap();
+        cache.commit_record("page-0".to_string(), alloc.seq_id, 1000, 200);
+
+        let error = cache.allocate_for_record("page-1", 1000, 200, |_| {
+            Err(anyhow::anyhow!("native drop failed"))
+        });
+
+        assert!(error.is_err());
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(cache.stats().resident_tokens, 1000);
+        assert_eq!(cache.stats().estimated_bytes, 200);
+        assert!(cache.lookup("page-0").is_some());
+        assert!(cache.lookup("page-1").is_none());
+        assert!(cache.free_seq_ids.is_empty());
+    }
+
+    #[test]
+    fn evict_lru_until_tokens_evicts_multiple_entries_until_target() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        let mut seq_ids = Vec::new();
+        for (index, token_count) in [300, 400, 500].into_iter().enumerate() {
+            let alloc = cache
+                .allocate_for_record(&format!("page-{index}"), token_count, 100, |_| Ok(()))
+                .unwrap();
+            seq_ids.push(alloc.seq_id);
+            cache.commit_record(format!("page-{index}"), alloc.seq_id, token_count, 100);
+        }
+
+        let mut dropped = Vec::new();
+        let evictions = cache
+            .evict_lru_until_tokens(700, &mut |seq_id| {
+                dropped.push(seq_id);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(evictions.len(), 2);
+        assert_eq!(evictions[0].page_id, "page-0");
+        assert_eq!(evictions[1].page_id, "page-1");
+        assert_eq!(dropped, vec![seq_ids[0], seq_ids[1]]);
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(cache.stats().resident_tokens, 500);
+        assert!(cache.lookup("page-2").is_some());
+    }
+
+    #[test]
+    fn evict_lru_until_tokens_stops_when_no_releasable_entries_remain() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        for (index, token_count) in [300, 400].into_iter().enumerate() {
+            let alloc = cache
+                .allocate_for_record(&format!("page-{index}"), token_count, 100, |_| Ok(()))
+                .unwrap();
+            cache.commit_record(format!("page-{index}"), alloc.seq_id, token_count, 100);
+        }
+        cache.acquire("page-1");
+
+        let evictions = cache.evict_lru_until_tokens(1024, &mut |_| Ok(())).unwrap();
+
+        assert_eq!(evictions.len(), 1);
+        assert_eq!(evictions[0].page_id, "page-0");
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(cache.stats().resident_tokens, 400);
+        assert!(cache.lookup("page-1").is_none());
+    }
+
+    #[test]
+    fn evict_one_lru_seq_id_reused_on_subsequent_allocation() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        let alloc = cache
+            .allocate_for_record("page-0", 500, 100, |_| Ok(()))
+            .unwrap();
+        let orig_seq_id = alloc.seq_id;
+        cache.commit_record("page-0".to_string(), orig_seq_id, 500, 100);
+
+        cache.evict_one_lru_entry(&mut |_| Ok(())).unwrap();
+
+        let alloc2 = cache
+            .allocate_for_record("page-1", 500, 100, |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            alloc2.seq_id, orig_seq_id,
+            "should reuse evicted seq_id before allocating new one"
+        );
+    }
+
+    #[test]
+    fn evict_one_lru_then_recommit_same_page_id() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        let alloc = cache
+            .allocate_for_record("page-0", 500, 100, |_| Ok(()))
+            .unwrap();
+        cache.commit_record("page-0".to_string(), alloc.seq_id, 500, 100);
+
+        cache.evict_one_lru_entry(&mut |_| Ok(())).unwrap();
+
+        assert_eq!(cache.stats().entries, 0);
+        assert_eq!(cache.stats().resident_tokens, 0);
+
+        let alloc2 = cache
+            .allocate_for_record("page-0", 800, 150, |_| Ok(()))
+            .unwrap();
+        cache.commit_record("page-0".to_string(), alloc2.seq_id, 800, 150);
+
+        assert_eq!(cache.stats().entries, 1);
+        assert_eq!(cache.stats().resident_tokens, 800);
+        assert_eq!(cache.stats().estimated_bytes, 150);
+    }
+
+    #[test]
+    fn evict_one_lru_preserves_allocate_for_record_eviction_logic() {
+        let mut cache = ResidentPrefixCache::new(cfg(4, 0, 4096));
+        let mut dropped: Vec<i32> = Vec::new();
+
+        for i in 0..4 {
+            let alloc = cache
+                .allocate_for_record(&format!("page-{i}"), 500, 100, |_| Ok(()))
+                .unwrap();
+            cache.commit_record(format!("page-{i}"), alloc.seq_id, 500, 100);
+        }
+        assert_eq!(cache.stats().entries, 4);
+
+        cache
+            .evict_one_lru_entry(&mut |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap()
+            .expect("should evict");
+        assert_eq!(cache.stats().entries, 3);
+
+        let alloc = cache
+            .allocate_for_record("page-4", 500, 100, |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            alloc.evictions.is_empty(),
+            "allocate after proactive eviction should not need more evictions"
+        );
+        cache.commit_record("page-4".to_string(), alloc.seq_id, 500, 100);
+        assert_eq!(cache.stats().entries, 4);
+    }
+
+    #[test]
+    fn evict_one_lru_after_release_shifts_lru_ordering() {
+        let mut cache = ResidentPrefixCache::new(cfg(16, 0, 0));
+        let mut dropped: Vec<i32> = Vec::new();
+
+        let alloc0 = cache
+            .allocate_for_record("page-0", 500, 100, |_| Ok(()))
+            .unwrap();
+        cache.commit_record("page-0".to_string(), alloc0.seq_id, 500, 100);
+
+        let alloc1 = cache
+            .allocate_for_record("page-1", 500, 100, |_| Ok(()))
+            .unwrap();
+        cache.commit_record("page-1".to_string(), alloc1.seq_id, 500, 100);
+
+        // Release bumps last_used, so page-0 becomes strictly newer.
+        cache.acquire("page-0");
+        cache.release("page-0");
+
+        let evicted = cache
+            .evict_one_lru_entry(&mut |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap()
+            .expect("should evict");
+        assert_eq!(
+            evicted.page_id, "page-1",
+            "recently released entry should not be LRU immediately"
+        );
+    }
+
+    #[test]
+    fn evict_one_lru_from_cache_at_entry_cap_does_not_panic() {
+        let mut cache = ResidentPrefixCache::new(cfg(4, 0, 0));
+        let mut dropped: Vec<i32> = Vec::new();
+        for i in 0..4 {
+            let alloc = cache
+                .allocate_for_record(&format!("page-{i}"), 500, 100, |_| Ok(()))
+                .unwrap();
+            cache.commit_record(format!("page-{i}"), alloc.seq_id, 500, 100);
+        }
+        assert_eq!(cache.stats().entries, 4);
+
+        let evicted = cache
+            .evict_one_lru_entry(&mut |sid| {
+                dropped.push(sid);
+                Ok(())
+            })
+            .unwrap()
+            .expect("should evict at cap");
+        assert_eq!(evicted.page_id, "page-0");
+        assert_eq!(cache.stats().entries, 3);
     }
 }

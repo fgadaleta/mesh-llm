@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs::{File, OpenOptions};
 use std::io::{LineWriter, Write};
 use std::path::Path;
@@ -10,7 +10,7 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use skippy_ffi::{
     ActivationDType, ActivationDesc as RawActivationDesc, ActivationLayout,
@@ -32,6 +32,13 @@ pub const GGML_TYPE_Q4_0: u32 = 2;
 pub const GGML_TYPE_Q8_0: u32 = 8;
 pub const LLAMA_SERVER_DEFAULT_N_BATCH: u32 = 2048;
 pub const LLAMA_SERVER_DEFAULT_N_UBATCH: u32 = 512;
+/// Smaller default prefill batch for multi-lane skippy serving.
+///
+/// When `lane_count > 1`, skippy enables llama.cpp unified KV mode: every
+/// lane shares one `n_ctx` cell pool. A smaller default batch reduces the
+/// amount of KV space each prefill asks the shared pool to reserve at once
+/// after other lanes reset or preserve resident prefixes.
+pub const SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH: u32 = 1024;
 
 /// GGML_LLAMA_LOG_LEVEL values (set before llama_backend_init).
 /// 0=silent, 1=error, 2=warn, 3=info (default), 4=debug.
@@ -46,7 +53,7 @@ pub enum FlashAttentionType {
     Enabled = 1,
 }
 
-pub use devices::{backend_devices, BackendDevice, BackendDeviceType};
+pub use devices::{BackendDevice, BackendDeviceType, backend_devices};
 pub use skippy_ffi::LoadMode as RuntimeLoadMode;
 pub use skippy_ffi::{
     ActivationDType as RuntimeActivationDType, ActivationLayout as RuntimeActivationLayout,
@@ -346,15 +353,14 @@ impl NativeLogAggregator {
         }
 
         if let Some(layer_index) = parse_layer_assign_index(s) {
-            if self.layer_assign_progress.total.is_none() {
-                if let Some(total) = self
+            if self.layer_assign_progress.total.is_none()
+                && let Some(total) = self
                     .metadata_highlights
                     .block_count
                     .as_deref()
                     .and_then(|s| s.parse::<usize>().ok())
-                {
-                    self.layer_assign_progress.set_total(total);
-                }
+            {
+                self.layer_assign_progress.set_total(total);
             }
             let new_completed = layer_index + 1;
             if new_completed > self.layer_assign_progress.completed {
@@ -652,12 +658,14 @@ pub fn restore_native_logs() {
 /// Enable verbose llama.cpp logging. Call before `llama_backend_init()` / model loading.
 /// Sets GGML_LLAMA_LOG_LEVEL=4 so LLAMA_LOG_DEBUG macros produce output.
 pub fn enable_verbose_native_logs() {
-    std::env::set_var("GGML_LLAMA_LOG_LEVEL", LLAMA_LOG_LEVEL_DEBUG);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("GGML_LLAMA_LOG_LEVEL", LLAMA_LOG_LEVEL_DEBUG) };
 }
 
 /// Disable verbose llama.cpp logging (restore default level).
 pub fn disable_verbose_native_logs() {
-    std::env::remove_var("GGML_LLAMA_LOG_LEVEL");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("GGML_LLAMA_LOG_LEVEL") };
 }
 
 unsafe extern "C" fn write_native_log(_level: c_int, text: *const c_char, _user_data: *mut c_void) {
@@ -666,10 +674,10 @@ unsafe extern "C" fn write_native_log(_level: c_int, text: *const c_char, _user_
     }
 
     let bytes = unsafe { CStr::from_ptr(text) }.to_bytes();
-    if let Ok(mut guard) = native_log_file().lock() {
-        if let Some(writer) = guard.as_mut() {
-            let _ = writer.write_all(bytes);
-        }
+    if let Ok(mut guard) = native_log_file().lock()
+        && let Some(writer) = guard.as_mut()
+    {
+        let _ = writer.write_all(bytes);
     }
 
     // Also send aggregated messages through the channel when runtime forwarding is enabled.
@@ -678,18 +686,16 @@ unsafe extern "C" fn write_native_log(_level: c_int, text: *const c_char, _user_
     }
 
     if let Ok(text_str) = core::str::from_utf8(bytes) {
-        let events = if let Ok(mut aggregator) = native_log_aggregator().lock() {
-            aggregator.process_line(text_str.trim())
-        } else {
-            Vec::new()
+        let events = match native_log_aggregator().lock() {
+            Ok(mut aggregator) => aggregator.process_line(text_str.trim()),
+            _ => Vec::new(),
         };
-        if let Some(tx) = NATIVE_LOG_FILTERED_TX.get() {
-            if let Ok(guard) = tx.lock() {
-                if let Some(ref sender) = *guard {
-                    for event in events {
-                        let _ = sender.send(event);
-                    }
-                }
+        if let Some(tx) = NATIVE_LOG_FILTERED_TX.get()
+            && let Ok(guard) = tx.lock()
+            && let Some(ref sender) = *guard
+        {
+            for event in events {
+                let _ = sender.send(event);
             }
         }
     }
@@ -757,6 +763,10 @@ impl RuntimeConfig {
 
     fn as_raw(&self) -> Result<RawRuntimeConfigParts> {
         self.validate().map_err(anyhow::Error::msg)?;
+        let n_batch = self
+            .n_batch
+            .unwrap_or_else(|| default_n_batch_for_lane_count(self.lane_count));
+        let n_ubatch = self.n_ubatch.unwrap_or(LLAMA_SERVER_DEFAULT_N_UBATCH);
         let selected_backend_device = self
             .selected_backend_device
             .as_ref()
@@ -776,20 +786,8 @@ impl RuntimeConfig {
                 layer_end: i32::try_from(self.layer_end).context("layer_end exceeds i32")?,
                 ctx_size: i32::try_from(self.ctx_size).context("ctx_size exceeds i32")?,
                 lane_count: i32::try_from(self.lane_count).context("lane_count exceeds i32")?,
-                n_batch: self
-                    .n_batch
-                    .or(Some(LLAMA_SERVER_DEFAULT_N_BATCH))
-                    .map(i32::try_from)
-                    .transpose()
-                    .context("n_batch exceeds i32")?
-                    .unwrap_or(0),
-                n_ubatch: self
-                    .n_ubatch
-                    .or(Some(LLAMA_SERVER_DEFAULT_N_UBATCH))
-                    .map(i32::try_from)
-                    .transpose()
-                    .context("n_ubatch exceeds i32")?
-                    .unwrap_or(0),
+                n_batch: i32::try_from(n_batch).context("n_batch exceeds i32")?,
+                n_ubatch: i32::try_from(n_ubatch).context("n_ubatch exceeds i32")?,
                 n_threads: self
                     .n_threads
                     .map(i32::try_from)
@@ -818,6 +816,14 @@ impl RuntimeConfig {
             },
             _selected_backend_device: selected_backend_device,
         })
+    }
+}
+
+fn default_n_batch_for_lane_count(lane_count: u32) -> u32 {
+    if lane_count > 1 {
+        SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH
+    } else {
+        LLAMA_SERVER_DEFAULT_N_BATCH
     }
 }
 
@@ -3480,20 +3486,21 @@ mod tests {
         path::PathBuf,
         ptr,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::mpsc::error::TryRecvError;
 
     use super::{
-        flush_native_log_writer, parse_cache_type, parse_layer_assign_index,
-        redirect_native_logs_to_file, register_filtered_native_logs, restore_native_logs,
-        set_filtered_native_logs_enabled, unregister_filtered_native_logs, write_native_log,
-        ChatTemplateMessage, FlashAttentionType, ModelInfo, NativeLogAggregator, NativeLogEvent,
-        RuntimeConfig, RuntimeLoadMode, StageModel, TensorRole, GGML_TYPE_F16, GGML_TYPE_Q4_0,
-        GGML_TYPE_Q8_0,
+        ChatTemplateMessage, FlashAttentionType, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
+        LLAMA_SERVER_DEFAULT_N_BATCH, LLAMA_SERVER_DEFAULT_N_UBATCH, ModelInfo,
+        NativeLogAggregator, NativeLogEvent, RuntimeConfig, RuntimeLoadMode,
+        SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH, StageModel, TensorRole, flush_native_log_writer,
+        parse_cache_type, parse_layer_assign_index, redirect_native_logs_to_file,
+        register_filtered_native_logs, restore_native_logs, set_filtered_native_logs_enabled,
+        unregister_filtered_native_logs, write_native_log,
     };
 
     static NATIVE_LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3531,6 +3538,27 @@ mod tests {
         assert_eq!(
             config.validate(),
             Err("selected_backend_device must not be empty")
+        );
+    }
+
+    #[test]
+    fn runtime_config_rejects_zero_thread_counts() {
+        let thread_config = RuntimeConfig {
+            n_threads: Some(0),
+            ..RuntimeConfig::default()
+        };
+        let batch_thread_config = RuntimeConfig {
+            n_threads_batch: Some(0),
+            ..RuntimeConfig::default()
+        };
+
+        assert_eq!(
+            thread_config.validate(),
+            Err("n_threads must be greater than zero when provided")
+        );
+        assert_eq!(
+            batch_thread_config.validate(),
+            Err("n_threads_batch must be greater than zero when provided")
         );
     }
 
@@ -3642,6 +3670,73 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_raw_uses_smaller_batch_for_unified_kv_defaults() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            lane_count: 4,
+            n_batch: None,
+            n_ubatch: None,
+            ..RuntimeConfig::default()
+        };
+
+        let raw = config.as_raw()?;
+
+        assert_eq!(raw.raw.n_batch, SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH as i32);
+        assert_eq!(raw.raw.n_ubatch, LLAMA_SERVER_DEFAULT_N_UBATCH as i32);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_config_raw_keeps_llama_batch_default_for_single_lane() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            lane_count: 1,
+            n_batch: None,
+            n_ubatch: None,
+            ..RuntimeConfig::default()
+        };
+
+        let raw = config.as_raw()?;
+
+        assert_eq!(raw.raw.n_batch, LLAMA_SERVER_DEFAULT_N_BATCH as i32);
+        assert_eq!(raw.raw.n_ubatch, LLAMA_SERVER_DEFAULT_N_UBATCH as i32);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_config_raw_preserves_explicit_unified_kv_batch() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            lane_count: 4,
+            n_batch: Some(2048),
+            n_ubatch: Some(256),
+            ..RuntimeConfig::default()
+        };
+
+        let raw = config.as_raw()?;
+
+        assert_eq!(raw.raw.n_batch, 2048);
+        assert_eq!(raw.raw.n_ubatch, 256);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_config_raw_preserves_thread_counts_and_batch_defaults() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            n_batch: None,
+            n_ubatch: None,
+            n_threads: Some(12),
+            n_threads_batch: Some(6),
+            ..RuntimeConfig::default()
+        };
+
+        let raw = config.as_raw()?;
+
+        assert_eq!(raw.raw.n_batch, LLAMA_SERVER_DEFAULT_N_BATCH as i32);
+        assert_eq!(raw.raw.n_ubatch, LLAMA_SERVER_DEFAULT_N_UBATCH as i32);
+        assert_eq!(raw.raw.n_threads, 12);
+        assert_eq!(raw.raw.n_threads_batch, 6);
+        Ok(())
+    }
+
+    #[test]
     fn invalid_selected_backend_device_fails_before_model_open() {
         let config = RuntimeConfig {
             selected_backend_device: Some("definitely-not-a-device".to_string()),
@@ -3728,9 +3823,11 @@ mod tests {
     #[test]
     fn aggregator_ignores_non_backend_cuda_mentions() {
         let mut aggregator = NativeLogAggregator::default();
-        assert!(aggregator
-            .process_line("CUDA kernel launch for attention")
-            .is_empty());
+        assert!(
+            aggregator
+                .process_line("CUDA kernel launch for attention")
+                .is_empty()
+        );
         assert!(aggregator.process_line("offloading to CUDA").is_empty());
     }
 
@@ -3775,17 +3872,21 @@ mod tests {
         }
 
         let flush_events = aggregator.process_line("llm_load_print_meta: version = 3");
-        assert!(flush_events
-            .iter()
-            .any(|event| event.message == "llm_load_print_meta: version = 3"));
-        assert!(flush_events
-            .iter()
-            .any(|event| event.message == "Reading model metadata..."));
-        assert!(flush_events.iter().any(|event| event
-            .params
-            .iter()
-            .any(|(key, value)| key == "architecture"
-                && value == &Value::String("qwen35".to_string()))));
+        assert!(
+            flush_events
+                .iter()
+                .any(|event| event.message == "llm_load_print_meta: version = 3")
+        );
+        assert!(
+            flush_events
+                .iter()
+                .any(|event| event.message == "Reading model metadata...")
+        );
+        assert!(flush_events.iter().any(|event| {
+            event.params.iter().any(|(key, value)| {
+                key == "architecture" && value == &Value::String("qwen35".to_string())
+            })
+        }));
     }
 
     #[test]
@@ -3796,17 +3897,23 @@ mod tests {
         );
 
         let first = aggregator.process_line("llama_model_loader: - type  f32:  30 tensors");
-        assert!(first
-            .iter()
-            .any(|event| event.message.contains("tensors 10%")));
-        assert!(first
-            .iter()
-            .any(|event| event.message.contains("tensors 30%")));
+        assert!(
+            first
+                .iter()
+                .any(|event| event.message.contains("tensors 10%"))
+        );
+        assert!(
+            first
+                .iter()
+                .any(|event| event.message.contains("tensors 30%"))
+        );
 
         let second = aggregator.process_line("llama_model_loader: - type q4_k:  70 tensors");
-        assert!(second
-            .iter()
-            .any(|event| event.message.contains("tensors 100%")));
+        assert!(
+            second
+                .iter()
+                .any(|event| event.message.contains("tensors 100%"))
+        );
         assert!(second.iter().any(|event| {
             event.message == "Reading tensor groups..."
                 && event
@@ -3849,9 +3956,11 @@ mod tests {
         );
 
         let first = aggregator.process_line("llama_kv_cache: layer   0: filtered");
-        assert!(first
-            .iter()
-            .any(|event| event.message.contains("kv cache 10%")));
+        assert!(
+            first
+                .iter()
+                .any(|event| event.message.contains("kv cache 10%"))
+        );
 
         let duplicate = aggregator.process_line("llama_kv_cache: layer   0: dev = MTL0");
         assert!(duplicate.is_empty());
@@ -3887,9 +3996,11 @@ mod tests {
     #[test]
     fn aggregator_suppresses_print_info_lines() {
         let mut aggregator = NativeLogAggregator::default();
-        assert!(aggregator
-            .process_line("print_info: n_vocab               = 248320")
-            .is_empty());
+        assert!(
+            aggregator
+                .process_line("print_info: n_vocab               = 248320")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3902,12 +4013,18 @@ mod tests {
     #[test]
     fn aggregator_suppresses_raw_noise_lines() {
         let mut aggregator = NativeLogAggregator::default();
-        assert!(aggregator
-            .process_line("clip_model_loader: tensor[0]: n_dims = 1, name = v.blk.0.attn_out.bias")
-            .is_empty());
-        assert!(aggregator
-            .process_line("tokenizer.ggml.tokens arr[str,248320] = [\"!\", ...]")
-            .is_empty());
+        assert!(
+            aggregator
+                .process_line(
+                    "clip_model_loader: tensor[0]: n_dims = 1, name = v.blk.0.attn_out.bias"
+                )
+                .is_empty()
+        );
+        assert!(
+            aggregator
+                .process_line("tokenizer.ggml.tokens arr[str,248320] = [\"!\", ...]")
+                .is_empty()
+        );
     }
 
     #[test]

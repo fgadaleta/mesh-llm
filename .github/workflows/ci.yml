@@ -19,7 +19,7 @@ env:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
       pull-requests: read
@@ -67,8 +67,12 @@ jobs:
               - 'crates/mesh-llm-gpu-bench/**'
               - '.github/workflows/ci.yml'
             sdk:
-              - 'crates/mesh-api/**'
-              - 'crates/mesh-api-ffi/**'
+              - 'crates/mesh-llm-api-client/**'
+              - 'crates/mesh-llm-api-server/**'
+              - 'crates/mesh-llm-config/**'
+              - 'crates/mesh-llm-console-server/**'
+              - 'crates/mesh-llm-ffi/**'
+              - 'crates/mesh-llm-nodejs/**'
               - 'crates/mesh-client/**'
               - 'crates/mesh-llm-identity/**'
               - 'crates/mesh-llm-protocol/**'
@@ -80,6 +84,10 @@ jobs:
               - 'scripts/ci-kotlin-sdk-smoke.sh'
               - 'scripts/ci-swift-sdk-smoke.sh'
               - 'scripts/ci-sdk-fixture.sh'
+              - 'scripts/prepare-swift-package-release.sh'
+              - 'scripts/verify-swift-package-manifest.sh'
+              - 'scripts/verify-swift-privacy-manifest.sh'
+              - 'scripts/verify-swift-release-artifact.sh'
               - '.github/workflows/ci.yml'
             docker:
               - '.dockerignore'
@@ -90,6 +98,7 @@ jobs:
               - 'Cargo.lock'
               - '.github/workflows/docker.yml'
             windows_cpu:
+              - 'crates/mesh-llm-nodejs/**'
               - 'crates/skippy-ffi/**'
               - 'scripts/build-windows.ps1'
               - 'third_party/llama.cpp/**'
@@ -130,7 +139,7 @@ jobs:
   linux:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ui == 'true') && needs.changes.outputs.docs_only != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v5
 
@@ -217,25 +226,6 @@ jobs:
             exit 1
           fi
 
-      - name: SDK and API crate tests
-        if: ${{ needs.changes.outputs.all_rust == 'true' || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-client') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-api') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-api-ffi') }}
-        env:
-          AFFECTED: ${{ needs.changes.outputs.affected_crates }}
-          ALL_RUST: ${{ needs.changes.outputs.all_rust }}
-        run: |
-          should_test() {
-            local crate="$1"
-            [ "$ALL_RUST" = "true" ] || jq -e --arg crate "$crate" 'index($crate) != null' <<<"$AFFECTED" >/dev/null
-          }
-
-          for c in mesh-llm-client mesh-api mesh-api-ffi; do
-            if should_test "$c"; then
-              cargo test -p "$c"
-            else
-              echo "Skipping $c; not affected"
-            fi
-          done
-
       - name: Ensure ABI cache directory
         run: mkdir -p "$LLAMA_STAGE_BUILD_DIR"
 
@@ -253,6 +243,25 @@ jobs:
       - name: Build patched llama.cpp ABI libraries
         if: steps.llama_cache.outputs.cache-hit != 'true'
         run: scripts/build-llama.sh
+
+      - name: SDK and API crate tests
+        if: ${{ needs.changes.outputs.all_rust == 'true' || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-client') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-api-client') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-api-server') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-config') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-console-server') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-ffi') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-nodejs') }}
+        env:
+          AFFECTED: ${{ needs.changes.outputs.affected_crates }}
+          ALL_RUST: ${{ needs.changes.outputs.all_rust }}
+        run: |
+          should_test() {
+            local crate="$1"
+            [ "$ALL_RUST" = "true" ] || jq -e --arg crate "$crate" 'index($crate) != null' <<<"$AFFECTED" >/dev/null
+          }
+
+          for c in mesh-llm-client mesh-llm-api-client mesh-llm-api-server mesh-llm-config mesh-llm-console-server mesh-llm-ffi mesh-llm-nodejs; do
+            if should_test "$c"; then
+              cargo test -p "$c"
+            else
+              echo "Skipping $c; not affected"
+            fi
+          done
 
       - name: Skippy crate tests
         if: ${{ needs.changes.outputs.all_rust == 'true' || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'skippy-protocol') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'skippy-server') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'openai-frontend') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'skippy-runtime') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'skippy-topology') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'skippy-model-package') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'skippy-prompt') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'metrics-server') }}
@@ -361,7 +370,7 @@ jobs:
   agent_live_smokes:
     needs: [changes, linux]
     if: ${{ (vars.MESH_AGENT_BASE_URL != '' || vars.MESH_OPENCODE_BASE_URL != '') && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.all_rust == 'true' || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'openai-frontend') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-client')) && needs.changes.outputs.docs_only != 'true' }}
-    runs-on: self-hosted
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     env:
       MESH_AGENT_BASE_URL: ${{ vars.MESH_AGENT_BASE_URL || vars.MESH_OPENCODE_BASE_URL }}
@@ -426,7 +435,7 @@ jobs:
       artifact_path: ci-artifacts/linux
       staged_binary_path: target/debug/mesh-llm
       model_cache_scope: sdk-smoke-model
-      runs_on: '"ubuntu-latest"'
+      runs_on: '"blacksmith-4vcpu-ubuntu-2404"'
 
   kotlin_sdk_smoke:
     needs: [changes, linux, inference_smoke_tests]
@@ -438,7 +447,7 @@ jobs:
       artifact_path: ci-artifacts/linux
       staged_binary_path: target/debug/mesh-llm
       model_cache_scope: sdk-smoke-model
-      runs_on: '"ubuntu-latest"'
+      runs_on: '"blacksmith-4vcpu-ubuntu-2404"'
 
   swift_sdk_smoke:
     needs: [changes, macos]
@@ -450,13 +459,13 @@ jobs:
       artifact_path: ci-artifacts/macos
       staged_binary_path: target/debug/mesh-llm
       model_cache_scope: sdk-smoke-model
-      runs_on: '"macos-14"'
+      runs_on: '"blacksmith-12vcpu-macos-latest"'
       timeout_minutes: 40
 
   macos:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ui == 'true' || needs.changes.outputs.benchmarks == 'true') && needs.changes.outputs.docs_only != 'true' }}
-    runs-on: macos-14
+    runs-on: blacksmith-12vcpu-macos-latest
     env:
       LLAMA_STAGE_BACKEND: metal
       LLAMA_STAGE_BUILD_DIR: .deps/llama.cpp/build-stage-abi-metal
@@ -496,7 +505,8 @@ jobs:
             echo "ERROR: crates/mesh-llm-ui/dist/index.html not found after restore/build"
             exit 1
           fi
-          echo "UI dist OK: $(ls crates/mesh-llm-ui/dist | wc -l) files"
+          file_count="$(find crates/mesh-llm-ui/dist -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+          echo "UI dist OK: ${file_count} files"
       - name: Test UI
         if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.ui == 'true' }}
         working-directory: crates/mesh-llm-ui
@@ -529,7 +539,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .deps/llama.cpp/build-stage-abi-metal
-          key: ${{ env.CACHE_NAMESPACE }}-macos-14-skippy-abi-metal-${{ hashFiles('scripts/build-mac.sh', 'scripts/build-llama.sh', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', 'Justfile', '.github/cache-version.txt') }}
+          key: ${{ env.CACHE_NAMESPACE }}-blacksmith-macos-latest-skippy-abi-metal-${{ hashFiles('scripts/build-mac.sh', 'scripts/build-llama.sh', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', 'Justfile', '.github/cache-version.txt') }}
       - name: Prepare patched llama.cpp ABI checkout
         if: steps.llama_cache.outputs.cache-hit != 'true'
         run: scripts/prepare-llama.sh pinned
@@ -572,7 +582,7 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.benchmarks == 'true') && needs.changes.outputs.docs_only != 'true' }}
     name: Linux CUDA slim
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container:
       image: nvidia/cuda:${{ vars.CUDA_VERSION || '12.6.3' }}-devel-ubuntu22.04
     env:
@@ -631,7 +641,7 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.benchmarks == 'true') && needs.changes.outputs.docs_only != 'true' }}
     name: Linux ROCm slim
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container:
       image: rocm/dev-ubuntu-24.04:7.0-complete
     env:
@@ -684,7 +694,7 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.docs_only != 'true' }}
     name: Linux Vulkan
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       LLAMA_STAGE_BACKEND: vulkan
       LLAMA_STAGE_BUILD_DIR: .deps/llama-build/build-stage-abi-vulkan
@@ -732,7 +742,7 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.docs_only != 'true' }}
     name: Windows CPU
-    runs-on: windows-2022
+    runs-on: blacksmith-8vcpu-windows-2025
     env:
       RUN_WINDOWS_CPU_FULL: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.windows_cpu == 'true' }}
       LLAMA_STAGE_BACKEND: cpu
@@ -772,7 +782,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .deps/llama.cpp/build-stage-abi-cpu
-          key: ${{ env.CACHE_NAMESPACE }}-windows-2022-skippy-abi-cpu-${{ hashFiles('scripts/build-windows.ps1', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', 'Justfile', '.github/cache-version.txt') }}
+          key: ${{ env.CACHE_NAMESPACE }}-windows-2025-skippy-abi-cpu--cpu-${{ hashFiles('scripts/build-windows.ps1', 'scripts/install-windows-sdk.ps1', '.github/actions/setup-windows-rocm-sdk/action.yml', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', 'Justfile', '.github/cache-version.txt') }}
       - name: Build Windows CPU backend
         if: ${{ env.RUN_WINDOWS_CPU_FULL == 'true' && steps.llama_cache.outputs.cache-hit != 'true' }}
         shell: pwsh
@@ -785,6 +795,13 @@ jobs:
         if: ${{ env.RUN_WINDOWS_CPU_FULL != 'true' }}
         shell: pwsh
         run: cargo check --locked -p mesh-llm --bin mesh-llm
+      - name: Check Node SDK addon on Windows
+        shell: pwsh
+        run: cargo check --locked -p mesh-llm-nodejs
+      - name: Build Node SDK addon on Windows
+        if: ${{ env.RUN_WINDOWS_CPU_FULL == 'true' }}
+        shell: pwsh
+        run: cargo build --release --locked -p mesh-llm-nodejs
       - name: CLI smoke test
         if: ${{ env.RUN_WINDOWS_CPU_FULL == 'true' }}
         shell: pwsh
@@ -796,7 +813,7 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.docs_only != 'true' }}
     name: Windows ${{ matrix.name }}
-    runs-on: windows-2022
+    runs-on: blacksmith-8vcpu-windows-2025
     env:
       RUN_WINDOWS_GPU: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.windows_gpu == 'true' }}
       LLAMA_STAGE_BUILD_DIR: .deps/llama.cpp/build-stage-abi-${{ matrix.backend }}
@@ -858,7 +875,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .deps/llama.cpp/build-stage-abi-${{ matrix.backend }}
-          key: ${{ env.CACHE_NAMESPACE }}-windows-2022-skippy-abi-${{ matrix.backend }}-${{ matrix.build_args }}-${{ matrix.backend == 'cuda' && format('cuda-{0}-Jimver-v0.2.35', env.WINDOWS_CUDA_VERSION) || matrix.backend == 'vulkan' && format('vulkan-{0}-jakoch-v1.5.2', env.WINDOWS_VULKAN_SDK_VERSION) || format('rocm-{0}', env.ROCM_HIP_SDK_FILENAME) }}-${{ hashFiles('scripts/build-windows.ps1', 'scripts/install-windows-sdk.ps1', '.github/actions/setup-windows-rocm-sdk/action.yml', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', 'Justfile', '.github/cache-version.txt') }}
+          key: ${{ env.CACHE_NAMESPACE }}-windows-2025-skippy-abi-${{ matrix.backend }}-${{ matrix.build_args }}-${{ matrix.backend == 'cuda' && format('cuda-{0}-Jimver-v0.2.35', env.WINDOWS_CUDA_VERSION) || matrix.backend == 'vulkan' && format('vulkan-{0}-jakoch-v1.5.2', env.WINDOWS_VULKAN_SDK_VERSION) || format('rocm-{0}', env.ROCM_HIP_SDK_FILENAME) }}-${{ hashFiles('scripts/build-windows.ps1', 'scripts/install-windows-sdk.ps1', '.github/actions/setup-windows-rocm-sdk/action.yml', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', 'Justfile', '.github/cache-version.txt') }}
       - name: Install CUDA toolkit
         if: ${{ env.RUN_WINDOWS_GPU == 'true' && matrix.backend == 'cuda' && steps.llama_cache.outputs.cache-hit != 'true' }}
         uses: Jimver/cuda-toolkit@v0.2.35

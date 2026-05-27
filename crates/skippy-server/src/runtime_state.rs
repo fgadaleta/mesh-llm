@@ -4,16 +4,22 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use skippy_protocol::{FlashAttentionType, LoadMode, StageConfig};
 use skippy_runtime::{
-    parse_cache_type, ActivationFrame, FlashAttentionType as RuntimeFlashAttentionType,
-    GenerationSignalWindow, MediaInput, MediaPrefill, MediaPrefillFrame, RuntimeConfig,
-    RuntimeKvPage, RuntimeKvPageDesc, RuntimeLoadMode, SamplingConfig, StageModel, StageSession,
-    StageSessionCheckpoint, TokenSignal,
+    ActivationFrame, FlashAttentionType as RuntimeFlashAttentionType, GenerationSignalWindow,
+    MediaInput, MediaPrefill, MediaPrefillFrame, RuntimeConfig, RuntimeKvPage, RuntimeKvPageDesc,
+    RuntimeLoadMode, SamplingConfig, StageModel, StageSession, StageSessionCheckpoint, TokenSignal,
+    parse_cache_type,
 };
 
 use crate::package::select_package_parts;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeLaunchOverrides {
+    pub n_threads: Option<usize>,
+    pub n_threads_batch: Option<usize>,
+}
 
 pub struct RuntimeState {
     pub model: StageModel,
@@ -155,6 +161,10 @@ impl RuntimeState {
         let token = session.decode_step_sampled(token_id, sampling)?;
         self.add_session_tokens(session_id, 1);
         Ok(token)
+    }
+
+    pub fn session_batch_size(&mut self, session_id: &str) -> Result<usize> {
+        self.active_session(session_id)?.batch_size()
     }
 
     pub fn configure_chat_sampling(
@@ -303,6 +313,13 @@ impl RuntimeState {
             .session)
     }
 
+    fn active_session(&mut self, session_id: &str) -> Result<&mut StageSession> {
+        self.sessions
+            .get_mut(session_id)
+            .map(|lane_session| &mut lane_session.session)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} is not active"))
+    }
+
     pub fn prewarm_idle_sessions(
         &mut self,
         target_idle_sessions: usize,
@@ -348,70 +365,44 @@ impl RuntimeState {
     pub fn drop_session_timed(&mut self, session_id: &str) -> Result<RuntimeSessionDropStats> {
         let reset_started = Instant::now();
         let mut reset_session = false;
-        let mut preserved_resident_prefix = false;
+        let preserved_resident_prefix = false;
         let mut lane_discarded = false;
         let mut lane_discard_reason: Option<String> = None;
 
         if let Some(mut lane_session) = self.sessions.remove(session_id) {
             let lane_index = lane_session.index;
-            if let Some(prefix) = self.session_resident_prefixes.remove(session_id) {
-                match lane_session.session.trim_session(prefix.token_count) {
-                    Ok(()) => {
-                        preserved_resident_prefix = true;
-                        lane_session.resident_prefix = Some(prefix);
-                        self.idle_sessions.push(lane_session);
-                    }
-                    Err(trim_err) => {
-                        reset_session = true;
-                        match lane_session.session.reset() {
-                            Ok(()) => {
-                                lane_session.resident_prefix = None;
-                                self.idle_sessions.push(lane_session);
-                            }
-                            Err(reset_err) => {
-                                lane_discarded = true;
-                                let reason = format!(
-                                    "trim_session({}) failed ({trim_err:#}); fallback reset() also failed ({reset_err:#})",
-                                    prefix.token_count
-                                );
-                                eprintln!(
-                                    "skippy::runtime_state: drop_session_timed: discarding lane {lane_index} for session {session_id}: {reason}"
-                                );
-                                lane_discard_reason = Some(reason);
-                                // `lane_session` falls out of scope and its
-                                // StageSession::drop runs, which calls
-                                // skippy_session_free on the C side. After
-                                // the native KV cells for this seq_id are
-                                // released, return the lane index to the
-                                // free list so the next allocation can
-                                // reuse it instead of consuming a fresh
-                                // slot from next_lane_index.
-                                drop(lane_session);
-                                self.free_lane_indices.push(lane_index);
-                            }
-                        }
-                    }
+            // Always release the lane's native KV cells back to the
+            // unified pool. The trim+preserve path kept the lane's cells
+            // pinned to a specific (`page_id`, `token_count`) pair so a
+            // future request whose content prefix hashed to the *exact*
+            // same `page_id` AND same `token_count` could acquire the
+            // warm lane via `acquire_resident_prefix_lane`. Real chat /
+            // agent workloads vary the conversation tail every turn, so
+            // both the hash and the length change request-to-request and
+            // that exact-match acquisition almost never fires. Meanwhile
+            // the pinned cells remain claimed in the unified pool, in
+            // parallel with the cells the cache layer itself pins, and
+            // the pool runs out of contiguous space — producing
+            // `decode: failed to find a memory slot` under repeated
+            // tool-using agent traffic (#652). Cross-request prefix
+            // reuse is still done by the cache layer (by `page_id`); we
+            // just stop double-claiming cells on the lane side.
+            self.session_resident_prefixes.remove(session_id);
+            reset_session = true;
+            match lane_session.session.reset() {
+                Ok(()) => {
+                    lane_session.resident_prefix = None;
+                    self.idle_sessions.push(lane_session);
                 }
-            } else {
-                reset_session = true;
-                match lane_session.session.reset() {
-                    Ok(()) => {
-                        lane_session.resident_prefix = None;
-                        self.idle_sessions.push(lane_session);
-                    }
-                    Err(reset_err) => {
-                        lane_discarded = true;
-                        let reason = format!("reset() failed ({reset_err:#})");
-                        eprintln!(
-                            "skippy::runtime_state: drop_session_timed: discarding lane {lane_index} for session {session_id}: {reason}"
-                        );
-                        lane_discard_reason = Some(reason);
-                        // See sibling branch above: free the lane index
-                        // after the StageSession drop releases the
-                        // native KV cells for this seq_id.
-                        drop(lane_session);
-                        self.free_lane_indices.push(lane_index);
-                    }
+                Err(reset_err) => {
+                    lane_discarded = true;
+                    let reason = format!("reset() failed ({reset_err:#})");
+                    eprintln!(
+                        "skippy::runtime_state: drop_session_timed: discarding lane {lane_index} for session {session_id}: {reason}"
+                    );
+                    lane_discard_reason = Some(reason);
+                    drop(lane_session);
+                    self.free_lane_indices.push(lane_index);
                 }
             }
         }
@@ -742,7 +733,7 @@ impl RuntimeState {
         session_id: &str,
         cache_seq_id: i32,
     ) -> Result<()> {
-        self.session(session_id)?.drop_sequence(cache_seq_id)
+        self.active_session(session_id)?.drop_sequence(cache_seq_id)
     }
 
     fn add_session_tokens(&mut self, session_id: &str, count: u64) {
@@ -844,7 +835,14 @@ impl Drop for RuntimeState {
 }
 
 pub fn load_runtime(config: &StageConfig) -> Result<Option<Arc<Mutex<RuntimeState>>>> {
-    let mut runtime_config = runtime_config_from_stage_config(config)?;
+    load_runtime_with_overrides(config, &RuntimeLaunchOverrides::default())
+}
+
+pub fn load_runtime_with_overrides(
+    config: &StageConfig,
+    overrides: &RuntimeLaunchOverrides,
+) -> Result<Option<Arc<Mutex<RuntimeState>>>> {
+    let mut runtime_config = runtime_config_from_stage_config(config, overrides)?;
 
     let model = match config.load_mode {
         _ if std::env::var("MESH_LLM_BYPASS_SKIPPY_MODEL_LOAD").is_ok() => {
@@ -888,11 +886,24 @@ fn should_attach_package_projector(config: &StageConfig) -> bool {
     config.stage_index == 0 && config.layer_start == 0
 }
 
-fn runtime_config_from_stage_config(config: &StageConfig) -> Result<RuntimeConfig> {
+fn runtime_config_from_stage_config(
+    config: &StageConfig,
+    overrides: &RuntimeLaunchOverrides,
+) -> Result<RuntimeConfig> {
     let cache_type_k = parse_cache_type(&config.cache_type_k)
         .with_context(|| format!("parse cache_type_k for {}", config.stage_id))?;
     let cache_type_v = parse_cache_type(&config.cache_type_v)
         .with_context(|| format!("parse cache_type_v for {}", config.stage_id))?;
+    let n_threads = overrides
+        .n_threads
+        .map(u32::try_from)
+        .transpose()
+        .with_context(|| format!("n_threads exceeds u32 for {}", config.stage_id))?;
+    let n_threads_batch = overrides
+        .n_threads_batch
+        .map(u32::try_from)
+        .transpose()
+        .with_context(|| format!("n_threads_batch exceeds u32 for {}", config.stage_id))?;
     Ok(RuntimeConfig {
         stage_index: config.stage_index,
         layer_start: config.layer_start,
@@ -901,8 +912,8 @@ fn runtime_config_from_stage_config(config: &StageConfig) -> Result<RuntimeConfi
         lane_count: config.lane_count,
         n_batch: config.n_batch,
         n_ubatch: config.n_ubatch,
-        n_threads: None,
-        n_threads_batch: None,
+        n_threads,
+        n_threads_batch,
         n_gpu_layers: config.n_gpu_layers,
         selected_backend_device: config
             .selected_device
@@ -940,12 +951,12 @@ fn open_stage_model_from_parts(
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{bail, Result};
+    use anyhow::{Result, bail};
     use skippy_protocol::{FlashAttentionType, LoadMode, PeerConfig, StageConfig, StageDevice};
     use skippy_runtime::FlashAttentionType as RuntimeFlashAttentionType;
 
     use super::{
-        create_indexed_lane_resource, runtime_config_from_stage_config,
+        RuntimeLaunchOverrides, create_indexed_lane_resource, runtime_config_from_stage_config,
         should_attach_package_projector,
     };
 
@@ -1068,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_preserves_selected_backend_device() {
+    fn runtime_config_preserves_selected_backend_device_and_thread_overrides() {
         let config = StageConfig {
             run_id: "run-a".to_string(),
             topology_id: "topology-a".to_string(),
@@ -1108,7 +1119,12 @@ mod tests {
             downstream: None,
         };
 
-        let runtime_config = runtime_config_from_stage_config(&config).unwrap();
+        let overrides = RuntimeLaunchOverrides {
+            n_threads: Some(8),
+            n_threads_batch: Some(4),
+        };
+
+        let runtime_config = runtime_config_from_stage_config(&config, &overrides).unwrap();
 
         assert_eq!(
             runtime_config.selected_backend_device.as_deref(),
@@ -1117,6 +1133,8 @@ mod tests {
         assert_eq!(runtime_config.lane_count, 2);
         assert_eq!(runtime_config.n_batch, Some(1024));
         assert_eq!(runtime_config.n_ubatch, Some(256));
+        assert_eq!(runtime_config.n_threads, Some(8));
+        assert_eq!(runtime_config.n_threads_batch, Some(4));
         assert_eq!(
             runtime_config.flash_attn_type,
             RuntimeFlashAttentionType::Enabled
@@ -1163,10 +1181,101 @@ mod tests {
             downstream: None,
         };
 
-        let runtime_config = runtime_config_from_stage_config(&config).unwrap();
+        let runtime_config =
+            runtime_config_from_stage_config(&config, &RuntimeLaunchOverrides::default()).unwrap();
 
         assert!(!runtime_config.include_embeddings);
         assert!(runtime_config.include_output);
+    }
+
+    #[test]
+    fn runtime_config_preserves_default_runtime_threads_when_omitted() {
+        let config = StageConfig {
+            run_id: "run-a".to_string(),
+            topology_id: "topology-a".to_string(),
+            model_id: "model-a".to_string(),
+            package_ref: None,
+            manifest_sha256: None,
+            source_model_path: None,
+            source_model_sha256: None,
+            source_model_bytes: None,
+            materialized_path: None,
+            materialized_pinned: false,
+            model_path: Some("/tmp/model.gguf".to_string()),
+            projector_path: None,
+            stage_id: "stage-0".to_string(),
+            stage_index: 0,
+            layer_start: 0,
+            layer_end: 24,
+            ctx_size: 512,
+            lane_count: 1,
+            n_batch: None,
+            n_ubatch: None,
+            n_gpu_layers: -1,
+            cache_type_k: "f16".to_string(),
+            cache_type_v: "f16".to_string(),
+            flash_attn_type: FlashAttentionType::Auto,
+            filter_tensors_on_load: false,
+            selected_device: None,
+            kv_cache: None,
+            load_mode: LoadMode::RuntimeSlice,
+            bind_addr: "127.0.0.1:0".to_string(),
+            upstream: None,
+            downstream: None,
+        };
+
+        let runtime_config =
+            runtime_config_from_stage_config(&config, &RuntimeLaunchOverrides::default()).unwrap();
+
+        assert_eq!(runtime_config.n_threads, None);
+        assert_eq!(runtime_config.n_threads_batch, None);
+        assert_eq!(runtime_config.n_batch, None);
+        assert_eq!(runtime_config.n_ubatch, None);
+    }
+
+    #[test]
+    fn runtime_config_rejects_unsupported_cache_type_before_launch() {
+        let config = StageConfig {
+            run_id: "run-a".to_string(),
+            topology_id: "topology-a".to_string(),
+            model_id: "model-a".to_string(),
+            package_ref: None,
+            manifest_sha256: None,
+            source_model_path: None,
+            source_model_sha256: None,
+            source_model_bytes: None,
+            materialized_path: None,
+            materialized_pinned: false,
+            model_path: Some("/tmp/model.gguf".to_string()),
+            projector_path: None,
+            stage_id: "stage-0".to_string(),
+            stage_index: 0,
+            layer_start: 0,
+            layer_end: 24,
+            ctx_size: 512,
+            lane_count: 1,
+            n_batch: None,
+            n_ubatch: None,
+            n_gpu_layers: -1,
+            cache_type_k: "auto".to_string(),
+            cache_type_v: "f16".to_string(),
+            flash_attn_type: FlashAttentionType::Auto,
+            filter_tensors_on_load: false,
+            selected_device: None,
+            kv_cache: None,
+            load_mode: LoadMode::RuntimeSlice,
+            bind_addr: "127.0.0.1:0".to_string(),
+            upstream: None,
+            downstream: None,
+        };
+
+        let error = runtime_config_from_stage_config(&config, &RuntimeLaunchOverrides::default())
+            .expect_err("unsupported cache types should fail during runtime config construction");
+
+        assert!(
+            error.to_string().contains("parse cache_type_k for stage-0"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

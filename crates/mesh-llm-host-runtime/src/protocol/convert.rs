@@ -2,6 +2,7 @@
 use crate::mesh::RouteEntry;
 use crate::mesh::{ModelDemand, NodeRole, PeerAnnouncement, RoutingTable};
 use crate::protocol::NODE_PROTOCOL_GENERATION;
+use anyhow::{Context, Result};
 use iroh::{EndpointAddr, EndpointId};
 use std::collections::{HashMap, HashSet};
 
@@ -630,7 +631,7 @@ pub(crate) fn build_gossip_frame(
     let peers: Vec<crate::proto::node::PeerAnnouncement> =
         anns.iter().map(local_ann_to_proto_ann).collect();
     crate::proto::node::GossipFrame {
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
         sender_id: sender_id.as_bytes().to_vec(),
         peers,
     }
@@ -819,7 +820,7 @@ pub(crate) fn routing_table_to_proto(table: &RoutingTable) -> crate::proto::node
     crate::proto::node::RouteTable {
         entries,
         mesh_id: table.mesh_id.clone(),
-        gen: NODE_PROTOCOL_GENERATION,
+        r#gen: NODE_PROTOCOL_GENERATION,
     }
 }
 
@@ -866,15 +867,52 @@ pub(crate) fn mesh_config_to_proto(
         gpu: Some(crate::proto::node::NodeGpuConfig { assignment }),
         models,
         plugins,
+        config_toml: crate::plugin::config_to_toml(config).ok(),
     }
 }
 
 pub(crate) fn proto_config_to_mesh(
     snapshot: &crate::proto::node::NodeConfigSnapshot,
 ) -> crate::plugin::MeshConfig {
+    if let Ok(Some(parsed)) = full_config_toml_to_mesh(snapshot) {
+        return parsed;
+    }
+
+    legacy_proto_config_to_mesh(snapshot)
+}
+
+pub(crate) fn proto_config_to_mesh_strict(
+    snapshot: &crate::proto::node::NodeConfigSnapshot,
+) -> Result<crate::plugin::MeshConfig> {
+    if let Some(parsed) = full_config_toml_to_mesh(snapshot)? {
+        return Ok(parsed);
+    }
+
+    Ok(legacy_proto_config_to_mesh(snapshot))
+}
+
+fn full_config_toml_to_mesh(
+    snapshot: &crate::proto::node::NodeConfigSnapshot,
+) -> Result<Option<crate::plugin::MeshConfig>> {
+    let Some(config_toml) = snapshot.config_toml.as_deref() else {
+        return Ok(None);
+    };
+
+    let mut parsed = crate::plugin::parse_config_toml(config_toml)
+        .context("invalid full config_toml payload")?;
+    if parsed.version.is_none() {
+        parsed.version = Some(snapshot.version);
+    }
+    Ok(Some(parsed))
+}
+
+fn legacy_proto_config_to_mesh(
+    snapshot: &crate::proto::node::NodeConfigSnapshot,
+) -> crate::plugin::MeshConfig {
     use crate::plugin::{
         GpuAssignment, GpuConfig, MeshConfig, ModelConfigEntry, PluginConfigEntry,
     };
+
     fn declared_ref_or_none(
         configured: Option<&crate::proto::node::ConfiguredModelRef>,
     ) -> Option<String> {
@@ -906,6 +944,7 @@ pub(crate) fn proto_config_to_mesh(
             batch: None,
             ubatch: None,
             flash_attention: None,
+            ..Default::default()
         })
         .collect();
     let plugins = snapshot
@@ -927,8 +966,11 @@ pub(crate) fn proto_config_to_mesh(
         },
         owner_control: Default::default(),
         telemetry: Default::default(),
+        defaults: None,
+        runtime: Default::default(),
         models,
         plugins,
+        extra: Default::default(),
     }
 }
 

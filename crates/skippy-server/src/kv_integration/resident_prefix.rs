@@ -7,6 +7,13 @@ use super::{
     StagePrefixCachePayload,
 };
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResidentPrefixDecodeEviction {
+    pub target_tokens: u64,
+    pub evicted_entries: usize,
+    pub evicted_tokens: u64,
+}
+
 impl KvStageIntegration {
     pub fn probe_resident_prefix(
         &self,
@@ -142,6 +149,36 @@ impl KvStageIntegration {
         Ok(None)
     }
 
+    /// Evict enough resident-prefix entries to free at least one native
+    /// decode batch worth of KV cells, or all currently releasable entries.
+    ///
+    /// The single-entry eviction path is not enough when the LRU entry is
+    /// smaller than `n_batch`; tool/grammar retries need a contiguous decode
+    /// batch, so the proactive path uses the active session batch size as its
+    /// concrete budget.
+    pub fn evict_resident_prefix_for_decode_batch(
+        &self,
+        runtime: &mut RuntimeState,
+        session_id: &str,
+    ) -> Result<ResidentPrefixDecodeEviction> {
+        if self.payload != StagePrefixCachePayload::ResidentKv {
+            return Ok(ResidentPrefixDecodeEviction::default());
+        }
+        let target_tokens = runtime.session_batch_size(session_id)? as u64;
+        let mut cache = self
+            .resident
+            .lock()
+            .expect("resident prefix cache lock poisoned");
+        let mut drop_fn = |seq_id: i32| runtime.drop_resident_prefix_sequence(session_id, seq_id);
+        let evictions = cache.evict_lru_until_tokens(target_tokens, &mut drop_fn)?;
+        let evicted_tokens = evictions.iter().map(|eviction| eviction.token_count).sum();
+        Ok(ResidentPrefixDecodeEviction {
+            target_tokens,
+            evicted_entries: evictions.len(),
+            evicted_tokens,
+        })
+    }
+
     pub fn release_resident_prefix(&self, page_id: &str) {
         self.resident
             .lock()
@@ -184,6 +221,9 @@ impl KvStageIntegration {
             estimated_bytes,
             |seq_id| runtime.drop_resident_prefix_sequence(session_id, seq_id),
         )?;
+        if !allocation.should_retain {
+            return Ok(None);
+        }
         if allocation.should_save {
             runtime.save_resident_prefix(session_id, allocation.seq_id, token_count as u64)?;
             cache.commit_record(
