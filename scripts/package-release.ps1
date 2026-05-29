@@ -263,15 +263,33 @@ function Copy-RuntimeDependencies {
     }
 }
 
+function Test-BinaryContainsAsciiText {
+    param(
+        [string]$Path,
+        [string]$Text
+    )
+
+    $binaryText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($Path))
+    return $binaryText.Contains($Text)
+}
+
 function Assert-MeshBinaryVersion {
     param(
         [string]$Path,
-        [string]$ExpectedVersion
+        [string]$ExpectedVersion,
+        [string]$BinaryFlavor
     )
 
     $expected = $ExpectedVersion.TrimStart("v")
     $output = & $Path --version
     if ($LASTEXITCODE -ne 0) {
+        if ($BinaryFlavor -in @("cuda", "cuda-blackwell") -and $LASTEXITCODE -eq -1073741515) {
+            if (Test-BinaryContainsAsciiText -Path $Path -Text $expected) {
+                Write-Warning "CUDA release binary could not start on this driverless Windows runner; verified embedded version string $expected instead."
+                return
+            }
+        }
+
         throw "Release binary failed --version with exit code ${LASTEXITCODE}: $Path"
     }
 
@@ -314,7 +332,7 @@ try {
     $bundleBinary = Join-Path $bundleDir (Get-BundleBinaryName "mesh-llm" $binaryFlavor)
     Copy-Item $meshBinary -Destination $bundleBinary -Force
     Copy-RuntimeDependencies -BundleDir $bundleDir -BinaryFlavor $binaryFlavor
-    Assert-MeshBinaryVersion -Path $bundleBinary -ExpectedVersion $Version
+    Assert-MeshBinaryVersion -Path $bundleBinary -ExpectedVersion $Version -BinaryFlavor $binaryFlavor
 
     $versionedPath = Join-Path $resolvedOutputDir $versionedAsset
     $stablePath = Join-Path $resolvedOutputDir $stableAsset
