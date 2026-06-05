@@ -1016,7 +1016,7 @@ fn handle_binary_connection(
             }
         }
 
-        if let Some(full_prompt_tokens) = decode_full_prompt_sideband(&message) {
+        if let Some(full_prompt_tokens) = decode_record_tokens_sideband(&message) {
             let mut runtime = runtime.lock().expect("runtime lock poisoned");
             let record = maybe_record_binary_full_prefill(
                 config,
@@ -3355,16 +3355,17 @@ fn decode_execution_token(message: &StageWireMessage, token_count: usize) -> Opt
     Some(message.state.current_token)
 }
 
-fn decode_full_prompt_sideband(message: &StageWireMessage) -> Option<&[i32]> {
+fn decode_record_tokens_sideband(message: &StageWireMessage) -> Option<&[i32]> {
     if message.kind != WireMessageKind::DecodeEmbd
         || message.token_count != 1
-        || message.state.decode_step != 0
         || message.state.prompt_token_count <= 0
     {
         return None;
     }
     let prompt_token_count = usize::try_from(message.state.prompt_token_count).ok()?;
-    if message.tokens.len() != prompt_token_count
+    let decode_step = usize::try_from(message.state.decode_step).ok()?;
+    let expected_token_count = prompt_token_count.checked_add(decode_step)?;
+    if message.tokens.len() != expected_token_count
         || message.tokens.last().copied() != Some(message.state.current_token)
     {
         return None;

@@ -106,6 +106,7 @@ pub const CONTEXT_BUDGET_MAX_TOKENS: u32 = u32::MAX;
 pub const DEFAULT_EMBEDDED_MAX_TOKENS: u32 = 4096;
 const GENERATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 const GENERATION_RETRY_AFTER_SECS: u64 = 1;
+const MAX_EXACT_REPLAY_TOKENS: usize = 8;
 
 pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
     let config = load_json::<StageConfig>(&args.config)
@@ -1660,6 +1661,7 @@ struct EmbeddedStageExecution {
 
 struct EmbeddedFusedFirstDecode {
     predicted: i32,
+    predicted_tokens: Vec<i32>,
     reply_stats: StageReplyStats,
     execution: EmbeddedExecutionStats,
     elapsed_ms: f64,
