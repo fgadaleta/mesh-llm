@@ -112,12 +112,48 @@ inference request.
 ## Mesh Identity
 
 Every mesh has a stable `mesh_id`:
-- **Named mesh**: `hash(name + originator_nostr_pubkey)` — deterministic, unique per creator
-- **Unnamed mesh**: random UUID, persisted to `~/.mesh-llm/mesh-id`
+- **Requirement-aware mesh**: canonical genesis policy hash, deterministic from
+  the immutable creation-time requirements policy
+- **Legacy named unrestricted mesh**: `hash(name + originator_nostr_pubkey)`,
+  deterministic and unique per creator
+- **Legacy unnamed unrestricted mesh**: random UUID, persisted to
+  `~/.mesh-llm/mesh-id`
+
+For requirement-aware meshes, the immutable inputs are node-version bounds,
+protocol-generation bounds, and release-attestation policy. Local owner-trust
+policy is excluded from the mesh identity hash.
 
 Propagated via gossip (`PeerAnnouncement.mesh_id`) and routing table (`RoutingTable.mesh_id`).
 Published in Nostr listings (`MeshListing.mesh_id`).
 Saved to `~/.mesh-llm/last-mesh` on successful join for sticky preference scoring.
+
+Mesh metadata and admission facts are different things:
+
+- Node version is self-advertised metadata in gossip and status surfaces.
+- Protocol generation is a negotiated and validated transport fact.
+- Build attestation is release certification proof, not proof that a remote
+  process is unmodified official code running with trusted hardware or OS state.
+- Certified-build admission is not remote runtime attestation.
+
+### Release provenance
+
+The shipped `mesh-llm` executable uses embedded release attestation, and the
+release-signing trust root is separate from owner trust. This applies only to
+the packaged `mesh-llm` binary, not SDK, XCFramework, or other native
+artifacts. `missing` is expected for unstamped local and dev builds, `valid`
+means the packaged binary matches a trusted release signer, and `invalid` means
+the bytes changed after packaging. Operators can verify stamped packaged
+binaries with `cargo run -p xtask -- release-attestation inspect --binary <path-to-packaged-mesh-llm> --public-key-file <release-signing-public-key.json>`.
+Bare `inspect --binary ...` is only sufficient for unstamped binaries that
+should classify as `missing`; stamped binaries require `--public-key-file` and
+otherwise report `invalid` with an explicit error.
+
+This is provenance and admission hardening, not runtime integrity proof. Mesh
+requirements can require a certified build at admission time through
+`require_release_attestation` and `release_signer_keys`, but that does not prove
+the remote process is running unmodified code on trusted hardware or OS state.
+
+Changing mesh requirements creates a new mesh.
 
 ## Bootstrap Proxy
 
@@ -155,6 +191,19 @@ Pinned GPU startup is also local-node only:
 
 Bare `mesh-llm serve` is the config-owned path. If `[[models]]` is empty, it warns,
 prints help, and exits cleanly. Background services use that path directly.
+
+Creation-time mesh requirement fields live under `[mesh_requirements]` in
+`~/.mesh-llm/config.toml`:
+
+- `min_node_version`
+- `max_node_version`
+- `min_protocol_version`
+- `max_protocol_version`
+- `require_release_attestation`
+- `release_signer_keys`
+
+Those fields are evaluated at mesh creation and join time. Changing them creates
+a new requirement-aware mesh; it does not mutate a running mesh.
 
 ## Passive Mode
 
@@ -212,7 +261,8 @@ and the embedded web dashboard.
 | `/api/model-interests/{model_ref}` | DELETE | Clear local explicit interest for one canonical model ref |
 | `/api/model-targets` | GET | Ranked model targets from explicit interest, active demand, and serving visibility |
 | `/api/events` | GET | SSE stream of status updates (2s interval + on change) |
-| `/api/discover` | GET | Browse Nostr-published meshes |
+| `/api/discover` | GET | Browse Nostr-published meshes, or LAN mDNS advertisements when `--mesh-discovery-mode mdns` is active |
+| `/api/discovery/lan-details` | POST | Return local LAN discovery detail after invite-token proof; advertised only when the management API is LAN-reachable, and the raw token is never returned |
 | `/api/chat` | POST | Proxy to inference API (`/v1/chat/completions`) |
 | `/` | GET | Embedded web dashboard |
 
@@ -231,8 +281,14 @@ without the HTML via curl/scripts.
 Runtime reconciliation is opt-in. When `[runtime] reconcile_model_targets = true`
 is set, the local runtime may load an already-present local GGUF for a locally
 registered explicit interest, but only when `/api/model-targets` says the target
-is wanted, unserved, and a single-node capacity fit for the current node. It
-does not download models, start split serving, or act on peer-only interest.
+is wanted, unserved, and a single-node capacity fit for the current node. A
+host that also sets `reconcile_model_target_demand_upgrades = true` may replace
+a less-demanded local model with a locally present, higher-ranked unserved
+target once fresh active request demand crosses
+`model_target_demand_upgrade_min_requests`. Stale demand older than
+`model_target_demand_upgrade_max_age_secs` is advisory only. Runtime
+reconciliation does not download models, start split serving, or act on
+requested-only seed interest.
 
 `/api/model-targets` keeps raw inputs and computed hints separate. Each target
 reports `signals` from observed mesh state (`explicit_interest_count`,
@@ -305,6 +361,13 @@ trait Collector {
 | `DefaultCollector` | Linux AMD | `/sys/class/drm`, `rocm-smi` |
 | `TegraCollector` | Jetson / Tegra | sysfs + `tegrastats` |
 
+The shipped `mesh-llm` binary builds `mesh-llm-system` with `skippy-devices`.
+In that mode, runtime-selectable GPU inventory is authoritative from the
+embedded Skippy/llama backend device API. Platform collectors remain legacy
+fallbacks for non-Skippy builds and diagnostic surfaces, but they must not
+invent GPU count, backend identity, or usable runtime capacity when the embedded
+backend reports no selectable GPU.
+
 `survey()` calls all applicable collectors and returns a `HardwareSurvey` with `gpu_name`, `gpu_vram` (per-GPU bytes), `gpu_reserved` (per-GPU reserved or unavailable bytes when the platform reports a true reserved/unavailable metric), `vram_bytes` (total), `hostname`, `is_soc`, and per-device `GpuFacts` entries. Benchmark-derived memory-bandwidth and compute-throughput hints are attached later when cached or freshly measured results are available. ROCm `rocm-smi --showmeminfo` and Intel `xpu-smi` discovery expose live used-memory counters, so mesh-llm intentionally omits `gpu_reserved` for those backends instead of reinterpreting used bytes as reserved memory.
 
 ### Gossip Fields
@@ -348,6 +411,14 @@ By default, nodes broadcast their GPU name, hostname, VRAM capacity, and reserve
 ```
 
 For ROCm and Intel hosts, `reserved_bytes` is omitted because their standard CLI telemetry exposes live used-memory counters rather than a true reserved/system-memory value.
+
+Routing health in `/api/status.routing_affinity.target_reputation` is local to
+the process that served the management API. It records behavioral routing
+signals such as penalized targets and routes reordered away from penalized
+targets. This is a local availability/reliability aid only: it is not gossiped,
+not a cross-mesh trust score, and not a replacement for owner attestation or
+model-output verification. The operator-facing behavior is specified in
+[Local Node Reputation](../NODE_REP.md).
 
 `peers[]` entries (only when peer has not passed `--no-enumerate-host`):
 ```json

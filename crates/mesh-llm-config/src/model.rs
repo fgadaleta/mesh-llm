@@ -11,6 +11,8 @@ pub struct MeshConfig {
     #[serde(default)]
     pub gpu: GpuConfig,
     #[serde(default)]
+    pub mesh_requirements: MeshRequirementsConfig,
+    #[serde(default)]
     pub owner_control: OwnerControlConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -42,10 +44,56 @@ pub struct GpuConfig {
     pub parallel: Option<usize>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub const DEFAULT_MODEL_TARGET_DEMAND_UPGRADE_MIN_REQUESTS: u64 = 2;
+pub const DEFAULT_MODEL_TARGET_DEMAND_UPGRADE_MAX_AGE_SECS: u64 = 60 * 60;
+
+fn default_model_target_demand_upgrade_min_requests() -> u64 {
+    DEFAULT_MODEL_TARGET_DEMAND_UPGRADE_MIN_REQUESTS
+}
+
+fn default_model_target_demand_upgrade_max_age_secs() -> u64 {
+    DEFAULT_MODEL_TARGET_DEMAND_UPGRADE_MAX_AGE_SECS
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RuntimeConfig {
     #[serde(default)]
     pub reconcile_model_targets: bool,
+    #[serde(default)]
+    pub reconcile_model_target_demand_upgrades: bool,
+    #[serde(default = "default_model_target_demand_upgrade_min_requests")]
+    pub model_target_demand_upgrade_min_requests: u64,
+    #[serde(default = "default_model_target_demand_upgrade_max_age_secs")]
+    pub model_target_demand_upgrade_max_age_secs: u64,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            reconcile_model_targets: false,
+            reconcile_model_target_demand_upgrades: false,
+            model_target_demand_upgrade_min_requests:
+                DEFAULT_MODEL_TARGET_DEMAND_UPGRADE_MIN_REQUESTS,
+            model_target_demand_upgrade_max_age_secs:
+                DEFAULT_MODEL_TARGET_DEMAND_UPGRADE_MAX_AGE_SECS,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MeshRequirementsConfig {
+    #[serde(default)]
+    pub min_node_version: Option<String>,
+    #[serde(default)]
+    pub max_node_version: Option<String>,
+    #[serde(default)]
+    pub min_protocol_version: Option<u32>,
+    #[serde(default)]
+    pub max_protocol_version: Option<u32>,
+    #[serde(default)]
+    pub require_release_attestation: bool,
+    #[serde(default)]
+    pub release_signer_keys: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -587,6 +635,8 @@ struct RawMeshConfig {
     #[serde(default)]
     gpu: GpuConfig,
     #[serde(default)]
+    mesh_requirements: MeshRequirementsConfig,
+    #[serde(default)]
     owner_control: OwnerControlConfig,
     #[serde(default)]
     telemetry: TelemetryConfig,
@@ -688,6 +738,7 @@ impl<'de> Deserialize<'de> for MeshConfig {
         Ok(Self {
             version: raw.version,
             gpu: raw.gpu,
+            mesh_requirements: raw.mesh_requirements,
             owner_control: raw.owner_control,
             telemetry: raw.telemetry,
             defaults: raw.defaults,
@@ -924,7 +975,27 @@ pub struct PluginConfigEntry {
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
-    /// Base URL for inference endpoint plugins (e.g. http://localhost:8000/v1).
+    /// Optional URL passed to the plugin as `MESH_LLM_PLUGIN_URL`.
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "PluginStartupConfig::is_default")]
+    pub startup: PluginStartupConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PluginStartupConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub optional: bool,
+    #[serde(default)]
+    pub lazy_start: bool,
+}
+
+impl PluginStartupConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }

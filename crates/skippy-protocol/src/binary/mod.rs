@@ -105,6 +105,24 @@ mod tests {
     }
 
     #[test]
+    fn reply_stats_preserve_prefill_edge_transport() {
+        let mut stats = StageReplyStats::default();
+        stats.observe_prefill_edge_transport(2, 12_000, 3_000, 1_048_576);
+        stats.observe_prefill_edge_transport(1, 4_000, 40_000, 524_288);
+
+        let mut bytes = Vec::new();
+        send_reply_predicted_with_stats(&mut bytes, 42, stats).unwrap();
+        let reply = recv_reply(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(reply.stats.prefill_edge_write_us_max, 12_000);
+        assert_eq!(reply.stats.prefill_edge_wait_us_max, 40_000);
+        assert_eq!(reply.stats.prefill_edge_total_us_max, 44_000);
+        assert_eq!(reply.stats.prefill_edge_stage_index, 1);
+        assert_eq!(reply.stats.prefill_edge_activation_bytes_max, 524_288);
+        assert_eq!(reply.stats.prefill_edge_observation_count, 2);
+    }
+
+    #[test]
     fn token_vector_reply_round_trips() {
         let mut bytes = Vec::new();
         send_reply_predicted_tokens_with_stats(&mut bytes, &[1, 2, 3], StageReplyStats::default())
@@ -630,6 +648,56 @@ mod tests {
             decoded.activation_f32_payload(2).unwrap(),
             message.activation
         );
+    }
+
+    #[test]
+    fn f32_activation_payload_can_be_moved_without_clone() {
+        let state = StageStateHeader::new(WireMessageKind::DecodeEmbd, WireActivationDType::F32);
+        let activation = vec![1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut message = StageWireMessage {
+            kind: WireMessageKind::DecodeEmbd,
+            pos_start: 0,
+            token_count: 1,
+            state,
+            request_id: 7,
+            session_id: 9,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: vec![42],
+            positions: Vec::new(),
+            activation: activation.clone(),
+            raw_bytes: Vec::new(),
+        };
+
+        let payload = message.take_activation_f32_payload(2).unwrap();
+
+        assert_eq!(payload, activation);
+        assert!(message.activation.is_empty());
+    }
+
+    #[test]
+    fn f32_activation_payload_clone_helper_preserves_wire_payload() {
+        let state = StageStateHeader::new(WireMessageKind::DecodeEmbd, WireActivationDType::F32);
+        let activation = vec![1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let message = StageWireMessage {
+            kind: WireMessageKind::DecodeEmbd,
+            pos_start: 0,
+            token_count: 1,
+            state,
+            request_id: 7,
+            session_id: 9,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: vec![42],
+            positions: Vec::new(),
+            activation: activation.clone(),
+            raw_bytes: Vec::new(),
+        };
+
+        let payload = message.activation_f32_payload(2).unwrap();
+
+        assert_eq!(payload, activation);
+        assert_eq!(message.activation, activation);
     }
 
     #[test]

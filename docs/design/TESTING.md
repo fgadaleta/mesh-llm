@@ -7,10 +7,11 @@
 ```bash
 mesh-llm gpus
 mesh-llm gpus --json | jq .
-mesh-llm gpu benchmark --json | jq .
+mesh-llm gpus detect --json | jq .
 ```
 
-- Prints local GPU entries with stable IDs, backend devices, VRAM, unified-memory status, and cached bandwidth when a fingerprint is available
+- Prints local runtime-selectable GPU entries with stable IDs, backend devices, VRAM, unified-memory status, and cached bandwidth when a fingerprint is available
+- In the shipped Skippy-enabled binary, platform tools alone are not enough: if the embedded backend does not enumerate a GPU, the node should report CPU-only rather than advertising probe-visible GPU capacity
 - `--json` emits machine-readable inventory and benchmark payloads suitable for automation
 
 ### 0a. Startup config smoke
@@ -76,7 +77,60 @@ mesh-llm serve
 - Explicit `mesh-llm serve --model ...` should still bypass configured `[[models]]` and therefore bypass config-owned pinned IDs
 - Do not use GPU indexes, `index:*`, or backend-device names like `CUDA0` / `HIP0` / `MTL0` as `gpu_id`
 
-### 0c. Terminal dashboard smoke
+### 0c. Requirement-aware mesh smoke
+
+Create an unrestricted mesh:
+
+```bash
+mesh-llm serve --model Qwen3-8B-Q4_K_M
+```
+
+Create a release-attestation-required public mesh:
+
+```bash
+mesh-llm serve --model Qwen3-8B-Q4_K_M --publish \
+  --require-release-attestation \
+  --release-signer-key ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --owner-key ~/.mesh-llm/owner-keystore.json \
+  --owner-required \
+  --trust-policy require-owned \
+  --node-label lab-a
+```
+
+The release-attestation flags are creation-time mesh requirements. The owner and
+trust-policy flags exercise local owner-identity behavior and must not change
+the mesh requirements hash.
+
+Or with config-backed creation requirements:
+
+```toml
+[mesh_requirements]
+require_release_attestation = true
+release_signer_keys = ["ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+```
+
+Join via signed bootstrap token:
+
+```bash
+mesh-llm serve --join <signed-bootstrap-token>
+```
+
+- `mesh-llm runtime bootstrap --port 3131` should show the local owner-control
+  bootstrap policy used by the node.
+- `curl -s http://localhost:3131/api/runtime/control-bootstrap | jq .` should
+  report the same local bootstrap policy in JSON form.
+- Admission failures for nodes that miss the certified-build gate should be
+  deterministic. In human-facing prose this is "certified build required";
+  the machine reason codes surfaced by logs, status, and evidence are
+  `certified_binary_required`, `build_proof_invalid`, and
+  `release_signer_untrusted`.
+- Legacy unrestricted meshes still accept the older unsigned invite-token path,
+  while requirement-aware meshes require signed bootstrap tokens.
+
+- For release smoke, always inspect the packaged `mesh-llm` executable with `cargo run -p xtask -- release-attestation inspect --binary /tmp/test-bundle/mesh-llm --public-key-file /tmp/mesh-release-key.pub`, never the raw `target/release/mesh-llm` path. Packaged release archives can report `valid`, unstamped local or dev builds report `missing`, and a binary mutated after download reports `invalid`, but default startup still allows it because this is provenance and admission hardening, not runtime integrity proof. Bare `inspect --binary ...` is only sufficient for unstamped binaries that should classify as `missing`; stamped release binaries require `--public-key-file` and otherwise report `invalid` with an explicit error.
+- Smoke and release evidence should come from the packaged archive contents, not raw release output, because the release pipeline now sources publishable binaries from extracted packaged archives.
+
+### 0d. Terminal dashboard smoke
 
 The pretty dashboard uses raw mode and the alternate screen when both stdin and stderr are interactive TTYs and `TERM` supports a real terminal. It should leave native terminal text selection available and fall back to line-oriented pretty output when stdin is not a TTY, stderr is not a TTY, or `TERM` is empty / `dumb`.
 
@@ -325,6 +379,21 @@ mesh-llm serve --model Qwen2.5-32B --split --join <TOKEN>
 - `--listen-all` is not a substitute for this test; it only affects local
   HTTP API/console listeners.
 
+#### Split-package preflight diagnostics
+
+Before starting a package-backed split run, preflight the local package
+directory and then certify the immutable published ref:
+
+```bash
+skippy-model-package preflight ./model-package --stages 2 --verify-sha256
+mesh-llm models certify hf://namespace/repo@revision --package-only --report-out target/skippy-preflight/cert.json
+```
+
+Clean packages should pass with a machine-readable report. Deliberately broken
+packages or refs should fail before the model is advertised through `/v1/models`
+and should name the blocked manifest field, missing artifact, size/SHA mismatch,
+sidecar, or stage part.
+
 ### 4. Two GPU nodes, model too big for one
 
 When the model exceeds host VRAM, split happens automatically without `--split`.
@@ -549,8 +618,10 @@ curl localhost:3131/api/discover # Nostr meshes (current mesh marked by mesh_id)
 - `/api/search` returns 200 JSON with canonical model refs for matching results
 - `/api/model-interests` stores and returns local explicit-interest entries keyed by canonical model refs
 - `/api/model-targets` returns ranked targets with explicit-interest counts, request counts, serving-node counts, `wanted` for targets not currently served, and derived `capacity_advice` without changing ranking or routing behavior
-- If `[runtime] reconcile_model_targets = true` is enabled, unserved local explicit interests that are already present on disk and fit the current node may be runtime-loaded automatically. Leave it unset for read-only advisory checks.
+- If `[runtime] reconcile_model_targets = true` is enabled, unserved local explicit interests that are already present on disk and fit the current node may be runtime-loaded automatically. If `reconcile_model_target_demand_upgrades = true` is also enabled, an already-serving host may replace a lower-demand local model with a locally present, higher-demand unserved target whose active demand is still within `model_target_demand_upgrade_max_age_secs`. Leave these unset for read-only advisory checks.
 - Discover results can be matched to current mesh by `mesh_id`
+- In `--mesh-discovery-mode mdns`, `/api/discover` must show LAN advertisements without raw invite tokens; token fingerprints are expected, while proof challenges and `/api/discovery/lan-details` should appear only when the publishing node's management API is LAN-reachable, such as with `--listen-all`.
+- POST `/api/discovery/lan-details` must reject missing or wrong-token proof and must return local detail without echoing the raw invite token.
 
 ### 24. HTTP proxy single-request connection contract
 
@@ -629,7 +700,7 @@ implementation gate.
 
 ## Control-Plane Protocol (Protobuf v1)
 
-The control plane uses QUIC ALPN `mesh-llm/1` with the `meshllm.node.v1` protobuf schema. Scoped control-plane streams use 4-byte LE framing followed by protobuf bytes. Skippy control/artifact streams are advertised through gossip subprotocol features and run through mesh `STREAM_SUBPROTOCOL` (0x0d); activation transport stays on `skippy-stage/1`.
+The control plane uses QUIC ALPN `mesh-llm/1` with the `meshllm.node.v1` protobuf schema. Scoped control-plane streams use 4-byte LE framing followed by protobuf bytes. Skippy control/artifact streams are advertised through gossip subprotocol features and run through mesh `STREAM_SUBPROTOCOL` (0x0d); activation transport stays on `skippy-stage/2`.
 
 | Stream | Type | Format |
 |--------|------|--------|
@@ -662,15 +733,12 @@ For a layer-package split where the coordinator already has the HF package
 cached and a worker does not:
 
 - Current/current mesh: the worker may use mesh `STREAM_SUBPROTOCOL` (0x0d)
-  to open `skippy-stage/1`, then Skippy artifact-transfer stream 0x03, to
+  to open `skippy-stage/2`, then Skippy artifact-transfer stream 0x03, to
   fetch only its assigned package files before the normal HF fallback path.
-- Rolling-update compatibility: nodes should still accept the legacy
-  `skippy-stage/1` artifact-transfer stream from an already-running pre-update
-  peer, but new outbound artifact transfer should use `STREAM_SUBPROTOCOL`.
-- Current/released mixed mesh: a released coordinator without
-  advertised `skippy-stage/1` `artifact-transfer` support must not be dialed
-  for artifact transfer; the worker must fall back to local/HF package
-  resolution.
+- Current/released mixed mesh: a released coordinator without advertised
+  `skippy-stage/2` `artifact-transfer`, `stage-generation-3`, and
+  `direct-prediction-return` support must not be selected for a generation-3
+  split topology; the worker must fall back to local/HF package resolution.
 - Default public-mesh safety: with `MESH_LLM_ARTIFACT_TRANSFER` unset, the node
   must advertise no `artifact-transfer` feature, reject inbound artifact
   transfer requests, and continue through local/HF fallback resolution.

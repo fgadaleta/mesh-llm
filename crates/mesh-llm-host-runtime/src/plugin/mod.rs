@@ -1,7 +1,9 @@
 mod config;
+mod installed;
 pub(crate) mod mcp;
 mod runtime;
 pub(crate) mod stapler;
+mod startup;
 mod support;
 mod transport;
 
@@ -30,6 +32,7 @@ use url::Url;
 
 #[allow(unused_imports)]
 pub use self::config::ExternalPluginSpec;
+pub(crate) use self::config::validate_config;
 #[allow(unused_imports)]
 pub(crate) use self::config::{
     BoolOrAuto, HardwareConfig, IntegerOrString, ModelConfigDefaults, ModelFitConfig,
@@ -39,36 +42,45 @@ pub(crate) use self::config::{
 #[allow(unused_imports)]
 pub use self::config::{
     ConfigEditor, ConfigStore, GpuAssignment, GpuConfig, LocalServingNodeConfig, MeshConfig,
-    ModelConfigEditor, ModelConfigEntry, ModelDefaultsEditor, ModelRuntimeKind, PluginConfigEditor,
-    PluginConfigEntry, PluginHostMode, ResolvedPlugins, TelemetryConfig, TelemetryMetricsConfig,
+    MeshRequirementsConfig, ModelConfigEditor, ModelConfigEntry, ModelDefaultsEditor,
+    ModelRuntimeKind, OwnerControlConfig, PluginConfigEditor, PluginConfigEntry, PluginHostMode,
+    PluginStartupConfig, ResolvedPlugins, TelemetryConfig, TelemetryMetricsConfig,
     bundled_cli_plugin_spec, config_path, config_to_toml, load_config, parse_config_toml,
     resolve_plugins,
 };
-pub(crate) use self::config::{telemetry_plugin_enabled, validate_config};
+#[cfg(test)]
+pub(crate) use self::config::{
+    assert_mesh_requirements_config_accepts_unset_min_only_max_only_and_full_ranges,
+    assert_mesh_requirements_config_rejects_non_ed25519_signer_key,
+    assert_mesh_requirements_config_rejects_required_attestation_without_signer_keys,
+};
+pub(crate) use self::config::{
+    mesh_requirements_config_from_runtime, mesh_requirements_config_to_runtime,
+    mesh_requirements_validation_error,
+};
 use self::runtime::ExternalPlugin;
+pub use self::startup::{PluginStartupOptions, PluginStartupSummary};
 pub(crate) use self::support::parse_optional_json;
 use self::support::{format_args_for_log, format_slice_for_log, format_tool_names_for_log};
 #[cfg(all(test, unix))]
 use self::transport::unix_socket_path;
 #[cfg(all(test, windows))]
 use self::transport::windows_pipe_name;
-use self::transport::{LocalStream, connect_side_stream, make_instance_id};
+pub(crate) use self::transport::{
+    LocalListener, LocalStream, bind_local_listener, connect_side_stream, make_instance_id,
+};
 #[cfg(test)]
 use mesh_llm_plugin::MeshVisibility;
+use tokio::sync::oneshot;
 
 pub const BLOBSTORE_PLUGIN_ID: &str = "blobstore";
-pub const FLASH_MOE_PLUGIN_ID: &str = "flash-moe";
-pub const OPENAI_ENDPOINT_PLUGIN_ID: &str = "openai-endpoint";
-pub const TELEMETRY_PLUGIN_ID: &str = "telemetry";
-pub const TELEMETRY_CAPABILITY: &str = "telemetry.metrics.v1";
 pub(crate) const PROTOCOL_VERSION: u32 = mesh_llm_plugin::PROTOCOL_VERSION;
-const CONNECT_TIMEOUT_SECS: u64 = 10;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 15;
 const ENDPOINT_STARTUP_GRACE_SECS: u64 = 30;
 const ENDPOINT_FAILURE_THRESHOLD: u32 = 2;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum PluginMeshEvent {
     Channel {
         plugin_id: String,
@@ -77,6 +89,11 @@ pub enum PluginMeshEvent {
     BulkTransfer {
         plugin_id: String,
         message: proto::BulkTransferMessage,
+    },
+    OpenStream {
+        plugin_id: String,
+        request: proto::OpenMeshStreamRequest,
+        response_tx: oneshot::Sender<Result<proto::OpenMeshStreamResponse, proto::ErrorResponse>>,
     },
 }
 
@@ -140,6 +157,8 @@ pub struct PluginSummary {
     pub tools: Vec<ToolSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<PluginManifestOverview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup: Option<PluginStartupSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -254,7 +273,7 @@ impl PluginManager {
         let rpc_bridge = Arc::new(Mutex::new(None));
         let runtime_data = RuntimeDataCollector::new();
         let instance_id = make_instance_id();
-        let plugins = Self::load_external_plugins(
+        let (plugins, failed_plugins) = Self::load_external_plugins(
             specs,
             host_mode,
             mesh_tx,
@@ -262,11 +281,11 @@ impl PluginManager {
             rpc_bridge.clone(),
             &runtime_data,
         )
-        .await?;
+        .await;
         let manager = Self {
             inner: Arc::new(PluginManagerInner {
                 plugins,
-                inactive: Self::inactive_plugins(specs),
+                inactive: Self::inactive_plugins(specs, failed_plugins),
                 endpoint_health: Arc::new(Mutex::new(BTreeMap::new())),
                 runtime_data,
                 rpc_bridge,
@@ -297,20 +316,35 @@ impl PluginManager {
     }
 
     fn log_startup_plan(specs: &ResolvedPlugins) {
+        Self::log_inactive_plugins(&specs.inactive);
         if specs.externals.is_empty() {
             tracing::info!("Plugin manager: no plugins enabled");
             return;
         }
 
-        let names = specs
-            .externals
+        Self::log_enabled_plugins(&specs.externals);
+    }
+
+    fn log_inactive_plugins(inactive: &[PluginSummary]) {
+        for summary in inactive {
+            tracing::warn!(
+                plugin = %summary.name,
+                status = %summary.status,
+                error = %summary.error.as_deref().unwrap_or(""),
+                "Plugin inactive at startup"
+            );
+        }
+    }
+
+    fn log_enabled_plugins(externals: &[ExternalPluginSpec]) {
+        let names = externals
             .iter()
             .map(|spec| spec.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
         tracing::info!(
             "Plugin manager: loading {} plugin(s): {}",
-            specs.externals.len(),
+            externals.len(),
             names
         );
     }
@@ -333,10 +367,11 @@ impl PluginManager {
         instance_id: String,
         rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
         runtime_data: &RuntimeDataCollector,
-    ) -> Result<BTreeMap<String, ExternalPlugin>> {
+    ) -> (BTreeMap<String, ExternalPlugin>, Vec<PluginSummary>) {
         let mut plugins = BTreeMap::new();
+        let mut failed = Vec::new();
         for spec in &specs.externals {
-            let plugin = Self::load_external_plugin(
+            match Self::load_external_plugin(
                 spec,
                 host_mode,
                 mesh_tx.clone(),
@@ -344,10 +379,17 @@ impl PluginManager {
                 rpc_bridge.clone(),
                 runtime_data,
             )
-            .await?;
-            plugins.insert(spec.name.clone(), plugin);
+            .await
+            {
+                Ok(plugin) => {
+                    plugins.insert(spec.name.clone(), plugin);
+                }
+                Err(error) => {
+                    failed.push(Self::plugin_load_failure_summary(spec, &error));
+                }
+            }
         }
-        Ok(plugins)
+        (plugins, failed)
     }
 
     async fn load_external_plugin(
@@ -393,11 +435,43 @@ impl PluginManager {
         Ok(plugin)
     }
 
-    fn inactive_plugins(specs: &ResolvedPlugins) -> BTreeMap<String, PluginSummary> {
+    fn plugin_load_failure_summary(
+        spec: &ExternalPluginSpec,
+        error: &anyhow::Error,
+    ) -> PluginSummary {
+        tracing::warn!(
+            plugin = %spec.name,
+            command = %spec.command,
+            args = %format_args_for_log(&spec.args),
+            error = %error,
+            "Plugin disabled after load failure"
+        );
+        PluginSummary {
+            name: spec.name.clone(),
+            kind: "external".to_string(),
+            enabled: false,
+            status: "error".to_string(),
+            pid: None,
+            version: None,
+            capabilities: Vec::new(),
+            command: Some(spec.command.clone()),
+            args: spec.args.clone(),
+            tools: Vec::new(),
+            manifest: None,
+            startup: Some(spec.startup.summary()),
+            error: Some(error.to_string()),
+        }
+    }
+
+    fn inactive_plugins(
+        specs: &ResolvedPlugins,
+        failed_plugins: Vec<PluginSummary>,
+    ) -> BTreeMap<String, PluginSummary> {
         specs
             .inactive
             .iter()
             .cloned()
+            .chain(failed_plugins)
             .map(|summary| (summary.name.clone(), summary))
             .collect()
     }
@@ -493,6 +567,7 @@ impl PluginManager {
                         args: Vec::new(),
                         tools: Vec::new(),
                         manifest: Some(plugin_manifest_overview(&manifest)),
+                        startup: None,
                         error: None,
                     })
                     .collect::<Vec<_>>();
@@ -515,7 +590,7 @@ impl PluginManager {
         summaries
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub async fn shutdown(&self) {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         for plugin in self.inner.plugins.values() {
             plugin.shutdown().await;
@@ -581,6 +656,7 @@ impl PluginManager {
             args: Vec::new(),
             tools: Vec::new(),
             manifest: Some(plugin_manifest_overview(&manifest)),
+            startup: None,
             error: None,
         };
         self.publish_plugin_summary(&summary);
@@ -1074,7 +1150,7 @@ impl PluginManager {
     }
 
     #[cfg(test)]
-    pub async fn set_test_stream_handler<F>(&self, plugin_name: &str, handler: F)
+    pub(crate) async fn set_test_stream_handler<F>(&self, plugin_name: &str, handler: F)
     where
         F: Fn(proto::OpenStreamRequest) -> TestStreamFuture + Send + Sync + 'static,
     {
@@ -1265,7 +1341,11 @@ impl PluginManager {
         };
         self.publish_plugin_summary(&summary);
 
-        let manifest = self.manifest(plugin_name).await.ok().flatten();
+        let manifest = if let Some(plugin) = self.inner.plugins.get(plugin_name) {
+            plugin.manifest_snapshot().await
+        } else {
+            self.manifest(plugin_name).await.ok().flatten()
+        };
         let Some(manifest) = manifest else {
             self.clear_plugin_endpoint_health(plugin_name).await;
             self.publish_plugin_summary(&summary);
@@ -1815,9 +1895,6 @@ fn endpoint_models_url(address: &str) -> Option<Url> {
 pub async fn run_plugin_process(name: String) -> Result<()> {
     match name.as_str() {
         BLOBSTORE_PLUGIN_ID => crate::plugins::blobstore::run_plugin(name).await,
-        FLASH_MOE_PLUGIN_ID => crate::plugins::flash_moe::run_plugin(name).await,
-        OPENAI_ENDPOINT_PLUGIN_ID => crate::plugins::openai_endpoint::run_plugin(name).await,
-        TELEMETRY_PLUGIN_ID => crate::plugins::telemetry::run_plugin(name).await,
         _ => bail!("Unknown built-in plugin '{}'", name),
     }
 }
@@ -1866,9 +1943,8 @@ mod tests {
     #[test]
     fn resolves_default_builtin_plugins() {
         let resolved = resolve_plugins(&MeshConfig::default(), private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 2);
-        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 1);
+        assert_eq!(resolved.externals[0].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
@@ -1881,18 +1957,98 @@ mod tests {
                 command: Some("mesh-llm-plugin-demo".into()),
                 args: vec!["--stdio".into()],
                 url: None,
+                startup: Default::default(),
             }],
             defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 3);
-        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, "demo");
-        assert_eq!(resolved.externals[1].command, "mesh-llm-plugin-demo");
-        assert_eq!(resolved.externals[1].args, ["--stdio"]);
-        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals[0].name, "demo");
+        assert_eq!(resolved.externals[0].command, "mesh-llm-plugin-demo");
+        assert_eq!(resolved.externals[0].args, ["--stdio"]);
+        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
+    }
+
+    #[test]
+    fn external_plugin_startup_policy_is_resolved() {
+        let config = MeshConfig {
+            plugins: vec![PluginConfigEntry {
+                name: "metrics".into(),
+                enabled: Some(true),
+                command: Some("mesh-llm-plugin-metrics".into()),
+                args: Vec::new(),
+                url: None,
+                startup: PluginStartupConfig {
+                    connect_timeout_secs: Some(75),
+                    init_timeout_secs: Some(90),
+                    optional: true,
+                    lazy_start: true,
+                },
+            }],
+            defaults: None,
+            ..MeshConfig::default()
+        };
+
+        let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+        let spec = resolved
+            .externals
+            .iter()
+            .find(|spec| spec.name == "metrics")
+            .expect("configured plugin should resolve");
+
+        assert_eq!(spec.startup.connect_timeout().as_secs(), 75);
+        assert_eq!(spec.startup.init_timeout().as_secs(), 90);
+        assert!(spec.startup.optional);
+        assert!(spec.startup.lazy_start);
+    }
+
+    #[test]
+    fn optional_missing_installed_plugin_becomes_inactive_summary() {
+        let config = MeshConfig {
+            plugins: vec![PluginConfigEntry {
+                name: "missing-optional".into(),
+                enabled: Some(true),
+                command: None,
+                args: Vec::new(),
+                url: None,
+                startup: PluginStartupConfig {
+                    optional: true,
+                    ..PluginStartupConfig::default()
+                },
+            }],
+            defaults: None,
+            ..MeshConfig::default()
+        };
+
+        let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+
+        assert_eq!(
+            resolved
+                .inactive
+                .iter()
+                .filter(|summary| summary.name == "missing-optional")
+                .count(),
+            1
+        );
+        let summary = resolved
+            .inactive
+            .iter()
+            .find(|summary| summary.name == "missing-optional")
+            .unwrap();
+        assert_eq!(summary.status, "missing");
+        assert_eq!(
+            summary.startup.as_ref().map(|startup| startup.optional),
+            Some(true)
+        );
+        assert!(
+            summary
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("optional")
+        );
     }
 
     #[test]
@@ -1904,231 +2060,80 @@ mod tests {
                 command: None,
                 args: Vec::new(),
                 url: None,
+                startup: Default::default(),
             }],
             defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 1);
-        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert!(resolved.externals.is_empty());
         assert!(resolved.inactive.is_empty());
     }
 
     #[test]
-    fn telemetry_plugin_is_opt_out_builtin() {
-        let resolved = resolve_plugins(&MeshConfig::default(), private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 2);
-        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
-        assert!(resolved.externals[0].args.contains(&"--plugin".to_string()));
-        assert!(
-            resolved.externals[0]
-                .args
-                .contains(&TELEMETRY_PLUGIN_ID.to_string())
-        );
-
+    fn external_plugin_can_be_enabled_with_url() {
         let config = MeshConfig {
             plugins: vec![PluginConfigEntry {
-                name: TELEMETRY_PLUGIN_ID.into(),
-                enabled: Some(false),
-                command: None,
-                args: Vec::new(),
-                url: None,
-            }],
-            defaults: None,
-            ..MeshConfig::default()
-        };
-
-        let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 1);
-        assert_eq!(resolved.externals[0].name, BLOBSTORE_PLUGIN_ID);
-    }
-
-    #[test]
-    fn telemetry_plugin_rejects_custom_runtime_fields() {
-        let config = MeshConfig {
-            plugins: vec![PluginConfigEntry {
-                name: TELEMETRY_PLUGIN_ID.into(),
+                name: "endpoint-plugin".into(),
                 enabled: Some(true),
-                command: Some("/tmp/telemetry".into()),
-                args: Vec::new(),
-                url: None,
-            }],
-            defaults: None,
-            ..MeshConfig::default()
-        };
-
-        let result = resolve_plugins(&config, private_host_mode());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn openai_endpoint_can_be_enabled_with_url() {
-        let config = MeshConfig {
-            plugins: vec![PluginConfigEntry {
-                name: OPENAI_ENDPOINT_PLUGIN_ID.into(),
-                enabled: Some(true),
-                command: None,
+                command: Some("endpoint-plugin".into()),
                 args: Vec::new(),
                 url: Some("http://gpu-box:8000/v1".into()),
+                startup: Default::default(),
             }],
             defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 3);
-        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, OPENAI_ENDPOINT_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
-        let spec = &resolved.externals[1];
-        assert!(spec.args.contains(&"openai-endpoint".to_string()));
+        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals[0].name, "endpoint-plugin");
+        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        let spec = &resolved.externals[0];
+        assert_eq!(spec.command, "endpoint-plugin");
+        assert!(spec.args.is_empty());
         assert_eq!(spec.url.as_deref(), Some("http://gpu-box:8000/v1"));
     }
 
     #[test]
-    fn openai_endpoint_can_be_enabled_explicitly() {
+    fn external_plugin_can_be_enabled_with_command_args() {
         let config = MeshConfig {
             plugins: vec![PluginConfigEntry {
-                name: OPENAI_ENDPOINT_PLUGIN_ID.into(),
+                name: "endpoint-plugin".into(),
                 enabled: Some(true),
-                command: None,
-                args: Vec::new(),
+                command: Some("/opt/plugins/endpoint-plugin".into()),
+                args: vec!["--verbose".into()],
                 url: None,
+                startup: Default::default(),
             }],
             defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 3);
-        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, OPENAI_ENDPOINT_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
-        // Verify the spec args dispatch to the right plugin binary
-        let spec = &resolved.externals[1];
-        assert!(spec.args.contains(&"--plugin".to_string()));
-        assert!(spec.args.contains(&"openai-endpoint".to_string()));
+        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals[0].name, "endpoint-plugin");
+        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        let spec = &resolved.externals[0];
+        assert_eq!(spec.command, "/opt/plugins/endpoint-plugin");
+        assert_eq!(spec.args, vec!["--verbose"]);
     }
 
     #[test]
-    fn openai_endpoint_rejects_custom_command() {
+    fn external_plugin_ignores_disabled_entry_without_install() {
         let config = MeshConfig {
             plugins: vec![PluginConfigEntry {
-                name: OPENAI_ENDPOINT_PLUGIN_ID.into(),
-                enabled: Some(true),
-                command: Some("/usr/bin/something".into()),
+                name: "endpoint-plugin".into(),
+                enabled: Some(false),
+                command: None,
                 args: Vec::new(),
-                url: None,
+                url: Some("http://gpu-box:8000/v1".into()),
+                startup: Default::default(),
             }],
             defaults: None,
             ..MeshConfig::default()
         };
-        let result = resolve_plugins(&config, private_host_mode());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn flash_moe_can_be_enabled_with_managed_command() {
-        let config = MeshConfig {
-            plugins: vec![PluginConfigEntry {
-                name: FLASH_MOE_PLUGIN_ID.into(),
-                enabled: Some(true),
-                command: Some(" /opt/flash-moe/infer ".into()),
-                args: vec![
-                    "--model".into(),
-                    "/models/qwen3.5".into(),
-                    "--weights".into(),
-                    "/models/experts.bin".into(),
-                ],
-                url: None,
-            }],
-            ..MeshConfig::default()
-        };
-
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-
-        assert_eq!(resolved.externals.len(), 3);
-        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, FLASH_MOE_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
-        let spec = &resolved.externals[1];
-        assert!(spec.args.contains(&"--plugin".to_string()));
-        assert!(spec.args.contains(&FLASH_MOE_PLUGIN_ID.to_string()));
-        assert_eq!(
-            spec.env
-                .get("MESH_LLM_FLASH_MOE_COMMAND")
-                .map(String::as_str),
-            Some("/opt/flash-moe/infer")
-        );
-        assert_eq!(
-            spec.env
-                .get("MESH_LLM_FLASH_MOE_ARGS_JSON")
-                .map(String::as_str),
-            Some(r#"["--model","/models/qwen3.5","--weights","/models/experts.bin"]"#)
-        );
-        assert!(!spec.env.contains_key("MESH_LLM_FLASH_MOE_URL"));
-        assert_eq!(spec.url, None);
-    }
-
-    #[test]
-    fn flash_moe_can_attach_existing_endpoint() {
-        let config = MeshConfig {
-            plugins: vec![PluginConfigEntry {
-                name: FLASH_MOE_PLUGIN_ID.into(),
-                enabled: Some(true),
-                command: None,
-                args: Vec::new(),
-                url: Some(" http://127.0.0.1:8000/v1/ ".into()),
-            }],
-            ..MeshConfig::default()
-        };
-
-        let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        let spec = resolved
-            .externals
-            .iter()
-            .find(|spec| spec.name == FLASH_MOE_PLUGIN_ID)
-            .expect("flash-moe spec");
-
-        assert_eq!(
-            spec.env.get("MESH_LLM_FLASH_MOE_URL").map(String::as_str),
-            Some("http://127.0.0.1:8000/v1/")
-        );
-        assert!(!spec.env.contains_key("MESH_LLM_FLASH_MOE_COMMAND"));
-        assert!(spec.args.contains(&FLASH_MOE_PLUGIN_ID.to_string()));
-    }
-
-    #[test]
-    fn flash_moe_rejects_missing_command_or_url() {
-        let config = MeshConfig {
-            plugins: vec![PluginConfigEntry {
-                name: FLASH_MOE_PLUGIN_ID.into(),
-                enabled: Some(true),
-                command: None,
-                args: Vec::new(),
-                url: None,
-            }],
-            ..MeshConfig::default()
-        };
-
-        let err = resolve_plugins(&config, private_host_mode()).unwrap_err();
-        assert!(err.to_string().contains("requires `command` or `url`"));
-    }
-
-    #[test]
-    fn flash_moe_rejects_user_supplied_serve_arg() {
-        let config = MeshConfig {
-            plugins: vec![PluginConfigEntry {
-                name: FLASH_MOE_PLUGIN_ID.into(),
-                enabled: Some(true),
-                command: Some("/opt/flash-moe/infer".into()),
-                args: vec!["--serve".into(), "9000".into()],
-                url: None,
-            }],
-            ..MeshConfig::default()
-        };
-
-        let err = resolve_plugins(&config, private_host_mode()).unwrap_err();
-        assert!(err.to_string().contains("owns the flash-moe `--serve`"));
+        assert_eq!(resolved.externals.len(), 1);
+        assert_eq!(resolved.externals[0].name, BLOBSTORE_PLUGIN_ID);
     }
 
     #[test]
@@ -2140,9 +2145,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(resolved.externals.len(), 2);
-        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 1);
+        assert_eq!(resolved.externals[0].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
@@ -2155,16 +2159,88 @@ mod tests {
                 command: Some("/tmp/demo".into()),
                 args: vec!["--flag".into()],
                 url: None,
+                startup: Default::default(),
             }],
             defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 3);
-        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, "demo");
-        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals[0].name, "demo");
+        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plugin_load_failure_becomes_inactive_summary() {
+        let specs = ResolvedPlugins {
+            externals: vec![ExternalPluginSpec {
+                name: "broken".into(),
+                command: "mesh-llm-definitely-missing-plugin-binary".into(),
+                args: vec!["--stdio".into()],
+                url: None,
+                env: BTreeMap::new(),
+                startup: PluginStartupOptions::default(),
+            }],
+            inactive: Vec::new(),
+        };
+        let (mesh_tx, _mesh_rx) = mpsc::channel(1);
+
+        let manager = PluginManager::start(&specs, private_host_mode(), mesh_tx)
+            .await
+            .expect("broken plugin should not stop manager startup");
+        let summaries = manager.list().await;
+        manager.shutdown().await;
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].name, "broken");
+        assert_eq!(summaries[0].status, "error");
+        assert!(!summaries[0].error.as_deref().unwrap_or_default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lazy_start_plugin_does_not_block_manager_startup() {
+        let specs = ResolvedPlugins {
+            externals: vec![ExternalPluginSpec {
+                name: "lazy".into(),
+                command: "mesh-llm-definitely-missing-plugin-binary".into(),
+                args: Vec::new(),
+                url: None,
+                env: BTreeMap::new(),
+                startup: PluginStartupOptions {
+                    optional: true,
+                    lazy_start: true,
+                    ..PluginStartupOptions::default()
+                },
+            }],
+            inactive: Vec::new(),
+        };
+        let (mesh_tx, _mesh_rx) = mpsc::channel(1);
+
+        let manager = PluginManager::start(&specs, private_host_mode(), mesh_tx)
+            .await
+            .expect("lazy plugin should not start during manager startup");
+        let summaries = manager.list().await;
+        manager.shutdown().await;
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].name, "lazy");
+        assert_eq!(summaries[0].status, "deferred");
+        assert_eq!(
+            summaries[0]
+                .startup
+                .as_ref()
+                .map(|startup| startup.lazy_start),
+            Some(true)
+        );
+        assert!(summaries[0].pid.is_none());
+        assert!(
+            summaries[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("lazy")
+        );
     }
 
     #[test]
@@ -2212,6 +2288,7 @@ mod tests {
             args: Vec::new(),
             tools: Vec::new(),
             manifest: None,
+            startup: None,
             error: None,
         }
     }

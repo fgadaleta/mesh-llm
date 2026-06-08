@@ -8,17 +8,17 @@ pub mod proto {
 }
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub const STAGE_ALPN_V1: &[u8] = b"skippy-stage/1";
+pub const STAGE_ALPN_V2: &[u8] = b"skippy-stage/2";
 pub const STAGE_SUBPROTOCOL_NAME: &str = "skippy-stage";
-pub const STAGE_SUBPROTOCOL_MAJOR: u32 = 1;
+pub const STAGE_SUBPROTOCOL_MAJOR: u32 = 2;
 pub const STAGE_SUBPROTOCOL_FEATURE_STAGE_CONTROL: &str = "stage-control";
-pub const STAGE_PROTOCOL_GENERATION: u32 = 2;
+pub const STAGE_PROTOCOL_GENERATION: u32 = 3;
 /// Generation-scoped stage capability. A peer can advertise `stage-control`
 /// while still rejecting current-generation frames, so split planning gates on
-/// this exact token before sending gen=2 control requests.
-pub const STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2: &str = "stage-generation-2";
+/// this exact token before sending current-generation control requests.
+pub const STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V3: &str = "stage-generation-3";
 pub const STAGE_SUBPROTOCOL_FEATURE_STAGE_GENERATION: &str =
-    STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2;
+    STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V3;
 pub const STAGE_SUBPROTOCOL_FEATURE_ARTIFACT_TRANSFER: &str = "artifact-transfer";
 pub const STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST: &str = "status-list";
 pub const STAGE_STREAM_CONTROL: u8 = 0x01;
@@ -652,7 +652,7 @@ mod tests {
         stage_control_response,
     };
     use super::{
-        STAGE_PROTOCOL_GENERATION, STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2,
+        STAGE_PROTOCOL_GENERATION, STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V3,
         StageFrameError, validate_stage_artifact_transfer_request,
         validate_stage_artifact_transfer_response, validate_stage_control_request,
         validate_stage_control_response, validate_stage_transport_open,
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn stage_protocol_generation_feature_names_current_generation() {
         assert_eq!(
-            STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2,
+            STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V3,
             format!("stage-generation-{STAGE_PROTOCOL_GENERATION}")
         );
     }

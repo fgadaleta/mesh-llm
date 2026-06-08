@@ -356,6 +356,7 @@ impl RuntimeDataCollector {
             latest_version: input.latest_version,
             node_id: input.node_id,
             owner: build_ownership_payload(&input.owner),
+            release_attestation: input.release_attestation,
             token: input.token,
             node_state: derivation.node_state,
             node_status: derivation.node_status,
@@ -386,6 +387,9 @@ impl RuntimeDataCollector {
             inflight_requests: input.inflight_requests,
             mesh_id: input.mesh_id,
             mesh_name: input.mesh_name,
+            mesh_discovery_mode: input.mesh_discovery_mode,
+            discovery_scope: input.discovery_scope,
+            discovery_source: input.discovery_source,
             nostr_discovery: input.nostr_discovery,
             publication_state: input.publication_state,
             routing_affinity: input.routing_affinity,
@@ -942,7 +946,7 @@ fn derive_runtime_status(input: RuntimeStatusDerivationInput<'_>) -> RuntimeStat
         Some(format!(
             "mesh-llm pi --host 127.0.0.1:{} --model {}",
             input.api_port,
-            crate::cli::shell::single_quote(&display_model_name)
+            single_quote_shell_arg(&display_model_name)
         ))
     } else {
         None
@@ -965,6 +969,10 @@ fn derive_runtime_status(input: RuntimeStatusDerivationInput<'_>) -> RuntimeStat
         launch_pi,
         launch_goose,
     }
+}
+
+fn single_quote_shell_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn derive_local_node_state(
@@ -1032,6 +1040,7 @@ fn build_peer_payload(peer: &mesh::PeerInfo) -> PeerPayload {
     PeerPayload {
         id: peer.id.fmt_short().to_string(),
         owner: build_ownership_payload(&peer.owner_summary),
+        release_attestation: peer.release_attestation_summary.clone(),
         role: match peer.role {
             mesh::NodeRole::Worker => "Worker".into(),
             mesh::NodeRole::Host { .. } => "Host".into(),
@@ -1045,6 +1054,7 @@ fn build_peer_payload(peer: &mesh::PeerInfo) -> PeerPayload {
         serving_models: peer.serving_models.clone(),
         hosted_models: peer.hosted_models.clone(),
         hosted_models_known: peer.hosted_models_known,
+        advertised_model_throughput: peer.advertised_model_throughput.clone(),
         version: peer.version.clone(),
         rtt_ms: peer.rtt_ms,
         latency_ms: display_latency.latency_ms,

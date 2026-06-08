@@ -1,5 +1,7 @@
 mod chat;
+mod diagnostics;
 mod discover;
+mod mcp;
 mod mesh_hook;
 mod model_interests;
 mod model_targets;
@@ -31,6 +33,18 @@ pub(super) const DISPATCH_REQUEST: DispatchRequestFn =
             match (method, path_only) {
                 ("GET", "/api/discover") => {
                     discover::handle(stream, state).await?;
+                    Ok(true)
+                }
+                ("POST", p) if p == crate::network::discovery::LAN_DETAILS_PATH => {
+                    discover::handle_lan_details(stream, state, body).await?;
+                    Ok(true)
+                }
+                ("GET", "/api/diagnostics/split-readiness") => {
+                    diagnostics::handle(stream, state, path).await?;
+                    Ok(true)
+                }
+                ("GET" | "POST" | "DELETE", "/mcp") => {
+                    mcp::handle(stream, state, raw_request).await?;
                     Ok(true)
                 }
                 ("GET", "/api/status")

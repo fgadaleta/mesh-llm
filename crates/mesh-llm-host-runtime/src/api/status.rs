@@ -3,7 +3,8 @@
 //! Keep these shapes stable; the API layer and collector tests rely on them.
 
 use super::{RuntimeModelPayload, RuntimeProcessPayload};
-use crate::crypto::{OwnershipStatus, OwnershipSummary};
+use crate::crypto::{OwnershipStatus, OwnershipSummary, ReleaseAttestationSummary};
+use crate::mesh::requirements::{MeshRequirementPolicySummary, MeshRequirementRejectionEvent};
 use crate::network::{affinity, metrics};
 use crate::runtime_data;
 use crate::system::hardware::expand_gpu_names;
@@ -340,6 +341,7 @@ pub(crate) struct StatusPayload {
     pub(crate) latest_version: Option<String>,
     pub(crate) node_id: String,
     pub(crate) owner: OwnershipPayload,
+    pub(crate) release_attestation: ReleaseAttestationSummary,
     pub(crate) token: String,
     pub(crate) node_state: NodeState,
     pub(crate) node_status: String,
@@ -369,6 +371,9 @@ pub(crate) struct StatusPayload {
     pub(crate) mesh_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mesh_name: Option<String>,
+    pub(crate) mesh_discovery_mode: String,
+    pub(crate) discovery_scope: String,
+    pub(crate) discovery_source: String,
     pub(crate) nostr_discovery: bool,
     /// Best-effort publication state per Issue #240: private | public | publish_failed.
     pub(crate) publication_state: String,
@@ -381,6 +386,10 @@ pub(crate) struct StatusPayload {
     pub(crate) routing_metrics: metrics::RoutingMetricsStatusSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) first_joined_mesh_ts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mesh_requirements: Option<MeshRequirementPolicySummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) recent_mesh_rejections: Vec<MeshRequirementRejectionEvent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -399,6 +408,7 @@ pub(crate) struct WakeableNode {
 pub(crate) struct PeerPayload {
     pub(crate) id: String,
     pub(crate) owner: OwnershipPayload,
+    pub(crate) release_attestation: ReleaseAttestationSummary,
     pub(crate) role: String,
     pub(crate) state: NodeState,
     pub(crate) models: Vec<String>,
@@ -408,6 +418,8 @@ pub(crate) struct PeerPayload {
     pub(crate) serving_models: Vec<String>,
     pub(crate) hosted_models: Vec<String>,
     pub(crate) hosted_models_known: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) advertised_model_throughput: Vec<metrics::ModelThroughputHint>,
     pub(crate) version: Option<String>,
     pub(crate) rtt_ms: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -927,6 +939,7 @@ pub(super) fn decode_runtime_model_path(path: &str, prefix: &str) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReleaseAttestationSummary;
 
     fn test_owner_payload() -> OwnershipPayload {
         OwnershipPayload {
@@ -938,6 +951,10 @@ mod tests {
             node_label: None,
             hostname_hint: None,
         }
+    }
+
+    fn test_release_attestation_summary() -> ReleaseAttestationSummary {
+        ReleaseAttestationSummary::default()
     }
 
     #[test]
@@ -962,6 +979,7 @@ mod tests {
         let peer = PeerPayload {
             id: "test-id".to_string(),
             owner: test_owner_payload(),
+            release_attestation: test_release_attestation_summary(),
             role: "Worker".to_string(),
             state: NodeState::Standby,
             models: vec![],
@@ -971,6 +989,7 @@ mod tests {
             serving_models: vec![],
             hosted_models: vec![],
             hosted_models_known: false,
+            advertised_model_throughput: vec![],
             version: Some("0.56.0".to_string()),
             rtt_ms: None,
             latency_ms: None,
@@ -985,6 +1004,7 @@ mod tests {
 
         let json = serde_json::to_string(&peer).expect("serialization failed");
         assert!(json.contains("\"version\":\"0.56.0\""));
+        assert!(!json.contains("advertised_model_throughput"));
     }
 
     #[test]
@@ -992,6 +1012,7 @@ mod tests {
         let peer = PeerPayload {
             id: "test-id".to_string(),
             owner: test_owner_payload(),
+            release_attestation: test_release_attestation_summary(),
             role: "Worker".to_string(),
             state: NodeState::Standby,
             models: vec![],
@@ -1001,6 +1022,7 @@ mod tests {
             serving_models: vec![],
             hosted_models: vec![],
             hosted_models_known: false,
+            advertised_model_throughput: vec![],
             version: None,
             rtt_ms: None,
             latency_ms: None,
@@ -1031,6 +1053,7 @@ mod tests {
             latest_version: None,
             node_id: "node-1".to_string(),
             owner: test_owner_payload(),
+            release_attestation: test_release_attestation_summary(),
             token: "token-1".to_string(),
             node_state: NodeState::Loading,
             node_status: NodeState::Loading.node_status_alias().to_string(),
@@ -1062,6 +1085,9 @@ mod tests {
             inflight_requests: 0,
             mesh_id: None,
             mesh_name: None,
+            mesh_discovery_mode: "nostr".into(),
+            discovery_scope: "public".into(),
+            discovery_source: "nostr-relay".into(),
             nostr_discovery: false,
             publication_state: "private".into(),
             my_hostname: None,
@@ -1070,11 +1096,16 @@ mod tests {
             routing_affinity: affinity::AffinityStatsSnapshot::default(),
             routing_metrics: metrics::RoutingMetricsStatusSnapshot::default(),
             first_joined_mesh_ts: None,
+            mesh_requirements: None,
+            recent_mesh_rejections: vec![],
         };
 
         let json = serde_json::to_string(&status).expect("serialization failed");
         assert!(json.contains("\"node_state\":\"loading\""));
         assert!(json.contains("\"node_status\":\"Loading\""));
+        assert!(json.contains("\"mesh_discovery_mode\":\"nostr\""));
+        assert!(json.contains("\"discovery_scope\":\"public\""));
+        assert!(json.contains("\"discovery_source\":\"nostr-relay\""));
     }
 
     #[test]
@@ -1084,6 +1115,7 @@ mod tests {
             latest_version: None,
             node_id: "node-1".to_string(),
             owner: test_owner_payload(),
+            release_attestation: test_release_attestation_summary(),
             token: "token-1".to_string(),
             node_state: NodeState::Serving,
             node_status: NodeState::Serving.node_status_alias().to_string(),
@@ -1115,6 +1147,9 @@ mod tests {
             inflight_requests: 0,
             mesh_id: None,
             mesh_name: None,
+            mesh_discovery_mode: "nostr".into(),
+            discovery_scope: "public".into(),
+            discovery_source: "nostr-relay".into(),
             nostr_discovery: false,
             publication_state: "private".into(),
             my_hostname: None,
@@ -1123,6 +1158,8 @@ mod tests {
             routing_affinity: affinity::AffinityStatsSnapshot::default(),
             routing_metrics: metrics::RoutingMetricsStatusSnapshot::default(),
             first_joined_mesh_ts: None,
+            mesh_requirements: None,
+            recent_mesh_rejections: vec![],
         };
 
         let json = serde_json::to_string(&status).expect("serialization failed");
@@ -1137,6 +1174,7 @@ mod tests {
             latest_version: None,
             node_id: "node-1".to_string(),
             owner: test_owner_payload(),
+            release_attestation: test_release_attestation_summary(),
             token: "token-1".to_string(),
             node_state: NodeState::Standby,
             node_status: NodeState::Standby.node_status_alias().to_string(),
@@ -1175,6 +1213,9 @@ mod tests {
             inflight_requests: 0,
             mesh_id: None,
             mesh_name: None,
+            mesh_discovery_mode: "nostr".into(),
+            discovery_scope: "public".into(),
+            discovery_source: "nostr-relay".into(),
             nostr_discovery: false,
             publication_state: "private".into(),
             my_hostname: None,
@@ -1183,6 +1224,8 @@ mod tests {
             routing_affinity: affinity::AffinityStatsSnapshot::default(),
             routing_metrics: metrics::RoutingMetricsStatusSnapshot::default(),
             first_joined_mesh_ts: None,
+            mesh_requirements: None,
+            recent_mesh_rejections: vec![],
         };
 
         let json = serde_json::to_value(&status).expect("serialization failed");
@@ -1199,6 +1242,7 @@ mod tests {
             latest_version: None,
             node_id: "node-1".to_string(),
             owner: test_owner_payload(),
+            release_attestation: test_release_attestation_summary(),
             token: "token-1".to_string(),
             node_state: NodeState::Standby,
             node_status: NodeState::Standby.node_status_alias().to_string(),
@@ -1230,6 +1274,9 @@ mod tests {
             inflight_requests: 0,
             mesh_id: None,
             mesh_name: None,
+            mesh_discovery_mode: "nostr".into(),
+            discovery_scope: "public".into(),
+            discovery_source: "nostr-relay".into(),
             nostr_discovery: false,
             publication_state: "private".into(),
             my_hostname: None,
@@ -1238,6 +1285,8 @@ mod tests {
             routing_affinity: affinity::AffinityStatsSnapshot::default(),
             routing_metrics: metrics::RoutingMetricsStatusSnapshot::default(),
             first_joined_mesh_ts: None,
+            mesh_requirements: None,
+            recent_mesh_rejections: vec![],
         };
 
         let json = serde_json::to_value(&status).expect("serialization failed");
@@ -1250,6 +1299,7 @@ mod tests {
         let peer = PeerPayload {
             id: "test-id".to_string(),
             owner: test_owner_payload(),
+            release_attestation: test_release_attestation_summary(),
             role: "Host".to_string(),
             state: NodeState::Serving,
             models: vec![],
@@ -1259,6 +1309,7 @@ mod tests {
             serving_models: vec!["Qwen".to_string()],
             hosted_models: vec!["Qwen".to_string()],
             hosted_models_known: true,
+            advertised_model_throughput: vec![],
             version: Some("0.60.2".to_string()),
             rtt_ms: Some(12),
             latency_ms: None,

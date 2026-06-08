@@ -12,17 +12,7 @@ use crate::proto::node::{GossipFrame, NodeRole, PeerAnnouncement, RouteTableRequ
 use serial_test::serial;
 use skippy_protocol::proto::stage as skippy_stage_proto;
 use std::collections::{HashMap, HashSet};
-use tokio::sync::watch;
-
-/// Empty per-relay auth map for tests that don't exercise gated relays.
-///
-/// Bound to a local before being passed by reference so the borrow lives
-/// for the full duration of any async call — cleaner than `&HashMap::new()`
-/// at the call site, and future-proofs the call against the callee
-/// holding the reference across an internal `.await`.
-fn empty_relay_auths() -> HashMap<String, String> {
-    HashMap::new()
-}
+use tokio::sync::{mpsc, watch};
 
 #[test]
 fn quic_bind_addr_uses_explicit_port_on_all_platforms() {
@@ -70,6 +60,144 @@ fn quic_bind_addr_falls_back_to_localhost_ephemeral_on_windows() {
 #[cfg(not(target_os = "windows"))]
 fn quic_bind_addr_keeps_endpoint_default_on_non_windows() {
     assert_eq!(quic_bind_addr(QuicBindSelection::default()), None);
+}
+
+#[test]
+fn split_stage_path_allows_fast_direct_path() {
+    assert_eq!(
+        SplitStagePathSnapshot::direct(Some(MAX_SPLIT_RTT_MS)).stage_path_rejection(),
+        None
+    );
+}
+
+#[test]
+fn split_stage_path_rejects_missing_rtt() {
+    assert_eq!(
+        SplitStagePathSnapshot::direct(None).stage_path_rejection(),
+        Some(SplitStagePathRejection::MissingStagePath)
+    );
+}
+
+#[test]
+fn split_stage_path_accepts_direct_path_with_peer_rtt_fallback() {
+    assert_eq!(
+        SplitStagePathSnapshot::direct(None)
+            .with_direct_rtt_fallback(Some(MAX_SPLIT_RTT_MS))
+            .stage_path_rejection(),
+        None
+    );
+}
+
+#[test]
+fn split_stage_path_keeps_relay_rejection_with_peer_rtt_fallback() {
+    assert_eq!(
+        SplitStagePathSnapshot::relay(None)
+            .with_direct_rtt_fallback(Some(1))
+            .stage_path_rejection(),
+        Some(SplitStagePathRejection::StagePathRelayOnly)
+    );
+}
+
+#[test]
+fn split_stage_path_rejects_slow_peer_rtt_fallback() {
+    assert_eq!(
+        SplitStagePathSnapshot::direct(None)
+            .with_direct_rtt_fallback(Some(MAX_SPLIT_RTT_MS + 1))
+            .stage_path_rejection(),
+        Some(SplitStagePathRejection::StagePathTooSlow)
+    );
+}
+
+#[test]
+fn split_stage_path_rejects_relay_path() {
+    assert_eq!(
+        SplitStagePathSnapshot::relay(Some(1)).stage_path_rejection(),
+        Some(SplitStagePathRejection::StagePathRelayOnly)
+    );
+}
+
+#[test]
+fn split_stage_path_rejects_slow_direct_path() {
+    assert_eq!(
+        SplitStagePathSnapshot::direct(Some(MAX_SPLIT_RTT_MS + 1)).stage_path_rejection(),
+        Some(SplitStagePathRejection::StagePathTooSlow)
+    );
+}
+
+#[test]
+fn split_stage_path_rejects_unknown_path() {
+    assert_eq!(
+        SplitStagePathSnapshot::unknown().stage_path_rejection(),
+        Some(SplitStagePathRejection::MissingStagePath)
+    );
+}
+
+#[test]
+fn split_stage_path_uses_direct_peer_path_fallback_for_unknown_stage_path() {
+    let fallback = SelectedPathObservation {
+        path_type: "direct",
+        rtt_ms: Some(MAX_SPLIT_RTT_MS),
+        observed_direct_remote_addr: None,
+    };
+
+    assert_eq!(
+        SplitStagePathSnapshot::unknown()
+            .with_peer_path_fallback(Some(fallback))
+            .stage_path_rejection(),
+        None
+    );
+}
+
+#[test]
+fn split_stage_path_keeps_relay_peer_path_fallback_rejected() {
+    let fallback = SelectedPathObservation {
+        path_type: "relay",
+        rtt_ms: Some(1),
+        observed_direct_remote_addr: None,
+    };
+
+    assert_eq!(
+        SplitStagePathSnapshot::unknown()
+            .with_peer_path_fallback(Some(fallback))
+            .stage_path_rejection(),
+        Some(SplitStagePathRejection::StagePathRelayOnly)
+    );
+}
+
+#[test]
+fn split_stage_path_peer_fallback_does_not_convert_relay_rtt_to_direct() {
+    let mut peer = make_test_peer_info(make_test_endpoint_id(0x4a));
+    peer.rtt_ms = Some(1);
+    peer.selected_path = Some(SelectedPathObservation {
+        path_type: "relay",
+        rtt_ms: Some(1),
+        observed_direct_remote_addr: None,
+    });
+
+    assert_eq!(
+        SplitStagePathSnapshot::unknown()
+            .with_peer_path_fallback(peer.split_stage_path_fallback())
+            .stage_path_rejection(),
+        Some(SplitStagePathRejection::StagePathRelayOnly)
+    );
+}
+
+#[test]
+fn split_stage_path_peer_fallback_uses_best_direct_rtt() {
+    let mut peer = make_test_peer_info(make_test_endpoint_id(0x4b));
+    peer.rtt_ms = Some(MAX_SPLIT_RTT_MS);
+    peer.selected_path = Some(SelectedPathObservation {
+        path_type: "direct",
+        rtt_ms: None,
+        observed_direct_remote_addr: None,
+    });
+
+    assert_eq!(
+        SplitStagePathSnapshot::unknown()
+            .with_peer_path_fallback(peer.split_stage_path_fallback())
+            .stage_path_rejection(),
+        None
+    );
 }
 
 #[test]
@@ -156,16 +284,24 @@ fn stage_load_request() -> crate::inference::skippy::StageLoadRequest {
 }
 
 async fn make_test_node(role: super::NodeRole) -> Result<Node> {
+    make_test_node_with_requirements(role, crate::MeshRequirements::unrestricted()).await
+}
+
+async fn make_test_node_with_requirements(
+    role: super::NodeRole,
+    local_mesh_requirements: crate::MeshRequirements,
+) -> Result<Node> {
     use iroh::endpoint::QuicTransportConfig;
 
     let transport_config = QuicTransportConfig::builder()
         .max_concurrent_bidi_streams(128u32.into())
         .build();
+    let endpoint_secret_key = SecretKey::generate();
     let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .secret_key(SecretKey::generate())
+        .secret_key(endpoint_secret_key.clone())
         .alpns(vec![
             ALPN_V1.to_vec(),
-            skippy_protocol::STAGE_ALPN_V1.to_vec(),
+            skippy_protocol::STAGE_ALPN_V2.to_vec(),
         ])
         .transport_config(transport_config)
         .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
@@ -187,8 +323,11 @@ async fn make_test_node(role: super::NodeRole) -> Result<Node> {
 
     let node = Node {
         endpoint,
+        endpoint_secret_key,
         public_addr: None,
         quic_bind: QuicBindSelection::default(),
+        owner_keypair: None,
+        local_mesh_requirements,
         state: Arc::new(Mutex::new(MeshState {
             peers: HashMap::new(),
             connections: HashMap::new(),
@@ -198,6 +337,8 @@ async fn make_test_node(role: super::NodeRole) -> Result<Node> {
             seen_plugin_messages: HashMap::new(),
             seen_plugin_message_order: VecDeque::new(),
             policy_rejected_peers: HashMap::new(),
+            requirement_rejected_peers: HashSet::new(),
+            recent_mesh_rejections: VecDeque::new(),
         })),
         role: Arc::new(Mutex::new(role)),
         models: Arc::new(Mutex::new(Vec::new())),
@@ -212,6 +353,10 @@ async fn make_test_node(role: super::NodeRole) -> Result<Node> {
         explicit_model_interests: Arc::new(Mutex::new(Vec::new())),
         model_demand: Arc::new(std::sync::Mutex::new(HashMap::new())),
         mesh_id: Arc::new(Mutex::new(None)),
+        mesh_policy_hash: Arc::new(Mutex::new(None)),
+        genesis_policy: Arc::new(Mutex::new(None)),
+        signed_genesis_policy: Arc::new(Mutex::new(None)),
+        bootstrap_token: Arc::new(Mutex::new(None)),
         first_joined_mesh_ts: Arc::new(Mutex::new(None)),
         accepting: Arc::new((
             tokio::sync::Notify::new(),
@@ -232,10 +377,15 @@ async fn make_test_node(role: super::NodeRole) -> Result<Node> {
         stage_transport_tx,
         stage_control_tx: Arc::new(Mutex::new(None)),
         stage_transport_bridges: Arc::new(Mutex::new(HashMap::new())),
+        stage_transport_aliases: Arc::new(Mutex::new(HashMap::new())),
         stage_topologies: Arc::new(Mutex::new(StageTopologyState::default())),
         plugin_manager: Arc::new(Mutex::new(None)),
         display_name: Arc::new(Mutex::new(None)),
         owner_attestation: Arc::new(Mutex::new(None)),
+        release_attestation: Arc::new(Mutex::new(None)),
+        release_attestation_summary: Arc::new(Mutex::new(
+            crate::ReleaseAttestationSummary::default(),
+        )),
         owner_summary: Arc::new(Mutex::new(OwnershipSummary::default())),
         control_listener: Arc::new(Mutex::new(None)),
         trust_store: Arc::new(Mutex::new(TrustStore::default())),
@@ -289,6 +439,7 @@ async fn set_serving_models_preserves_existing_known_descriptor_capabilities_whe
             ..Default::default()
         },
         topology: None,
+        metadata: None,
     })
     .await;
 
@@ -948,12 +1099,16 @@ fn make_test_peer_info(peer_id: EndpointId) -> PeerInfo {
             id: peer_id,
             addrs: Default::default(),
         },
+        mesh_id: None,
+        mesh_policy_hash: None,
+        genesis_policy: None,
         role: super::NodeRole::Worker,
         first_joined_mesh_ts: None,
         models: vec![],
         vram_bytes: 0,
         rtt_ms: None,
         model_source: None,
+        admitted: true,
         serving_models: vec![],
         hosted_models: vec![],
         hosted_models_known: false,
@@ -982,6 +1137,7 @@ fn make_test_peer_info(peer_id: EndpointId) -> PeerInfo {
             ready: true,
         }],
         owner_attestation: None,
+        release_attestation_summary: crate::ReleaseAttestationSummary::default(),
         artifact_transfer_supported: false,
         stage_protocol_generation_supported: false,
         stage_status_list_supported: false,
@@ -989,6 +1145,7 @@ fn make_test_peer_info(peer_id: EndpointId) -> PeerInfo {
         advertised_model_throughput: vec![],
 
         display_rtt: None,
+        selected_path: None,
         propagated_latency: None,
     }
 }
@@ -1139,8 +1296,7 @@ async fn control_plane_listener_starts_with_owner() -> anyhow::Result<()> {
     let (node, secret_key) = Node::new_for_tests_with_secret(super::NodeRole::Worker).await?;
     *node.owner_summary.lock().await = verified_owner_summary("owner-a");
 
-    let auths = empty_relay_auths();
-    node.maybe_start_control_listener(secret_key, None, None, None, &auths)
+    node.maybe_start_control_listener(secret_key, None, None, None)
         .await?;
 
     let endpoint = node
@@ -1165,8 +1321,7 @@ async fn control_plane_listener_uses_explicit_advertised_address() -> anyhow::Re
     *node.owner_summary.lock().await = verified_owner_summary("owner-a");
     let advertised_addr = std::net::SocketAddr::from(([203, 0, 113, 10], 18443));
 
-    let auths = empty_relay_auths();
-    node.maybe_start_control_listener(secret_key, None, Some(advertised_addr), None, &auths)
+    node.maybe_start_control_listener(secret_key, None, Some(advertised_addr), None)
         .await?;
 
     let endpoint = node
@@ -1190,13 +1345,11 @@ async fn control_plane_listener_uses_explicit_advertised_address() -> anyhow::Re
 async fn control_plane_listener_disabled_without_owner() -> anyhow::Result<()> {
     let (node, secret_key) = Node::new_for_tests_with_secret(super::NodeRole::Worker).await?;
 
-    let auths = empty_relay_auths();
     node.maybe_start_control_listener(
         secret_key,
         Some("127.0.0.1:7447".parse().unwrap()),
         None,
         None,
-        &auths,
     )
     .await?;
 
@@ -1208,8 +1361,7 @@ async fn control_plane_listener_disabled_without_owner() -> anyhow::Result<()> {
 async fn control_plane_listener_accepts_only_control_alpn() -> anyhow::Result<()> {
     let (node, secret_key) = Node::new_for_tests_with_secret(super::NodeRole::Worker).await?;
     *node.owner_summary.lock().await = verified_owner_summary("owner-a");
-    let auths = empty_relay_auths();
-    node.maybe_start_control_listener(secret_key, None, None, None, &auths)
+    node.maybe_start_control_listener(secret_key, None, None, None)
         .await?;
     let endpoint = Node::decode_invite_token(
         &node
@@ -1239,8 +1391,7 @@ async fn control_plane_listener_accepts_only_control_alpn() -> anyhow::Result<()
 async fn control_plane_endpoint_not_in_gossip_or_status() -> anyhow::Result<()> {
     let (node, secret_key) = Node::new_for_tests_with_secret(super::NodeRole::Worker).await?;
     *node.owner_summary.lock().await = verified_owner_summary("owner-a");
-    let auths = empty_relay_auths();
-    node.maybe_start_control_listener(secret_key, None, None, None, &auths)
+    node.maybe_start_control_listener(secret_key, None, None, None)
         .await?;
     let control_endpoint = node
         .control_endpoint()
@@ -1273,11 +1424,55 @@ async fn control_plane_endpoint_not_in_gossip_or_status() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
+async fn external_inference_endpoint_models_are_advertised_in_gossip() -> anyhow::Result<()> {
+    let node = Node::new_for_tests(super::NodeRole::Worker).await?;
+    let resolved_plugins = plugin::ResolvedPlugins {
+        externals: vec![],
+        inactive: vec![],
+    };
+    let (mesh_tx, _mesh_rx) = mpsc::channel(1);
+    let plugin_manager = plugin::PluginManager::start(
+        &resolved_plugins,
+        plugin::PluginHostMode {
+            mesh_visibility: mesh_llm_plugin::MeshVisibility::Private,
+        },
+        mesh_tx,
+    )
+    .await?;
+    plugin_manager
+        .set_test_inference_endpoints(vec![plugin::InferenceEndpointRoute {
+            plugin_name: "endpoint-plugin".into(),
+            endpoint_id: "endpoint-plugin".into(),
+            address: "http://127.0.0.1:8000/v1".into(),
+            models: vec!["lemonade-small".into()],
+        }])
+        .await;
+    node.set_plugin_manager(plugin_manager).await;
+
+    let announcements = node.collect_announcements().await;
+    let local = announcements.last().expect("local announcement");
+
+    assert!(local.models.iter().any(|model| model == "lemonade-small"));
+    assert!(
+        local
+            .serving_models
+            .iter()
+            .any(|model| model == "lemonade-small")
+    );
+    assert!(
+        local
+            .hosted_models
+            .as_ref()
+            .is_some_and(|models| models.iter().any(|model| model == "lemonade-small"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn control_plane_listener_shutdown_stops_listener_task() -> anyhow::Result<()> {
     let (node, secret_key) = Node::new_for_tests_with_secret(super::NodeRole::Worker).await?;
     *node.owner_summary.lock().await = verified_owner_summary("owner-a");
-    let auths = empty_relay_auths();
-    node.maybe_start_control_listener(secret_key, None, None, None, &auths)
+    node.maybe_start_control_listener(secret_key, None, None, None)
         .await?;
     let endpoint = Node::decode_invite_token(
         &node
@@ -1399,6 +1594,7 @@ async fn control_plane_get_watch_apply_config() -> Result<()> {
         }],
         plugins: vec![],
         config_toml: None,
+        mesh_requirements: None,
     };
     write_len_prefixed(
         &mut apply_send,
@@ -1555,6 +1751,7 @@ async fn control_plane_watch_observes_apply_revision() -> Result<()> {
                         models: vec![],
                         plugins: vec![],
                         config_toml: None,
+                        mesh_requirements: None,
                     }),
                 }),
                 refresh_inventory: None,
@@ -1722,6 +1919,7 @@ async fn control_plane_watch_without_snapshot_observes_apply_revision() -> Resul
                         models: vec![],
                         plugins: vec![],
                         config_toml: None,
+                        mesh_requirements: None,
                     }),
                 }),
                 refresh_inventory: None,
@@ -1804,6 +2002,7 @@ async fn control_plane_apply_rejects_stale_revision() -> Result<()> {
                     }],
                     plugins: vec![],
                     config_toml: None,
+                    mesh_requirements: None,
                 }),
             }),
             refresh_inventory: None,
@@ -1887,6 +2086,7 @@ async fn control_plane_apply_rejects_malformed_full_config_toml() -> Result<()> 
                         models: vec![],
                         plugins: vec![],
                         config_toml: Some("not valid toml = [".to_string()),
+                        mesh_requirements: None,
                     }),
                 }),
                 refresh_inventory: None,
@@ -3042,13 +3242,14 @@ fn incoming_peer_promoted_after_valid_gossip() {
         "peer must NOT be admitted before gossip"
     );
 
-    for &tunnel_stream in &[STREAM_TUNNEL, STREAM_TUNNEL_HTTP] {
-        assert!(
-            !stream_allowed_before_admission(tunnel_stream),
-            "stream {:#04x} must be gated until after admission — unadmitted peers must not reach tunnel paths",
-            tunnel_stream
-        );
-    }
+    assert!(
+        !stream_allowed_before_admission(STREAM_TUNNEL),
+        "raw tunnel streams must be gated until after admission"
+    );
+    assert!(
+        stream_allowed_before_admission(STREAM_TUNNEL_HTTP),
+        "HTTP tunnel streams must be allowed for passive SDK clients"
+    );
 
     assert!(
         stream_allowed_before_admission(STREAM_GOSSIP),
@@ -3097,12 +3298,12 @@ fn incoming_peer_rejected_on_legacy_or_malformed_gossip() {
 
     for stream_type in [
         STREAM_TUNNEL,
-        STREAM_TUNNEL_HTTP,
         STREAM_TUNNEL_MAP,
         STREAM_PEER_DOWN,
         STREAM_PEER_LEAVING,
         STREAM_PLUGIN_CHANNEL,
         STREAM_PLUGIN_BULK_TRANSFER,
+        STREAM_PLUGIN_MESH_STREAM,
     ] {
         assert!(
             !stream_allowed_before_admission(stream_type),
@@ -3118,6 +3319,10 @@ fn incoming_peer_rejected_on_legacy_or_malformed_gossip() {
     assert!(
         stream_allowed_before_admission(STREAM_ROUTE_REQUEST),
         "STREAM_ROUTE_REQUEST must bypass the gate (passive/client request-only path)"
+    );
+    assert!(
+        stream_allowed_before_admission(STREAM_TUNNEL_HTTP),
+        "STREAM_TUNNEL_HTTP must bypass the gate (passive/client inference path)"
     );
 
     let peer_id = EndpointId::from(SecretKey::from_bytes(&[0xcd; 32]).public());
@@ -3145,12 +3350,12 @@ fn passive_route_table_request_does_not_admit_peer() {
 
     for &gated in &[
         STREAM_TUNNEL,
-        STREAM_TUNNEL_HTTP,
         STREAM_TUNNEL_MAP,
         STREAM_PEER_DOWN,
         STREAM_PEER_LEAVING,
         STREAM_PLUGIN_CHANNEL,
         STREAM_PLUGIN_BULK_TRANSFER,
+        STREAM_PLUGIN_MESH_STREAM,
     ] {
         assert!(
             !stream_allowed_before_admission(gated),
@@ -3273,6 +3478,7 @@ fn gossip_frame_roundtrip_preserves_scanned_model_metadata() {
         vocab_size: 151936,
         embedding_size: 4096,
         head_count: 32,
+        kv_head_count: 0,
         layer_count: 36,
         feed_forward_length: 14336,
         key_length: 128,
@@ -3286,6 +3492,7 @@ fn gossip_frame_roundtrip_preserves_scanned_model_metadata() {
         expert_count: 0,
         used_expert_count: 0,
         quantization_type: "Q4_K_M".to_string(),
+        parameter_size: None,
     };
 
     let mut model_sizes = HashMap::new();
@@ -3315,6 +3522,7 @@ fn gossip_frame_roundtrip_preserves_scanned_model_metadata() {
         version: Some("0.42.0".to_string()),
         model_demand: HashMap::new(),
         mesh_id: Some("deadbeef12345678".to_string()),
+        mesh_policy_hash: None,
         gpu_name: Some("Apple M4 Max".to_string()),
         hostname: Some("test-node".to_string()),
         is_soc: Some(true),
@@ -3341,6 +3549,7 @@ fn gossip_frame_roundtrip_preserves_scanned_model_metadata() {
             capabilities_known: true,
             capabilities: crate::models::ModelCapabilities::default(),
             topology: None,
+            metadata: None,
         }],
         served_model_runtime: vec![ModelRuntimeDescriptor {
             model_name: "Qwen3-8B-Q4_K_M".to_string(),
@@ -3349,6 +3558,9 @@ fn gossip_frame_roundtrip_preserves_scanned_model_metadata() {
             ready: true,
         }],
         owner_attestation: None,
+        genesis_policy: None,
+        release_attestation: None,
+        direct_admission_proof: None,
         artifact_transfer_supported: false,
         stage_protocol_generation_supported: false,
         stage_status_list_supported: false,
@@ -3491,6 +3703,7 @@ fn proto_ann_to_local_treats_missing_default_capability_provenance_as_unknown() 
             capabilities: Some(crate::proto::node::ModelCapabilities::default()),
             capabilities_known: None,
             topology: None,
+            metadata: None,
         }],
         ..Default::default()
     };
@@ -3579,6 +3792,7 @@ fn transitive_peer_update_refreshes_metadata_fields() {
         vocab_size: 32000,
         embedding_size: 4096,
         head_count: 32,
+        kv_head_count: 0,
         layer_count: 32,
         feed_forward_length: 11008,
         key_length: 128,
@@ -3592,6 +3806,7 @@ fn transitive_peer_update_refreshes_metadata_fields() {
         expert_count: 0,
         used_expert_count: 0,
         quantization_type: "Q4_K_M".to_string(),
+        parameter_size: None,
     };
 
     let mut new_sizes = HashMap::new();
@@ -3616,6 +3831,7 @@ fn transitive_peer_update_refreshes_metadata_fields() {
         version: None,
         model_demand: HashMap::new(),
         mesh_id: None,
+        mesh_policy_hash: None,
         gpu_name: None,
         hostname: None,
         is_soc: None,
@@ -3630,6 +3846,9 @@ fn transitive_peer_update_refreshes_metadata_fields() {
         served_model_descriptors: vec![],
         served_model_runtime: vec![],
         owner_attestation: None,
+        genesis_policy: None,
+        release_attestation: None,
+        direct_admission_proof: None,
         artifact_transfer_supported: true,
         stage_protocol_generation_supported: true,
         stage_status_list_supported: true,
@@ -3702,6 +3921,7 @@ fn transitive_peer_merge_preserves_richer_direct_address() {
         version: None,
         model_demand: HashMap::new(),
         mesh_id: None,
+        mesh_policy_hash: None,
         gpu_name: None,
         hostname: None,
         is_soc: None,
@@ -3716,6 +3936,9 @@ fn transitive_peer_merge_preserves_richer_direct_address() {
         served_model_descriptors: vec![],
         served_model_runtime: vec![],
         owner_attestation: None,
+        genesis_policy: None,
+        release_attestation: None,
+        direct_admission_proof: None,
         artifact_transfer_supported: true,
         stage_protocol_generation_supported: true,
         stage_status_list_supported: true,
@@ -3762,6 +3985,7 @@ fn transitive_peer_merge_preserves_richer_direct_address() {
         version: None,
         model_demand: HashMap::new(),
         mesh_id: None,
+        mesh_policy_hash: None,
         gpu_name: None,
         hostname: None,
         is_soc: None,
@@ -3776,6 +4000,9 @@ fn transitive_peer_merge_preserves_richer_direct_address() {
         served_model_descriptors: vec![],
         served_model_runtime: vec![],
         owner_attestation: None,
+        genesis_policy: None,
+        release_attestation: None,
+        direct_admission_proof: None,
         artifact_transfer_supported: true,
         stage_protocol_generation_supported: true,
         stage_status_list_supported: true,
@@ -4345,6 +4572,7 @@ fn transitive_peer_update_refreshes_last_mentioned() {
         version: None,
         model_demand: HashMap::new(),
         mesh_id: None,
+        mesh_policy_hash: None,
         gpu_name: None,
         hostname: None,
         is_soc: None,
@@ -4359,6 +4587,9 @@ fn transitive_peer_update_refreshes_last_mentioned() {
         served_model_descriptors: vec![],
         served_model_runtime: vec![],
         owner_attestation: None,
+        genesis_policy: None,
+        release_attestation: None,
+        direct_admission_proof: None,
         artifact_transfer_supported: true,
         stage_protocol_generation_supported: true,
         stage_status_list_supported: true,
@@ -4576,6 +4807,7 @@ fn remote_model_scans_are_ignored_after_gossip() {
         vocab_size: 128256,
         embedding_size: 8192,
         head_count: 64,
+        kv_head_count: 0,
         layer_count: 80,
         feed_forward_length: 28672,
         key_length: 128,
@@ -4589,6 +4821,7 @@ fn remote_model_scans_are_ignored_after_gossip() {
         expert_count: 0,
         used_expert_count: 0,
         quantization_type: "Q4_K_M".to_string(),
+        parameter_size: None,
     };
     let mut model_sizes = std::collections::HashMap::new();
     model_sizes.insert("Llama-3.3-70B-Q4_K_M".to_string(), 42_000_000_000u64);
@@ -4957,18 +5190,16 @@ fn dead_peer_ttl_expires() {
 /// Verifies that non-scope tunnel streams (0x02 STREAM_TUNNEL and 0x04
 /// STREAM_TUNNEL_HTTP) are NOT subject to protobuf frame validation — they are
 /// raw byte pass-throughs and must not be accidentally broken by the cut-over.
-/// Also verifies they are correctly gated by admission policy.
+/// Also verifies their admission policy.
 #[test]
 fn non_scope_tunnel_streams_pass_through_without_proto_validation() {
-    // 0x02 and 0x04 must NOT be allowed before admission (they are raw TCP tunnels,
-    // quarantined until the peer is admitted via gossip).
     assert!(
         !stream_allowed_before_admission(STREAM_TUNNEL),
         "STREAM_TUNNEL (0x02) must be gated until after gossip admission"
     );
     assert!(
-        !stream_allowed_before_admission(STREAM_TUNNEL_HTTP),
-        "STREAM_TUNNEL_HTTP (0x04) must be gated until after gossip admission"
+        stream_allowed_before_admission(STREAM_TUNNEL_HTTP),
+        "STREAM_TUNNEL_HTTP (0x04) must be allowed for passive SDK inference"
     );
 
     // After admission these streams are live. Verify that the stream type constants
@@ -5012,15 +5243,10 @@ fn non_scope_tunnel_streams_pass_through_without_proto_validation() {
         err
     );
 
-    // Verify that all admission-gated streams besides tunnels are also gated
-    // (completeness check for non-scope stream policy)
-    for stream in [STREAM_TUNNEL, STREAM_TUNNEL_HTTP] {
-        assert!(
-            !stream_allowed_before_admission(stream),
-            "stream {:#04x} must require admission (raw tunnel security boundary)",
-            stream
-        );
-    }
+    assert!(
+        !stream_allowed_before_admission(STREAM_TUNNEL),
+        "STREAM_TUNNEL must require admission (raw tunnel security boundary)"
+    );
 }
 
 /// Proves the behavioral contract introduced in the reconnect fix:
@@ -5082,12 +5308,16 @@ fn make_test_peer(id: EndpointId, rtt_ms: Option<u32>, vram_gb: u64) -> PeerInfo
             id,
             addrs: Default::default(),
         },
+        mesh_id: None,
+        mesh_policy_hash: None,
+        genesis_policy: None,
         role: super::NodeRole::Worker,
         first_joined_mesh_ts: None,
         models: vec![],
         vram_bytes: vram_gb * 1024 * 1024 * 1024,
         rtt_ms,
         model_source: None,
+        admitted: true,
         serving_models: vec![],
         hosted_models: vec![],
         hosted_models_known: false,
@@ -5111,6 +5341,7 @@ fn make_test_peer(id: EndpointId, rtt_ms: Option<u32>, vram_gb: u64) -> PeerInfo
         served_model_descriptors: vec![],
         served_model_runtime: vec![],
         owner_attestation: None,
+        release_attestation_summary: crate::ReleaseAttestationSummary::default(),
         artifact_transfer_supported: false,
         stage_protocol_generation_supported: false,
         stage_status_list_supported: false,
@@ -5118,6 +5349,7 @@ fn make_test_peer(id: EndpointId, rtt_ms: Option<u32>, vram_gb: u64) -> PeerInfo
         advertised_model_throughput: vec![],
 
         display_rtt: None,
+        selected_path: None,
         propagated_latency: None,
     }
 }
@@ -5242,31 +5474,28 @@ async fn test_rtt_cannot_regress() -> Result<()> {
     Ok(())
 }
 
-/// Regression test: connect_to_peer must skip peers already in state.peers,
-/// even if there's no QUIC connection yet (transitive peers from gossip).
-/// If this check uses state.connections instead, every transitive peer
-/// triggers a 15s dial timeout and --client --auto hangs.
-/// See: d631c8d (broke it), 6ece4d1 (first revert).
+/// Discovered peers must still be dialed directly before admission.
 #[tokio::test]
-async fn test_connect_to_peer_skips_known_peer_without_connection() -> Result<()> {
+async fn test_connect_to_peer_attempts_direct_verification_for_known_unadmitted_peer() -> Result<()>
+{
     let node = make_test_node(super::NodeRole::Client).await?;
     let peer_key = SecretKey::generate();
     let peer_id = EndpointId::from(peer_key.public());
 
-    // Simulate a transitive peer: in state.peers but NOT in state.connections
+    // Simulate a transitive peer: tracked as a hint but not yet admitted.
     {
         let mut state = node.state.lock().await;
-        state
-            .peers
-            .insert(peer_id, make_test_peer(peer_id, Some(50), 8));
+        let mut peer = make_test_peer(peer_id, Some(50), 8);
+        peer.admitted = false;
+        state.peers.insert(peer_id, peer);
         assert!(
             !state.connections.contains_key(&peer_id),
             "setup: peer must not have a connection"
         );
     }
 
-    // connect_to_peer must return Ok immediately (peer already known).
-    // If it tries to dial, it will either timeout (15s) or fail — both wrong.
+    // connect_to_peer must attempt direct verification instead of treating the
+    // hint as already admitted.
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         node.connect_to_peer(super::EndpointAddr {
@@ -5278,11 +5507,11 @@ async fn test_connect_to_peer_skips_known_peer_without_connection() -> Result<()
 
     assert!(
         result.is_ok(),
-        "connect_to_peer must not attempt to dial a peer already in state.peers"
+        "connect_to_peer should complete quickly for a discovered-only peer"
     );
     assert!(
-        result.unwrap().is_ok(),
-        "connect_to_peer must return Ok for known peers"
+        result.unwrap().is_err(),
+        "connect_to_peer must try direct verification instead of silently accepting a hint"
     );
 
     Ok(())
@@ -5300,13 +5529,17 @@ async fn test_on_demand_transitive_peer_connection_completes_gossip() -> Result<
     bridge.start_accepting();
     client.start_accepting();
 
-    bridge.join(&host.invite_token()).await?;
-    wait_for_peer(&bridge, host.id()).await;
-    wait_for_peer(&host, bridge.id()).await;
+    bridge.sync_from_peer_for_tests(&host).await;
+    assert!(bridge.peers().await.iter().any(|peer| peer.id == host.id()));
 
-    client.join(&bridge.invite_token()).await?;
-    wait_for_peer(&client, bridge.id()).await;
-    wait_for_peer(&client, host.id()).await;
+    client.sync_from_peer_for_tests(&bridge).await;
+    assert!(
+        client
+            .peers()
+            .await
+            .iter()
+            .any(|peer| peer.id == bridge.id())
+    );
 
     {
         let state = client.state.lock().await;
@@ -5316,16 +5549,16 @@ async fn test_on_demand_transitive_peer_connection_completes_gossip() -> Result<
         );
     }
     assert!(
-        client
+        !client
             .hosts_for_model("remote-coding-model")
             .await
             .contains(&host.id()),
-        "setup: client should route the remote model to the transitive host"
+        "setup: client must not route to the transitive host before direct verification"
     );
 
     let _conn = client.connection_to_peer(host.id()).await?;
 
-    wait_for_peer(&host, client.id()).await;
+    wait_for_peer(&client, host.id()).await;
     {
         let state = client.state.lock().await;
         assert!(
@@ -5333,6 +5566,13 @@ async fn test_on_demand_transitive_peer_connection_completes_gossip() -> Result<
             "on-demand connection should be retained after gossip succeeds"
         );
     }
+    assert!(
+        client
+            .hosts_for_model("remote-coding-model")
+            .await
+            .contains(&host.id()),
+        "the host should become routable after direct gossip succeeds"
+    );
 
     Ok(())
 }
@@ -5352,6 +5592,10 @@ fn legacy_config_stream_ids_are_reserved_and_require_admission() {
 fn test_owner_keypair(signing_seed: u8, encryption_seed: u8) -> crate::crypto::OwnerKeypair {
     crate::crypto::OwnerKeypair::from_bytes(&[signing_seed; 32], &[encryption_seed; 32])
         .expect("test owner keypair must be valid")
+}
+
+fn requirement_policy_owner() -> crate::crypto::OwnerKeypair {
+    test_owner_keypair(0xb1, 0xb2)
 }
 
 fn proto_signed_node_ownership(
@@ -5461,8 +5705,7 @@ async fn start_owner_control_test_server(
     *node.owner_attestation.lock().await = Some(ownership);
     *node.owner_summary.lock().await = owner_summary;
     *node.trust_store.lock().await = trust_store;
-    let auths = empty_relay_auths();
-    node.maybe_start_control_listener(secret_key.clone(), None, None, None, &auths)
+    node.maybe_start_control_listener(secret_key.clone(), None, None, None)
         .await?;
     Ok((node, secret_key, config_path))
 }
@@ -5482,6 +5725,1303 @@ async fn wait_for_peer(node: &Node, target: EndpointId) {
     })
     .await
     .expect("peer was not admitted within 5 s");
+}
+
+fn requirement_policy(trusted_signer: &str) -> crate::MeshGenesisPolicy {
+    crate::MeshGenesisPolicy::new(
+        requirement_policy_owner().owner_id(),
+        1_717_171_717_000,
+        crate::MeshRequirements {
+            node_version: crate::NodeVersionBounds::default(),
+            protocol_generation: crate::ProtocolGenerationBounds {
+                min: Some(NODE_PROTOCOL_GENERATION),
+                max: Some(NODE_PROTOCOL_GENERATION),
+            },
+            release_attestation: crate::ReleaseAttestationRequirement {
+                required: true,
+                allowed_signer_keys: vec![trusted_signer.to_string()],
+            },
+        },
+    )
+    .expect("test mesh policy should validate")
+}
+
+fn requirement_policy_without_release_attestation() -> crate::MeshGenesisPolicy {
+    crate::MeshGenesisPolicy::new(
+        requirement_policy_owner().owner_id(),
+        1_717_171_717_000,
+        crate::MeshRequirements {
+            node_version: crate::NodeVersionBounds::default(),
+            protocol_generation: crate::ProtocolGenerationBounds {
+                min: Some(NODE_PROTOCOL_GENERATION),
+                max: Some(NODE_PROTOCOL_GENERATION),
+            },
+            release_attestation: crate::ReleaseAttestationRequirement {
+                required: false,
+                allowed_signer_keys: vec![],
+            },
+        },
+    )
+    .expect("test mesh policy should validate")
+}
+
+fn test_release_signing_key(seed: u8) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+}
+
+fn test_release_signer_key_id(seed: u8) -> String {
+    format!(
+        "ed25519:{}",
+        hex::encode(test_release_signing_key(seed).verifying_key().as_bytes())
+    )
+}
+
+fn test_release_attestation_with_seed(seed: u8) -> crate::ReleaseBuildAttestation {
+    let signing_key = test_release_signing_key(seed);
+    let mut attestation = crate::ReleaseBuildAttestation {
+        version: 1,
+        node_version: crate::VERSION.to_string(),
+        build_id: "test-build".into(),
+        commit: "deadbeef".into(),
+        target_triple: "x86_64-apple-darwin".into(),
+        supported_protocol_generation_min: Some(NODE_PROTOCOL_GENERATION),
+        supported_protocol_generation_max: Some(NODE_PROTOCOL_GENERATION),
+        artifact_digest: Some("sha256:test".into()),
+        signer_key_id: test_release_signer_key_id(seed),
+        signature_algorithm: "ed25519".into(),
+        signature: vec![0; 64],
+    };
+    attestation.signature = ed25519_dalek::Signer::sign(
+        &signing_key,
+        &attestation
+            .canonical_bytes()
+            .expect("canonical release attestation bytes"),
+    )
+    .to_bytes()
+    .to_vec();
+    attestation
+}
+
+fn test_release_attestation(signer_key_id: &str) -> crate::ReleaseBuildAttestation {
+    let mut attestation = test_release_attestation_with_seed(9);
+    attestation.signer_key_id = signer_key_id.into();
+    attestation
+}
+
+fn direct_proof_signing_key(seed: u8) -> SecretKey {
+    let mut bytes = [0u8; 32];
+    bytes[0] = seed;
+    SecretKey::from_bytes(&bytes)
+}
+
+fn direct_proof_for_announcement(
+    sender_seed: u8,
+    mesh_id: &str,
+    policy_hash: &str,
+    release_attestation: Option<&crate::ReleaseBuildAttestation>,
+) -> crate::DirectNodeAdmissionProof {
+    direct_proof_for_announcement_at(
+        sender_seed,
+        mesh_id,
+        policy_hash,
+        release_attestation,
+        current_time_unix_ms(),
+    )
+}
+
+fn direct_proof_for_announcement_at(
+    sender_seed: u8,
+    mesh_id: &str,
+    policy_hash: &str,
+    release_attestation: Option<&crate::ReleaseBuildAttestation>,
+    timestamp_unix_ms: u64,
+) -> crate::DirectNodeAdmissionProof {
+    let signing_key =
+        ed25519_dalek::SigningKey::from_bytes(&direct_proof_signing_key(sender_seed).to_bytes());
+    let attestation_hash = release_attestation
+        .map(|attestation| {
+            attestation
+                .canonical_hash_hex()
+                .unwrap_or_else(|_| "invalid-release-attestation".to_string())
+        })
+        .unwrap_or_else(|| "missing-release-attestation".to_string());
+    let mut proof = crate::DirectNodeAdmissionProof {
+        version: 1,
+        sender_id: make_test_endpoint_id(sender_seed).as_bytes().to_vec(),
+        mesh_id: mesh_id.to_string(),
+        policy_hash: policy_hash.to_string(),
+        attestation_hash,
+        timestamp_unix_ms,
+        signature_algorithm: "ed25519".to_string(),
+        signature: vec![],
+    };
+    proof.signature = ed25519_dalek::Signer::sign(
+        &signing_key,
+        &proof
+            .canonical_bytes()
+            .expect("canonical direct proof bytes"),
+    )
+    .to_bytes()
+    .to_vec();
+    proof
+}
+
+async fn install_requirement_policy(node: &Node, policy: &crate::MeshGenesisPolicy) -> Result<()> {
+    let mesh_id = policy
+        .policy_derived_mesh_id()
+        .map_err(|reason| anyhow::anyhow!("invalid test mesh id: {reason:?}"))?;
+    let policy_hash = policy
+        .canonical_hash_hex()
+        .map_err(|reason| anyhow::anyhow!("invalid test policy hash: {reason:?}"))?;
+    let owner = requirement_policy_owner();
+    let signed_policy = crate::SignedMeshGenesisPolicy::sign(policy.clone(), &owner)
+        .map_err(|reason| anyhow::anyhow!("invalid test signed policy: {reason:?}"))?;
+    let token = crate::SignedBootstrapToken::sign(
+        vec![serde_json::to_vec(&node.endpoint_addr_for_advertisement())?],
+        &signed_policy,
+        Some(current_time_unix_ms() + SIGNED_BOOTSTRAP_TOKEN_LIFETIME_MS),
+        &owner,
+    )
+    .map_err(|reason| anyhow::anyhow!("invalid test bootstrap token: {reason:?}"))?;
+    node.install_requirement_aware_mesh_state(
+        mesh_id,
+        policy_hash,
+        policy.clone(),
+        Some(signed_policy),
+        Some(token),
+    )
+    .await
+}
+
+async fn configure_requirement_node(
+    node: &Node,
+    policy: &crate::MeshGenesisPolicy,
+    signer: Option<&str>,
+) -> Result<()> {
+    install_requirement_policy(node, policy).await?;
+    *node.release_attestation.lock().await = signer.map(test_release_attestation);
+    Ok(())
+}
+
+fn requirement_peer_announcement(
+    sender_seed: u8,
+    policy: &crate::MeshGenesisPolicy,
+    release_attestation: Option<crate::ReleaseBuildAttestation>,
+    direct_admission_proof: Option<crate::DirectNodeAdmissionProof>,
+) -> super::PeerAnnouncement {
+    super::PeerAnnouncement {
+        addr: EndpointAddr {
+            id: make_test_endpoint_id(sender_seed),
+            addrs: Default::default(),
+        },
+        role: super::NodeRole::Worker,
+        first_joined_mesh_ts: None,
+        models: vec![],
+        vram_bytes: 0,
+        model_source: None,
+        serving_models: vec![],
+        hosted_models: None,
+        available_models: vec![],
+        requested_models: vec![],
+        explicit_model_interests: vec![],
+        version: Some(crate::VERSION.to_string()),
+        model_demand: HashMap::new(),
+        mesh_id: Some(policy.policy_derived_mesh_id().expect("mesh id")),
+        mesh_policy_hash: Some(policy.canonical_hash_hex().expect("policy hash")),
+        gpu_name: None,
+        hostname: None,
+        is_soc: None,
+        gpu_vram: None,
+        gpu_reserved_bytes: None,
+        gpu_mem_bandwidth_gbps: None,
+        gpu_compute_tflops_fp32: None,
+        gpu_compute_tflops_fp16: None,
+        available_model_metadata: vec![],
+        experts_summary: None,
+        available_model_sizes: HashMap::new(),
+        served_model_descriptors: vec![],
+        served_model_runtime: vec![],
+        owner_attestation: None,
+        genesis_policy: None,
+        release_attestation,
+        direct_admission_proof,
+        artifact_transfer_supported: true,
+        stage_protocol_generation_supported: true,
+        stage_status_list_supported: true,
+        advertised_model_throughput: vec![],
+        latency_ms: None,
+        latency_source: None,
+        latency_age_ms: None,
+        latency_observer_id: None,
+    }
+}
+
+async fn expect_no_route_table_response(requester: &Node, target: &Node) -> Result<()> {
+    use prost::Message as _;
+
+    let conn = connect_mesh(
+        &requester.endpoint,
+        target.endpoint_addr_for_advertisement(),
+    )
+    .await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&[STREAM_ROUTE_REQUEST]).await?;
+    let request = RouteTableRequest {
+        requester_id: requester.id().as_bytes().to_vec(),
+        r#gen: NODE_PROTOCOL_GENERATION,
+    };
+    write_len_prefixed(&mut send, &request.encode_to_vec()).await?;
+    send.finish()?;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        read_len_prefixed(&mut recv),
+    )
+    .await;
+    assert!(
+        result.is_err()
+            || result
+                .expect("route timeout should already be handled")
+                .is_err(),
+        "rejected peer must not receive a route table"
+    );
+    Ok(())
+}
+
+pub(crate) fn assert_mesh_requirements_outbound_admits_compliant_peer_after_requirements_pass() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let host = make_test_node(super::NodeRole::Host { http_port: 9337 })
+            .await
+            .expect("host node");
+        let joiner = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("joiner node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+
+        configure_requirement_node(&host, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure host policy");
+        configure_requirement_node(&joiner, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure joiner policy");
+
+        host.start_accepting();
+        joiner.start_accepting();
+        joiner
+            .join(&host.invite_token().await)
+            .await
+            .expect("join should succeed");
+
+        wait_for_peer(&joiner, host.id()).await;
+        wait_for_peer(&host, joiner.id()).await;
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_inbound_rejects_before_topology_announcement() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let host = make_test_node(super::NodeRole::Host { http_port: 9337 })
+            .await
+            .expect("host node");
+        let joiner = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("joiner node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+
+        configure_requirement_node(&host, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure host policy");
+        configure_requirement_node(&joiner, &policy, None)
+            .await
+            .expect("configure joiner policy");
+
+        host.start_accepting();
+        joiner.start_accepting();
+
+        let _error = joiner
+            .join(&host.invite_token().await)
+            .await
+            .expect_err("join should fail");
+        assert!(
+            joiner.peers().await.iter().all(|peer| peer.id != host.id()),
+            "inbound rejection must happen before the joiner receives host topology"
+        );
+        assert!(
+            host.peers().await.iter().all(|peer| peer.id != joiner.id()),
+            "host must not admit the rejected inbound peer"
+        );
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_outbound_rejects_before_peer_promotion() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let initiator = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("initiator node");
+        let remote = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("remote node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+
+        configure_requirement_node(&initiator, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure initiator policy");
+        configure_requirement_node(&remote, &policy, None)
+            .await
+            .expect("configure remote policy");
+
+        initiator.start_accepting();
+        remote.start_accepting();
+
+        initiator
+            .connect_to_peer(remote.endpoint_addr_for_advertisement())
+            .await
+            .expect_err("outbound connect should fail before promotion");
+        assert!(
+            initiator
+                .peers()
+                .await
+                .iter()
+                .all(|peer| peer.id != remote.id()),
+            "noncompliant outbound peer must never become admitted/routable"
+        );
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_add_peer_rejects_missing_direct_admission_proof() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+        configure_requirement_node(&node, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure node policy");
+
+        let ann = requirement_peer_announcement(
+            0x8f,
+            &policy,
+            Some(test_release_attestation(&trusted_signer)),
+            None,
+        );
+        let peer_id = ann.addr.id;
+
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        assert!(
+            !is_peer_admitted(&node.state.lock().await.peers.clone(), &peer_id),
+            "missing direct proof must reject before promotion"
+        );
+        let recent = node.recent_mesh_requirement_rejections().await;
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::DirectProofMissing
+        );
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_add_peer_rejects_invalid_direct_admission_proof() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+        configure_requirement_node(&node, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure node policy");
+
+        let release_attestation = test_release_attestation(&trusted_signer);
+        let mut direct_proof = direct_proof_for_announcement(
+            0x8e,
+            &policy.policy_derived_mesh_id().expect("mesh id"),
+            &policy.canonical_hash_hex().expect("policy hash"),
+            Some(&release_attestation),
+        );
+        direct_proof.signature[0] ^= 0x01;
+        let ann = requirement_peer_announcement(
+            0x8e,
+            &policy,
+            Some(release_attestation),
+            Some(direct_proof),
+        );
+        let peer_id = ann.addr.id;
+
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        assert!(
+            !is_peer_admitted(&node.state.lock().await.peers.clone(), &peer_id),
+            "invalid direct proof must reject before promotion"
+        );
+        let recent = node.recent_mesh_requirement_rejections().await;
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::BuildProofInvalid
+        );
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_add_peer_rejects_stale_direct_admission_proof() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+        configure_requirement_node(&node, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure node policy");
+
+        let release_attestation = test_release_attestation(&trusted_signer);
+        let direct_proof = direct_proof_for_announcement_at(
+            0x8d,
+            &policy.policy_derived_mesh_id().expect("mesh id"),
+            &policy.canonical_hash_hex().expect("policy hash"),
+            Some(&release_attestation),
+            current_time_unix_ms() - crate::DIRECT_NODE_ADMISSION_PROOF_MAX_CLOCK_SKEW_MS - 1,
+        );
+        let ann = requirement_peer_announcement(
+            0x8d,
+            &policy,
+            Some(release_attestation),
+            Some(direct_proof),
+        );
+        let peer_id = ann.addr.id;
+
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        let recent = node.recent_mesh_requirement_rejections().await;
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::DirectProofStale
+        );
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_add_peer_rejects_direct_proof_sender_mismatch() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+        configure_requirement_node(&node, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure node policy");
+
+        let release_attestation = test_release_attestation(&trusted_signer);
+        let direct_proof = direct_proof_for_announcement(
+            0x8c,
+            &policy.policy_derived_mesh_id().expect("mesh id"),
+            &policy.canonical_hash_hex().expect("policy hash"),
+            Some(&release_attestation),
+        );
+        let ann = requirement_peer_announcement(
+            0x8b,
+            &policy,
+            Some(release_attestation),
+            Some(direct_proof),
+        );
+        let peer_id = ann.addr.id;
+
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        let recent = node.recent_mesh_requirement_rejections().await;
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::DirectProofSenderIdMismatch
+        );
+    });
+}
+
+pub(crate) fn assert_requirement_aware_mesh_without_attestation_rejects_missing_direct_proof() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let policy = requirement_policy_without_release_attestation();
+        configure_requirement_node(&node, &policy, None)
+            .await
+            .expect("configure node policy");
+
+        let ann = requirement_peer_announcement(0x8a, &policy, None, None);
+        let peer_id = ann.addr.id;
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        let recent = node.recent_mesh_requirement_rejections().await;
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::DirectProofMissing
+        );
+    });
+}
+
+/// On the fast auto-join probe, if `apply_gossip_announcements` fails after the
+/// dispatcher has already been spawned, the winning candidate must be both
+/// dropped from `state.connections` AND have its QUIC connection closed (so the
+/// dispatcher unwinds and no orphaned, keep-alive'd connection lingers), and the
+/// `Err` must propagate so the caller falls back to the serial join path.
+pub(crate) fn assert_fast_join_apply_failure_closes_connection_and_propagates_err() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        // Joiner enforces a release-attestation requirement.
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+        let joiner = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("joiner test node");
+        configure_requirement_node(&joiner, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure joiner policy");
+
+        // Bootstrap peer accepts a real QUIC connection from the joiner.
+        let bootstrap = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("bootstrap test node");
+        bootstrap.start_accepting();
+        joiner.start_accepting();
+
+        let bootstrap_id = bootstrap.id();
+        let bootstrap_addr = bootstrap.endpoint_addr_for_advertisement();
+        let conn = connect_mesh(&joiner.endpoint, bootstrap_addr.clone())
+            .await
+            .expect("joiner connects to bootstrap");
+
+        // Self-announcement from the bootstrap peer carrying NO release
+        // attestation. `apply_announced_peer` hits the `peer_id == remote`
+        // branch, `validate_direct_peer_requirements` rejects it, and
+        // `apply_gossip_announcements` returns `Err`.
+        let mut self_ann = requirement_peer_announcement(0x00, &policy, None, None);
+        self_ann.addr = super::EndpointAddr {
+            id: bootstrap_id,
+            addrs: Default::default(),
+        };
+        let announcements = vec![(self_ann.addr.clone(), self_ann.clone())];
+
+        let success = super::gossip::JoinProbeSuccess::new_for_tests(
+            joiner.invite_token().await,
+            None,
+            super::EndpointAddr {
+                id: bootstrap_id,
+                addrs: Default::default(),
+            },
+            conn.clone(),
+            announcements,
+            42,
+        );
+
+        let result = joiner.commit_join_probe_success(success).await;
+        assert!(
+            result.is_err(),
+            "apply failure must propagate Err so the caller falls back to serial join"
+        );
+
+        // The tracked entry must be gone.
+        assert!(
+            !joiner
+                .state
+                .lock()
+                .await
+                .connections
+                .contains_key(&bootstrap_id),
+            "failed candidate must be removed from tracked connections"
+        );
+
+        // The QUIC connection must be closed, not merely untracked. If it were
+        // only untracked, `closed()` would hang here because the keep-alive
+        // would hold the orphaned connection open.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), conn.closed()).await;
+        assert!(
+            closed.is_ok(),
+            "QUIC connection must be closed on apply failure, not left orphaned"
+        );
+    });
+}
+
+pub(crate) fn assert_requirement_aware_mesh_without_attestation_rejects_invalid_direct_proof() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let policy = requirement_policy_without_release_attestation();
+        configure_requirement_node(&node, &policy, None)
+            .await
+            .expect("configure node policy");
+
+        let mut direct_proof = direct_proof_for_announcement(
+            0x89,
+            &policy.policy_derived_mesh_id().expect("mesh id"),
+            &policy.canonical_hash_hex().expect("policy hash"),
+            None,
+        );
+        direct_proof.signature[0] ^= 0x01;
+        let ann = requirement_peer_announcement(0x89, &policy, None, Some(direct_proof));
+        let peer_id = ann.addr.id;
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        let recent = node.recent_mesh_requirement_rejections().await;
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::BuildProofInvalid
+        );
+    });
+}
+
+pub(crate) fn assert_requirement_aware_mesh_without_attestation_rejects_stale_direct_proof() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let policy = requirement_policy_without_release_attestation();
+        configure_requirement_node(&node, &policy, None)
+            .await
+            .expect("configure node policy");
+
+        let direct_proof = direct_proof_for_announcement_at(
+            0x88,
+            &policy.policy_derived_mesh_id().expect("mesh id"),
+            &policy.canonical_hash_hex().expect("policy hash"),
+            None,
+            current_time_unix_ms() - crate::DIRECT_NODE_ADMISSION_PROOF_MAX_CLOCK_SKEW_MS - 1,
+        );
+        let ann = requirement_peer_announcement(0x88, &policy, None, Some(direct_proof));
+        let peer_id = ann.addr.id;
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        let recent = node.recent_mesh_requirement_rejections().await;
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::DirectProofStale
+        );
+    });
+}
+
+pub(crate) fn assert_requirement_aware_mesh_without_attestation_rejects_sender_mismatch_direct_proof()
+ {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let policy = requirement_policy_without_release_attestation();
+        configure_requirement_node(&node, &policy, None)
+            .await
+            .expect("configure node policy");
+
+        let direct_proof = direct_proof_for_announcement(
+            0x87,
+            &policy.policy_derived_mesh_id().expect("mesh id"),
+            &policy.canonical_hash_hex().expect("policy hash"),
+            None,
+        );
+        let ann = requirement_peer_announcement(0x86, &policy, None, Some(direct_proof));
+        let peer_id = ann.addr.id;
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        let recent = node.recent_mesh_requirement_rejections().await;
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::DirectProofSenderIdMismatch
+        );
+    });
+}
+
+pub(crate) fn assert_requirement_aware_mesh_without_attestation_accepts_valid_direct_proof() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let policy = requirement_policy_without_release_attestation();
+        configure_requirement_node(&node, &policy, None)
+            .await
+            .expect("configure node policy");
+
+        let direct_proof = direct_proof_for_announcement(
+            0x85,
+            &policy.policy_derived_mesh_id().expect("mesh id"),
+            &policy.canonical_hash_hex().expect("policy hash"),
+            None,
+        );
+        let ann = requirement_peer_announcement(0x85, &policy, None, Some(direct_proof));
+        let peer_id = ann.addr.id;
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        assert!(is_peer_admitted(
+            &node.state.lock().await.peers.clone(),
+            &peer_id
+        ));
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_add_peer_rejects_untrusted_release_signer() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+        configure_requirement_node(&node, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure node policy");
+
+        let peer_id = make_test_endpoint_id(0x91);
+        let ann = super::PeerAnnouncement {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            first_joined_mesh_ts: None,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving_models: vec![],
+            hosted_models: None,
+            available_models: vec![],
+            requested_models: vec![],
+            explicit_model_interests: vec![],
+            version: Some(crate::VERSION.to_string()),
+            model_demand: HashMap::new(),
+            mesh_id: Some(policy.policy_derived_mesh_id().expect("mesh id")),
+            mesh_policy_hash: Some(policy.canonical_hash_hex().expect("policy hash")),
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+            owner_attestation: None,
+            genesis_policy: None,
+            release_attestation: Some(test_release_attestation_with_seed(10)),
+            direct_admission_proof: Some(direct_proof_for_announcement(
+                0x91,
+                &policy.policy_derived_mesh_id().expect("mesh id"),
+                &policy.canonical_hash_hex().expect("policy hash"),
+                Some(&test_release_attestation_with_seed(10)),
+            )),
+            artifact_transfer_supported: true,
+            stage_protocol_generation_supported: true,
+            stage_status_list_supported: true,
+            advertised_model_throughput: vec![],
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
+        };
+
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        let peers = node.state.lock().await.peers.clone();
+        assert!(
+            !is_peer_admitted(&peers, &peer_id),
+            "add_peer must reject untrusted release signers before promotion"
+        );
+        let recent = node.recent_mesh_requirement_rejections().await;
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::ReleaseSignerUntrusted
+        );
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_add_peer_rejects_invalid_release_attestation_signature() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+        configure_requirement_node(&node, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure node policy");
+
+        let peer_id = make_test_endpoint_id(0x90);
+        let mut invalid_attestation = test_release_attestation_with_seed(9);
+        invalid_attestation.signature[0] ^= 0x01;
+        let invalid_direct_proof = direct_proof_for_announcement(
+            0x90,
+            &policy.policy_derived_mesh_id().expect("mesh id"),
+            &policy.canonical_hash_hex().expect("policy hash"),
+            Some(&invalid_attestation),
+        );
+        let ann = super::PeerAnnouncement {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            first_joined_mesh_ts: None,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving_models: vec![],
+            hosted_models: None,
+            available_models: vec![],
+            requested_models: vec![],
+            explicit_model_interests: vec![],
+            version: Some(crate::VERSION.to_string()),
+            model_demand: HashMap::new(),
+            mesh_id: Some(policy.policy_derived_mesh_id().expect("mesh id")),
+            mesh_policy_hash: Some(policy.canonical_hash_hex().expect("policy hash")),
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+            owner_attestation: None,
+            genesis_policy: None,
+            release_attestation: Some(invalid_attestation),
+            direct_admission_proof: Some(invalid_direct_proof),
+            artifact_transfer_supported: true,
+            stage_protocol_generation_supported: true,
+            stage_status_list_supported: true,
+            advertised_model_throughput: vec![],
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
+        };
+
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        let peers = node.state.lock().await.peers.clone();
+        assert!(
+            !is_peer_admitted(&peers, &peer_id),
+            "add_peer must reject cryptographically invalid release attestations before promotion"
+        );
+        let recent = node.recent_mesh_requirement_rejections().await;
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::BuildProofInvalid
+        );
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_add_peer_rejects_wrong_mesh_id() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let node = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("test node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+        configure_requirement_node(&node, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure node policy");
+
+        let peer_id = make_test_endpoint_id(0x92);
+        let ann = super::PeerAnnouncement {
+            addr: EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Worker,
+            first_joined_mesh_ts: None,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving_models: vec![],
+            hosted_models: None,
+            available_models: vec![],
+            requested_models: vec![],
+            explicit_model_interests: vec![],
+            version: Some(crate::VERSION.to_string()),
+            model_demand: HashMap::new(),
+            mesh_id: Some("mesh-wrong".to_string()),
+            mesh_policy_hash: Some(policy.canonical_hash_hex().expect("policy hash")),
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+            owner_attestation: None,
+            genesis_policy: None,
+            release_attestation: Some(test_release_attestation(&test_release_signer_key_id(9))),
+            direct_admission_proof: Some(direct_proof_for_announcement(
+                0x92,
+                "mesh-wrong",
+                &policy.canonical_hash_hex().expect("policy hash"),
+                Some(&test_release_attestation(&test_release_signer_key_id(9))),
+            )),
+            artifact_transfer_supported: true,
+            stage_protocol_generation_supported: true,
+            stage_status_list_supported: true,
+            advertised_model_throughput: vec![],
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
+        };
+
+        node.add_peer(
+            peer_id,
+            ann.addr.clone(),
+            &ann,
+            Some(NODE_PROTOCOL_GENERATION),
+        )
+        .await;
+
+        let peers = node.state.lock().await.peers.clone();
+        assert!(
+            !is_peer_admitted(&peers, &peer_id),
+            "direct peers advertising the wrong mesh must be rejected before promotion"
+        );
+        let recent = node.recent_mesh_requirement_rejections().await;
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::MeshPolicyMismatch
+        );
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_transitive_gossip_never_admits_peer_without_direct_proof() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let host = make_test_node(super::NodeRole::Host { http_port: 9337 })
+            .await
+            .expect("host node");
+        let bridge = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("bridge node");
+        let client = make_test_node(super::NodeRole::Client)
+            .await
+            .expect("client node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+
+        host.set_hosted_models(vec!["remote-coding-model".to_string()])
+            .await;
+        configure_requirement_node(&host, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure host policy");
+        configure_requirement_node(&bridge, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure bridge policy");
+        configure_requirement_node(&client, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure client policy");
+
+        host.start_accepting();
+        bridge.start_accepting();
+        client.start_accepting();
+
+        bridge.sync_from_peer_for_tests(&host).await;
+        assert!(bridge.peers().await.iter().any(|peer| peer.id == host.id()));
+
+        client.sync_from_peer_for_tests(&bridge).await;
+        assert!(
+            client
+                .peers()
+                .await
+                .iter()
+                .any(|peer| peer.id == bridge.id())
+        );
+
+        let peers = client.state.lock().await.peers.clone();
+        assert!(
+            peers.contains_key(&host.id()),
+            "host should still be tracked as a hint"
+        );
+        assert!(
+            !is_peer_admitted(&peers, &host.id()),
+            "transitive gossip must not admit the host without a direct proof path"
+        );
+        assert!(
+            !client
+                .hosts_for_model("remote-coding-model")
+                .await
+                .contains(&host.id()),
+            "transitive-only host must not be routable before direct verification"
+        );
+
+        let _conn = client
+            .connection_to_peer(host.id())
+            .await
+            .expect("direct connection should promote the host");
+        wait_for_peer(&client, host.id()).await;
+        assert!(
+            client
+                .hosts_for_model("remote-coding-model")
+                .await
+                .contains(&host.id()),
+            "host should become routable only after direct verification"
+        );
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_rejected_peer_messages_have_no_mesh_effect() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let host = make_test_node(super::NodeRole::Host { http_port: 9337 })
+            .await
+            .expect("host node");
+        let bridge = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("bridge node");
+        let rejected = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("rejected node");
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+
+        configure_requirement_node(&host, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure host policy");
+        configure_requirement_node(&bridge, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure bridge policy");
+        configure_requirement_node(&rejected, &policy, None)
+            .await
+            .expect("configure rejected policy");
+
+        host.start_accepting();
+        bridge.start_accepting();
+        rejected.start_accepting();
+
+        bridge
+            .join(&host.invite_token().await)
+            .await
+            .expect("bridge joins host");
+        wait_for_peer(&host, bridge.id()).await;
+
+        rejected
+            .join(&host.invite_token().await)
+            .await
+            .expect_err("rejected peer should fail admission");
+        expect_no_route_table_response(&rejected, &host)
+            .await
+            .expect("route request should be suppressed");
+
+        let admitted_ids: Vec<_> = host.peers().await.into_iter().map(|peer| peer.id).collect();
+        assert_eq!(admitted_ids, vec![bridge.id()]);
+        assert!(
+            admitted_ids
+                .into_iter()
+                .all(|peer_id| peer_id != rejected.id()),
+            "rejected peer messages must not change mesh membership"
+        );
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_join_rejects_invalid_bootstrap_token() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let host = make_test_node(super::NodeRole::Host { http_port: 9337 })
+            .await
+            .expect("host node");
+        let joiner = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("joiner node");
+        let owner = crate::crypto::OwnerKeypair::generate();
+        let policy = crate::MeshGenesisPolicy::new(
+            owner.owner_id(),
+            1_717_171_717_000,
+            requirement_policy(&test_release_signer_key_id(9)).requirements,
+        )
+        .expect("policy should validate");
+        let signed_policy =
+            crate::SignedMeshGenesisPolicy::sign(policy.clone(), &owner).expect("signed policy");
+        let addr_bytes = serde_json::to_vec(&host.endpoint_addr_for_advertisement())
+            .expect("serializable endpoint addr");
+
+        host.start_accepting();
+        joiner.start_accepting();
+
+        let mut token = crate::SignedBootstrapToken::sign(
+            vec![addr_bytes],
+            &signed_policy,
+            Some(current_time_unix_ms() + 60_000),
+            &owner,
+        )
+        .expect("bootstrap token should sign");
+        token.signature[0] ^= 0x01;
+        let tampered = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            serde_json::to_vec(&token).expect("serializable token"),
+        );
+
+        let err = joiner
+            .join(&tampered)
+            .await
+            .expect_err("tampered bootstrap tokens must be rejected");
+        assert!(err.to_string().contains("bootstrap_token_invalid"));
+        assert!(joiner.peers().await.is_empty());
+        let recent = joiner.recent_mesh_requirement_rejections().await;
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].reason,
+            crate::MeshRequirementRejectReason::BootstrapTokenInvalid
+        );
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_join_accepts_matching_bootstrap_before_policy_state_installed()
+ {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let trusted_signer = test_release_signer_key_id(9);
+        let policy = requirement_policy(&trusted_signer);
+        let policy_hash = policy.canonical_hash_hex().expect("policy hash");
+        let host = make_test_node(super::NodeRole::Host { http_port: 9337 })
+            .await
+            .expect("host node");
+        let joiner =
+            make_test_node_with_requirements(super::NodeRole::Worker, policy.requirements.clone())
+                .await
+                .expect("joiner node");
+
+        configure_requirement_node(&host, &policy, Some(&trusted_signer))
+            .await
+            .expect("configure host policy");
+        *joiner.release_attestation.lock().await = Some(test_release_attestation(&trusted_signer));
+
+        assert_eq!(
+            *joiner.mesh_policy_hash.lock().await,
+            None,
+            "fresh constrained joiner must not have active policy state before joining"
+        );
+        host.start_accepting();
+        joiner.start_accepting();
+
+        joiner
+            .join(&host.invite_token().await)
+            .await
+            .expect("matching bootstrap token should install policy and join");
+
+        wait_for_peer(&joiner, host.id()).await;
+        wait_for_peer(&host, joiner.id()).await;
+        assert_eq!(*joiner.mesh_policy_hash.lock().await, Some(policy_hash));
+    });
+}
+
+pub(crate) fn assert_mesh_requirements_unrestricted_legacy_mesh_join_stays_compatible() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let host = make_test_node(super::NodeRole::Host { http_port: 9337 })
+            .await
+            .expect("host node");
+        let joiner = make_test_node(super::NodeRole::Worker)
+            .await
+            .expect("joiner node");
+
+        host.start_accepting();
+        joiner.start_accepting();
+        joiner
+            .join(&host.invite_token().await)
+            .await
+            .expect("legacy unrestricted meshes should remain join-compatible");
+
+        wait_for_peer(&joiner, host.id()).await;
+        wait_for_peer(&host, joiner.id()).await;
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6303,6 +7843,56 @@ fn active_stage_topology_replaces_previous_generation_for_model() {
 }
 
 #[test]
+fn stage_topology_withdraw_removes_active_topology_and_statuses() {
+    let host_id = EndpointId::from(SecretKey::from_bytes(&[0x41; 32]).public());
+    let worker_id = EndpointId::from(SecretKey::from_bytes(&[0x42; 32]).public());
+    let mut state = StageTopologyState::default();
+    state.activate_topology(StageTopologyInstance {
+        topology_id: "topology-a".to_string(),
+        run_id: "run-a".to_string(),
+        model_id: "model-a".to_string(),
+        package_ref: "gguf:///model.gguf".to_string(),
+        manifest_sha256: "direct-gguf:1:model.gguf".to_string(),
+        stages: vec![
+            StageAssignment {
+                stage_id: "stage-0".to_string(),
+                stage_index: 0,
+                node_id: host_id,
+                layer_start: 0,
+                layer_end: 12,
+                endpoint: StageEndpoint {
+                    bind_addr: "127.0.0.1:50000".to_string(),
+                },
+            },
+            StageAssignment {
+                stage_id: "stage-1".to_string(),
+                stage_index: 1,
+                node_id: worker_id,
+                layer_start: 12,
+                layer_end: 24,
+                endpoint: StageEndpoint {
+                    bind_addr: "127.0.0.1:0".to_string(),
+                },
+            },
+        ],
+    });
+    state.record_status(test_stage_status(
+        worker_id,
+        "stage-1",
+        1,
+        "127.0.0.1:51234",
+        crate::inference::skippy::StageRuntimeState::Ready,
+    ));
+
+    assert_eq!(state.visible_topologies().len(), 1);
+    assert_eq!(state.runtime_statuses().len(), 1);
+    assert!(state.withdraw_topology("topology-a", "run-a"));
+    assert!(state.visible_topologies().is_empty());
+    assert!(state.runtime_statuses().is_empty());
+    assert!(!state.withdraw_topology("topology-a", "run-a"));
+}
+
+#[test]
 fn empty_stage_status_snapshots_are_ignored() {
     let node_id = EndpointId::from(SecretKey::from_bytes(&[0x39; 32]).public());
     let mut state = StageTopologyState::default();
@@ -6351,5 +7941,31 @@ fn active_stage_refresh_marks_missing_stage_failed() {
     assert_eq!(
         status.error.as_deref(),
         Some("stage status missing from runtime")
+    );
+}
+
+#[test]
+fn active_stage_refresh_timeout_marks_cached_stage_failed() {
+    let node_id = EndpointId::from(SecretKey::from_bytes(&[0x43; 32]).public());
+    let mut state = StageTopologyState::default();
+    state.record_status(test_stage_status(
+        node_id,
+        "stage-1",
+        1,
+        "127.0.0.1:51234",
+        crate::inference::skippy::StageRuntimeState::Ready,
+    ));
+    let cached = state.active_statuses().into_iter().next().unwrap();
+
+    state.record_status_refresh_failure(&cached, "stage status refresh timed out".to_string());
+
+    let status = state.runtime_statuses().into_iter().next().unwrap();
+    assert_eq!(
+        status.state,
+        crate::inference::skippy::StageRuntimeState::Failed
+    );
+    assert_eq!(
+        status.error.as_deref(),
+        Some("stage status refresh timed out")
     );
 }

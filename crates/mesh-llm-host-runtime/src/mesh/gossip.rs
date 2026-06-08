@@ -2,6 +2,7 @@
 //! and peer list management (add/remove/update).
 
 use super::*;
+use crate::models::append_external_inference_models;
 
 /// Minimum peer version we accept into the local mesh table and re-broadcast.
 ///
@@ -20,6 +21,78 @@ use super::*;
 /// targeted bypass.
 const MIN_REBROADCAST_VERSION_MAJOR: u64 = 0;
 const MIN_REBROADCAST_VERSION_MINOR: u64 = 60;
+const CLIENT_AUTO_JOIN_PROBE_LIMIT: usize = 4;
+const CLIENT_AUTO_JOIN_PROBE_TIMEOUT: std::time::Duration = PEER_CONNECT_AND_GOSSIP_TIMEOUT;
+
+#[derive(Clone, Copy)]
+struct AnnouncedPeerContext {
+    remote: EndpointId,
+    rtt_ms: Option<u32>,
+    negotiated_protocol_generation: Option<u32>,
+    direct_peer_requirements_validated: bool,
+}
+
+struct JoinProbeCandidate {
+    token: String,
+    mesh_name: Option<String>,
+    addr: EndpointAddr,
+}
+
+pub(super) struct JoinProbeSuccess {
+    candidate: JoinProbeCandidate,
+    conn: Connection,
+    announcements: Vec<(EndpointAddr, PeerAnnouncement)>,
+    rtt_ms: u32,
+    elapsed: std::time::Duration,
+}
+
+#[cfg(test)]
+impl JoinProbeSuccess {
+    /// Test-only constructor so sibling test modules can drive
+    /// `commit_join_probe_success` against a real QUIC connection.
+    pub(super) fn new_for_tests(
+        token: String,
+        mesh_name: Option<String>,
+        addr: EndpointAddr,
+        conn: Connection,
+        announcements: Vec<(EndpointAddr, PeerAnnouncement)>,
+        rtt_ms: u32,
+    ) -> Self {
+        Self {
+            candidate: JoinProbeCandidate {
+                token,
+                mesh_name,
+                addr,
+            },
+            conn,
+            announcements,
+            rtt_ms,
+            elapsed: std::time::Duration::from_millis(0),
+        }
+    }
+}
+
+fn emit_join_probe_race_started(candidate_count: usize) {
+    tracing::info!(
+        candidates = candidate_count,
+        timeout_ms = CLIENT_AUTO_JOIN_PROBE_TIMEOUT.as_millis(),
+        "Racing auto-join bootstrap candidates"
+    );
+    emit_mesh_info(format!(
+        "Racing {candidate_count} auto-join bootstrap candidates"
+    ));
+}
+
+fn emit_join_probe_fallback(last_error: Option<&anyhow::Error>) {
+    if let Some(error) = last_error {
+        tracing::debug!(
+            "No auto-join candidate completed the fast probe; falling back to serial join: {error:#}"
+        );
+    }
+    emit_mesh_info(
+        "No auto-join candidate completed the fast probe; falling back to serial join".to_string(),
+    );
+}
 
 /// Returns `true` if `version` is recent enough to include in outbound
 /// gossip. `None` (no advertised version) returns `true` for back-compat.
@@ -120,6 +193,10 @@ struct LocalAnnouncementData {
     explicit_model_interests: Vec<String>,
     model_demand: HashMap<String, ModelDemand>,
     mesh_id: Option<String>,
+    mesh_policy_hash: Option<String>,
+    signed_genesis_policy: Option<crate::SignedMeshGenesisPolicy>,
+    release_attestation: Option<crate::ReleaseBuildAttestation>,
+    direct_admission_proof: Option<crate::DirectNodeAdmissionProof>,
     available_model_metadata: Vec<crate::proto::node::CompactModelMetadata>,
     available_model_sizes: HashMap<String, u64>,
     served_model_descriptors: Vec<ServedModelDescriptor>,
@@ -155,6 +232,9 @@ pub fn backfill_legacy_descriptors(ann: &mut PeerAnnouncement) {
 
 pub(super) fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool {
     old.addr != new.addr
+        || old.mesh_id != new.mesh_id
+        || old.mesh_policy_hash != new.mesh_policy_hash
+        || old.genesis_policy != new.genesis_policy
         || old.role != new.role
         || old.first_joined_mesh_ts != new.first_joined_mesh_ts
         || old.models != new.models
@@ -194,6 +274,9 @@ pub(super) fn apply_transitive_ann(
     bridge_id: EndpointId,
 ) -> bool {
     let ann_hosted_models = ann.hosted_models.clone().unwrap_or_default();
+    existing.mesh_id = ann.mesh_id.clone();
+    existing.mesh_policy_hash = ann.mesh_policy_hash.clone();
+    existing.genesis_policy = ann.genesis_policy.clone();
     let serving_changed = existing.serving_models != ann.serving_models
         || existing.hosted_models != ann_hosted_models
         || existing.hosted_models_known != ann.hosted_models.is_some();
@@ -281,28 +364,67 @@ pub(super) fn apply_transitive_ann(
 impl Node {
     async fn apply_announced_peer(
         &self,
-        remote: EndpointId,
         peer_id: EndpointId,
         addr: &EndpointAddr,
         ann: &PeerAnnouncement,
-        rtt_ms: Option<u32>,
-    ) {
+        context: AnnouncedPeerContext,
+    ) -> Result<()> {
+        let remote = context.remote;
         if peer_id == self.endpoint.id() {
-            return;
+            return Ok(());
         }
         if peer_id == remote {
             if let Some(ref their_id) = ann.mesh_id {
                 self.set_mesh_id(their_id.clone()).await;
             }
+            if !context.direct_peer_requirements_validated
+                && let Err(reason) = self
+                    .validate_direct_peer_requirements(
+                        remote,
+                        ann,
+                        context.negotiated_protocol_generation,
+                    )
+                    .await
+            {
+                self.record_mesh_requirement_rejection(
+                    super::requirements::MeshRequirementRejectionSource::Gossip,
+                    Some(remote),
+                    reason.clone(),
+                )
+                .await;
+                self.state
+                    .lock()
+                    .await
+                    .requirement_rejected_peers
+                    .insert(remote);
+                anyhow::bail!(
+                    "peer {} rejected by mesh requirements: {}",
+                    remote.fmt_short(),
+                    reason.code()
+                );
+            }
             self.merge_remote_demand(&ann.model_demand);
-            self.add_peer(remote, addr.clone(), ann).await;
-            if let Some(rtt_ms) = rtt_ms {
+            self.add_peer_after_direct_requirements_validated(remote, addr.clone(), ann)
+                .await;
+            if let Some(rtt_ms) = context.rtt_ms {
                 self.update_peer_rtt(remote, rtt_ms).await;
             }
-            return;
+            return Ok(());
+        }
+        if let Err(err) = self
+            .validate_peer_announcement_against_active_policy(peer_id, ann)
+            .await
+        {
+            tracing::debug!(
+                "ignoring transitive peer {} because its policy announcement did not match the active mesh: {}",
+                peer_id.fmt_short(),
+                err.code()
+            );
+            return Ok(());
         }
         self.update_transitive_peer(peer_id, addr, ann, remote)
             .await;
+        Ok(())
     }
 
     async fn apply_announced_peers(
@@ -310,11 +432,20 @@ impl Node {
         remote: EndpointId,
         their_announcements: &[(EndpointAddr, PeerAnnouncement)],
         rtt_ms: Option<u32>,
-    ) {
+        negotiated_protocol_generation: Option<u32>,
+        direct_peer_requirements_validated: bool,
+    ) -> Result<()> {
+        let context = AnnouncedPeerContext {
+            remote,
+            rtt_ms,
+            negotiated_protocol_generation,
+            direct_peer_requirements_validated,
+        };
         for (addr, ann) in their_announcements {
-            self.apply_announced_peer(remote, addr.id, addr, ann, rtt_ms)
-                .await;
+            self.apply_announced_peer(addr.id, addr, ann, context)
+                .await?;
         }
+        Ok(())
     }
 
     async fn refresh_gossip_path_rtt(&self, remote: EndpointId, ceiling_rtt_ms: Option<u32>) {
@@ -327,34 +458,29 @@ impl Node {
         } else {
             "inbound_gossip_path"
         };
-        self.capture_selected_connection_path(remote, &conn, capture_source);
-        let path_list = conn.paths();
-        for path_info in &path_list {
-            if !path_info.is_selected() {
-                continue;
-            }
-            let path_rtt_ms = path_info.rtt().as_millis() as u32;
-            if path_rtt_ms == 0 {
-                continue;
-            }
+        let Some(observation) =
+            self.capture_selected_connection_path(remote, &conn, capture_source)
+        else {
+            return;
+        };
+        if let Some(path_rtt_ms) = observation.rtt_ms {
             if ceiling_rtt_ms.is_some_and(|ceiling| path_rtt_ms >= ceiling) {
-                break;
+                self.update_peer_selected_path(remote, observation).await;
+                return;
             }
-            let path_type = if path_info.is_ip() { "direct" } else { "relay" };
             super::emit_mesh_info(format!(
                 "📡 Peer {} RTT: {}ms ({}){}",
                 remote.fmt_short(),
                 path_rtt_ms,
-                path_type,
+                observation.path_type,
                 if ceiling_rtt_ms.is_some() {
                     " [path info]"
                 } else {
                     ""
                 }
             ));
-            self.update_peer_rtt(remote, path_rtt_ms).await;
-            break;
         }
+        self.update_peer_selected_path(remote, observation).await;
     }
 
     async fn maybe_connect_discovered_peer(
@@ -384,6 +510,42 @@ impl Node {
                 );
             }
         }
+    }
+
+    async fn connect_discovered_peers(
+        &self,
+        their_announcements: &[(EndpointAddr, PeerAnnouncement)],
+        known_peer_check_uses_connections: bool,
+        log_discovery_failure_as_warning: bool,
+    ) {
+        let my_role = self.role.lock().await.clone();
+        for (addr, ann) in their_announcements {
+            self.maybe_connect_discovered_peer(
+                &my_role,
+                addr.clone(),
+                ann,
+                known_peer_check_uses_connections,
+                log_discovery_failure_as_warning,
+            )
+            .await;
+        }
+    }
+
+    fn spawn_discovered_peer_connects(
+        &self,
+        their_announcements: Vec<(EndpointAddr, PeerAnnouncement)>,
+        known_peer_check_uses_connections: bool,
+        log_discovery_failure_as_warning: bool,
+    ) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            node.connect_discovered_peers(
+                &their_announcements,
+                known_peer_check_uses_connections,
+                log_discovery_failure_as_warning,
+            )
+            .await;
+        });
     }
 
     /// Returns `true` if the announcement would be rejected by the same
@@ -454,6 +616,10 @@ impl Node {
         let serving_changed = existing.serving_models != ann.serving_models
             || existing.hosted_models != ann_hosted_models
             || existing.hosted_models_known != ann.hosted_models.is_some();
+        existing.admitted = true;
+        existing.mesh_id = ann.mesh_id.clone();
+        existing.mesh_policy_hash = ann.mesh_policy_hash.clone();
+        existing.genesis_policy = ann.genesis_policy.clone();
         if role_changed {
             tracing::info!(
                 "Peer {} role updated: {:?} → {:?}",
@@ -504,6 +670,10 @@ impl Node {
         if ann.experts_summary.is_some() {
             existing.experts_summary = ann.experts_summary.clone();
         }
+        existing.release_attestation_summary = crate::verify_release_attestation(
+            ann.release_attestation.as_ref(),
+            &crate::ReleaseSignerTrustStore::default(),
+        );
         let updated_peer = existing.clone();
         let changed = peer_meaningfully_changed(&old_peer, &updated_peer)
             || Self::peer_hardware_changed(&old_peer, &updated_peer);
@@ -513,7 +683,12 @@ impl Node {
     async fn remove_disallowed_peer(&self, id: EndpointId) {
         let mut state = self.state.lock().await;
         if state.peers.remove(&id).is_some() {
-            let _ = self.peer_change_tx.send(state.peers.len());
+            let admitted_count = state
+                .peers
+                .values()
+                .filter(|peer| peer.is_admitted())
+                .count();
+            let _ = self.peer_change_tx.send(admitted_count);
         }
     }
 
@@ -554,7 +729,12 @@ impl Node {
                 .insert(id, owner_summary.status.clone());
         }
         if state.peers.remove(&id).is_some() {
-            let _ = self.peer_change_tx.send(state.peers.len());
+            let admitted_count = state
+                .peers
+                .values()
+                .filter(|peer| peer.is_admitted())
+                .count();
+            let _ = self.peer_change_tx.send(admitted_count);
         }
         true
     }
@@ -600,7 +780,11 @@ impl Node {
         };
         let (updated_peer, changed, role_changed, serving_changed) =
             Self::update_existing_direct_peer(existing, addr, ann, owner_summary, now);
-        let count = state.peers.len();
+        let count = state
+            .peers
+            .values()
+            .filter(|peer| peer.is_admitted())
+            .count();
         let should_publish_count = role_changed || serving_changed;
         drop(state);
         self.publish_direct_peer_update(updated_peer, changed, should_publish_count, count)
@@ -626,9 +810,14 @@ impl Node {
             ann.available_models,
             state.peers.len() + 1
         );
-        let peer = PeerInfo::from_announcement(id, addr, ann, owner_summary);
+        let mut peer = PeerInfo::from_announcement(id, addr, ann, owner_summary);
+        peer.admitted = true;
         state.peers.insert(id, peer.clone());
-        let count = state.peers.len();
+        let count = state
+            .peers
+            .values()
+            .filter(|peer| peer.is_admitted())
+            .count();
         drop(state);
         self.capture_peer_observation("peer_direct_add", &peer, "direct", None);
         let _ = self.peer_change_tx.send(count);
@@ -669,24 +858,49 @@ impl Node {
         }
     }
 
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "local gossip snapshots intentionally gather many independent advertised fields in one atomic view"
+    )]
     async fn snapshot_local_announcement_data(&self) -> LocalAnnouncementData {
         let owner_summary = self.owner_summary.lock().await.clone();
-        let hosted_models = self.hosted_models.lock().await.clone();
+        let plugin_models = self.plugin_inference_models().await;
+        let mut models = self.models.lock().await.clone();
+        append_external_inference_models(&mut models, &plugin_models);
+        let mut serving_models = self.serving_models.lock().await.clone();
+        append_external_inference_models(&mut serving_models, &plugin_models);
+        let mut hosted_models = self.hosted_models.lock().await.clone();
+        append_external_inference_models(&mut hosted_models, &plugin_models);
         let advertised_model_throughput = self
             .routing_metrics
             .advertisable_model_throughput(&hosted_models);
+        let mesh_id = self.mesh_id.lock().await.clone();
+        let mesh_policy_hash = self.mesh_policy_hash.lock().await.clone();
+        let release_attestation = self.release_attestation.lock().await.clone();
+        let direct_admission_proof = match (mesh_id.as_deref(), mesh_policy_hash.as_deref()) {
+            (Some(mesh_id), Some(policy_hash)) => self.build_self_direct_admission_proof(
+                mesh_id,
+                policy_hash,
+                release_attestation.as_ref(),
+            ),
+            _ => None,
+        };
         LocalAnnouncementData {
             role: self.role.lock().await.clone(),
             first_joined_mesh_ts: *self.first_joined_mesh_ts.lock().await,
-            models: self.models.lock().await.clone(),
+            models,
             model_source: self.model_source.lock().await.clone(),
-            serving_models: self.serving_models.lock().await.clone(),
+            serving_models,
             hosted_models,
             available_models: self.available_models.lock().await.clone(),
             requested_models: self.requested_models.lock().await.clone(),
             explicit_model_interests: self.explicit_model_interests.lock().await.clone(),
             model_demand: self.get_demand(),
-            mesh_id: self.mesh_id.lock().await.clone(),
+            mesh_id,
+            mesh_policy_hash,
+            signed_genesis_policy: self.signed_genesis_policy.lock().await.clone(),
+            release_attestation,
+            direct_admission_proof,
             available_model_metadata: Vec::new(),
             available_model_sizes: HashMap::new(),
             served_model_descriptors: self.served_model_descriptors.lock().await.clone(),
@@ -710,6 +924,20 @@ impl Node {
         }
     }
 
+    async fn plugin_inference_models(&self) -> Vec<String> {
+        let plugin_manager = self.plugin_manager.lock().await.clone();
+        let Some(plugin_manager) = plugin_manager else {
+            return Vec::new();
+        };
+        plugin_manager
+            .inference_models()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "failed to collect plugin inference models for gossip");
+                Vec::new()
+            })
+    }
+
     fn announcement_from_peer(peer: &PeerInfo) -> PeerAnnouncement {
         let latency = peer.display_latency();
         PeerAnnouncement {
@@ -726,7 +954,8 @@ impl Node {
             explicit_model_interests: peer.explicit_model_interests.clone(),
             version: peer.version.clone(),
             model_demand: HashMap::new(),
-            mesh_id: None,
+            mesh_id: peer.mesh_id.clone(),
+            mesh_policy_hash: peer.mesh_policy_hash.clone(),
             gpu_name: peer.gpu_name.clone(),
             hostname: peer.hostname.clone(),
             is_soc: peer.is_soc,
@@ -741,6 +970,9 @@ impl Node {
             served_model_descriptors: peer.served_model_descriptors.clone(),
             served_model_runtime: peer.served_model_runtime.clone(),
             owner_attestation: peer.owner_attestation.clone(),
+            genesis_policy: peer.genesis_policy.clone(),
+            release_attestation: None,
+            direct_admission_proof: None,
             artifact_transfer_supported: peer.artifact_transfer_supported,
             stage_protocol_generation_supported: peer.stage_protocol_generation_supported,
             stage_status_list_supported: peer.stage_status_list_supported,
@@ -784,6 +1016,7 @@ impl Node {
             version: Some(crate::VERSION.to_string()),
             model_demand: data.model_demand,
             mesh_id: data.mesh_id,
+            mesh_policy_hash: data.mesh_policy_hash,
             gpu_name: self.enumerate_host.then(|| self.gpu_name.clone()).flatten(),
             hostname: self.enumerate_host.then(|| self.hostname.clone()).flatten(),
             is_soc: self.is_soc,
@@ -801,6 +1034,9 @@ impl Node {
             served_model_descriptors: data.served_model_descriptors,
             served_model_runtime: data.served_model_runtime,
             owner_attestation: data.owner_attestation,
+            genesis_policy: data.signed_genesis_policy,
+            release_attestation: data.release_attestation,
+            direct_admission_proof: data.direct_admission_proof,
             artifact_transfer_supported: data.artifact_transfer_supported,
             stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
@@ -835,6 +1071,217 @@ impl Node {
                 PEER_CONNECT_AND_GOSSIP_TIMEOUT.as_secs()
             ),
         }
+    }
+
+    pub(crate) async fn join_first_responsive_candidate(
+        &self,
+        join_attempts: &[(String, Option<String>)],
+    ) -> Result<Option<(String, Option<String>)>> {
+        let candidates = self.collect_join_probe_candidates(join_attempts).await;
+        if candidates.len() <= 1 {
+            tracing::debug!(
+                valid_candidates = candidates.len(),
+                "auto-join probe skipped"
+            );
+            return Ok(None);
+        }
+
+        emit_join_probe_race_started(candidates.len());
+        match self.race_join_probe_candidates(candidates).await {
+            Some(success) => self.commit_join_probe_success(success).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn collect_join_probe_candidates(
+        &self,
+        join_attempts: &[(String, Option<String>)],
+    ) -> Vec<JoinProbeCandidate> {
+        if join_attempts.len() <= 1 {
+            return Vec::new();
+        }
+
+        let mut candidates = Vec::new();
+        let mut invalid = 0usize;
+        for (token, mesh_name) in join_attempts.iter().take(CLIENT_AUTO_JOIN_PROBE_LIMIT) {
+            match self
+                .prepare_join_probe_candidate(token, mesh_name.clone())
+                .await
+            {
+                Ok(Some(candidate)) => candidates.push(candidate),
+                Ok(None) => {}
+                Err(error) => {
+                    invalid += 1;
+                    tracing::debug!("Skipping invalid auto-join candidate: {error:#}");
+                }
+            }
+        }
+        tracing::debug!(
+            valid_candidates = candidates.len(),
+            invalid_candidates = invalid,
+            "collected auto-join probe candidates"
+        );
+        candidates
+    }
+
+    async fn race_join_probe_candidates(
+        &self,
+        candidates: Vec<JoinProbeCandidate>,
+    ) -> Option<JoinProbeSuccess> {
+        let mut probes = tokio::task::JoinSet::new();
+        for candidate in candidates {
+            let node = self.clone();
+            probes.spawn(async move { node.probe_join_candidate(candidate).await });
+        }
+
+        let mut last_error = None;
+        while let Some(result) = probes.join_next().await {
+            match result {
+                Ok(Ok(success)) => {
+                    probes.abort_all();
+                    return Some(success);
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!("auto-join candidate probe failed: {error:#}");
+                    last_error = Some(error);
+                }
+                Err(error) => {
+                    tracing::debug!("auto-join candidate probe task failed: {error:#}");
+                }
+            }
+        }
+
+        emit_join_probe_fallback(last_error.as_ref());
+        None
+    }
+
+    async fn prepare_join_probe_candidate(
+        &self,
+        token: &str,
+        mesh_name: Option<String>,
+    ) -> Result<Option<JoinProbeCandidate>> {
+        let addr = match parse_invite_token(token)
+            .map_err(|reason| anyhow::anyhow!("join rejected: {}", reason.code()))?
+        {
+            InviteTokenMaterial::Legacy(addr) => addr,
+            // Requirement-aware bootstrap tokens may require installing the
+            // signed policy before gossip. Keep those on the established
+            // serial join path rather than probing them out-of-band.
+            InviteTokenMaterial::Signed(_) => return Ok(None),
+        };
+
+        if addr.id == self.endpoint.id() {
+            return Ok(None);
+        }
+
+        let state = self.state.lock().await;
+        if state.connections.contains_key(&addr.id) {
+            return Ok(None);
+        }
+        if state
+            .dead_peers
+            .get(&addr.id)
+            .is_some_and(|t| t.elapsed() < DEAD_PEER_TTL)
+        {
+            return Ok(None);
+        }
+        drop(state);
+
+        Ok(Some(JoinProbeCandidate {
+            token: token.to_string(),
+            mesh_name,
+            addr,
+        }))
+    }
+
+    async fn probe_join_candidate(
+        &self,
+        candidate: JoinProbeCandidate,
+    ) -> Result<JoinProbeSuccess> {
+        let peer_id = candidate.addr.id;
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(CLIENT_AUTO_JOIN_PROBE_TIMEOUT, async {
+            let conn = connect_mesh(&self.endpoint, candidate.addr.clone()).await?;
+            let (announcements, rtt_ms) = self.gossip_round_trip(&conn, peer_id).await?;
+            Ok::<_, anyhow::Error>((conn, announcements, rtt_ms))
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "candidate {} timed out after {}s",
+                peer_id.fmt_short(),
+                CLIENT_AUTO_JOIN_PROBE_TIMEOUT.as_secs()
+            )
+        })??;
+
+        Ok(JoinProbeSuccess {
+            candidate,
+            conn: result.0,
+            announcements: result.1,
+            rtt_ms: result.2,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    pub(super) async fn commit_join_probe_success(
+        &self,
+        success: JoinProbeSuccess,
+    ) -> Result<(String, Option<String>)> {
+        let JoinProbeSuccess {
+            candidate,
+            conn,
+            announcements,
+            rtt_ms,
+            elapsed,
+        } = success;
+        let peer_id = candidate.addr.id;
+
+        {
+            let mut state = self.state.lock().await;
+            state.dead_peers.remove(&peer_id);
+            state.connections.insert(peer_id, conn.clone());
+        }
+        let node_for_dispatch = self.clone();
+        let conn_for_dispatch = conn.clone();
+        tokio::spawn(async move {
+            node_for_dispatch
+                .dispatch_streams(conn_for_dispatch, peer_id)
+                .await;
+        });
+
+        if let Err(error) = self
+            .apply_gossip_announcements(peer_id, rtt_ms, &announcements, false)
+            .await
+        {
+            // Drop the tracked entry AND close the QUIC connection. The
+            // dispatcher task above holds its own `conn` clone, so removing the
+            // map entry alone would leave a live, keep-alive'd connection and a
+            // running dispatcher for a peer nobody tracks (and one whose
+            // close-recovery path could even reconnect it). Closing here makes
+            // the dispatcher's `accept_*` calls error so it unwinds cleanly.
+            self.state.lock().await.connections.remove(&peer_id);
+            conn.close(0u32.into(), b"join announcement-apply failed");
+            return Err(error);
+        }
+
+        // Match `connect_to_peer`: the probe gossip RTT above likely reflects
+        // relay latency, so refresh the selected-path/RTT after holepunch.
+        self.schedule_selected_path_recheck(peer_id);
+        self.spawn_discovered_peer_connects(announcements, true, false);
+
+        tracing::info!(
+            peer = %peer_id.fmt_short(),
+            elapsed_ms = elapsed_ms_u64(elapsed),
+            rtt_ms,
+            "Fast auto-join probe selected bootstrap candidate"
+        );
+        emit_mesh_info(format!(
+            "Fast auto-join selected peer {} in {}ms",
+            peer_id.fmt_short(),
+            elapsed_ms_u64(elapsed)
+        ));
+
+        Ok((candidate.token, candidate.mesh_name))
     }
 
     pub(super) async fn initiate_gossip_inner(
@@ -878,19 +1325,22 @@ impl Node {
         their_announcements: &[(EndpointAddr, PeerAnnouncement)],
         discover_peers: bool,
     ) -> Result<()> {
-        self.apply_announced_peers(remote, their_announcements, Some(rtt_ms))
-            .await;
+        self.apply_announced_peers(
+            remote,
+            their_announcements,
+            Some(rtt_ms),
+            Some(NODE_PROTOCOL_GENERATION),
+            false,
+        )
+        .await?;
 
         // Also check the connection's actual path info — the gossip round-trip
         // time above may reflect relay latency even if a direct path is now active.
         self.refresh_gossip_path_rtt(remote, Some(rtt_ms)).await;
 
         if discover_peers {
-            let my_role = self.role.lock().await.clone();
-            for (addr, ann) in their_announcements {
-                self.maybe_connect_discovered_peer(&my_role, addr.clone(), ann, true, false)
-                    .await;
-            }
+            self.connect_discovered_peers(their_announcements, true, false)
+                .await;
         }
 
         Ok(())
@@ -940,21 +1390,64 @@ impl Node {
             &prior_state,
         );
 
+        let direct_announcement = their_announcements
+            .iter()
+            .find_map(|(addr, ann)| (addr.id == remote).then_some(ann))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "gossip payload from {} omitted its direct announcement",
+                    remote.fmt_short()
+                )
+            })?;
+
+        let negotiated_protocol_generation = match protocol {
+            ControlProtocol::ProtoV1 => Some(NODE_PROTOCOL_GENERATION),
+        };
+
+        if let Err(reason) = self
+            .validate_direct_peer_requirements(
+                remote,
+                direct_announcement,
+                negotiated_protocol_generation,
+            )
+            .await
+        {
+            self.record_mesh_requirement_rejection(
+                super::requirements::MeshRequirementRejectionSource::Gossip,
+                Some(remote),
+                reason.clone(),
+            )
+            .await;
+            self.state
+                .lock()
+                .await
+                .requirement_rejected_peers
+                .insert(remote);
+            anyhow::bail!(
+                "peer {} rejected by mesh requirements: {}",
+                remote.fmt_short(),
+                reason.code()
+            );
+        }
+
         let our_announcements = self.collect_announcements().await;
         write_gossip_payload(&mut send, protocol, &our_announcements, self.endpoint.id()).await?;
         send.finish()?;
 
         let _ = recv.read_to_end(0).await;
 
-        self.apply_announced_peers(remote, &their_announcements, None)
-            .await;
+        self.apply_announced_peers(
+            remote,
+            &their_announcements,
+            None,
+            negotiated_protocol_generation,
+            true,
+        )
+        .await?;
         self.refresh_gossip_path_rtt(remote, None).await;
 
-        let my_role = self.role.lock().await.clone();
-        for (addr, ann) in their_announcements {
-            self.maybe_connect_discovered_peer(&my_role, addr, &ann, false, true)
-                .await;
-        }
+        self.connect_discovered_peers(&their_announcements, false, true)
+            .await;
 
         Ok(())
     }
@@ -963,6 +1456,7 @@ impl Node {
         // Always clear any rejection-tracking entry so the map stays bounded.
         state.policy_rejected_peers.remove(&id);
         let had_connection = state.connections.contains_key(&id);
+        state.requirement_rejected_peers.remove(&id);
         if let Some(peer) = state.peers.remove(&id) {
             let last_seen_age_ms = super::elapsed_ms_u64(peer.last_seen.elapsed());
             let last_mentioned_age_ms = super::elapsed_ms_u64(peer.last_mentioned.elapsed());
@@ -975,7 +1469,11 @@ impl Node {
                 id.fmt_short(),
                 state.peers.len()
             );
-            let count = state.peers.len();
+            let count = state
+                .peers
+                .values()
+                .filter(|peer| peer.is_admitted())
+                .count();
             drop(state);
             self.capture_peer_lifecycle_event(PeerLifecycleCaptureEvent {
                 event: "peer_removed",
@@ -997,7 +1495,46 @@ impl Node {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn add_peer(
+        &self,
+        id: EndpointId,
+        addr: EndpointAddr,
+        ann: &PeerAnnouncement,
+        negotiated_protocol_generation: Option<u32>,
+    ) {
+        if let Err(reason) = self
+            .validate_direct_peer_requirements(id, ann, negotiated_protocol_generation)
+            .await
+        {
+            self.record_mesh_requirement_rejection(
+                super::requirements::MeshRequirementRejectionSource::Gossip,
+                Some(id),
+                reason.clone(),
+            )
+            .await;
+            tracing::warn!(
+                "Rejecting peer {} before promotion: {}",
+                id.fmt_short(),
+                reason.code()
+            );
+            let mut state = self.state.lock().await;
+            state.requirement_rejected_peers.insert(id);
+            if state.peers.remove(&id).is_some() {
+                let admitted_count = state
+                    .peers
+                    .values()
+                    .filter(|peer| peer.is_admitted())
+                    .count();
+                let _ = self.peer_change_tx.send(admitted_count);
+            }
+            return;
+        }
+        self.add_peer_after_direct_requirements_validated(id, addr, ann)
+            .await;
+    }
+
+    async fn add_peer_after_direct_requirements_validated(
         &self,
         id: EndpointId,
         addr: EndpointAddr,
@@ -1023,6 +1560,7 @@ impl Node {
         }
         let mut state = self.state.lock().await;
         state.policy_rejected_peers.remove(&id);
+        state.requirement_rejected_peers.remove(&id);
         if id == self.endpoint.id() {
             return;
         }
@@ -1069,7 +1607,12 @@ impl Node {
         if !version_allowed_for_rebroadcast(ann.version.as_deref()) {
             let mut state = self.state.lock().await;
             if state.peers.remove(&id).is_some() {
-                let _ = self.peer_change_tx.send(state.peers.len());
+                let admitted_count = state
+                    .peers
+                    .values()
+                    .filter(|peer| peer.is_admitted())
+                    .count();
+                let _ = self.peer_change_tx.send(admitted_count);
             }
             return;
         }
@@ -1087,7 +1630,12 @@ impl Node {
         if peer_is_idle_transitive_client(ann) {
             let mut state = self.state.lock().await;
             if state.peers.remove(&id).is_some() {
-                let _ = self.peer_change_tx.send(state.peers.len());
+                let admitted_count = state
+                    .peers
+                    .values()
+                    .filter(|peer| peer.is_admitted())
+                    .count();
+                let _ = self.peer_change_tx.send(admitted_count);
             }
             return;
         }
@@ -1102,7 +1650,12 @@ impl Node {
         if !policy_accepts_peer(self.trust_policy, &owner_summary) {
             let mut state = self.state.lock().await;
             if state.peers.remove(&id).is_some() {
-                let _ = self.peer_change_tx.send(state.peers.len());
+                let admitted_count = state
+                    .peers
+                    .values()
+                    .filter(|peer| peer.is_admitted())
+                    .count();
+                let _ = self.peer_change_tx.send(admitted_count);
             }
             drop(state);
             self.capture_peer_rejected(
@@ -1139,7 +1692,11 @@ impl Node {
             let updated_peer = existing.clone();
             let changed = peer_meaningfully_changed(&old_peer, &updated_peer);
             if serving_changed {
-                let count = state.peers.len();
+                let count = state
+                    .peers
+                    .values()
+                    .filter(|peer| peer.is_admitted())
+                    .count();
                 drop(state);
                 self.capture_peer_observation(
                     "peer_transitive_update",
@@ -1179,6 +1736,7 @@ impl Node {
             // last_mentioned = now keeps the peer alive for the prune window.
             let mut peer = PeerInfo::from_announcement(id, addr.clone(), ann, owner_summary);
             // Mark as never directly seen — only transitively mentioned.
+            peer.admitted = false;
             peer.last_seen =
                 std::time::Instant::now() - std::time::Duration::from_secs(PEER_STALE_SECS * 2);
             state.peers.insert(id, peer.clone());
@@ -1254,6 +1812,7 @@ mod tests {
             version: None,
             model_demand: HashMap::new(),
             mesh_id: None,
+            mesh_policy_hash: None,
             gpu_name: None,
             hostname: None,
             is_soc: None,
@@ -1268,6 +1827,9 @@ mod tests {
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
             owner_attestation: None,
+            genesis_policy: None,
+            release_attestation: None,
+            direct_admission_proof: None,
             artifact_transfer_supported: true,
             stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
@@ -1483,9 +2045,9 @@ mod tests {
         let mut ann = test_announcement(Some(100));
         ann.stage_status_list_supported = false;
 
-        node.add_peer(peer_id, addr.clone(), &ann).await;
+        node.add_peer(peer_id, addr.clone(), &ann, None).await;
         ann.stage_status_list_supported = true;
-        node.add_peer(peer_id, addr, &ann).await;
+        node.add_peer(peer_id, addr, &ann, None).await;
 
         let state = node.state.lock().await;
         let peer = state.peers.get(&peer_id).expect("peer should be tracked");
@@ -1500,9 +2062,9 @@ mod tests {
         let mut ann = test_announcement(Some(100));
         ann.stage_protocol_generation_supported = false;
 
-        node.add_peer(peer_id, addr.clone(), &ann).await;
+        node.add_peer(peer_id, addr.clone(), &ann, None).await;
         ann.stage_protocol_generation_supported = true;
-        node.add_peer(peer_id, addr, &ann).await;
+        node.add_peer(peer_id, addr, &ann, None).await;
 
         let state = node.state.lock().await;
         let peer = state.peers.get(&peer_id).expect("peer should be tracked");
@@ -1521,10 +2083,10 @@ mod tests {
             throughput_samples: 2,
         }];
 
-        node.add_peer(peer_id, addr.clone(), &ann).await;
+        node.add_peer(peer_id, addr.clone(), &ann, None).await;
         ann.advertised_model_throughput[0].avg_tokens_per_second_milli = 48_000;
         ann.advertised_model_throughput[0].throughput_samples = 9;
-        node.add_peer(peer_id, addr, &ann).await;
+        node.add_peer(peer_id, addr, &ann, None).await;
 
         let state = node.state.lock().await;
         let peer = state.peers.get(&peer_id).expect("peer should be tracked");
@@ -1773,7 +2335,7 @@ mod tests {
         ann.version = Some("0.65.1".to_string());
         // No requested, no serving, no hosted — pure idle client.
 
-        node.add_peer(id, addr, &ann).await;
+        node.add_peer(id, addr, &ann, None).await;
 
         let state = node.state.lock().await;
         assert!(
@@ -1794,7 +2356,7 @@ mod tests {
         ann.role = NodeRole::Client;
         ann.version = Some("0.57.0".to_string());
 
-        node.add_peer(id, addr, &ann).await;
+        node.add_peer(id, addr, &ann, None).await;
 
         let state = node.state.lock().await;
         assert!(
@@ -1870,5 +2432,47 @@ mod tests {
             !state.peers.contains_key(&idle_id),
             "idle transitive client must not be added (this path is dial-only)"
         );
+    }
+
+    #[tokio::test]
+    async fn client_auto_join_probe_returns_none_for_single_candidate() {
+        let node = Node::new_for_tests(NodeRole::Client).await.unwrap();
+        let token = encode_endpoint_addr_token(&test_addr(0x42));
+
+        let selected = node
+            .join_first_responsive_candidate(&[(token, Some("single".to_string()))])
+            .await
+            .unwrap();
+
+        assert!(selected.is_none());
+    }
+
+    #[tokio::test]
+    async fn client_auto_join_probe_candidate_collection_filters_unusable_tokens() {
+        let node = Node::new_for_tests(NodeRole::Client).await.unwrap();
+        let valid_addr = test_addr(0x42);
+        let dead_addr = test_addr(0x43);
+        let self_token = encode_endpoint_addr_token(&node.endpoint_addr_for_advertisement());
+        let dead_token = encode_endpoint_addr_token(&dead_addr);
+        let valid_token = encode_endpoint_addr_token(&valid_addr);
+
+        node.state
+            .lock()
+            .await
+            .dead_peers
+            .insert(dead_addr.id, std::time::Instant::now());
+
+        let candidates = node
+            .collect_join_probe_candidates(&[
+                ("not-an-invite-token".to_string(), None),
+                (self_token, None),
+                (dead_token, None),
+                (valid_token, Some("usable".to_string())),
+            ])
+            .await;
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].addr.id, valid_addr.id);
+        assert_eq!(candidates[0].mesh_name.as_deref(), Some("usable"));
     }
 }

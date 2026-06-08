@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use skippy_cache::{
     ExactStateCache, PrefixCandidatePolicy, ResidentActivationCache, ResidentPrefixCache,
 };
+use skippy_metrics::attr as attr_key;
 use skippy_runtime::{ActivationFrame, RuntimeKvPageDesc};
 
 use crate::kv_proto::{
@@ -27,6 +28,55 @@ pub use records::{
     RecordPageOutcome, ResidentActivationRecord, ResidentActivationRestore, ResidentPrefixRecord,
     ResidentPrefixRestore,
 };
+
+pub(crate) fn proactive_eviction_error_kind(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("is not active") {
+        "inactive_session"
+    } else if message.contains("batch size") {
+        "invalid_batch_size"
+    } else {
+        "native_drop_failed"
+    }
+}
+
+pub(crate) fn proactive_eviction_attrs(
+    status: &str,
+    error_kind: Option<&str>,
+    target_tokens: u64,
+    evicted_entries: usize,
+    evicted_tokens: u64,
+) -> BTreeMap<String, Value> {
+    let mut attrs = BTreeMap::from([
+        (
+            "skippy.kv.decision".to_string(),
+            json!("proactive_eviction"),
+        ),
+        (
+            attr_key::KV_PROACTIVE_EVICTION_STATUS.to_string(),
+            json!(status),
+        ),
+        (
+            attr_key::KV_PROACTIVE_EVICTION_TARGET_TOKENS.to_string(),
+            json!(target_tokens),
+        ),
+        (
+            attr_key::KV_PROACTIVE_EVICTED_ENTRIES.to_string(),
+            json!(evicted_entries),
+        ),
+        (
+            attr_key::KV_PROACTIVE_EVICTED_TOKENS.to_string(),
+            json!(evicted_tokens),
+        ),
+    ]);
+    if let Some(error_kind) = error_kind {
+        attrs.insert(
+            attr_key::KV_PROACTIVE_EVICTION_ERROR_KIND.to_string(),
+            json!(error_kind),
+        );
+    }
+    attrs
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StageKvMode {
@@ -47,6 +97,8 @@ pub struct KvStageIntegration {
     pub(crate) resident: Arc<Mutex<ResidentPrefixCache>>,
     pub(crate) activations: Arc<Mutex<ResidentActivationCache<ActivationFrame>>>,
     pub(crate) exact_states: Arc<Mutex<ExactStateCache<ExactStateExtra>>>,
+    pub(crate) first_tokens: Arc<Mutex<BTreeMap<String, i32>>>,
+    pub(crate) replay_tokens: Arc<Mutex<BTreeMap<String, Vec<i32>>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,6 +303,71 @@ impl KvStageIntegration {
 
     fn lookup_candidate_token_counts(&self, token_count: u64) -> Vec<u64> {
         self.candidate_policy.candidate_token_counts(token_count)
+    }
+
+    pub fn record_cached_first_token(&self, identity: &PrefillKvIdentity, predicted: i32) -> bool {
+        if !self.should_record() || identity.identity.token_count < self.candidate_policy.min_tokens
+        {
+            return false;
+        }
+        self.first_tokens
+            .lock()
+            .expect("first-token cache lock poisoned")
+            .insert(identity.page_id.clone(), predicted)
+            .is_none()
+    }
+
+    pub fn lookup_cached_first_token(&self, identity: &PrefillKvIdentity) -> Option<i32> {
+        if !self.should_lookup() {
+            return None;
+        }
+        self.first_tokens
+            .lock()
+            .expect("first-token cache lock poisoned")
+            .get(&identity.page_id)
+            .copied()
+    }
+
+    pub fn record_cached_replay_tokens(
+        &self,
+        cache_key: &str,
+        identity: &PrefillKvIdentity,
+        previous: &[i32],
+        predicted: i32,
+        max_replay_tokens: usize,
+    ) -> Option<usize> {
+        if !self.should_record()
+            || max_replay_tokens == 0
+            || previous.len() >= max_replay_tokens
+            || identity.identity.token_count < self.candidate_policy.min_tokens
+        {
+            return None;
+        }
+        let mut replay_tokens = self
+            .replay_tokens
+            .lock()
+            .expect("replay-token cache lock poisoned");
+        let entry = replay_tokens.entry(cache_key.to_string()).or_default();
+        if entry.len() > previous.len() {
+            return Some(entry.len().min(max_replay_tokens));
+        }
+        if entry.as_slice() != previous {
+            return None;
+        }
+        entry.push(predicted);
+        Some(entry.len())
+    }
+
+    pub fn lookup_cached_replay_tokens(&self, cache_key: &str, max_tokens: usize) -> Vec<i32> {
+        if !self.should_lookup() || max_tokens == 0 {
+            return Vec::new();
+        }
+        self.replay_tokens
+            .lock()
+            .expect("replay-token cache lock poisoned")
+            .get(cache_key)
+            .map(|tokens| tokens.iter().copied().take(max_tokens).collect())
+            .unwrap_or_default()
     }
 }
 

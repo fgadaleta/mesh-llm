@@ -59,6 +59,47 @@ pub use skippy_ffi::{
     ActivationDType as RuntimeActivationDType, ActivationLayout as RuntimeActivationLayout,
 };
 
+#[cfg(feature = "dynamic-native-runtime")]
+pub use skippy_ffi::{
+    NativeRuntimeLoadError, load_native_runtime_libraries, load_native_runtime_library,
+    native_runtime_loaded,
+};
+
+#[cfg(not(feature = "dynamic-native-runtime"))]
+pub fn native_runtime_loaded() -> bool {
+    true
+}
+
+#[cfg(not(feature = "dynamic-native-runtime"))]
+/// No-op for statically linked Skippy runtime builds.
+///
+/// # Safety
+///
+/// Static builds resolve the native ABI at process link/load time, so this
+/// function does not dereference the supplied path or mutate loader state.
+pub unsafe fn load_native_runtime_library(
+    _path: impl AsRef<std::path::Path>,
+) -> Result<(), skippy_ffi::NativeRuntimeLoadError> {
+    Ok(())
+}
+
+#[cfg(not(feature = "dynamic-native-runtime"))]
+/// No-op for statically linked Skippy runtime builds.
+///
+/// # Safety
+///
+/// Static builds resolve the native ABI at process link/load time, so this
+/// function does not dereference the supplied paths or mutate loader state.
+pub unsafe fn load_native_runtime_libraries<I, P>(
+    _paths: I,
+) -> Result<(), skippy_ffi::NativeRuntimeLoadError>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<std::path::Path>,
+{
+    Ok(())
+}
+
 static NATIVE_LOG_FILE: OnceLock<Mutex<Option<LineWriter<File>>>> = OnceLock::new();
 
 /// Channel sender for filtered native log messages.
@@ -463,11 +504,25 @@ fn should_suppress_native_log_line(line: &str) -> bool {
 }
 
 fn summarize_native_log_line(line: &str) -> Option<NativeLogEvent> {
+    if let Some((category, params)) = cpu_offload_diagnostic_params(line) {
+        return Some(NativeLogEvent {
+            message: line.to_string(),
+            category,
+            params,
+        });
+    }
+
+    let lower = line.to_ascii_lowercase();
     if line.contains("backend_init")
         || line.contains("llama_backend_init")
         || line.contains("GGML_CUDA")
-        || (line.contains("CUDA") && (line.contains("init") || line.contains("device")))
-        || (line.contains("metal") && (line.contains("init") || line.contains("device")))
+        || line.contains("GGML_HIP")
+        || line.contains("GGML_ROCM")
+        || ((lower.contains("cuda")
+            || lower.contains("hip")
+            || lower.contains("rocm")
+            || lower.contains("metal"))
+            && (lower.contains("init") || lower.contains("device") || lower.contains("backend")))
     {
         return Some(NativeLogEvent {
             message: line.to_string(),
@@ -526,6 +581,32 @@ fn summarize_native_log_line(line: &str) -> Option<NativeLogEvent> {
     }
 
     None
+}
+
+fn cpu_offload_diagnostic_params(line: &str) -> Option<(&'static str, Vec<(String, Value)>)> {
+    let lower = line.to_ascii_lowercase();
+    let (category, surface) = if lower.contains("cpu_mapped model buffer size") {
+        ("memory", "model_buffer")
+    } else if lower.contains("cpu kv buffer size") {
+        ("kv_cache", "kv_buffer")
+    } else if lower.contains("cpu compute buffer size") {
+        ("memory", "compute_buffer")
+    } else {
+        return None;
+    };
+    Some((
+        category,
+        vec![
+            (
+                "offload_device".to_string(),
+                Value::String("CPU".to_string()),
+            ),
+            (
+                "offload_surface".to_string(),
+                Value::String(surface.to_string()),
+            ),
+        ],
+    ))
 }
 
 fn parse_loaded_metadata_counts(line: &str) -> Option<(usize, usize)> {
@@ -609,6 +690,22 @@ fn flush_native_log_writer<W: Write>(writer: &mut Option<LineWriter<W>>) {
     }
 }
 
+fn sanitize_native_log_note(note: &str) -> String {
+    note.chars()
+        .map(|ch| if matches!(ch, '\n' | '\r') { ' ' } else { ch })
+        .collect()
+}
+
+pub fn write_native_log_note(note: impl AsRef<str>) {
+    let note = sanitize_native_log_note(note.as_ref());
+    if let Ok(mut guard) = native_log_file().lock()
+        && let Some(writer) = guard.as_mut()
+    {
+        let _ = writeln!(writer, "mesh-llm: {note}");
+        let _ = writer.flush();
+    }
+}
+
 fn clear_native_log_file() {
     if let Ok(mut guard) = native_log_file().lock() {
         flush_native_log_writer(&mut guard);
@@ -617,8 +714,12 @@ fn clear_native_log_file() {
 }
 
 fn set_native_log_callback(callback: skippy_ffi::LlamaLogCallback) {
+    if !skippy_ffi::native_runtime_loaded() {
+        return;
+    }
     unsafe {
         skippy_ffi::llama_log_set(callback, ptr::null_mut());
+        skippy_ffi::ggml_log_set(callback, ptr::null_mut());
         skippy_ffi::mtmd_helper_log_set(callback, ptr::null_mut());
     }
 }
@@ -816,6 +917,32 @@ impl RuntimeConfig {
             },
             _selected_backend_device: selected_backend_device,
         })
+    }
+
+    fn native_log_summary(&self) -> String {
+        let n_batch = self
+            .n_batch
+            .unwrap_or_else(|| default_n_batch_for_lane_count(self.lane_count));
+        let n_ubatch = self.n_ubatch.unwrap_or(LLAMA_SERVER_DEFAULT_N_UBATCH);
+        format!(
+            "stage_index={} layers={}..{} ctx={} lanes={} n_batch={} n_ubatch={} n_gpu_layers={} backend={} cache_k={} cache_v={} flash_attn={:?} load_mode={:?} include_embeddings={} include_output={} filter_tensors_on_load={}",
+            self.stage_index,
+            self.layer_start,
+            self.layer_end,
+            self.ctx_size,
+            self.lane_count,
+            n_batch,
+            n_ubatch,
+            self.n_gpu_layers,
+            self.selected_backend_device.as_deref().unwrap_or("auto"),
+            self.cache_type_k,
+            self.cache_type_v,
+            self.flash_attn_type,
+            self.load_mode,
+            self.include_embeddings,
+            self.include_output,
+            self.filter_tensors_on_load,
+        )
     }
 }
 
@@ -1291,6 +1418,11 @@ impl StageModel {
 
     pub fn open(path: impl AsRef<Path>, config: &RuntimeConfig) -> Result<Self> {
         let path = path.as_ref();
+        write_native_log_note(format!(
+            "skippy_model_open begin path={} {}",
+            path.display(),
+            config.native_log_summary()
+        ));
         let path = CString::new(path.to_string_lossy().as_bytes())
             .context("model path contains an interior NUL byte")?;
         let raw_config = config.as_raw()?;
@@ -1299,6 +1431,7 @@ impl StageModel {
         let status = unsafe {
             skippy_ffi::skippy_model_open(path.as_ptr(), &raw_config.raw, &mut raw, &mut error)
         };
+        write_native_log_note(format!("skippy_model_open returned status={status:?}"));
         ensure_ok(status, error)?;
         if raw.is_null() {
             return Err(anyhow!("skippy_model_open returned a null handle"));
@@ -1315,6 +1448,16 @@ impl StageModel {
         if paths.is_empty() {
             return Err(anyhow!("at least one GGUF part path is required"));
         }
+        let path_list = paths
+            .iter()
+            .map(|path| path.as_ref().display().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        write_native_log_note(format!(
+            "skippy_model_open_from_parts begin parts={} {}",
+            path_list,
+            config.native_log_summary()
+        ));
         let paths = paths
             .iter()
             .map(|path| {
@@ -1335,6 +1478,9 @@ impl StageModel {
                 &mut error,
             )
         };
+        write_native_log_note(format!(
+            "skippy_model_open_from_parts returned status={status:?}"
+        ));
         ensure_ok(status, error)?;
         if raw.is_null() {
             return Err(anyhow!(
@@ -1350,9 +1496,11 @@ impl StageModel {
     }
 
     pub fn create_session(&self) -> Result<StageSession> {
+        write_native_log_note("skippy_session_create begin");
         let mut raw = ptr::null_mut();
         let mut error = ptr::null_mut();
         let status = unsafe { skippy_ffi::skippy_session_create(self.raw, &mut raw, &mut error) };
+        write_native_log_note(format!("skippy_session_create returned status={status:?}"));
         ensure_ok(status, error)?;
         if raw.is_null() {
             return Err(anyhow!("skippy_session_create returned a null handle"));
@@ -3436,6 +3584,14 @@ pub fn write_gguf_from_parts(
     ensure_ok(status, error)
 }
 
+fn format_skippy_error(status: Status, message: &str) -> String {
+    if message.is_empty() {
+        format!("{:?}", status)
+    } else {
+        format!("{:?}: {}", status, message)
+    }
+}
+
 fn ensure_ok(status: Status, error: *mut RawError) -> Result<()> {
     if status == Status::Ok {
         free_error(error);
@@ -3443,11 +3599,7 @@ fn ensure_ok(status: Status, error: *mut RawError) -> Result<()> {
     } else {
         let message = error_message(error);
         free_error(error);
-        if message.is_empty() {
-            Err(anyhow!("skippy ABI call failed: {:?}", status))
-        } else {
-            Err(anyhow!("skippy ABI call failed: {:?}: {}", status, message))
-        }
+        Err(anyhow!("{}", format_skippy_error(status, &message)))
     }
 }
 
@@ -3497,10 +3649,11 @@ mod tests {
         ChatTemplateMessage, FlashAttentionType, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
         LLAMA_SERVER_DEFAULT_N_BATCH, LLAMA_SERVER_DEFAULT_N_UBATCH, ModelInfo,
         NativeLogAggregator, NativeLogEvent, RuntimeConfig, RuntimeLoadMode,
-        SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH, StageModel, TensorRole, flush_native_log_writer,
-        parse_cache_type, parse_layer_assign_index, redirect_native_logs_to_file,
-        register_filtered_native_logs, restore_native_logs, set_filtered_native_logs_enabled,
-        unregister_filtered_native_logs, write_native_log,
+        SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH, SamplingConfig, StageModel, Status, TensorRole,
+        flush_native_log_writer, format_skippy_error, parse_cache_type, parse_layer_assign_index,
+        redirect_native_logs_to_file, register_filtered_native_logs, restore_native_logs,
+        set_filtered_native_logs_enabled, unregister_filtered_native_logs, write_native_log,
+        write_native_log_note,
     };
 
     static NATIVE_LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3651,6 +3804,43 @@ mod tests {
         let contents = fs::read_to_string(&path)?;
         fs::remove_file(&path)?;
         assert_eq!(contents, "partial native log line");
+        Ok(())
+    }
+
+    #[test]
+    fn native_log_note_writes_sanitized_flushed_context() -> anyhow::Result<()> {
+        let _native_log_guard = native_log_test_guard();
+
+        struct RestoreNativeLogs;
+
+        impl Drop for RestoreNativeLogs {
+            fn drop(&mut self) {
+                restore_native_logs();
+            }
+        }
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = env::temp_dir().join(format!(
+            "skippy-native-log-note-test-{}-{nanos}.log",
+            std::process::id()
+        ));
+        let _guard = RestoreNativeLogs;
+        redirect_native_logs_to_file(&path)?;
+
+        write_native_log_note("native call begin\nwith context");
+
+        let contents = fs::read_to_string(&path)?;
+        restore_native_logs();
+        fs::remove_file(&path)?;
+
+        assert!(
+            contents.ends_with("mesh-llm: native call begin with context\n"),
+            "unexpected native log contents: {contents:?}"
+        );
+        assert!(
+            !contents.contains("native call begin\nwith context"),
+            "native log note was not sanitized: {contents:?}"
+        );
         Ok(())
     }
 
@@ -3818,6 +4008,22 @@ mod tests {
                 params: Vec::new(),
             }]
         );
+        assert_eq!(
+            aggregator.process_line("llama_backend_init: GGML_HIP backend initialized"),
+            vec![NativeLogEvent {
+                message: "llama_backend_init: GGML_HIP backend initialized".to_string(),
+                category: "backend",
+                params: Vec::new(),
+            }]
+        );
+        assert_eq!(
+            aggregator.process_line("llama_backend_init: GGML_ROCM backend initialized"),
+            vec![NativeLogEvent {
+                message: "llama_backend_init: GGML_ROCM backend initialized".to_string(),
+                category: "backend",
+                params: Vec::new(),
+            }]
+        );
     }
 
     #[test]
@@ -3938,6 +4144,82 @@ mod tests {
                 params: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn aggregator_tags_cpu_offload_evidence_without_capacity_facts() {
+        let mut aggregator = NativeLogAggregator::default();
+        let model_buffer =
+            aggregator.process_line("load_tensors:   CPU_Mapped model buffer size = 47492.37 MiB");
+        assert_eq!(
+            model_buffer,
+            vec![NativeLogEvent {
+                message: "load_tensors:   CPU_Mapped model buffer size = 47492.37 MiB".to_string(),
+                category: "memory",
+                params: vec![
+                    (
+                        "offload_device".to_string(),
+                        Value::String("CPU".to_string())
+                    ),
+                    (
+                        "offload_surface".to_string(),
+                        Value::String("model_buffer".to_string())
+                    ),
+                ],
+            }]
+        );
+        assert_no_capacity_params(&model_buffer);
+
+        assert_eq!(
+            aggregator.process_line("llama_kv_cache:        CPU KV buffer size =  3264.00 MiB"),
+            vec![NativeLogEvent {
+                message: "llama_kv_cache:        CPU KV buffer size =  3264.00 MiB".to_string(),
+                category: "kv_cache",
+                params: vec![
+                    (
+                        "offload_device".to_string(),
+                        Value::String("CPU".to_string())
+                    ),
+                    (
+                        "offload_surface".to_string(),
+                        Value::String("kv_buffer".to_string())
+                    ),
+                ],
+            }]
+        );
+        assert_eq!(
+            aggregator.process_line("sched_reserve:        CPU compute buffer size =   856.29 MiB"),
+            vec![NativeLogEvent {
+                message: "sched_reserve:        CPU compute buffer size =   856.29 MiB".to_string(),
+                category: "memory",
+                params: vec![
+                    (
+                        "offload_device".to_string(),
+                        Value::String("CPU".to_string())
+                    ),
+                    (
+                        "offload_surface".to_string(),
+                        Value::String("compute_buffer".to_string())
+                    ),
+                ],
+            }]
+        );
+    }
+
+    fn assert_no_capacity_params(events: &[NativeLogEvent]) {
+        const CAPACITY_KEYS: &[&str] = &[
+            "backend_device",
+            "capacity_gb",
+            "gpu_count",
+            "gpu_vram",
+            "vram_bytes",
+        ];
+        assert!(events.iter().all(|event| {
+            event
+                .params
+                .iter()
+                .all(|(key, _)| !CAPACITY_KEYS.contains(&key.as_str()))
+        }));
     }
 
     #[test]
@@ -4171,5 +4453,72 @@ mod tests {
             "expected layers 100% at final layer, got {:?}",
             pcts
         );
+    }
+
+    #[test]
+    fn format_skippy_error_omits_abi_envelope() {
+        let err = format_skippy_error(Status::RuntimeError, "something broke");
+        assert!(
+            !err.contains("skippy ABI call failed"),
+            "error format must not contain the old ABI envelope prefix: {err}"
+        );
+        assert!(
+            err.contains("RuntimeError"),
+            "error must contain the status variant"
+        );
+        assert!(
+            err.contains("something broke"),
+            "error must contain the message"
+        );
+    }
+
+    #[test]
+    fn format_skippy_error_works_without_message() {
+        let err = format_skippy_error(Status::Unsupported, "");
+        assert!(!err.contains("skippy ABI call failed"));
+        assert!(err.contains("Unsupported"));
+    }
+
+    #[test]
+    fn format_skippy_error_covers_all_status_variants() {
+        for status in [
+            Status::Error,
+            Status::InvalidArgument,
+            Status::Unsupported,
+            Status::BufferTooSmall,
+            Status::IoError,
+            Status::ModelError,
+            Status::RuntimeError,
+        ] {
+            let err = format_skippy_error(status, "test");
+            assert!(
+                !err.contains("skippy ABI call failed"),
+                "error must not contain ABI envelope for {status:?}: {err}"
+            );
+            assert!(err.contains("test"));
+        }
+    }
+
+    #[test]
+    fn configure_chat_sampling_survives_bad_metadata_json() -> anyhow::Result<()> {
+        let Some(model_path) = correctness_model() else {
+            eprintln!("skipping: SKIPPY_CORRECTNESS_MODEL is not set");
+            return Ok(());
+        };
+        let model = open_correctness_model(&model_path)?;
+        let mut session = model.create_session()?;
+        let sampling = SamplingConfig {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        // Send deliberately malformed JSON — the C++ catch blocks
+        // should clear chat sampling and return success instead of
+        // surfacing the parse error as a fatal status.
+        let result = session.configure_chat_sampling("this is not valid json", 0, Some(&sampling));
+        assert!(
+            result.is_ok(),
+            "configure_chat_sampling should return Ok even with bad metadata: {result:?}"
+        );
+        Ok(())
     }
 }

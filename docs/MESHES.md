@@ -14,6 +14,75 @@ mesh-llm serve --auto
 starts serving if this machine has usable hardware. Use this when you just want
 the system to work end to end.
 
+## Immutable mesh requirements
+
+Mesh requirements are fixed when the mesh is created. For requirement-aware
+meshes, changing mesh requirements creates a new mesh: changing the required
+node version, protocol generation, or release-attestation policy derives a new
+mesh id from the new policy hash. Trust policy is a local owner-trust setting,
+not part of the immutable mesh requirements hash.
+
+The release-attestation side of mesh requirements is build provenance only:
+certified-build admission is not remote runtime attestation. A signed release
+attestation proves a peer's binary was published by a trusted release signer.
+It does not prove the remote process is actually running unmodified code, nor
+that the host OS or hardware has not been tampered with. The shipped
+`mesh-llm` executable uses embedded release attestation, and operators can
+verify a stamped packaged binary with `cargo run -p xtask -- release-attestation inspect --binary <path-to-packaged-mesh-llm> --public-key-file <release-signing-public-key.json>`.
+`valid` means a stamped package, `missing` is normal for unstamped local or dev
+builds, and `invalid` means the bytes changed after packaging. Bare
+`inspect --binary ...` is only sufficient for unstamped binaries that should
+classify as `missing`; stamped packages require `--public-key-file` and
+otherwise report `invalid` with an explicit error. Even `invalid` binaries still
+follow the normal startup path unless mesh policy requires certified builds.
+
+Requirement-aware meshes use signed bootstrap tokens. Unrestricted legacy and
+private meshes still keep the older unsigned invite-token path.
+
+Create an unrestricted mesh:
+
+```bash
+mesh-llm serve --model Qwen3-8B-Q4_K_M
+```
+
+Create a release-attestation-required public mesh:
+
+```bash
+mesh-llm serve --model Qwen3-8B-Q4_K_M --publish \
+  --require-release-attestation \
+  --release-signer-key ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --owner-key ~/.mesh-llm/owner-keystore.json \
+  --owner-required \
+  --trust-policy require-owned \
+  --node-label lab-a
+```
+
+The release-attestation flags above are creation-time mesh requirements. The
+owner-key and trust-policy flags are local owner-identity policy; they do not
+change the mesh requirements hash.
+
+Equivalent creation-time config:
+
+```toml
+[mesh_requirements]
+require_release_attestation = true
+release_signer_keys = ["ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+```
+
+Join via signed bootstrap token:
+
+```bash
+mesh-llm serve --join <signed-bootstrap-token>
+```
+
+If a node does not satisfy the certified-build gate, the human-facing outcome is
+"certified build required". The machine reason codes surfaced in logs, status,
+and evidence are underscored: `certified_binary_required`,
+`build_proof_invalid`, and `release_signer_untrusted`.
+
+When migrating from an unrestricted legacy mesh to a requirement-aware mesh,
+recreate the mesh, republish it, and issue new signed bootstrap tokens.
+
 For an API-only node that does not serve models:
 
 ```bash
@@ -60,7 +129,8 @@ mesh-llm serve --split --join <token> --model Qwen3-8B-Q4_K_M
 ```
 
 `--bind-ip` binds mesh QUIC to that local address and filters the invite/gossip
-direct-address set to the selected IP while keeping relay/public candidates.
+direct-address set to the selected IP. Default Nostr mode can still keep
+relay/public candidates; `--mesh-discovery-mode mdns` keeps startup LAN-only.
 Use `--listen-all` only for the local HTTP API/console listener; it does not
 select the mesh QUIC interface.
 
@@ -74,6 +144,9 @@ mesh-llm serve --model Qwen3-8B-Q4_K_M --publish
 with `--auto`, `--discover`, or `mesh-llm discover`. Published meshes are
 republished periodically and include a TTL; if the node exits, the publication
 ages out.
+
+Public discovery is separate from admission. A public mesh can still reject
+nodes that do not satisfy its creation-time requirements.
 
 Add a friendly discovery name:
 
@@ -115,6 +188,14 @@ mesh-llm discover --auto
 ```
 
 `discover --auto` prints the best invite token, which is useful for scripts.
+When using `--mesh-discovery-mode mdns`, discovery is LAN-scoped: mDNS TXT
+records advertise bounded capacity/model summaries and a token fingerprint.
+When the management API is reachable from LAN peers, for example with
+`--listen-all`, they also advertise a short-lived proof challenge and
+`/api/discovery/lan-details`. They never carry the raw invite token. A node can
+request local detail from that endpoint only by posting proof derived from the
+matching invite token, and mDNS re-discovery uses the same supplied-token gate
+if peers are lost.
 
 ## Console and management API
 
@@ -134,7 +215,16 @@ curl -s http://localhost:3131/api/discover | jq .
 ```
 
 `/api/status` reports whether the local mesh publication is `private`,
-`public`, or `publish_failed`.
+`public`, or `publish_failed`. `/api/discover` follows the active discovery
+mode: Nostr mode returns public relay results, while mDNS mode returns LAN
+advertisements with token fingerprints and challenge metadata only.
+
+The same status payload also includes `routing_affinity.target_reputation`.
+Those counters are local behavioral health signals used by the current proxy to
+avoid peers that recently timed out or returned unavailable. They are not
+gossiped, not persisted as mesh trust, and not proof of a peer's identity or
+model honesty. See [NODE_REP.md](NODE_REP.md) for the local reputation model,
+status fields, and testing boundary.
 
 ## Private ownership and trust
 
@@ -164,8 +254,14 @@ mesh-llm auth trust remove <owner-id>
 ## Networking notes
 
 - Discovery uses Nostr relays by default.
+- `--mesh-discovery-mode mdns` is LAN-only discovery and transport startup:
+  it does not contact Nostr relays, does not register with public iroh relays,
+  and does not run raw public STUN probing. mDNS TXT records contain only a
+  token fingerprint plus, when the management API is LAN-reachable, challenge
+  metadata; joins and LAN detail requests still require proof from a matching
+  supplied invite token.
 - Mesh connectivity uses managed iroh relay infrastructure by default when
-  direct paths are unavailable.
+  direct paths are unavailable in Nostr mode.
 - Hidden relay override flags exist for lab/debug deployments, but normal users
   should not need to run their own relay.
 - `/v1` request routing and Skippy stage traffic are separate paths. HTTP

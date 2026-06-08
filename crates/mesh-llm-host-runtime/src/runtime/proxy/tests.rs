@@ -36,6 +36,33 @@ async fn spawn_api_proxy_test_harness(
     (addr, handle)
 }
 
+async fn spawn_api_proxy_test_harness_with_contexts(
+    targets: election::ModelTargets,
+    contexts: &[(&str, u32)],
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let node = mesh::Node::new_for_tests(mesh::NodeRole::Worker)
+        .await
+        .unwrap();
+    for (model, context_length) in contexts {
+        node.set_model_runtime_context_length(model, Some(*context_length))
+            .await;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (_target_tx, target_rx) = watch::channel(targets);
+    let (drop_tx, _drop_rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(api_proxy(
+        node,
+        addr.port(),
+        target_rx,
+        drop_tx,
+        Some(listener),
+        false,
+        affinity::AffinityRouter::default(),
+    ));
+    (addr, handle)
+}
+
 async fn spawn_api_proxy_test_harness_with_plugin_manager(
     targets: election::ModelTargets,
     plugin_manager: plugin::PluginManager,
@@ -282,8 +309,8 @@ async fn start_inference_endpoint_plugin_manager(
     let plugin_manager = plugin::PluginManager::for_test_bridge(&[], Arc::new(NoopTestBridge));
     plugin_manager
         .set_test_inference_endpoints(vec![plugin::InferenceEndpointRoute {
-            plugin_name: plugin::OPENAI_ENDPOINT_PLUGIN_ID.into(),
-            endpoint_id: "openai-endpoint".into(),
+            plugin_name: "endpoint-plugin".into(),
+            endpoint_id: "endpoint-plugin".into(),
             address,
             models,
         }])
@@ -1611,6 +1638,175 @@ async fn test_api_proxy_returns_last_context_overflow_bad_request_when_all_targe
     proxy_handle.abort();
     let _ = first_handle.await;
     let _ = second_handle.await;
+}
+
+#[tokio::test]
+async fn test_api_proxy_rejects_request_when_all_known_contexts_too_small() {
+    let (first_port, first_rx, first_handle) = spawn_capturing_upstream(r#"{"ok":"first"}"#).await;
+    let (second_port, second_rx, second_handle) =
+        spawn_capturing_upstream(r#"{"ok":"second"}"#).await;
+    let (proxy_addr, proxy_handle) = spawn_api_proxy_test_harness_with_contexts(
+        single_model_targets("test", &[first_port, second_port]),
+        &[("test", 4096)],
+    )
+    .await;
+
+    let body = json!({
+        "model": "test",
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": "x".repeat(20_000)}],
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = send_request_and_read_response(proxy_addr, vec![request.into_bytes()]).await;
+    let first_seen = tokio::time::timeout(Duration::from_millis(100), first_rx).await;
+    let second_seen = tokio::time::timeout(Duration::from_millis(100), second_rx).await;
+
+    proxy_handle.abort();
+    first_handle.abort();
+    second_handle.abort();
+
+    assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+    assert!(
+        response.contains("context") || response.contains("target"),
+        "response should explain why no target was eligible: {response}"
+    );
+    assert!(
+        first_seen.is_err(),
+        "proxy should not contact a known-too-small target"
+    );
+    assert!(
+        second_seen.is_err(),
+        "proxy should not contact any known-too-small fallback target"
+    );
+}
+
+#[tokio::test]
+async fn test_api_proxy_retries_empty_success_response_to_next_target() {
+    let empty_body = json!({
+        "id": "chatcmpl-empty",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": ""},
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let healthy_body = json!({
+        "id": "chatcmpl-healthy",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "recovered answer"},
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let (empty_port, empty_rx, empty_handle) = spawn_capturing_upstream(&empty_body).await;
+    let (healthy_port, healthy_rx, healthy_handle) = spawn_capturing_upstream(&healthy_body).await;
+    let (proxy_addr, proxy_handle) =
+        spawn_api_proxy_test_harness(single_model_targets("test", &[empty_port, healthy_port]))
+            .await;
+
+    let body = json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "empty then retry"}],
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = send_request_and_read_response(proxy_addr, vec![request.into_bytes()]).await;
+    let empty_raw = String::from_utf8(empty_rx.await.unwrap()).unwrap();
+    let healthy_raw = String::from_utf8(
+        tokio::time::timeout(Duration::from_secs(2), healthy_rx)
+            .await
+            .expect("proxy did not retry empty success response to the healthy target")
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("recovered answer"));
+    assert!(!response.contains("chatcmpl-empty"));
+    assert!(empty_raw.contains("empty then retry"));
+    assert!(healthy_raw.contains("empty then retry"));
+
+    proxy_handle.abort();
+    let _ = empty_handle.await;
+    let _ = healthy_handle.await;
+}
+
+#[tokio::test]
+async fn test_api_proxy_retries_length_finish_success_response_to_next_target() {
+    let truncated_body = json!({
+        "id": "chatcmpl-length",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "partial"},
+            "finish_reason": "length"
+        }]
+    })
+    .to_string();
+    let healthy_body = json!({
+        "id": "chatcmpl-healthy",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "complete answer"},
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let (truncated_port, truncated_rx, truncated_handle) =
+        spawn_capturing_upstream(&truncated_body).await;
+    let (healthy_port, healthy_rx, healthy_handle) = spawn_capturing_upstream(&healthy_body).await;
+    let (proxy_addr, proxy_handle) = spawn_api_proxy_test_harness(single_model_targets(
+        "test",
+        &[truncated_port, healthy_port],
+    ))
+    .await;
+
+    let body = json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "length then retry"}],
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = send_request_and_read_response(proxy_addr, vec![request.into_bytes()]).await;
+    let truncated_raw = String::from_utf8(truncated_rx.await.unwrap()).unwrap();
+    let healthy_raw = String::from_utf8(
+        tokio::time::timeout(Duration::from_secs(2), healthy_rx)
+            .await
+            .expect("proxy did not retry length-truncated success response to the healthy target")
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("complete answer"));
+    assert!(!response.contains("chatcmpl-length"));
+    assert!(truncated_raw.contains("length then retry"));
+    assert!(healthy_raw.contains("length then retry"));
+
+    proxy_handle.abort();
+    let _ = truncated_handle.await;
+    let _ = healthy_handle.await;
 }
 
 #[tokio::test]

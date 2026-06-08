@@ -81,6 +81,10 @@ fn sanitize_worker_output(mut output: WorkerOutput) -> WorkerOutput {
     if !output.confidence.is_finite() {
         output.confidence = 0.5;
     }
+    if output.kind == OutputKind::Answer && is_silent_reply_sentinel(&output.payload) {
+        output.kind = OutputKind::Uncertainty;
+        output.confidence = 0.0;
+    }
     if let Some(args) = output.tool_arguments.as_ref() {
         if args.is_null() {
             output.tool_arguments = Some(serde_json::json!({}));
@@ -93,6 +97,18 @@ fn sanitize_worker_output(mut output: WorkerOutput) -> WorkerOutput {
         }
     }
     output
+}
+
+/// OpenClaw and similar messaging clients use an exact `NO_REPLY` assistant
+/// message as an app-level "stay silent" directive. MoA workers can copy that
+/// directive from tool/system prompts even for ordinary user questions; treat
+/// it as no usable answer inside the aggregator.
+pub fn is_silent_reply_sentinel(text: &str) -> bool {
+    let trimmed = text.trim();
+    let unquoted = trimmed
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+        .trim();
+    unquoted.eq_ignore_ascii_case("NO_REPLY")
 }
 
 /// Remove KV envelope metadata lines from text.  Models sometimes include
@@ -173,9 +189,12 @@ fn try_json_parse(
     // — if the worker writes inline tool JSON and we miss it, MoA leaks
     // the JSON back as `content` and the agent does nothing. This is
     // the failure mode PR #566 review called out.
-    if obj.get("kind").is_none()
-        && let Some((tool_name, arguments)) = extract_tool_name_and_arguments(&obj)
-    {
+    let openai_tool_call = obj
+        .get("kind")
+        .is_none()
+        .then(|| extract_tool_name_and_arguments(&obj))
+        .flatten();
+    if let Some((tool_name, arguments)) = openai_tool_call {
         let args = normalize_tool_arguments(arguments).map(Value::Object);
         return Some(WorkerOutput {
             kind: OutputKind::ToolProposal,
@@ -515,9 +534,9 @@ fn extract_tool_proposal(raw: &str) -> (Option<String>, Option<Value>) {
     }
 
     // Strategy 1: Look for structured JSON in the text
-    if let Some(json_str) = extract_json_object(raw)
-        && let Ok(obj) = serde_json::from_str::<Value>(&json_str)
-    {
+    let parsed_json =
+        extract_json_object(raw).and_then(|json_str| serde_json::from_str::<Value>(&json_str).ok());
+    if let Some(obj) = parsed_json {
         if let Some((name, arguments)) = extract_tool_name_and_arguments(&obj) {
             let args = normalize_tool_arguments(arguments).map(Value::Object);
             return (Some(name.to_string()), args);
@@ -638,6 +657,25 @@ mod tests {
         let raw = "I'm not sure about this. It could be either way.";
         let out = normalize_worker_output(raw, "test-model", WorkerRole::Fast, 50);
         assert_eq!(out.kind, OutputKind::Uncertainty);
+    }
+
+    #[test]
+    fn no_reply_sentinel_is_not_a_usable_answer() {
+        let out = normalize_worker_output("NO_REPLY", "test-model", WorkerRole::Fast, 50);
+        assert_eq!(out.kind, OutputKind::Uncertainty);
+        assert_eq!(out.confidence, 0.0);
+        assert_eq!(out.payload, "NO_REPLY");
+    }
+
+    #[test]
+    fn no_reply_sentence_is_still_a_normal_answer() {
+        let out = normalize_worker_output(
+            "The literal token NO_REPLY appears in this documentation.",
+            "test-model",
+            WorkerRole::Fast,
+            50,
+        );
+        assert_eq!(out.kind, OutputKind::Answer);
     }
 
     #[test]

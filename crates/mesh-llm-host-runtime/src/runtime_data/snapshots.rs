@@ -5,7 +5,7 @@ use crate::api::status::{
     GpuEntry, LocalInstance, MeshModelPayload, NodeState, OwnershipPayload, PeerPayload,
     WakeableNode,
 };
-use crate::crypto::OwnershipSummary;
+use crate::crypto::{OwnershipSummary, ReleaseAttestationSummary};
 use crate::mesh::{MeshCatalogEntry, ModelDemand, PeerInfo};
 use crate::models::LocalModelInventorySnapshot;
 use crate::network::metrics::RoutingCollectorSnapshot;
@@ -99,6 +99,7 @@ pub(crate) struct StatusViewInput {
     pub latest_version: Option<String>,
     pub node_id: String,
     pub owner: OwnershipSummary,
+    pub release_attestation: ReleaseAttestationSummary,
     pub token: String,
     pub is_host: bool,
     pub is_client: bool,
@@ -114,6 +115,9 @@ pub(crate) struct StatusViewInput {
     pub inflight_requests: u64,
     pub mesh_id: Option<String>,
     pub mesh_name: Option<String>,
+    pub mesh_discovery_mode: String,
+    pub discovery_scope: String,
+    pub discovery_source: String,
     pub nostr_discovery: bool,
     pub publication_state: String,
     pub local_processes: Vec<RuntimeProcessPayload>,
@@ -129,6 +133,7 @@ pub(crate) struct StatusViewSnapshot {
     pub latest_version: Option<String>,
     pub node_id: String,
     pub owner: OwnershipPayload,
+    pub release_attestation: ReleaseAttestationSummary,
     pub token: String,
     pub node_state: NodeState,
     pub node_status: String,
@@ -151,6 +156,9 @@ pub(crate) struct StatusViewSnapshot {
     pub inflight_requests: u64,
     pub mesh_id: Option<String>,
     pub mesh_name: Option<String>,
+    pub mesh_discovery_mode: String,
+    pub discovery_scope: String,
+    pub discovery_source: String,
     pub nostr_discovery: bool,
     pub publication_state: String,
     pub routing_affinity: affinity::AffinityStatsSnapshot,

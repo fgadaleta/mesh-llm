@@ -64,7 +64,13 @@ mesh-llm client --auto
 Runtime switches:
 
 - `--join <TOKEN>`: join a specific mesh using an invite token (repeatable).
-- `--discover [NAME]`: discover a mesh via Nostr and join it. With a name, joins the mesh matching that name. Without a name, behaves like `--auto`.
+- `--discover [NAME]`: discover a mesh and join it. With a name, joins the mesh matching that name. Without a name, behaves like `--auto`.
+- `--mesh-discovery-mode <nostr|mdns>`: choose the discovery provider. `nostr`
+  is the default public/WAN-capable mode. `mdns` browses LAN DNS-SD records,
+  requires a supplied matching invite token for join material and LAN detail
+  proof, and disables public iroh relays plus raw STUN startup probing. LAN
+  detail endpoints are only advertised when the management API is reachable
+  from LAN peers, for example with `--listen-all`.
 - `--auto`: auto-join the best discovered mesh.
 - `--model <MODEL>`: model to serve (catalog id from `models recommended`, HF ref/URL, or path).
 - `--gguf <GGUF>`: serve a specific local GGUF file directly (repeatable).
@@ -72,15 +78,21 @@ Runtime switches:
 - `--client`: API-only mode (no GPU/model serving).
 - `--console <CONSOLE>`: console/API management port (default `3131`).
 - `--headless`: disable the embedded web UI; keep the management API on the `--console` port.
-- `--bind-ip <IP>`: bind mesh QUIC to a specific local IP address and advertise
-  only that selected direct IP, plus relay/public candidates. Use this on
-  multi-interface hosts where Docker/CNI bridge addresses overlap across nodes.
+- `--bind-ip <IP>`: bind mesh QUIC to a specific local IP address. In default
+  Nostr discovery mode the invite can still include relay/public candidates.
+  In `--mesh-discovery-mode mdns`, only LAN/direct candidates are advertised.
+  Use this on multi-interface hosts where Docker/CNI bridge addresses overlap
+  across nodes.
 - `--bind-port <PORT>`: bind mesh QUIC to a fixed UDP port, usually paired
   with `--bind-ip` for firewall or NAT rules.
 - `--swarm-capture <DIR>`: write passive local mesh membership and connection
   diagnostics as JSONL. See [SWARM_CAPTURE.md](SWARM_CAPTURE.md) for the full
   debug-capture workflow.
 - `--publish`: publish your mesh for discovery.
+- `--require-release-attestation`: when creating a requirement-aware mesh,
+  require peers to present a trusted release attestation.
+- `--release-signer-key <KEY>`: allow a release signer key in the creation-time
+  attestation policy (repeatable). Use with `--require-release-attestation`.
 - `--mesh-name <MESH_NAME>`: friendly mesh name in discovery.
 - `--region <REGION>`: region hint for discovery.
 - `--name <NAME>`: display name for this node.
@@ -328,6 +340,32 @@ Switches:
 - `--auto-update`: available on most commands; when set, mesh-llm checks for a newer bundled release before proceeding.
 
 
+### `release-attestation inspect`
+
+Use this to inspect the embedded release attestation on the packaged `mesh-llm` executable.
+
+Usage:
+
+```bash
+cargo run -p xtask -- release-attestation inspect --binary /path/to/mesh-bundle/mesh-llm --public-key-file /path/to/release-signing-public-key.json
+```
+
+Switches:
+
+- `--binary <PATH>`: packaged `mesh-llm` executable to inspect.
+- `--public-key-file <PATH>`: release-signing trust root required to validate an embedded stamped binary.
+- `--json`: machine-readable output.
+
+The command reports `missing`, `valid`, or `invalid`. It applies only to the
+shipped executable, not SDK, XCFramework, or other native artifacts. Local and
+dev builds are unstamped by default, so `missing` is normal there. A
+post-download mutation can turn a stamped binary `invalid`, but the default
+startup path still allows it because this is provenance and admission
+hardening, not runtime integrity proof. Bare `inspect --binary ...` is only
+enough to classify an unstamped binary as `missing`; if an embedded attestation
+is present, the command requires `--public-key-file` and otherwise reports
+`invalid` with an explicit error.
+
 ### `gpus`
 
 Use this to inspect local GPU identity and capacity, including per-device VRAM, unified-memory state, and cached benchmark-derived bandwidth when present.
@@ -399,7 +437,9 @@ curl -s localhost:3131/api/status | jq '.runtime.openai_guardrails'
 
 ### `discover`
 
-Use this to discover meshes via Nostr and optionally select one automatically.
+Use this to discover meshes through the selected discovery provider and
+optionally select one automatically. The default provider is Nostr; pass the
+global `--mesh-discovery-mode mdns` before the command for LAN mDNS discovery.
 
 Switches:
 
@@ -408,7 +448,8 @@ Switches:
 - `--min-vram <MIN_VRAM>`: filter by minimum VRAM (GB).
 - `--region <REGION>`: filter by region.
 - `--auto`: print best invite token (useful for piping).
-- `--relay <RELAY>`: custom relay URL(s).
+- `--relay <RELAY>`: custom Nostr relay URL(s). Only valid with
+  `--mesh-discovery-mode nostr`.
 
 ### `goose`
 
@@ -428,6 +469,16 @@ Switches:
 - `--model <MODEL>`: model id from `/v1/models`.
 - `--port <PORT>`: mesh-llm API port (default `9337`).
 
+### `pi`
+
+Use this to launch Pi already wired to mesh-llm’s OpenAI-compatible endpoint.
+
+Switches:
+
+- `--model <MODEL>`: model id from `/v1/models`.
+- `--host <HOST|HOST:PORT|URL>`: Pi target host or URL (default `127.0.0.1:9337`).
+- `--write`: write the mesh provider config without launching Pi.
+
 ### `opencode`
 
 Use this to launch OpenCode already wired to mesh-llm’s OpenAI-compatible endpoint.
@@ -439,6 +490,30 @@ Switches:
 - `--model <MODEL>`: model id from `/v1/models`.
 - `--host <HOST|HOST:PORT|URL>`: OpenCode target host or URL (default `127.0.0.1:9337`). Bare host forms assume `http`, default inference port `9337`, and default management port `3131`.
 - `--write`: write a merged `~/.config/opencode/opencode.json` that preserves unrelated root keys and sibling providers. If only `opencode.jsonc` exists, mesh-llm errors and tells you to rename or migrate it to `opencode.json` first.
+
+### `skills`
+
+Use this to install Agent Skills exposed by installed mesh plugins.
+
+Usage:
+
+```bash
+mesh-llm skills install
+mesh-llm skills install --agent goose --agent codex
+mesh-llm skills install --all --dry-run
+```
+
+By default, the installer writes only to detected agents. Plugin packages expose
+skills by shipping `skills/<name>/SKILL.md` under the plugin archive root.
+Agent launch commands (`goose`, `pi`, `opencode`, and `claude`) install
+available plugin skills for that agent before starting the session.
+
+Switches:
+
+- `--agent <AGENT>`: install to a specific agent (`goose`, `pi`, `codex`, `opencode`, `claude`); repeatable.
+- `--all`: install to every supported target location even if the agent is not detected.
+- `--dry-run`: print planned writes without changing files.
+- `--force`: overwrite an existing user-owned skill directory with the same name.
 
 ### `stop`
 
@@ -475,7 +550,6 @@ Subcommands:
 
 - `plugin list`: list auto-registered/configured plugins.
 - `plugin install <NAME>`: compatibility shim for older install workflows.
-- `plugin mcp`: run configured plugin tools as an MCP server over stdio.
 
 
 ### `auth`

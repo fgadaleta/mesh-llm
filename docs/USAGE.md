@@ -13,6 +13,12 @@ Install the latest release bundle:
 curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | bash
 ```
 
+On Windows, use PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.ps1 | iex
+```
+
 To opt into the latest published prerelease bundle instead:
 
 ```bash
@@ -27,13 +33,20 @@ For a non-interactive install, set the flavor explicitly:
 curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | MESH_LLM_INSTALL_FLAVOR=vulkan bash
 ```
 
+On Windows:
+
+```powershell
+$env:MESH_LLM_INSTALL_FLAVOR = "vulkan"
+irm https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.ps1 | iex
+```
+
 Release bundles install the `mesh-llm` host binary plus the flavor-specific
 native runtime libraries it embeds. Normal serving runs inside the `mesh-llm`
 host process, which loads the Skippy/llama.cpp stage runtime directly.
 
-Published bundle flavors include macOS, Linux CPU, Linux ARM64 CPU, Linux CUDA,
-Linux CUDA Blackwell, Linux ROCm, Linux Vulkan, Windows CPU, Windows CUDA,
-Windows ROCm, and Windows Vulkan. Metal remains macOS-only.
+Published bundle flavors include macOS, Linux CPU, Linux ARM64 CPU, Linux ARM64
+CUDA, Linux CUDA, Linux CUDA Blackwell, Linux ROCm, Linux Vulkan, Windows CPU,
+Windows CUDA, Windows ROCm, and Windows Vulkan. Metal remains macOS-only.
 
 If you keep more than one flavor in the same `bin` directory, choose one explicitly:
 
@@ -609,6 +622,12 @@ command = "mesh-llm-plugin-blackboard"
 # [[plugin]]
 # name    = "openai-endpoint"
 # url     = "http://localhost:8000/api/v1"
+#
+# [plugin.startup]
+# connect_timeout_secs = 75
+# init_timeout_secs = 90
+# optional = true
+# lazy_start = true
 ```
 
 Use the default config:
@@ -650,6 +669,11 @@ Config precedence:
   written back into TOML.
 - Changing this file affects future starts or reloads, not active sessions.
 - Plugin entries stay in the same file.
+- `[plugin.startup]` controls how long mesh-llm waits for an external plugin to
+  connect and initialize. `optional = true` records a missing installed plugin
+  as inactive instead of rejecting the config, and `lazy_start = true` defers
+  process launch until direct plugin use. This is useful for very slow legacy
+  hosts or emulator-assisted startup paths.
 
 ## Lemonade integration
 
@@ -662,6 +686,18 @@ lemonade-server serve
 curl -s http://localhost:8000/api/v1/models | jq '.data[].id'
 ```
 
+Install the plugin:
+
+```bash
+mesh-llm plugins install openai-endpoint
+```
+
+You can also install directly from GitHub:
+
+```bash
+mesh-llm plugins install Mesh-LLM/openai-endpoint
+```
+
 Then enable the plugin in `~/.mesh-llm/config.toml`:
 
 ```toml
@@ -669,6 +705,10 @@ Then enable the plugin in `~/.mesh-llm/config.toml`:
 name = "openai-endpoint"
 url = "http://localhost:8000/api/v1"
 ```
+
+If you are running the plugin binary yourself instead of using
+`mesh-llm plugins install`, set `command = "openai-endpoint"` in the same
+plugin block.
 
 Start mesh-llm normally:
 
@@ -699,7 +739,7 @@ Notes:
 
 - mesh-llm does not start or supervise Lemonade; run it separately with the Desktop app or CLI.
 - Use the exact model ID returned by Lemonade's `/api/v1/models`.
-- The URL can also be set via `MESH_LLM_OPENAI_ENDPOINT_URL` env var (config takes precedence).
+- mesh-llm passes the configured URL to the plugin through `MESH_LLM_PLUGIN_URL`.
 
 Useful model commands:
 
@@ -731,10 +771,10 @@ mesh-llm models prune
 ```bash
 mesh-llm gpus
 mesh-llm gpus --json
-mesh-llm gpu benchmark --json
+mesh-llm gpus detect --json
 ```
 
-This prints the local GPU inventory with stable IDs, backend device names, VRAM, unified-memory status, and cached bandwidth when a benchmark fingerprint is already present. Add `--json` for machine-readable inventory output, or run `mesh-llm gpu benchmark --json` to refresh the cached fingerprint and print the benchmark summary as JSON.
+This prints the local GPU inventory with stable IDs, backend device names, VRAM, unified-memory status, and cached bandwidth when a benchmark fingerprint is already present. Add `--json` for machine-readable inventory output, or run `mesh-llm gpus detect --json` to refresh the cached fingerprint and print the benchmark summary as JSON.
 
 ## Local runtime control
 

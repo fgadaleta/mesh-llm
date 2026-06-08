@@ -27,7 +27,18 @@ The release bundle is now a single `mesh-llm` runtime binary. External
 just bundle
 ```
 
-This creates `/tmp/mesh-bundle.tar.gz` containing `mesh-llm`.
+This creates `/tmp/mesh-llm-bundle.tar.gz` containing the packaged `mesh-llm`
+executable for local deployment. Platform release archives are named by target,
+such as `mesh-llm-aarch64-apple-darwin.tar.gz`.
+
+Verify the packaged executable with `cargo run -p xtask -- release-attestation inspect --binary /tmp/test-bundle/mesh-llm --public-key-file /tmp/mesh-release-key.pub`.
+`valid` means the packaged binary matches a trusted release signer, `missing`
+means an unstamped build, and `invalid` means the bytes changed after packaging.
+Bare `inspect --binary ...` is only sufficient for unstamped binaries that
+should classify as `missing`; a stamped package requires `--public-key-file` and
+otherwise reports `invalid` with an explicit error. A post-download mutation can
+turn a stamped binary `invalid`, but default startup still allows it because this
+is provenance and admission hardening, not runtime integrity proof.
 
 Platform release archives are created with:
 
@@ -59,12 +70,13 @@ in the workflow workspace, and creates the requested release tag at a
 manifest-only commit before publishing.
 
 The current GitHub Actions release workflow publishes macOS aarch64, Linux
-x86_64 CPU, Linux ARM64 CPU, Linux CUDA, Linux CUDA Blackwell, Linux ROCm,
-Linux Vulkan, Windows CPU, Windows CUDA, Windows ROCm, and Windows Vulkan
-bundles, plus the SwiftPM `MeshLLMFFI.xcframework.zip` binary artifact. The
-Linux ARM64 artifact is named
-`mesh-llm-aarch64-unknown-linux-gnu.tar.gz`; CUDA lanes are named
-`mesh-llm-x86_64-unknown-linux-gnu-cuda.tar.gz` and
+x86_64 CPU, Linux ARM64 CPU, Linux ARM64 CUDA, Linux CUDA, Linux CUDA
+Blackwell, Linux ROCm, Linux Vulkan, Windows CPU, Windows CUDA, Windows ROCm,
+and Windows Vulkan bundles, plus the SwiftPM `MeshLLMFFI.xcframework.zip`
+binary artifact. The Linux ARM64 CPU artifact is named
+`mesh-llm-aarch64-unknown-linux-gnu.tar.gz`; the Linux ARM64 CUDA artifact is
+named `mesh-llm-aarch64-unknown-linux-gnu-cuda.tar.gz`. x86_64 CUDA lanes are
+named `mesh-llm-x86_64-unknown-linux-gnu-cuda.tar.gz` and
 `mesh-llm-x86_64-unknown-linux-gnu-cuda-blackwell.tar.gz`.
 
 Windows release artifacts use the `x86_64-pc-windows-msvc` target triple and
@@ -76,7 +88,7 @@ On native Windows, `just check-release` still runs the Rust/docs/workflow invari
 
 ```bash
 mkdir /tmp/test-bundle
-tar xzf /tmp/mesh-bundle.tar.gz -C /tmp/test-bundle --strip-components=1
+tar xzf /tmp/mesh-llm-bundle.tar.gz -C /tmp/test-bundle --strip-components=1
 /tmp/test-bundle/mesh-llm --model Qwen2.5-3B
 rm -rf /tmp/test-bundle
 ```
@@ -96,8 +108,33 @@ On non-prerelease tags, the release workflow also publishes the Rust SDK crate
 chain to crates.io in dependency order:
 
 ```bash
+cargo run -p xtask -- repo-consistency publish-crates
 scripts/publish-crates.sh --dry-run
 ```
+
+SDK packages that expose the optional console must package the built web
+console before publishing language SDK artifacts:
+
+```bash
+scripts/package-sdk-console-assets.sh --sdk all
+scripts/verify-sdk-console-assets.sh --sdk all
+```
+
+The script builds `crates/mesh-llm-ui/dist` in release mode and copies it to
+the canonical SDK resource locations: `sdk/node/console`,
+`sdk/swift/Sources/MeshLLM/Resources/Console`, and
+`sdk/kotlin/src/main/resources/mesh-llm/console`.
+
+These generated directories are ignored during normal development. For a
+manual tag push, force-add them into the release commit before tagging because
+SwiftPM resolves package resources from the Git tag:
+
+```bash
+git add -f sdk/node/console sdk/swift/Sources/MeshLLM/Resources/Console sdk/kotlin/src/main/resources/mesh-llm/console
+```
+
+Workflow-dispatch releases generate and force-add these resources into the
+release tag commit automatically.
 
 The chain currently publishes:
 
@@ -113,11 +150,14 @@ The chain currently publishes:
 10. `mesh-llm-node`
 11. `mesh-llm-api-server`
 
-Run the dry-run before cutting a GA tag after changing SDK crate manifests or
-workspace-internal SDK dependencies. On the first release that introduces a
-new internal SDK crate, the dry-run validates packages whose registry
-dependencies already exist and reports downstream packages that will be fully
-verified during the real sequential publish after their upstream crates land.
+Run the consistency check and dry-run before cutting a GA tag after changing
+SDK crate manifests or workspace-internal SDK dependencies. The consistency
+check keeps the scripted publish order, workspace path dependency versions,
+publish metadata, bundled file includes, and CI release preflight in sync. On
+the first release that introduces a new internal SDK crate, the dry-run
+validates packages whose registry dependencies already exist and reports
+downstream packages that will be fully verified during the real sequential
+publish after their upstream crates land.
 
 If crates.io rate-limits the non-prerelease publish chain after some crates
 have already uploaded, rerun `scripts/publish-crates.sh` for the same checked

@@ -1,7 +1,7 @@
 //! Prefix affinity and sticky routing helpers for inference target selection.
 
 use crate::inference::election;
-use crate::network::target_health::{TargetHealth, TargetHealthOutcome};
+use crate::network::target_health::{TargetHealth, TargetHealthOutcome, TargetReputationStats};
 use iroh::EndpointId;
 use serde::Serialize;
 use serde_json::Value;
@@ -34,6 +34,7 @@ pub struct AffinityStatsSnapshot {
     pub session_routes: u64,
     pub learned: u64,
     pub evicted: u64,
+    pub target_reputation: TargetReputationStats,
 }
 
 fn prefix_only_enabled() -> bool {
@@ -119,6 +120,7 @@ impl AffinityRouter {
         stats.prefix_entries = state.entries.len();
         stats.prefix_enabled = self.config.prefix_enabled;
         stats.sticky_enabled = self.config.sticky_enabled;
+        stats.target_reputation = self.target_health.reputation_stats();
         stats
     }
 
@@ -128,6 +130,15 @@ impl AffinityRouter {
         candidates: &[election::InferenceTarget],
     ) -> Vec<election::InferenceTarget> {
         self.target_health.eligible_candidates(model, candidates)
+    }
+
+    pub(crate) fn route_strict_eligible_candidates(
+        &self,
+        model: &str,
+        candidates: &[election::InferenceTarget],
+    ) -> Vec<election::InferenceTarget> {
+        self.target_health
+            .strict_eligible_candidates(model, candidates)
     }
 
     pub(crate) fn record_target_outcome(
@@ -730,14 +741,45 @@ mod tests {
     use crate::network::target_health::TargetHealthOutcome;
     use iroh::SecretKey;
 
+    const TEST_MODEL: &str = "qwen";
+
     fn make_id(seed: u8) -> EndpointId {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         SecretKey::from_bytes(&bytes).public()
     }
 
+    fn remote(seed: u8) -> election::InferenceTarget {
+        election::InferenceTarget::Remote(make_id(seed))
+    }
+
     fn parse_body(body: &str) -> Value {
         serde_json::from_str(body).unwrap()
+    }
+
+    struct SimulatedMeshRouter {
+        affinity: AffinityRouter,
+        hosts: Vec<EndpointId>,
+    }
+
+    impl SimulatedMeshRouter {
+        fn new(host_seeds: &[u8]) -> Self {
+            Self {
+                affinity: AffinityRouter::default(),
+                hosts: host_seeds.iter().map(|seed| make_id(*seed)).collect(),
+            }
+        }
+
+        fn route_order(&self) -> Vec<election::InferenceTarget> {
+            prepare_remote_targets_for_request(TEST_MODEL, &self.hosts, None, &self.affinity)
+                .ordered
+        }
+
+        fn record_peer_outcome(&self, host_index: usize, outcome: TargetHealthOutcome) {
+            let target = election::InferenceTarget::Remote(self.hosts[host_index]);
+            self.affinity
+                .record_target_outcome(Some(TEST_MODEL), &target, outcome);
+        }
     }
 
     #[test]
@@ -888,6 +930,66 @@ mod tests {
         assert_eq!(prepared.ordered.len(), 1);
         assert_eq!(prepared.learn_prefix_hash, None);
         assert_eq!(prepared.cached_target, None);
+    }
+
+    #[test]
+    fn strict_eligible_candidates_drop_single_cooling_auto_target() {
+        let id = make_id(1);
+        let target = election::InferenceTarget::Remote(id);
+        let affinity = AffinityRouter::with_config(true, true);
+
+        affinity.record_target_outcome(Some("qwen"), &target, TargetHealthOutcome::Unavailable);
+
+        assert_eq!(
+            affinity.route_eligible_candidates("qwen", std::slice::from_ref(&target)),
+            vec![target.clone()]
+        );
+        assert!(
+            affinity
+                .route_strict_eligible_candidates("qwen", std::slice::from_ref(&target))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stats_snapshot_exposes_local_target_reputation() {
+        let id_a = make_id(1);
+        let id_b = make_id(2);
+        let first = election::InferenceTarget::Remote(id_a);
+        let second = election::InferenceTarget::Remote(id_b);
+        let affinity = AffinityRouter::with_config(true, true);
+
+        affinity.record_target_outcome(Some("qwen"), &first, TargetHealthOutcome::Unavailable);
+
+        assert_eq!(
+            affinity.route_eligible_candidates("qwen", &[first.clone(), second.clone()]),
+            vec![second]
+        );
+        let stats = affinity.stats_snapshot();
+        assert_eq!(stats.target_reputation.penalized_targets, 1);
+        assert_eq!(stats.target_reputation.routes_penalized, 0);
+    }
+
+    #[test]
+    fn simulated_multi_node_reputation_changes_remote_request_flow() {
+        let mesh = SimulatedMeshRouter::new(&[1, 2, 3]);
+
+        assert_eq!(mesh.route_order(), vec![remote(1), remote(2), remote(3)]);
+
+        mesh.record_peer_outcome(0, TargetHealthOutcome::Unavailable);
+
+        assert_eq!(mesh.route_order(), vec![remote(2), remote(3)]);
+        assert_eq!(
+            mesh.affinity
+                .stats_snapshot()
+                .target_reputation
+                .penalized_targets,
+            1
+        );
+
+        mesh.record_peer_outcome(0, TargetHealthOutcome::Success);
+
+        assert_eq!(mesh.route_order(), vec![remote(1), remote(2), remote(3)]);
     }
 
     #[test]

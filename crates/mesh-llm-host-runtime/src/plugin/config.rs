@@ -1,15 +1,20 @@
-use super::{
-    BLOBSTORE_PLUGIN_ID, FLASH_MOE_PLUGIN_ID, OPENAI_ENDPOINT_PLUGIN_ID, PluginSummary,
-    TELEMETRY_PLUGIN_ID,
+use super::installed::{
+    ConfiguredExternalPlugin, append_installed_plugins, configured_external_plugin_spec,
+};
+use super::{BLOBSTORE_PLUGIN_ID, PluginStartupOptions, PluginSummary};
+use crate::{
+    MeshRequirementRejectReason, MeshRequirements, NodeVersionBounds, ProtocolGenerationBounds,
+    ReleaseAttestationRequirement,
 };
 use anyhow::{Context, Result, bail};
 #[allow(unused_imports)]
 pub use mesh_llm_config::{
     AdvancedConfig, AdvancedServerConfig, BoolOrAuto, BoolOrString, ConfigEditor, ConfigStore,
     FlashAttentionType, GpuAssignment, GpuConfig, HardwareConfig, IntegerOrString,
-    LocalServingNodeConfig, MeshConfig, ModelConfigDefaults, ModelConfigEditor, ModelConfigEntry,
-    ModelDefaultsEditor, ModelFitConfig, ModelRuntimeKind, MultimodalConfig, OwnerControlConfig,
-    PluginConfigEditor, PluginConfigEntry, PrefixCacheConfig, ReasoningBudget, ReasoningEnabled,
+    LocalServingNodeConfig, MeshConfig, MeshRequirementsConfig, ModelConfigDefaults,
+    ModelConfigEditor, ModelConfigEntry, ModelDefaultsEditor, ModelFitConfig, ModelRuntimeKind,
+    MultimodalConfig, OwnerControlConfig, PluginConfigEditor, PluginConfigEntry,
+    PluginStartupConfig, PrefixCacheConfig, ReasoningBudget, ReasoningEnabled,
     RequestDefaultsConfig, ReservedObjectConfig, SkippyConfig, SpeculativeConfig,
     StringOrStringList, TelemetryConfig, TelemetryMetricsConfig, TensorSplitConfig,
     ThroughputConfig, config_path, config_to_toml, load_config, parse_config_toml, validate_config,
@@ -17,9 +22,176 @@ pub use mesh_llm_config::{
 use mesh_llm_plugin::MeshVisibility;
 use std::collections::BTreeMap;
 
-const FLASH_MOE_INSTALL_HINT: &str = "Install Flash-MoE separately and set \
-                                     `command` to its infer binary, or set \
-                                     `url` to an already-running Flash-MoE /v1 endpoint.";
+pub(crate) fn mesh_requirements_config_to_runtime(
+    config: &MeshRequirementsConfig,
+) -> MeshRequirements {
+    MeshRequirements {
+        node_version: NodeVersionBounds {
+            min: config.min_node_version.clone(),
+            max: config.max_node_version.clone(),
+        },
+        protocol_generation: ProtocolGenerationBounds {
+            min: config.min_protocol_version,
+            max: config.max_protocol_version,
+        },
+        release_attestation: ReleaseAttestationRequirement {
+            required: config.require_release_attestation,
+            allowed_signer_keys: config.release_signer_keys.clone(),
+        },
+    }
+}
+
+pub(crate) fn mesh_requirements_config_from_runtime(
+    requirements: &MeshRequirements,
+) -> MeshRequirementsConfig {
+    MeshRequirementsConfig {
+        min_node_version: requirements.node_version.min.clone(),
+        max_node_version: requirements.node_version.max.clone(),
+        min_protocol_version: requirements.protocol_generation.min,
+        max_protocol_version: requirements.protocol_generation.max,
+        require_release_attestation: requirements.release_attestation.required,
+        release_signer_keys: requirements.release_attestation.allowed_signer_keys.clone(),
+    }
+}
+
+pub(crate) fn mesh_requirements_validation_error(reason: MeshRequirementRejectReason) -> String {
+    match reason {
+        MeshRequirementRejectReason::NodeVersionMalformed => {
+            "mesh_requirements node version bounds must be valid semver strings (an optional leading 'v' is allowed)".into()
+        }
+        MeshRequirementRejectReason::NodeVersionBoundsInvalid => {
+            "mesh_requirements.min_node_version must be less than or equal to mesh_requirements.max_node_version".into()
+        }
+        MeshRequirementRejectReason::ProtocolGenerationBoundsInvalid => {
+            "mesh_requirements.min_protocol_version must be less than or equal to mesh_requirements.max_protocol_version".into()
+        }
+        MeshRequirementRejectReason::ReleaseSignerUntrusted => {
+            "mesh_requirements.release_signer_keys entries must not be empty".into()
+        }
+        MeshRequirementRejectReason::ReleaseSignerListEmpty => {
+            "mesh_requirements.require_release_attestation is true but mesh_requirements.release_signer_keys is empty; certified-build admission is not remote runtime attestation, so trust must be anchored in at least one release signer key".into()
+        }
+        MeshRequirementRejectReason::ReleaseSignerKeyMalformed => {
+            "mesh_requirements.release_signer_keys entries must be of the form 'ed25519:<64-character-hex-public-key>'".into()
+        }
+        other => format!("mesh_requirements are invalid: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_mesh_requirements_config_accepts_unset_min_only_max_only_and_full_ranges() {
+    let config: MeshConfig = toml::from_str(
+        r#"
+version = 1
+
+[mesh_requirements]
+min_node_version = "0.65.0"
+min_protocol_version = 1
+require_release_attestation = true
+release_signer_keys = [
+    "ed25519:d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "ed25519:3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+]
+"#,
+    )
+    .expect("config should parse");
+    validate_config(&config).expect("min-only config should validate");
+    assert_eq!(
+        config.mesh_requirements.min_node_version.as_deref(),
+        Some("0.65.0")
+    );
+    assert_eq!(config.mesh_requirements.max_node_version, None);
+    assert_eq!(config.mesh_requirements.min_protocol_version, Some(1));
+    assert_eq!(config.mesh_requirements.max_protocol_version, None);
+    assert!(config.mesh_requirements.require_release_attestation);
+    assert_eq!(
+        config.mesh_requirements.release_signer_keys,
+        vec![
+            "ed25519:d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".to_string(),
+            "ed25519:3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c".to_string(),
+        ]
+    );
+
+    let max_only: MeshConfig = toml::from_str(
+        r#"
+[mesh_requirements]
+max_node_version = "0.65.9"
+max_protocol_version = 3
+"#,
+    )
+    .expect("config should parse");
+    validate_config(&max_only).expect("max-only config should validate");
+    assert_eq!(max_only.mesh_requirements.min_node_version, None);
+    assert_eq!(
+        max_only.mesh_requirements.max_node_version.as_deref(),
+        Some("0.65.9")
+    );
+    assert_eq!(max_only.mesh_requirements.min_protocol_version, None);
+    assert_eq!(max_only.mesh_requirements.max_protocol_version, Some(3));
+
+    let full_range: MeshConfig = toml::from_str(
+        r#"
+[mesh_requirements]
+min_node_version = "0.65.0"
+max_node_version = "0.65.9"
+min_protocol_version = 1
+max_protocol_version = 3
+"#,
+    )
+    .expect("config should parse");
+    validate_config(&full_range).expect("full-range config should validate");
+    assert_eq!(
+        full_range.mesh_requirements.min_node_version.as_deref(),
+        Some("0.65.0")
+    );
+    assert_eq!(
+        full_range.mesh_requirements.max_node_version.as_deref(),
+        Some("0.65.9")
+    );
+    assert_eq!(full_range.mesh_requirements.min_protocol_version, Some(1));
+    assert_eq!(full_range.mesh_requirements.max_protocol_version, Some(3));
+
+    let unset = MeshConfig::default();
+    validate_config(&unset).expect("omitted mesh_requirements should validate");
+    assert_eq!(unset.mesh_requirements, MeshRequirementsConfig::default());
+}
+
+#[cfg(test)]
+pub(crate) fn assert_mesh_requirements_config_rejects_required_attestation_without_signer_keys() {
+    let config: MeshConfig = toml::from_str(
+        r#"
+[mesh_requirements]
+require_release_attestation = true
+"#,
+    )
+    .expect("config should parse");
+    let err = validate_config(&config)
+        .expect_err("require_release_attestation=true with no signer keys must be rejected");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("certified-build admission is not remote runtime attestation"),
+        "operator error must reference the certified-build / runtime-attestation distinction; got: {message}"
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn assert_mesh_requirements_config_rejects_non_ed25519_signer_key() {
+    let config: MeshConfig = toml::from_str(
+        r#"
+[mesh_requirements]
+require_release_attestation = true
+release_signer_keys = ["not-an-ed25519-key"]
+"#,
+    )
+    .expect("config should parse");
+    let err = validate_config(&config)
+        .expect_err("non-ed25519 release_signer_keys entry must be rejected at policy creation");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("ed25519:<64-character-hex-public-key>"),
+        "operator error must spell out the required ed25519:<hex> shape; got: {message}"
+    );
+}
 
 #[derive(Clone, Debug)]
 pub struct ResolvedPlugins {
@@ -32,10 +204,11 @@ pub struct ExternalPluginSpec {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
-    /// Backend URL for inference endpoint plugins.
+    /// Optional plugin URL passed through the generic plugin launch contract.
     pub url: Option<String>,
     /// Extra environment passed only to the plugin process.
     pub env: BTreeMap<String, String>,
+    pub startup: PluginStartupOptions,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -43,31 +216,22 @@ pub struct PluginHostMode {
     pub mesh_visibility: MeshVisibility,
 }
 
-pub(crate) fn telemetry_plugin_enabled(config: &MeshConfig) -> bool {
-    config
-        .plugins
-        .iter()
-        .find(|entry| entry.name == TELEMETRY_PLUGIN_ID)
-        .map(|entry| entry.enabled.unwrap_or(true))
-        .unwrap_or(true)
-}
-
 pub fn resolve_plugins(config: &MeshConfig, _host_mode: PluginHostMode) -> Result<ResolvedPlugins> {
     let mut externals = Vec::new();
-    let inactive = Vec::new();
+    let mut inactive = Vec::new();
     let mut names = BTreeMap::<String, ()>::new();
     let mut blobstore_enabled = true;
-    let mut openai_endpoint_enabled = false;
-    let mut openai_endpoint_url: Option<String> = None;
-    let mut flash_moe_entry: Option<&PluginConfigEntry> = None;
-    let mut telemetry_enabled = true;
     for entry in &config.plugins {
         if names.insert(entry.name.clone(), ()).is_some() {
             bail!("Duplicate plugin entry '{}'", entry.name);
         }
         let enabled = entry.enabled.unwrap_or(true);
         if entry.name == BLOBSTORE_PLUGIN_ID {
-            if entry.command.is_some() || !entry.args.is_empty() || entry.url.is_some() {
+            if entry.command.is_some()
+                || !entry.args.is_empty()
+                || entry.url.is_some()
+                || !entry.startup.is_default()
+            {
                 bail!(
                     "Plugin '{}' is served by mesh-llm itself; only `enabled` may be set",
                     BLOBSTORE_PLUGIN_ID
@@ -76,63 +240,17 @@ pub fn resolve_plugins(config: &MeshConfig, _host_mode: PluginHostMode) -> Resul
             blobstore_enabled = enabled;
             continue;
         }
-        if entry.name == OPENAI_ENDPOINT_PLUGIN_ID {
-            if entry.command.is_some() || !entry.args.is_empty() {
-                bail!(
-                    "Plugin '{}' is served by mesh-llm itself; only `enabled` and `url` may be set",
-                    OPENAI_ENDPOINT_PLUGIN_ID
-                );
-            }
-            openai_endpoint_enabled = enabled;
-            if let Some(ref url) = entry.url {
-                openai_endpoint_url = Some(url.clone());
-            }
-            continue;
-        }
-        if entry.name == FLASH_MOE_PLUGIN_ID {
-            if !enabled {
-                continue;
-            }
-            flash_moe_entry = Some(entry);
-            continue;
-        }
-        if entry.name == TELEMETRY_PLUGIN_ID {
-            if entry.command.is_some() || !entry.args.is_empty() || entry.url.is_some() {
-                bail!(
-                    "Plugin '{}' is served by mesh-llm itself; only `enabled` may be set",
-                    TELEMETRY_PLUGIN_ID
-                );
-            }
-            telemetry_enabled = enabled;
-            continue;
-        }
         if !enabled {
             continue;
         }
-        let command = entry
-            .command
-            .clone()
-            .with_context(|| format!("Plugin '{}' is enabled but missing command", entry.name))?;
-        externals.push(ExternalPluginSpec {
-            name: entry.name.clone(),
-            command,
-            args: entry.args.clone(),
-            url: None,
-            env: BTreeMap::new(),
-        });
+        match configured_external_plugin_spec(entry)? {
+            ConfiguredExternalPlugin::Active(spec) => externals.push(spec),
+            ConfiguredExternalPlugin::Inactive(summary) => inactive.push(summary),
+        }
     }
 
-    if telemetry_enabled {
-        externals.insert(0, telemetry_plugin_spec()?);
-    }
-    if openai_endpoint_enabled {
-        let mut spec = openai_endpoint_plugin_spec()?;
-        spec.url = openai_endpoint_url;
-        externals.push(spec);
-    }
-    if let Some(entry) = flash_moe_entry {
-        externals.push(flash_moe_plugin_spec(entry)?);
-    }
+    append_installed_plugins(&mut externals, &mut inactive, &mut names);
+
     if blobstore_enabled {
         externals.push(blobstore_plugin_spec()?);
     }
@@ -159,116 +277,7 @@ pub fn blobstore_plugin_spec() -> Result<ExternalPluginSpec> {
         ],
         url: None,
         env: BTreeMap::new(),
-    })
-}
-
-pub fn openai_endpoint_plugin_spec() -> Result<ExternalPluginSpec> {
-    let command = std::env::current_exe()
-        .context("Cannot determine mesh-llm executable path")?
-        .display()
-        .to_string();
-    Ok(ExternalPluginSpec {
-        name: OPENAI_ENDPOINT_PLUGIN_ID.to_string(),
-        command,
-        args: vec![
-            "--log-format".into(),
-            "json".into(),
-            "--plugin".into(),
-            OPENAI_ENDPOINT_PLUGIN_ID.into(),
-        ],
-        url: None,
-        env: BTreeMap::new(),
-    })
-}
-
-pub fn flash_moe_plugin_spec(entry: &PluginConfigEntry) -> Result<ExternalPluginSpec> {
-    let backend_command = entry
-        .command
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let endpoint_url = entry
-        .url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    if backend_command.is_some() && endpoint_url.is_some() {
-        bail!(
-            "Plugin '{}' accepts either `command` for a managed flash-moe process or `url` for an already-running endpoint, not both",
-            FLASH_MOE_PLUGIN_ID
-        );
-    }
-    if backend_command.is_none() && endpoint_url.is_none() {
-        bail!(
-            "Plugin '{}' requires `command` or `url`. {}",
-            FLASH_MOE_PLUGIN_ID,
-            FLASH_MOE_INSTALL_HINT
-        );
-    }
-    if backend_command.is_none() && !entry.args.is_empty() {
-        bail!("Plugin '{}' args require `command`", FLASH_MOE_PLUGIN_ID);
-    }
-    if entry
-        .args
-        .iter()
-        .any(|arg| arg == "--serve" || arg.starts_with("--serve="))
-    {
-        bail!(
-            "Plugin '{}' owns the flash-moe `--serve` port; remove `--serve` from args",
-            FLASH_MOE_PLUGIN_ID
-        );
-    }
-
-    let command = std::env::current_exe()
-        .context("Cannot determine mesh-llm executable path")?
-        .display()
-        .to_string();
-    let mut env = BTreeMap::new();
-    if let Some(backend_command) = backend_command {
-        env.insert(
-            "MESH_LLM_FLASH_MOE_COMMAND".to_string(),
-            backend_command.to_string(),
-        );
-        env.insert(
-            "MESH_LLM_FLASH_MOE_ARGS_JSON".to_string(),
-            serde_json::to_string(&entry.args)?,
-        );
-    }
-    if let Some(url) = endpoint_url {
-        env.insert("MESH_LLM_FLASH_MOE_URL".to_string(), url.to_string());
-    }
-
-    Ok(ExternalPluginSpec {
-        name: FLASH_MOE_PLUGIN_ID.to_string(),
-        command,
-        args: vec![
-            "--log-format".into(),
-            "json".into(),
-            "--plugin".into(),
-            FLASH_MOE_PLUGIN_ID.into(),
-        ],
-        url: None,
-        env,
-    })
-}
-
-pub fn telemetry_plugin_spec() -> Result<ExternalPluginSpec> {
-    let command = std::env::current_exe()
-        .context("Cannot determine mesh-llm executable path")?
-        .display()
-        .to_string();
-    Ok(ExternalPluginSpec {
-        name: TELEMETRY_PLUGIN_ID.to_string(),
-        command,
-        args: vec![
-            "--log-format".into(),
-            "json".into(),
-            "--plugin".into(),
-            TELEMETRY_PLUGIN_ID.into(),
-        ],
-        url: None,
-        env: BTreeMap::new(),
+        startup: PluginStartupOptions::default(),
     })
 }
 
@@ -287,7 +296,10 @@ mod tests {
         include_str!("../../tests/fixtures/skippy_full_surface_invalid.toml");
 
     fn documented_matrix_key_paths() -> BTreeSet<String> {
-        let matrix = include_str!("../../../../docs/skippy/CONFIGURATION.md");
+        let matrix = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/skippy/CONFIGURATION.md"
+        ));
         matrix
             .lines()
             .filter(|line| line.starts_with('|'))
@@ -409,7 +421,7 @@ prompt_shape_metrics = false
 endpoint = "https://otel.example.com/v1/metrics"
 
 [[plugin]]
-name = "telemetry"
+name = "metrics"
 enabled = true
 "#,
         )
@@ -522,25 +534,6 @@ prompt_shape_metrics = true
                 .contains("telemetry.prompt_shape_metrics is not supported yet"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn flash_moe_config_requires_external_command_or_endpoint_with_install_hint() {
-        let entry = PluginConfigEntry {
-            name: FLASH_MOE_PLUGIN_ID.to_string(),
-            enabled: Some(true),
-            command: None,
-            args: Vec::new(),
-            url: None,
-        };
-
-        let err = flash_moe_plugin_spec(&entry)
-            .expect_err("flash-moe requires a managed command or attached endpoint");
-        let message = err.to_string();
-
-        assert!(message.contains("Install Flash-MoE separately"));
-        assert!(message.contains("command"));
-        assert!(message.contains("url"));
     }
 
     #[test]
@@ -1426,7 +1419,10 @@ mmproj = "multimodal.gguf"
             "omitted per-model request defaults should stay absent"
         );
 
-        let matrix = include_str!("../../../../docs/skippy/CONFIGURATION.md");
+        let matrix = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/skippy/CONFIGURATION.md"
+        ));
         let matrix_keys = documented_matrix_key_paths();
         assert!(
             matrix_keys.len() >= 100,
@@ -1447,9 +1443,10 @@ mmproj = "multimodal.gguf"
             assert!(matrix.contains(key), "missing matrix doc entry {key}");
         }
 
-        let docs_readme = include_str!("../../../../docs/README.md");
-        let usage = include_str!("../../../../docs/USAGE.md");
-        let cli = include_str!("../../../../docs/CLI.md");
+        let docs_readme =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/README.md"));
+        let usage = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/USAGE.md"));
+        let cli = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/CLI.md"));
         assert!(docs_readme.contains("[skippy/CONFIGURATION.md](skippy/CONFIGURATION.md)"));
         assert!(usage.contains("request payload values still win"));
         assert!(cli.contains("Request defaults only fill absent or null request fields"));

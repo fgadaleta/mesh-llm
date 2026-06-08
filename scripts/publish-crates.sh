@@ -15,6 +15,7 @@ Environment:
   CRATES_IO_PUBLISH_MAX_ATTEMPTS        Real-publish retry attempts for crates.io 429s (default: 6)
   CRATES_IO_PUBLISH_RETRY_BASE_SECONDS Fallback retry base when crates.io gives no timestamp (default: 60)
   CRATES_IO_PUBLISH_RETRY_MAX_SECONDS  Fallback retry cap when crates.io gives no timestamp (default: 900)
+  CRATES_IO_PUBLISH_ALLOW_UNKNOWN_STATUS Set to 1 to allow publish when crates.io status cannot be verified (default: 0)
 USAGE
 }
 
@@ -40,6 +41,15 @@ require_nonnegative_int() {
     local value="$2"
     if [[ ! "$value" =~ ^[0-9]+$ ]]; then
         echo "${name} must be a non-negative integer" >&2
+        exit 1
+    fi
+}
+
+require_binary_flag() {
+    local name="$1"
+    local value="$2"
+    if [[ "$value" != "0" && "$value" != "1" ]]; then
+        echo "${name} must be 0 or 1" >&2
         exit 1
     fi
 }
@@ -93,11 +103,13 @@ fi
 max_attempts="${CRATES_IO_PUBLISH_MAX_ATTEMPTS:-6}"
 retry_base_seconds="${CRATES_IO_PUBLISH_RETRY_BASE_SECONDS:-60}"
 retry_max_seconds="${CRATES_IO_PUBLISH_RETRY_MAX_SECONDS:-900}"
+allow_unknown_status="${CRATES_IO_PUBLISH_ALLOW_UNKNOWN_STATUS:-0}"
 
 require_nonnegative_int CRATES_IO_PUBLISH_SETTLE_SECONDS "$sleep_seconds"
 require_positive_int CRATES_IO_PUBLISH_MAX_ATTEMPTS "$max_attempts"
 require_positive_int CRATES_IO_PUBLISH_RETRY_BASE_SECONDS "$retry_base_seconds"
 require_positive_int CRATES_IO_PUBLISH_RETRY_MAX_SECONDS "$retry_max_seconds"
+require_binary_flag CRATES_IO_PUBLISH_ALLOW_UNKNOWN_STATUS "$allow_unknown_status"
 
 if [[ "$dry_run" -eq 0 && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
     echo "CARGO_REGISTRY_TOKEN is required for real crates.io publishing" >&2
@@ -161,7 +173,7 @@ publish_error_is_429() {
 
 publish_error_is_already_uploaded() {
     local output="$1"
-    [[ "$output" == *"already uploaded"* ]]
+    [[ "$output" == *"already uploaded"* || "$output" == *"already exists on crates.io index"* ]]
 }
 
 print_publish_output() {
@@ -259,7 +271,12 @@ publish_crate_with_retry() {
             return 0
         fi
         if [[ "$status" == "unknown" ]]; then
-            warn "[${index}/${total}] could not verify ${crate}@${workspace_version} on crates.io; trying cargo publish"
+            if [[ "$allow_unknown_status" -ne 1 ]]; then
+                warn "[${index}/${total}] could not verify ${crate}@${workspace_version} on crates.io; aborting before publish"
+                warn "set CRATES_IO_PUBLISH_ALLOW_UNKNOWN_STATUS=1 to continue when registry status cannot be verified"
+                return 101
+            fi
+            warn "[${index}/${total}] could not verify ${crate}@${workspace_version} on crates.io; trying cargo publish because CRATES_IO_PUBLISH_ALLOW_UNKNOWN_STATUS=1"
         fi
     fi
 
@@ -317,6 +334,16 @@ unpublished_registry_deps() {
                 model-artifact \
                 model-ref
             ;;
+        mesh-llm-hardware-profile)
+            printf '%s\n' \
+                mesh-llm-native-runtime
+            ;;
+        mesh-llm-runtime-install)
+            printf '%s\n' \
+                mesh-llm-hardware-profile \
+                mesh-llm-native-runtime \
+                skippy-ffi
+            ;;
         mesh-llm-client)
             printf '%s\n' \
                 model-artifact \
@@ -328,6 +355,109 @@ unpublished_registry_deps() {
         mesh-llm-api-client)
             printf '%s\n' \
                 mesh-llm-client
+            ;;
+        mesh-llm-console-server)
+            printf '%s\n' \
+                mesh-llm-ui
+            ;;
+        mesh-llm-cli)
+            printf '%s\n' \
+                mesh-llm-events
+            ;;
+        mesh-llm-tui)
+            printf '%s\n' \
+                mesh-llm-events
+            ;;
+        mesh-llm-plugin-manager)
+            printf '%s\n' \
+                mesh-llm-skills
+            ;;
+        mesh-llm-system)
+            printf '%s\n' \
+                mesh-llm-gpu-bench \
+                skippy-runtime
+            ;;
+        mesh-llm-config)
+            printf '%s\n' \
+                mesh-llm-types \
+                skippy-protocol
+            ;;
+        mesh-mixture-of-agents)
+            printf '%s\n' \
+                mesh-llm-guardrails
+            ;;
+        model-resolver)
+            printf '%s\n' \
+                model-artifact \
+                model-ref
+            ;;
+        model-package)
+            printf '%s\n' \
+                model-hf \
+                model-ref
+            ;;
+        openai-frontend)
+            printf '%s\n' \
+                mesh-llm-guardrails
+            ;;
+        skippy-cache)
+            printf '%s\n' \
+                skippy-protocol
+            ;;
+        skippy-runtime)
+            printf '%s\n' \
+                skippy-ffi
+            ;;
+        skippy-server)
+            printf '%s\n' \
+                openai-frontend \
+                skippy-cache \
+                skippy-metrics \
+                skippy-protocol \
+                skippy-runtime
+            ;;
+        mesh-llm-host-runtime)
+            printf '%s\n' \
+                mesh-llm-api-server \
+                mesh-llm-client \
+                mesh-llm-config \
+                mesh-llm-events \
+                mesh-llm-guardrails \
+                mesh-llm-identity \
+                mesh-llm-native-runtime \
+                mesh-llm-node \
+                mesh-llm-plugin \
+                mesh-llm-plugin-manager \
+                mesh-llm-protocol \
+                mesh-llm-routing \
+                mesh-llm-runtime-install \
+                mesh-llm-system \
+                mesh-llm-types \
+                mesh-llm-ui \
+                mesh-mixture-of-agents \
+                model-artifact \
+                model-hf \
+                model-package \
+                model-ref \
+                model-resolver \
+                openai-frontend \
+                skippy-coordinator \
+                skippy-protocol \
+                skippy-runtime \
+                skippy-server \
+                skippy-topology
+            ;;
+        mesh-llm-sdk)
+            printf '%s\n' \
+                mesh-llm-api-client \
+                mesh-llm-api-server \
+                mesh-llm-console-server \
+                mesh-llm-embedded-runtime \
+                mesh-llm-runtime-install
+            ;;
+        mesh-llm-embedded-runtime)
+            printf '%s\n' \
+                mesh-llm-host-runtime
             ;;
         mesh-llm-node)
             printf '%s\n' \
@@ -358,17 +488,47 @@ should_skip_initial_dry_run() {
 }
 
 publish_crates=(
-    model-ref
     mesh-llm-identity
     mesh-llm-protocol
     mesh-llm-routing
     mesh-llm-types
+    mesh-llm-guardrails
+    mesh-llm-plugin
+    mesh-llm-skills
+    mesh-llm-gpu-bench
+    skippy-ffi
+    skippy-protocol
+    skippy-coordinator
+    skippy-topology
+    skippy-metrics
+    skippy-cache
+    model-ref
     model-artifact
-    model-hf
+    model-resolver
     mesh-llm-client
     mesh-llm-api-client
+    mesh-llm-events
+    mesh-llm-config
+    mesh-llm-ui
+    mesh-llm-console-server
+    mesh-llm-tui
+    mesh-llm-cli
+    model-hf
+    model-package
     mesh-llm-node
     mesh-llm-api-server
+    mesh-llm-native-runtime
+    mesh-llm-hardware-profile
+    skippy-runtime
+    openai-frontend
+    skippy-server
+    mesh-llm-plugin-manager
+    mesh-mixture-of-agents
+    mesh-llm-system
+    mesh-llm-runtime-install
+    mesh-llm-host-runtime
+    mesh-llm-embedded-runtime
+    mesh-llm-sdk
 )
 
 for index in "${!publish_crates[@]}"; do

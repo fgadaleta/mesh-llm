@@ -60,15 +60,49 @@ runs:
       with:
         path: ~/.models/${{ inputs.model_file }}
         key: ${{ inputs.cache_key_prefix }}mesh-llm-${{ runner.os }}-${{ inputs.model_cache_scope }}-${{ inputs.model_file }}-${{ hashFiles('.github/cache-version.txt') }}
+        restore-keys: |
+          ${{ inputs.cache_key_prefix }}mesh-llm-${{ runner.os }}-${{ inputs.model_cache_scope }}-${{ inputs.model_file }}-
+
+    - name: Check restored integration model
+      id: model-file
+      shell: bash
+      run: |
+        set -euo pipefail
+        model_path="$HOME/.models/${{ inputs.model_file }}"
+        if [[ -s "$model_path" ]]; then
+          echo "present=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "present=false" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Download integration model
-      if: ${{ steps.cache-model.outputs.cache-hit != 'true' }}
+      if: ${{ steps.model-file.outputs.present != 'true' }}
       shell: bash
       run: |
         set -euo pipefail
         mkdir -p ~/.models
-        curl -fSL "${{ inputs.model_url }}" -o "$HOME/.models/${{ inputs.model_file }}"
-        ls -lh "$HOME/.models/${{ inputs.model_file }}"
+        retry_attempts="${MODEL_DOWNLOAD_RETRY_ATTEMPTS:-12}"
+        retry_delay="${MODEL_DOWNLOAD_RETRY_DELAY_SECS:-20}"
+        retry_max_time="${MODEL_DOWNLOAD_RETRY_MAX_TIME_SECS:-600}"
+        token="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
+        curl_args=(
+          --fail --location --show-error
+          --retry "$retry_attempts"
+          --retry-delay "$retry_delay"
+          --retry-max-time "$retry_max_time"
+          --retry-all-errors
+        )
+        if [[ -n "$token" ]]; then
+          curl_args+=(--header "Authorization: Bearer ${token}")
+        fi
+        output="$HOME/.models/${{ inputs.model_file }}"
+        partial="${output}.download"
+        rm -f "$partial"
+        curl "${curl_args[@]}" \
+          "${{ inputs.model_url }}" \
+          -o "$partial"
+        mv "$partial" "$output"
+        ls -lh "$output"
 
     - name: Save integration model cache
       if: ${{ inputs.save_model_cache == 'true' && steps.cache-model.outputs.cache-hit != 'true' }}

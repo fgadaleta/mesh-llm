@@ -63,6 +63,7 @@ pub enum WireMessageKind {
     TryRestorePrefill = 17,
     TryRestorePrefillDecode = 18,
     TrimSession = 19,
+    PredictionReturnOpen = 20,
 }
 
 impl WireMessageKind {
@@ -143,6 +144,7 @@ impl TryFrom<i32> for WireMessageKind {
             17 => Ok(Self::TryRestorePrefill),
             18 => Ok(Self::TryRestorePrefillDecode),
             19 => Ok(Self::TrimSession),
+            20 => Ok(Self::PredictionReturnOpen),
             _ => Err(invalid_data("unknown stage message kind")),
         }
     }
@@ -431,6 +433,29 @@ impl StageWireMessage {
             ),
         }
     }
+
+    pub fn take_activation_f32_payload(&mut self, n_embd: i32) -> io::Result<Vec<u8>> {
+        if self.activation.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self.state.dtype()? {
+            WireActivationDType::F32 => {
+                if self.activation.len() > MAX_STAGE_DECODED_ACTIVATION_BYTES {
+                    return Err(invalid_data(
+                        "decoded activation payload byte count exceeds maximum",
+                    ));
+                }
+                Ok(std::mem::take(&mut self.activation))
+            }
+            WireActivationDType::F16 => decode_f16_to_f32_bytes(&self.activation),
+            WireActivationDType::Q8 => decode_q8_to_f32_bytes_with_state_flags(
+                &self.activation,
+                self.token_count,
+                n_embd,
+                self.state.flags,
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,6 +501,12 @@ pub struct StageReplyStats {
     pub verify_span_max_tokens: i64,
     pub verify_span_checkpointed_requests: i64,
     pub verify_span_skip_checkpoint_requests: i64,
+    pub prefill_edge_write_us_max: i64,
+    pub prefill_edge_wait_us_max: i64,
+    pub prefill_edge_total_us_max: i64,
+    pub prefill_edge_stage_index: i64,
+    pub prefill_edge_activation_bytes_max: i64,
+    pub prefill_edge_observation_count: i64,
 }
 
 impl StageReplyStats {
@@ -515,6 +546,39 @@ impl StageReplyStats {
             .max(other.verify_span_max_tokens);
         self.verify_span_checkpointed_requests += other.verify_span_checkpointed_requests;
         self.verify_span_skip_checkpoint_requests += other.verify_span_skip_checkpoint_requests;
+        self.prefill_edge_write_us_max = self
+            .prefill_edge_write_us_max
+            .max(other.prefill_edge_write_us_max);
+        self.prefill_edge_wait_us_max = self
+            .prefill_edge_wait_us_max
+            .max(other.prefill_edge_wait_us_max);
+        if other.prefill_edge_total_us_max > self.prefill_edge_total_us_max {
+            self.prefill_edge_total_us_max = other.prefill_edge_total_us_max;
+            self.prefill_edge_stage_index = other.prefill_edge_stage_index;
+            self.prefill_edge_activation_bytes_max = other.prefill_edge_activation_bytes_max;
+        }
+        self.prefill_edge_observation_count += other.prefill_edge_observation_count;
+    }
+
+    pub fn observe_prefill_edge_transport(
+        &mut self,
+        stage_index: u32,
+        write_us: i64,
+        wait_us: i64,
+        activation_bytes: usize,
+    ) {
+        let write_us = write_us.max(0);
+        let wait_us = wait_us.max(0);
+        let total_us = write_us.saturating_add(wait_us);
+        self.prefill_edge_write_us_max = self.prefill_edge_write_us_max.max(write_us);
+        self.prefill_edge_wait_us_max = self.prefill_edge_wait_us_max.max(wait_us);
+        if total_us > self.prefill_edge_total_us_max {
+            self.prefill_edge_total_us_max = total_us;
+            self.prefill_edge_stage_index = i64::from(stage_index);
+            self.prefill_edge_activation_bytes_max =
+                i64::try_from(activation_bytes).unwrap_or(i64::MAX);
+        }
+        self.prefill_edge_observation_count = self.prefill_edge_observation_count.saturating_add(1);
     }
 
     pub fn is_empty(self) -> bool {
@@ -551,6 +615,7 @@ impl StageReplyStats {
             && self.verify_span_max_tokens == 0
             && self.verify_span_checkpointed_requests == 0
             && self.verify_span_skip_checkpoint_requests == 0
+            && self.prefill_edge_observation_count == 0
     }
 }
 

@@ -154,7 +154,14 @@ pub trait Collector {
 
 struct DefaultCollector;
 
-#[cfg(all(target_os = "linux", any(not(feature = "skippy-devices"), test)))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        not(feature = "skippy-devices"),
+        feature = "dynamic-native-runtime",
+        test
+    )
+))]
 struct TegraCollector;
 
 fn detect_hostname() -> Option<String> {
@@ -187,7 +194,14 @@ fn apply_cpu_only_runtime_budget(survey: &mut HardwareSurvey, metrics: &[Metric]
     }
 }
 
-#[cfg(all(target_os = "linux", any(not(feature = "skippy-devices"), test)))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        not(feature = "skippy-devices"),
+        feature = "dynamic-native-runtime",
+        test
+    )
+))]
 fn try_tegrastats_ram() -> Option<u64> {
     use std::io::BufRead;
     let mut child = std::process::Command::new("tegrastats")
@@ -271,9 +285,18 @@ fn apply_skippy_backend_devices_to_survey(survey: &mut HardwareSurvey, metrics: 
     if !wants_gpu_data {
         return false;
     }
-
-    let Ok(gpus) = skippy_devices::gpu_facts() else {
+    #[cfg(feature = "dynamic-native-runtime")]
+    if !skippy_runtime::native_runtime_loaded() {
         return false;
+    }
+
+    let gpus = match skippy_devices::gpu_facts() {
+        Ok(gpus) => gpus,
+        Err(_) => {
+            #[cfg(target_os = "linux")]
+            apply_cpu_only_runtime_budget(survey, metrics, read_system_ram_bytes());
+            return true;
+        }
     };
     if gpus.is_empty() {
         #[cfg(target_os = "linux")]
@@ -323,36 +346,45 @@ impl Collector for DefaultCollector {
             return survey;
         }
 
-        #[cfg(all(target_os = "macos", not(feature = "skippy-devices")))]
+        #[cfg(all(
+            target_os = "macos",
+            any(not(feature = "skippy-devices"), feature = "dynamic-native-runtime")
+        ))]
         {
             if metrics.contains(&Metric::IsSoc) {
                 survey.is_soc = true;
             }
-            if metrics.contains(&Metric::VramBytes)
-                && let Some((vram_bytes, reserved_bytes)) =
-                    macos_metal_gpu_budget(query_metal_recommended_working_set_bytes())
-            {
+            let metal_budget = if metrics.contains(&Metric::VramBytes) {
+                macos_metal_gpu_budget(query_metal_recommended_working_set_bytes())
+            } else {
+                None
+            };
+            if let Some((vram_bytes, reserved_bytes)) = metal_budget {
                 survey.vram_bytes = vram_bytes;
                 survey.gpu_vram = vec![vram_bytes];
                 survey.gpu_reserved = vec![reserved_bytes];
             }
-            if metrics.contains(&Metric::GpuName) {
-                let out = std::process::Command::new("sysctl")
+            let macos_gpu_name = if metrics.contains(&Metric::GpuName) {
+                std::process::Command::new("sysctl")
                     .args(["-n", "machdep.cpu.brand_string"])
                     .output()
-                    .ok();
-                if let Some(out) = out
-                    && let Ok(s) = String::from_utf8(out.stdout)
-                {
-                    survey.gpu_name = parse_macos_cpu_brand(&s);
-                }
+                    .ok()
+                    .and_then(|out| String::from_utf8(out.stdout).ok())
+            } else {
+                None
+            };
+            if let Some(gpu_name) = macos_gpu_name {
+                survey.gpu_name = parse_macos_cpu_brand(&gpu_name);
             }
             if metrics.contains(&Metric::GpuCount) {
                 survey.gpu_count = 1;
             }
         }
 
-        #[cfg(all(target_os = "linux", not(feature = "skippy-devices")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(not(feature = "skippy-devices"), feature = "dynamic-native-runtime")
+        ))]
         {
             let system_ram = read_system_ram_bytes();
 
@@ -366,21 +398,22 @@ impl Collector for DefaultCollector {
                         ])
                         .output()
                         .ok();
-                    if let Some(out) = out
-                        && out.status.success()
-                    {
-                        let s = String::from_utf8(out.stdout).ok()?;
-                        let parsed = parse_nvidia_gpu_memory_and_reserved(&s);
-                        if !parsed.is_empty() {
-                            survey.gpu_reserved =
-                                parsed.iter().map(|(_, reserved)| *reserved).collect();
-                            let per_gpu: Vec<u64> =
-                                parsed.iter().map(|(total, _)| *total).collect();
-                            let total: u64 = per_gpu.iter().sum();
-                            if total > 0 {
-                                return Some((total, per_gpu));
+                    match out {
+                        Some(out) if out.status.success() => {
+                            let s = String::from_utf8(out.stdout).ok()?;
+                            let parsed = parse_nvidia_gpu_memory_and_reserved(&s);
+                            if !parsed.is_empty() {
+                                survey.gpu_reserved =
+                                    parsed.iter().map(|(_, reserved)| *reserved).collect();
+                                let per_gpu: Vec<u64> =
+                                    parsed.iter().map(|(total, _)| *total).collect();
+                                let total: u64 = per_gpu.iter().sum();
+                                if total > 0 {
+                                    return Some((total, per_gpu));
+                                }
                             }
                         }
+                        Some(_) | None => {}
                     }
                     let out = std::process::Command::new("nvidia-smi")
                         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
@@ -533,49 +566,57 @@ impl Collector for DefaultCollector {
                         .args(["--showproductname"])
                         .output()
                         .ok();
-                    if let Some(out) = out {
-                        if out.status.success()
-                            && let Ok(s) = String::from_utf8(out.stdout)
-                        {
-                            let names = parse_rocm_gpu_names(&s);
-                            if metrics.contains(&Metric::GpuName) {
-                                survey.gpu_name = summarize_gpu_name(&names);
-                            }
-                            if metrics.contains(&Metric::GpuCount) {
-                                survey.gpu_count = u8::try_from(names.len()).unwrap_or(u8::MAX);
-                            }
-                        }
-                    } else {
-                        for args in [["discovery", "--json"], ["discovery", "-j"]] {
-                            let out = std::process::Command::new("xpu-smi")
-                                .args(args)
-                                .output()
-                                .ok();
-                            if let Some(out) = out
-                                && out.status.success()
-                                && let Ok(stdout) = String::from_utf8(out.stdout)
-                            {
-                                let gpus = parse_xpu_smi_discovery_json(&stdout);
-                                if !gpus.is_empty() {
-                                    let names: Vec<String> =
-                                        gpus.iter().map(|gpu| gpu.name.clone()).collect();
-                                    if metrics.contains(&Metric::GpuName) {
-                                        survey.gpu_name = summarize_gpu_name(&names);
-                                    }
-                                    if metrics.contains(&Metric::GpuCount) {
-                                        survey.gpu_count =
-                                            u8::try_from(names.len()).unwrap_or(u8::MAX);
-                                    }
-                                    break;
+                    match out {
+                        Some(out) if out.status.success() => {
+                            if let Ok(s) = String::from_utf8(out.stdout) {
+                                let names = parse_rocm_gpu_names(&s);
+                                if metrics.contains(&Metric::GpuName) {
+                                    survey.gpu_name = summarize_gpu_name(&names);
+                                }
+                                if metrics.contains(&Metric::GpuCount) {
+                                    survey.gpu_count = u8::try_from(names.len()).unwrap_or(u8::MAX);
                                 }
                             }
                         }
+                        None => {
+                            for args in [["discovery", "--json"], ["discovery", "-j"]] {
+                                let out = std::process::Command::new("xpu-smi")
+                                    .args(args)
+                                    .output()
+                                    .ok();
+                                if let Some(out) = out {
+                                    if !out.status.success() {
+                                        continue;
+                                    }
+                                    let Ok(stdout) = String::from_utf8(out.stdout) else {
+                                        continue;
+                                    };
+                                    let gpus = parse_xpu_smi_discovery_json(&stdout);
+                                    if !gpus.is_empty() {
+                                        let names: Vec<String> =
+                                            gpus.iter().map(|gpu| gpu.name.clone()).collect();
+                                        if metrics.contains(&Metric::GpuName) {
+                                            survey.gpu_name = summarize_gpu_name(&names);
+                                        }
+                                        if metrics.contains(&Metric::GpuCount) {
+                                            survey.gpu_count =
+                                                u8::try_from(names.len()).unwrap_or(u8::MAX);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Some(_) => {}
                     }
                 }
             }
         }
 
-        #[cfg(all(target_os = "windows", not(feature = "skippy-devices")))]
+        #[cfg(all(
+            target_os = "windows",
+            any(not(feature = "skippy-devices"), feature = "dynamic-native-runtime")
+        ))]
         {
             let system_ram = read_windows_total_ram_bytes().unwrap_or(0);
             let want_gpu_info =
@@ -676,7 +717,14 @@ impl Collector for DefaultCollector {
     }
 }
 
-#[cfg(all(target_os = "linux", any(not(feature = "skippy-devices"), test)))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        not(feature = "skippy-devices"),
+        feature = "dynamic-native-runtime",
+        test
+    )
+))]
 impl Collector for TegraCollector {
     fn collect(&self, metrics: &[Metric]) -> HardwareSurvey {
         let mut survey = HardwareSurvey::default();
@@ -685,10 +733,10 @@ impl Collector for TegraCollector {
             survey.is_soc = true;
         }
 
-        if metrics.contains(&Metric::GpuName)
-            && let Ok(model) = std::fs::read_to_string("/sys/firmware/devicetree/base/model")
-        {
-            survey.gpu_name = parse_tegra_model_name(&model);
+        if metrics.contains(&Metric::GpuName) {
+            survey.gpu_name = std::fs::read_to_string("/sys/firmware/devicetree/base/model")
+                .ok()
+                .and_then(|model| parse_tegra_model_name(&model));
         }
 
         if metrics.contains(&Metric::VramBytes) {
@@ -722,20 +770,38 @@ fn detect_collector_impl() -> Box<dyn Collector> {
     Box::new(DefaultCollector)
 }
 
-#[cfg(all(target_os = "linux", feature = "skippy-devices"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "skippy-devices",
+    not(feature = "dynamic-native-runtime")
+))]
 fn detect_collector_impl() -> Box<dyn Collector> {
     Box::new(DefaultCollector)
 }
 
-#[cfg(all(target_os = "linux", not(feature = "skippy-devices")))]
+#[cfg(all(
+    target_os = "linux",
+    any(not(feature = "skippy-devices"), feature = "dynamic-native-runtime")
+))]
 fn detect_collector_impl() -> Box<dyn Collector> {
-    if cfg!(target_arch = "aarch64")
-        && let Ok(compat) = std::fs::read_to_string("/proc/device-tree/compatible")
-        && is_tegra(&compat)
-    {
+    if is_tegra_host() {
         return Box::new(TegraCollector);
     }
     Box::new(DefaultCollector)
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(not(feature = "skippy-devices"), feature = "dynamic-native-runtime")
+))]
+fn is_tegra_host() -> bool {
+    if !cfg!(target_arch = "aarch64") {
+        return false;
+    }
+    match std::fs::read_to_string("/proc/device-tree/compatible") {
+        Ok(compat) => is_tegra(&compat),
+        Err(_) => false,
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -747,12 +813,20 @@ fn detect_collector() -> Box<dyn Collector> {
     detect_collector_impl()
 }
 
-#[cfg(any(not(feature = "skippy-devices"), test))]
+#[cfg(any(
+    not(feature = "skippy-devices"),
+    feature = "dynamic-native-runtime",
+    test
+))]
 fn backend_device_for_name(name: &str, index: usize, is_soc: bool) -> Option<String> {
     backend_device_for_name_for_platform(name, index, is_soc, cfg!(target_os = "macos"))
 }
 
-#[cfg(any(not(feature = "skippy-devices"), test))]
+#[cfg(any(
+    not(feature = "skippy-devices"),
+    feature = "dynamic-native-runtime",
+    test
+))]
 fn backend_device_for_name_for_platform(
     name: &str,
     index: usize,
@@ -783,7 +857,11 @@ fn backend_device_for_name_for_platform(
 }
 
 #[cfg(all(
-    any(not(feature = "skippy-devices"), test),
+    any(
+        not(feature = "skippy-devices"),
+        feature = "dynamic-native-runtime",
+        test
+    ),
     any(target_os = "linux", target_os = "windows")
 ))]
 fn detect_nvidia_identities() -> Vec<(Option<String>, Option<String>)> {
@@ -801,14 +879,22 @@ fn detect_nvidia_identities() -> Vec<(Option<String>, Option<String>)> {
 }
 
 #[cfg(all(
-    any(not(feature = "skippy-devices"), test),
+    any(
+        not(feature = "skippy-devices"),
+        feature = "dynamic-native-runtime",
+        test
+    ),
     not(any(target_os = "linux", target_os = "windows"))
 ))]
 fn detect_nvidia_identities() -> Vec<(Option<String>, Option<String>)> {
     Vec::new()
 }
 
-#[cfg(any(not(feature = "skippy-devices"), test))]
+#[cfg(any(
+    not(feature = "skippy-devices"),
+    feature = "dynamic-native-runtime",
+    test
+))]
 fn inferred_gpu_name_count(name: Option<&str>) -> usize {
     let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
         return 0;
@@ -925,7 +1011,10 @@ fn resolve_pinned_gpu_with_compatibility<'a>(
                 .iter()
                 .filter(|gpu| !gpu_pinnable_ids(gpu).is_empty())
                 .collect::<Vec<_>>();
-            if accept_single_pinnable_gpu_fallback && let [gpu] = pinnable_gpus.as_slice() {
+            if let (true, [gpu]) = (
+                accept_single_pinnable_gpu_fallback,
+                pinnable_gpus.as_slice(),
+            ) {
                 tracing::warn!(
                     "configured gpu_id '{}' did not match the single available pinnable GPU; accepting '{}' for compatibility",
                     configured_id,
@@ -947,7 +1036,11 @@ fn resolve_pinned_gpu_with_compatibility<'a>(
     }
 }
 
-#[cfg(any(not(feature = "skippy-devices"), test))]
+#[cfg(any(
+    not(feature = "skippy-devices"),
+    feature = "dynamic-native-runtime",
+    test
+))]
 fn hydrate_gpu_facts(survey: &mut HardwareSurvey, metrics: &[Metric]) {
     let expected_count = survey
         .gpu_vram
@@ -977,7 +1070,11 @@ fn hydrate_gpu_facts(survey: &mut HardwareSurvey, metrics: &[Metric]) {
     );
 }
 
-#[cfg(any(not(feature = "skippy-devices"), test))]
+#[cfg(any(
+    not(feature = "skippy-devices"),
+    feature = "dynamic-native-runtime",
+    test
+))]
 fn hydrate_gpu_facts_with_identities(
     survey: &mut HardwareSurvey,
     metrics: &[Metric],
@@ -1065,7 +1162,7 @@ pub fn query(metrics: &[Metric]) -> HardwareSurvey {
     if metrics.contains(&Metric::Hostname) {
         survey.hostname = detect_hostname();
     }
-    #[cfg(not(feature = "skippy-devices"))]
+    #[cfg(any(not(feature = "skippy-devices"), feature = "dynamic-native-runtime"))]
     if metrics.contains(&Metric::GpuFacts) && survey.gpus.is_empty() {
         hydrate_gpu_facts(&mut survey, metrics);
     }

@@ -181,6 +181,7 @@ impl ConfigEditor {
                     command: None,
                     args: Vec::new(),
                     url: None,
+                    startup: Default::default(),
                 });
                 self.config.plugins.len() - 1
             }
@@ -210,13 +211,6 @@ impl ConfigEditor {
             .enabled(true)
             .command(command)
             .args(args);
-        Ok(self)
-    }
-
-    pub fn upsert_openai_endpoint_plugin(&mut self, url: impl Into<String>) -> Result<&mut Self> {
-        self.upsert_plugin("openai-endpoint")?
-            .enabled(true)
-            .url(url);
         Ok(self)
     }
 }
@@ -387,6 +381,26 @@ impl PluginConfigEditor<'_> {
 
     pub fn url(&mut self, url: impl Into<String>) -> &mut Self {
         self.plugin.url = Some(url.into());
+        self
+    }
+
+    pub fn connect_timeout_secs(&mut self, seconds: u64) -> &mut Self {
+        self.plugin.startup.connect_timeout_secs = Some(seconds);
+        self
+    }
+
+    pub fn init_timeout_secs(&mut self, seconds: u64) -> &mut Self {
+        self.plugin.startup.init_timeout_secs = Some(seconds);
+        self
+    }
+
+    pub fn optional(&mut self, optional: bool) -> &mut Self {
+        self.plugin.startup.optional = optional;
+        self
+    }
+
+    pub fn lazy_start(&mut self, lazy_start: bool) -> &mut Self {
+        self.plugin.startup.lazy_start = lazy_start;
         self
     }
 }

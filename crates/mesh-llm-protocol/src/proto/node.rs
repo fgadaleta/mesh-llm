@@ -118,6 +118,14 @@ pub struct PeerAnnouncement {
     pub latency_observer_id: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     #[prost(message, repeated, tag = "44")]
     pub advertised_model_throughput: ::prost::alloc::vec::Vec<AdvertisedModelThroughput>,
+    #[prost(string, optional, tag = "45")]
+    pub mesh_policy_hash: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "46")]
+    pub genesis_policy: ::core::option::Option<SignedMeshGenesisPolicy>,
+    #[prost(message, optional, tag = "47")]
+    pub release_attestation: ::core::option::Option<ReleaseBuildAttestation>,
+    #[prost(message, optional, tag = "48")]
+    pub direct_admission_proof: ::core::option::Option<DirectNodeAdmissionProof>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AdvertisedModelThroughput {
@@ -202,7 +210,7 @@ pub struct SignedNodeOwnership {
     #[prost(bytes = "vec", tag = "10")]
     pub signature: ::prost::alloc::vec::Vec<u8>,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ServedModelDescriptor {
     #[prost(message, optional, tag = "1")]
     pub identity: ::core::option::Option<ServedModelIdentity>,
@@ -212,6 +220,35 @@ pub struct ServedModelDescriptor {
     pub topology: ::core::option::Option<ModelTopology>,
     #[prost(bool, optional, tag = "4")]
     pub capabilities_known: ::core::option::Option<bool>,
+    #[prost(message, optional, tag = "5")]
+    pub metadata: ::core::option::Option<ServedModelMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ServedModelMetadata {
+    #[prost(string, optional, tag = "1")]
+    pub architecture: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub parameter_size: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(double, optional, tag = "3")]
+    pub parameter_count_b: ::core::option::Option<f64>,
+    #[prost(string, optional, tag = "4")]
+    pub quant: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, optional, tag = "5")]
+    pub native_context_length: ::core::option::Option<u32>,
+    #[prost(string, optional, tag = "6")]
+    pub tokenizer: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, optional, tag = "7")]
+    pub layer_count: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "8")]
+    pub embedding_size: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "9")]
+    pub head_count: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "10")]
+    pub kv_head_count: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "11")]
+    pub expert_count: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "12")]
+    pub active_expert_count: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ServedModelIdentity {
@@ -327,6 +364,11 @@ pub struct CompactModelMetadata {
     /// GGUF quantization type string (e.g. "Q4_K_M")
     #[prost(string, tag = "18")]
     pub quantization_type: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "19")]
+    pub kv_head_count: u32,
+    /// GGUF general.size_label when present (e.g. "32B")
+    #[prost(string, optional, tag = "20")]
+    pub parameter_size: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SpecialToken {
@@ -434,6 +476,11 @@ pub struct NodeConfigSnapshot {
     /// canonical persisted config payload for additive owner-control roundtrip
     #[prost(string, optional, tag = "5")]
     pub config_toml: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional, additive: mesh admission requirements snapshot.
+    /// Older nodes ignore this field. Owner-control config get/apply must
+    /// round-trip this so \[mesh_requirements\] is not silently dropped.
+    #[prost(message, optional, tag = "6")]
+    pub mesh_requirements: ::core::option::Option<MeshRequirements>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NodeGpuConfig {
@@ -750,6 +797,125 @@ pub enum LatencySource {
     Direct = 1,
     Estimated = 2,
     Unknown = 3,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SignedMeshGenesisPolicy {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(message, optional, tag = "2")]
+    pub policy: ::core::option::Option<MeshGenesisPolicy>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub origin_sign_public_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "4")]
+    pub signature_algorithm: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "5")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MeshGenesisPolicy {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(string, tag = "2")]
+    pub origin_owner_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub created_at_unix_ms: u64,
+    #[prost(message, optional, tag = "4")]
+    pub requirements: ::core::option::Option<MeshRequirements>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MeshRequirements {
+    #[prost(message, optional, tag = "1")]
+    pub node_version: ::core::option::Option<NodeVersionBounds>,
+    #[prost(message, optional, tag = "2")]
+    pub protocol_generation: ::core::option::Option<ProtocolGenerationBounds>,
+    #[prost(message, optional, tag = "3")]
+    pub release_attestation: ::core::option::Option<ReleaseAttestationRequirement>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NodeVersionBounds {
+    #[prost(string, optional, tag = "1")]
+    pub min: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub max: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ProtocolGenerationBounds {
+    #[prost(uint32, optional, tag = "1")]
+    pub min: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub max: ::core::option::Option<u32>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReleaseAttestationRequirement {
+    #[prost(bool, optional, tag = "1")]
+    pub required: ::core::option::Option<bool>,
+    #[prost(string, repeated, tag = "2")]
+    pub allowed_signer_keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SignedBootstrapToken {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub serialized_addrs: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(string, tag = "3")]
+    pub mesh_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub policy_hash: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub genesis_policy: ::core::option::Option<MeshGenesisPolicy>,
+    #[prost(uint64, optional, tag = "6")]
+    pub expires_at_unix_ms: ::core::option::Option<u64>,
+    #[prost(bytes = "vec", tag = "7")]
+    pub origin_sign_public_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "8")]
+    pub signature_algorithm: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "9")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReleaseBuildAttestation {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(string, tag = "2")]
+    pub node_version: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub build_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub commit: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub target_triple: ::prost::alloc::string::String,
+    #[prost(uint32, optional, tag = "6")]
+    pub supported_protocol_generation_min: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "7")]
+    pub supported_protocol_generation_max: ::core::option::Option<u32>,
+    #[prost(string, optional, tag = "8")]
+    pub artifact_digest: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "9")]
+    pub signer_key_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub signature_algorithm: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "11")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DirectNodeAdmissionProof {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub sender_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "3")]
+    pub mesh_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub policy_hash: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub attestation_hash: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "6")]
+    pub timestamp_unix_ms: u64,
+    #[prost(string, tag = "7")]
+    pub signature_algorithm: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "8")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
 }
 impl LatencySource {
     pub fn as_str_name(&self) -> &'static str {

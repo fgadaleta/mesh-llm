@@ -3,27 +3,34 @@
 //! Mesh control traffic uses QUIC ALPN `mesh-llm/1` and multiplexes bi-streams
 //! by first byte. Mesh-owned subsystem streams use `STREAM_SUBPROTOCOL` on the
 //! admitted mesh connection; Skippy activation transport remains on the
-//! latency-sensitive `skippy-stage/1` ALPN.
+//! latency-sensitive `skippy-stage/2` ALPN.
 
 pub use mesh_llm_types::mesh::{
     DEMAND_TTL_SECS, MAX_SPLIT_RTT_MS, ModelDemand, ModelRuntimeDescriptor, ModelSourceKind,
-    ServedModelDescriptor, ServedModelIdentity, infer_available_model_descriptors,
-    infer_local_served_model_descriptor, infer_served_model_descriptors, merge_demand,
+    ServedModelDescriptor, ServedModelIdentity, ServedModelMetadata,
+    infer_available_model_descriptors, infer_local_served_model_descriptor,
+    infer_served_model_descriptors, merge_demand,
 };
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
+use mesh_llm_events::OutputEvent;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, watch};
 
+use self::requirements::{
+    DirectPeerProofStatus, MeshRequirementDecision, MeshRequirementPolicySummary,
+    MeshRequirementRejectReason, MeshRequirementRejectionEvent, MeshRequirementRejectionSource,
+    evaluate_direct_peer_admission, peer_release_attestation_status,
+};
 use crate::crypto::{
     DEFAULT_NODE_CERT_LIFETIME_SECS, OwnershipStatus, OwnershipSummary, SignedNodeOwnership,
     TrustPolicy, TrustStore, default_node_ownership_path, save_node_ownership, sign_node_ownership,
@@ -42,16 +49,18 @@ use skippy_protocol::proto::stage as skippy_stage_proto;
 
 const PRETTY_LOCAL_REQUEST_WINDOW_SECS: u64 = 24 * 60 * 60;
 const EPHEMERAL_QUIC_PORT: u16 = 0;
+const SIGNED_BOOTSTRAP_TOKEN_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
+const RECENT_MESH_REJECTION_LIMIT: usize = 16;
 
 fn emit_mesh_info(message: String) {
-    let _ = crate::cli::output::emit_event(crate::cli::output::OutputEvent::Info {
+    let _ = mesh_llm_events::emit_event(OutputEvent::Info {
         message,
         context: None,
     });
 }
 
 fn emit_mesh_warning(message: String) {
-    let _ = crate::cli::output::emit_event(crate::cli::output::OutputEvent::Warning {
+    let _ = mesh_llm_events::emit_event(OutputEvent::Warning {
         message,
         context: None,
     });
@@ -116,6 +125,90 @@ pub(crate) struct HttpCaptureEvent<'a> {
     pub(crate) stream: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SplitStagePathKind {
+    Direct,
+    Relay,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SplitStagePathRejection {
+    MissingStagePath,
+    StagePathRelayOnly,
+    StagePathTooSlow,
+}
+
+impl SplitStagePathRejection {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingStagePath => "missing_stage_path",
+            Self::StagePathRelayOnly => "stage_path_relay_only",
+            Self::StagePathTooSlow => "stage_path_too_slow",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SplitStagePathSnapshot {
+    pub(crate) kind: SplitStagePathKind,
+    pub(crate) rtt_ms: Option<u32>,
+}
+
+impl SplitStagePathSnapshot {
+    pub(crate) const fn direct(rtt_ms: Option<u32>) -> Self {
+        Self {
+            kind: SplitStagePathKind::Direct,
+            rtt_ms,
+        }
+    }
+
+    pub(crate) const fn relay(rtt_ms: Option<u32>) -> Self {
+        Self {
+            kind: SplitStagePathKind::Relay,
+            rtt_ms,
+        }
+    }
+
+    pub(crate) const fn unknown() -> Self {
+        Self {
+            kind: SplitStagePathKind::Unknown,
+            rtt_ms: None,
+        }
+    }
+
+    pub(crate) const fn with_direct_rtt_fallback(self, fallback_rtt_ms: Option<u32>) -> Self {
+        match (self.kind, self.rtt_ms, fallback_rtt_ms) {
+            (SplitStagePathKind::Direct, None, Some(rtt_ms)) => Self::direct(Some(rtt_ms)),
+            _ => self,
+        }
+    }
+
+    pub(crate) fn with_peer_path_fallback(self, fallback: Option<SelectedPathObservation>) -> Self {
+        match (self.kind, fallback) {
+            (SplitStagePathKind::Direct, Some(observation)) => {
+                self.with_direct_rtt_fallback(observation.rtt_ms)
+            }
+            (SplitStagePathKind::Unknown, Some(observation)) => {
+                split_stage_path_snapshot_from_observation(observation)
+            }
+            _ => self,
+        }
+    }
+
+    pub(crate) const fn stage_path_rejection(self) -> Option<SplitStagePathRejection> {
+        match self.kind {
+            SplitStagePathKind::Direct => match self.rtt_ms {
+                Some(rtt_ms) if rtt_ms <= MAX_SPLIT_RTT_MS => None,
+                Some(_) => Some(SplitStagePathRejection::StagePathTooSlow),
+                None => Some(SplitStagePathRejection::MissingStagePath),
+            },
+            SplitStagePathKind::Relay => Some(SplitStagePathRejection::StagePathRelayOnly),
+            SplitStagePathKind::Unknown => Some(SplitStagePathRejection::MissingStagePath),
+        }
+    }
+}
+
 fn selected_path_observation(conn: &Connection) -> Option<SelectedPathObservation> {
     let path_list = conn.paths();
     for path_info in &path_list {
@@ -143,6 +236,36 @@ fn selected_path_observation(conn: &Connection) -> Option<SelectedPathObservatio
     }
 
     None
+}
+
+fn split_stage_path_snapshot_from_observation(
+    observation: SelectedPathObservation,
+) -> SplitStagePathSnapshot {
+    match observation.path_type {
+        "direct" => SplitStagePathSnapshot::direct(observation.rtt_ms),
+        "relay" => SplitStagePathSnapshot::relay(observation.rtt_ms),
+        _ => SplitStagePathSnapshot::unknown(),
+    }
+}
+
+fn split_stage_path_snapshot_from_connection(conn: &Connection) -> SplitStagePathSnapshot {
+    let Some(observation) = selected_path_observation(conn) else {
+        return SplitStagePathSnapshot::unknown();
+    };
+    split_stage_path_snapshot_from_observation(observation)
+}
+
+fn stage_transport_path_rejection(
+    conn: &Connection,
+    stream_type: u8,
+    fallback: Option<SelectedPathObservation>,
+) -> Option<SplitStagePathRejection> {
+    if stream_type != skippy_protocol::STAGE_STREAM_TRANSPORT {
+        return None;
+    }
+    split_stage_path_snapshot_from_connection(conn)
+        .with_peer_path_fallback(fallback)
+        .stage_path_rejection()
 }
 
 fn endpoint_id_capture_fields(id: EndpointId) -> serde_json::Value {
@@ -210,6 +333,12 @@ const ARTIFACT_TRANSFER_INVALID_OFFSET_ERROR: &str = "invalid transfer offset";
 
 type MeshBiStream = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
 
+enum StageBiAccept {
+    Streams(MeshBiStream),
+    Continue,
+    Closed,
+}
+
 enum StageStreamAccept {
     Dispatch(MeshBiStream, u8),
     Continue,
@@ -264,6 +393,25 @@ pub struct QuicBindSelection {
 pub struct RelayConfig<'a> {
     pub urls: &'a [String],
     pub auths: &'a std::collections::HashMap<String, String>,
+    pub policy: RelayPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RelayPolicy {
+    #[default]
+    DefaultPublic,
+    ExplicitlyDisabled,
+    Disabled,
+}
+
+impl RelayPolicy {
+    pub(crate) fn uses_relay(self) -> bool {
+        matches!(self, Self::DefaultPublic)
+    }
+
+    fn uses_raw_stun(self) -> bool {
+        matches!(self, Self::DefaultPublic | Self::ExplicitlyDisabled)
+    }
 }
 
 fn quic_bind_addr(bind: QuicBindSelection) -> Option<SocketAddr> {
@@ -409,14 +557,48 @@ fn filter_endpoint_addr_for_bind_ip(
     addr
 }
 
-fn effective_relay_urls(relay_urls: &[String]) -> Vec<String> {
-    if relay_urls.is_empty() {
-        vec![
+fn effective_relay_urls(policy: RelayPolicy, relay_urls: &[String]) -> Vec<String> {
+    match policy {
+        RelayPolicy::Disabled | RelayPolicy::ExplicitlyDisabled => Vec::new(),
+        RelayPolicy::DefaultPublic if relay_urls.is_empty() => vec![
             "https://usw1-2.relay.michaelneale.mesh-llm.iroh.link./".into(),
             "https://aps1-1.relay.michaelneale.mesh-llm.iroh.link./".into(),
-        ]
-    } else {
-        relay_urls.to_vec()
+        ],
+        RelayPolicy::DefaultPublic => relay_urls.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod relay_policy_tests {
+    use super::{RelayPolicy, effective_relay_urls};
+
+    #[test]
+    fn default_policy_uses_managed_relays_when_no_urls_are_given() {
+        let urls = effective_relay_urls(RelayPolicy::DefaultPublic, &[]);
+
+        assert!(urls.iter().any(|url| url.contains("relay.michaelneale")));
+    }
+
+    #[test]
+    fn default_policy_uses_custom_relay_urls_when_supplied() {
+        let custom = vec!["https://relay.example/".to_string()];
+
+        assert_eq!(
+            effective_relay_urls(RelayPolicy::DefaultPublic, &custom),
+            custom
+        );
+    }
+
+    #[test]
+    fn disabled_policy_uses_no_relays_but_explicit_disable_keeps_raw_stun() {
+        let custom = vec!["https://relay.example/".to_string()];
+
+        assert!(effective_relay_urls(RelayPolicy::Disabled, &custom).is_empty());
+        assert!(effective_relay_urls(RelayPolicy::ExplicitlyDisabled, &custom).is_empty());
+        assert!(!RelayPolicy::Disabled.uses_relay());
+        assert!(!RelayPolicy::ExplicitlyDisabled.uses_relay());
+        assert!(!RelayPolicy::Disabled.uses_raw_stun());
+        assert!(RelayPolicy::ExplicitlyDisabled.uses_raw_stun());
     }
 }
 
@@ -689,6 +871,53 @@ fn encode_endpoint_addr_token(addr: &EndpointAddr) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
 }
 
+#[derive(Clone, Debug)]
+enum InviteTokenMaterial {
+    Legacy(EndpointAddr),
+    Signed(Box<crate::SignedBootstrapToken>),
+}
+
+#[derive(Clone, Debug)]
+struct ActiveMeshPolicyState {
+    mesh_id: String,
+    policy_hash: String,
+    policy: crate::MeshGenesisPolicy,
+}
+
+fn decode_invite_token_payload(invite_token: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(invite_token)
+        .context("invalid invite token encoding")
+}
+
+fn parse_invite_token(
+    invite_token: &str,
+) -> std::result::Result<InviteTokenMaterial, MeshRequirementRejectReason> {
+    let payload = decode_invite_token_payload(invite_token)
+        .map_err(|_| MeshRequirementRejectReason::BootstrapTokenInvalid)?;
+    if let Ok(addr) = serde_json::from_slice::<EndpointAddr>(&payload) {
+        return Ok(InviteTokenMaterial::Legacy(addr));
+    }
+    let token = serde_json::from_slice::<crate::SignedBootstrapToken>(&payload)
+        .map_err(|_| MeshRequirementRejectReason::BootstrapTokenInvalid)?;
+    Ok(InviteTokenMaterial::Signed(Box::new(token)))
+}
+
+fn decode_signed_bootstrap_addrs(token: &crate::SignedBootstrapToken) -> Result<Vec<EndpointAddr>> {
+    anyhow::ensure!(
+        !token.serialized_addrs.is_empty(),
+        "bootstrap token does not contain any endpoint addresses"
+    );
+    token
+        .serialized_addrs
+        .iter()
+        .map(|bytes| {
+            serde_json::from_slice(bytes)
+                .context("bootstrap token contains an invalid serialized endpoint address")
+        })
+        .collect()
+}
+
 fn control_endpoint_addr(
     endpoint: &Endpoint,
     advertise_addr: Option<std::net::SocketAddr>,
@@ -934,6 +1163,7 @@ fn infer_remote_served_descriptors(
                 capabilities_known: false,
                 capabilities: crate::models::ModelCapabilities::default(),
                 topology: None,
+                metadata: None,
             }
         })
         .collect()
@@ -1126,6 +1356,7 @@ fn descriptor_from_identity(
         capabilities_known: true,
         capabilities,
         topology,
+        metadata: crate::models::served_model_metadata_for_path(model_name, &path),
     }
 }
 
@@ -1247,7 +1478,8 @@ fn model_descriptor_score(descriptor: &ServedModelDescriptor) -> u8 {
         + u8::from(descriptor.capabilities.vision != crate::models::CapabilityLevel::None)
         + u8::from(descriptor.capabilities.reasoning != crate::models::CapabilityLevel::None)
         + u8::from(descriptor.capabilities.tool_use != crate::models::CapabilityLevel::None);
-    model_identity_score(identity) + capability_bonus
+    let metadata_bonus = u8::from(descriptor.metadata.is_some());
+    model_identity_score(identity) + capability_bonus + metadata_bonus
 }
 
 fn upsert_mesh_catalog_descriptor(
@@ -1307,6 +1539,7 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) version: Option<String>,
     pub(crate) model_demand: HashMap<String, ModelDemand>,
     pub(crate) mesh_id: Option<String>,
+    pub(crate) mesh_policy_hash: Option<String>,
     pub(crate) gpu_name: Option<String>,
     pub(crate) hostname: Option<String>,
     pub(crate) is_soc: Option<bool>,
@@ -1321,6 +1554,9 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) served_model_descriptors: Vec<ServedModelDescriptor>,
     pub(crate) served_model_runtime: Vec<ModelRuntimeDescriptor>,
     pub(crate) owner_attestation: Option<SignedNodeOwnership>,
+    pub(crate) genesis_policy: Option<crate::SignedMeshGenesisPolicy>,
+    pub(crate) release_attestation: Option<crate::ReleaseBuildAttestation>,
+    pub(crate) direct_admission_proof: Option<crate::DirectNodeAdmissionProof>,
     pub(crate) artifact_transfer_supported: bool,
     pub(crate) stage_protocol_generation_supported: bool,
     pub(crate) stage_status_list_supported: bool,
@@ -1368,12 +1604,16 @@ pub struct DisplayLatency {
 pub struct PeerInfo {
     pub id: EndpointId,
     pub addr: EndpointAddr,
+    pub mesh_id: Option<String>,
+    pub mesh_policy_hash: Option<String>,
+    pub genesis_policy: Option<crate::SignedMeshGenesisPolicy>,
     pub role: NodeRole,
     pub first_joined_mesh_ts: Option<u64>,
     pub models: Vec<String>,
     pub vram_bytes: u64,
     pub rtt_ms: Option<u32>,
     pub model_source: Option<String>,
+    pub admitted: bool,
     /// All models assigned to this peer, even if not yet healthy.
     pub serving_models: Vec<String>,
     /// Models this node is actively routing inference for.
@@ -1414,12 +1654,15 @@ pub struct PeerInfo {
     pub served_model_descriptors: Vec<ServedModelDescriptor>,
     pub served_model_runtime: Vec<ModelRuntimeDescriptor>,
     pub owner_attestation: Option<SignedNodeOwnership>,
+    pub release_attestation_summary: crate::ReleaseAttestationSummary,
     pub artifact_transfer_supported: bool,
     pub stage_protocol_generation_supported: bool,
     pub stage_status_list_supported: bool,
     pub(crate) advertised_model_throughput: Vec<crate::network::metrics::ModelThroughputHint>,
     /// Most recent direct RTT sample for display purposes (refreshed periodically).
     pub display_rtt: Option<DirectLatencyObservation>,
+    /// Last selected path observed on the mesh control connection to this peer.
+    pub(crate) selected_path: Option<SelectedPathObservation>,
     /// Latency propagated via transitive gossip.
     pub propagated_latency: Option<PropagatedLatencyObservation>,
     pub owner_summary: OwnershipSummary,
@@ -1449,7 +1692,7 @@ pub struct MeshCatalogEntry {
 }
 
 impl PeerInfo {
-    fn from_announcement(
+    pub(crate) fn from_announcement(
         id: EndpointId,
         addr: EndpointAddr,
         ann: &PeerAnnouncement,
@@ -1458,12 +1701,16 @@ impl PeerInfo {
         Self {
             id,
             addr,
+            mesh_id: ann.mesh_id.clone(),
+            mesh_policy_hash: ann.mesh_policy_hash.clone(),
+            genesis_policy: ann.genesis_policy.clone(),
             role: ann.role.clone(),
             first_joined_mesh_ts: ann.first_joined_mesh_ts,
             models: ann.models.clone(),
             vram_bytes: ann.vram_bytes,
             rtt_ms: None,
             model_source: ann.model_source.clone(),
+            admitted: false,
             serving_models: ann.serving_models.clone(),
             hosted_models: ann.hosted_models.clone().unwrap_or_default(),
             hosted_models_known: ann.hosted_models.is_some(),
@@ -1487,19 +1734,39 @@ impl PeerInfo {
             served_model_descriptors: ann.served_model_descriptors.clone(),
             served_model_runtime: ann.served_model_runtime.clone(),
             owner_attestation: ann.owner_attestation.clone(),
+            release_attestation_summary: crate::verify_release_attestation(
+                ann.release_attestation.as_ref(),
+                &crate::ReleaseSignerTrustStore::default(),
+            ),
             artifact_transfer_supported: ann.artifact_transfer_supported,
             stage_protocol_generation_supported: ann.stage_protocol_generation_supported,
             stage_status_list_supported: ann.stage_status_list_supported,
             advertised_model_throughput: ann.advertised_model_throughput.clone(),
             display_rtt: None,
+            selected_path: None,
             propagated_latency: None,
             owner_summary,
         }
     }
 
+    pub fn is_admitted(&self) -> bool {
+        self.admitted
+    }
+
     /// Return the most recent direct RTT sample for display, falling back to best-seen RTT.
     pub fn current_direct_rtt_ms(&self) -> Option<u32> {
         self.display_rtt.as_ref().map(|d| d.rtt_ms).or(self.rtt_ms)
+    }
+
+    pub(crate) fn split_stage_path_fallback(&self) -> Option<SelectedPathObservation> {
+        let observation = self.selected_path?;
+        if observation.path_type != "direct" {
+            return Some(observation);
+        }
+        Some(SelectedPathObservation {
+            rtt_ms: self.rtt_ms.or(observation.rtt_ms),
+            ..observation
+        })
     }
 
     /// Compute display latency from direct sample or propagated data.
@@ -1764,26 +2031,35 @@ fn startup_transport_config() -> iroh::endpoint::QuicTransportConfig {
         .build()
 }
 
+fn relay_mode_for_startup(relay: RelayConfig<'_>) -> iroh::endpoint::RelayMode {
+    let urls = effective_relay_urls(relay.policy, relay.urls);
+    if relay.policy.uses_relay() {
+        tracing::info!("Relay: {:?}", urls);
+        iroh::endpoint::RelayMode::Custom(relay_map_from_urls(&urls, relay.auths))
+    } else {
+        let reason = match relay.policy {
+            RelayPolicy::ExplicitlyDisabled => "disabled by embedded config",
+            RelayPolicy::Disabled => "disabled by LAN-only discovery mode",
+            RelayPolicy::DefaultPublic => unreachable!("default public uses relays"),
+        };
+        tracing::info!("Relay: {reason}");
+        iroh::endpoint::RelayMode::Disabled
+    }
+}
+
 async fn bind_mesh_endpoint(
     secret_key: SecretKey,
-    relay_urls: &[String],
-    relay_auths: &std::collections::HashMap<String, String>,
+    relay: RelayConfig<'_>,
     quic_bind: QuicBindSelection,
 ) -> Result<Endpoint> {
     let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(secret_key)
         .alpns(vec![
             ALPN_V1.to_vec(),
-            skippy_protocol::STAGE_ALPN_V1.to_vec(),
+            skippy_protocol::STAGE_ALPN_V2.to_vec(),
         ])
-        .transport_config(startup_transport_config());
-
-    let urls = effective_relay_urls(relay_urls);
-    tracing::info!("Relay: {:?}", urls);
-    builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(relay_map_from_urls(
-        &urls,
-        relay_auths,
-    )));
+        .transport_config(startup_transport_config())
+        .relay_mode(relay_mode_for_startup(relay));
 
     if let Some(addr) = quic_bind_addr(quic_bind) {
         tracing::info!("Binding QUIC to {addr}");
@@ -1917,15 +2193,14 @@ fn init_owner_runtime(
 
 fn configure_control_relay(
     mut builder: iroh::endpoint::Builder,
-    relay_urls: Option<&[String]>,
-    relay_auths: &std::collections::HashMap<String, String>,
+    relay: Option<RelayConfig<'_>>,
 ) -> iroh::endpoint::Builder {
-    if let Some(relay_urls) = relay_urls {
-        let urls = effective_relay_urls(relay_urls);
+    if let Some(relay) = relay.filter(|relay| relay.policy.uses_relay()) {
+        let urls = effective_relay_urls(relay.policy, relay.urls);
         tracing::info!("Owner-control relay: {:?}", urls);
         builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(relay_map_from_urls(
             &urls,
-            relay_auths,
+            relay.auths,
         )));
     } else {
         builder = builder.relay_mode(iroh::endpoint::RelayMode::Disabled);
@@ -1942,8 +2217,11 @@ fn default_plugin_event_source(endpoint_id: EndpointId, source_peer_id: &mut Str
 #[derive(Clone)]
 pub struct Node {
     endpoint: Endpoint,
+    endpoint_secret_key: SecretKey,
     public_addr: Option<std::net::SocketAddr>,
     quic_bind: QuicBindSelection,
+    owner_keypair: Option<crate::crypto::OwnerKeypair>,
+    local_mesh_requirements: crate::MeshRequirements,
     state: Arc<Mutex<MeshState>>,
     role: Arc<Mutex<NodeRole>>,
     models: Arc<Mutex<Vec<String>>>,
@@ -1960,6 +2238,10 @@ pub struct Node {
     /// This is the single source of truth for "what does the mesh want?"
     model_demand: Arc<std::sync::Mutex<HashMap<String, ModelDemand>>>,
     mesh_id: Arc<Mutex<Option<String>>>,
+    mesh_policy_hash: Arc<Mutex<Option<String>>>,
+    genesis_policy: Arc<Mutex<Option<crate::MeshGenesisPolicy>>>,
+    signed_genesis_policy: Arc<Mutex<Option<crate::SignedMeshGenesisPolicy>>>,
+    bootstrap_token: Arc<Mutex<Option<crate::SignedBootstrapToken>>>,
     first_joined_mesh_ts: Arc<Mutex<Option<u64>>>,
     accepting: Arc<(tokio::sync::Notify, std::sync::atomic::AtomicBool)>,
     vram_bytes: u64,
@@ -1989,10 +2271,13 @@ pub struct Node {
         >,
     >,
     stage_transport_bridges: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    stage_transport_aliases: Arc<Mutex<HashMap<String, String>>>,
     stage_topologies: Arc<Mutex<StageTopologyState>>,
     plugin_manager: Arc<Mutex<Option<crate::plugin::PluginManager>>>,
     display_name: Arc<Mutex<Option<String>>>,
     owner_attestation: Arc<Mutex<Option<SignedNodeOwnership>>>,
+    release_attestation: Arc<Mutex<Option<crate::ReleaseBuildAttestation>>>,
+    release_attestation_summary: Arc<Mutex<crate::ReleaseAttestationSummary>>,
     owner_summary: Arc<Mutex<OwnershipSummary>>,
     control_listener: Arc<Mutex<Option<ControlListenerLifecycle>>>,
     trust_store: Arc<Mutex<TrustStore>>,
@@ -2154,6 +2439,10 @@ struct MeshState {
     /// Last policy-rejection status per peer — used to suppress duplicate log lines.
     /// Only logs when the status transitions (first rejection or status change).
     policy_rejected_peers: HashMap<EndpointId, OwnershipStatus>,
+    /// Peers rejected by immutable mesh requirements. Used to keep pre-admission
+    /// streams from disclosing topology after a deterministic requirement reject.
+    requirement_rejected_peers: HashSet<EndpointId>,
+    recent_mesh_rejections: VecDeque<MeshRequirementRejectionEvent>,
 }
 
 /// Returns `true` if the given peer has completed gossip validation and is
@@ -2161,7 +2450,7 @@ struct MeshState {
 /// in `state.peers` — they are quarantined until gossip succeeds.
 #[cfg(test)]
 pub(crate) fn is_peer_admitted(peers: &HashMap<EndpointId, PeerInfo>, id: &EndpointId) -> bool {
-    peers.contains_key(id)
+    peers.get(id).is_some_and(PeerInfo::is_admitted)
 }
 
 /// Returns `true` if the given stream type is permitted before a peer has
@@ -2171,11 +2460,15 @@ pub(crate) fn is_peer_admitted(peers: &HashMap<EndpointId, PeerInfo>, id: &Endpo
 /// - `STREAM_GOSSIP (0x01)`: the admission handshake itself.
 /// - `STREAM_ROUTE_REQUEST (0x05)`: passive/client request-only path — caller
 ///   is NEVER promoted to `state.peers`.
+/// - `STREAM_TUNNEL_HTTP (0x04)`: passive SDK inference path for callers that
+///   have an invite token but should not need a local `/v1` HTTP listener.
 ///
-/// Every other stream — including tunnel (0x02 / 0x04) — requires the
-/// remote to have completed gossip first.
+/// Every other stream — including raw tunnel (0x02) — requires the remote to
+/// have completed gossip first.
 pub(crate) fn stream_allowed_before_admission(stream_type: u8) -> bool {
-    stream_type == STREAM_GOSSIP || stream_type == STREAM_ROUTE_REQUEST
+    stream_type == STREAM_GOSSIP
+        || stream_type == STREAM_ROUTE_REQUEST
+        || stream_type == STREAM_TUNNEL_HTTP
 }
 
 pub(crate) fn ingest_tunnel_map(
@@ -2338,6 +2631,15 @@ impl StageTopologyState {
         self.record_topology(topology);
     }
 
+    fn withdraw_topology(&mut self, topology_id: &str, run_id: &str) -> bool {
+        let topology_key = stage_topology_key(topology_id, run_id);
+        let removed_topology = self.topologies.remove(&topology_key).is_some();
+        let old_status_count = self.statuses.len();
+        self.statuses
+            .retain(|_, status| status.topology_id != topology_id || status.run_id != run_id);
+        removed_topology || self.statuses.len() != old_status_count
+    }
+
     fn visible_topologies(&self) -> Vec<StageTopologyInstance> {
         self.topologies
             .values()
@@ -2391,6 +2693,17 @@ impl StageTopologyState {
             ),
             runtime_status,
         );
+    }
+
+    fn record_status_refresh_failure(&mut self, status: &StageRuntimeStatus, error: String) {
+        self.record_status(stage_runtime_status_from_snapshot(
+            status.node_id,
+            stage_snapshot_from_runtime_status(
+                status,
+                crate::inference::skippy::StageRuntimeState::Failed,
+                Some(error),
+            ),
+        ));
     }
 
     fn active_statuses(&self) -> Vec<StageRuntimeStatus> {
@@ -2813,6 +3126,13 @@ impl Node {
             .activate_topology(topology);
     }
 
+    pub async fn withdraw_stage_topology(&self, topology_id: &str, run_id: &str) -> bool {
+        self.stage_topologies
+            .lock()
+            .await
+            .withdraw_topology(topology_id, run_id)
+    }
+
     pub async fn stage_topologies(&self) -> Vec<StageTopologyInstance> {
         self.stage_topologies.lock().await.visible_topologies()
     }
@@ -2851,15 +3171,13 @@ impl Node {
             match tokio::time::timeout(timeout, refresh).await {
                 Ok(Ok(crate::inference::skippy::StageControlResponse::Status(statuses))) => {
                     if statuses.is_empty() {
-                        self.record_stage_status(
-                            Some(peer_id),
-                            stage_snapshot_from_runtime_status(
+                        self.stage_topologies
+                            .lock()
+                            .await
+                            .record_status_refresh_failure(
                                 &status,
-                                crate::inference::skippy::StageRuntimeState::Failed,
-                                Some("stage status missing from runtime".to_string()),
-                            ),
-                        )
-                        .await;
+                                "stage status missing from runtime".to_string(),
+                            );
                     } else {
                         for status in statuses {
                             self.record_stage_status(Some(peer_id), status).await;
@@ -2871,23 +3189,25 @@ impl Node {
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
-                    self.record_stage_status(
-                        Some(peer_id),
-                        stage_snapshot_from_runtime_status(
-                            &status,
-                            crate::inference::skippy::StageRuntimeState::Failed,
-                            Some(error.to_string()),
-                        ),
-                    )
-                    .await;
+                    self.stage_topologies
+                        .lock()
+                        .await
+                        .record_status_refresh_failure(&status, error.to_string());
                 }
                 Err(_) => {
+                    self.stage_topologies
+                        .lock()
+                        .await
+                        .record_status_refresh_failure(
+                            &status,
+                            "stage status refresh timed out".to_string(),
+                        );
                     tracing::debug!(
                         topology_id = %status.topology_id,
                         run_id = %status.run_id,
                         stage_id = %status.stage_id,
                         peer = %peer_id.fmt_short(),
-                        "stage status refresh timed out; preserving last known status"
+                        "stage status refresh timed out; marking stage failed"
                     );
                 }
             }
@@ -3071,6 +3391,15 @@ impl Node {
         skippy_protocol::validate_stage_transport_open(&open)
             .map_err(|e| anyhow::anyhow!("StageTransportOpen validation error: {e}"))?;
         let conn = self.stage_connection_to_peer(peer_id).await?;
+        let snapshot = split_stage_path_snapshot_from_connection(&conn)
+            .with_peer_path_fallback(self.peer_stage_path_fallback(peer_id).await);
+        if let Some(rejection) = snapshot.stage_path_rejection() {
+            anyhow::bail!(
+                "stage transport path to {} is not eligible for split serving: {}",
+                peer_id.fmt_short(),
+                rejection.as_str()
+            );
+        }
         let (mut send, recv) = conn.open_bi().await?;
         send.write_all(&[skippy_protocol::STAGE_STREAM_TRANSPORT])
             .await?;
@@ -3135,6 +3464,40 @@ impl Node {
             .await
             .insert(key, handle);
         Ok(bind_addr)
+    }
+
+    pub(crate) async fn register_stage_transport_alias(
+        &self,
+        topology_id: &str,
+        run_id: &str,
+        stage_id: &str,
+        bind_addr: impl Into<String>,
+    ) {
+        let key = stage_runtime_status_key(topology_id, run_id, stage_id);
+        self.stage_transport_aliases
+            .lock()
+            .await
+            .insert(key, bind_addr.into());
+    }
+
+    pub(crate) async fn stage_transport_alias(
+        &self,
+        topology_id: &str,
+        run_id: &str,
+        stage_id: &str,
+    ) -> Option<String> {
+        let key = stage_runtime_status_key(topology_id, run_id, stage_id);
+        self.stage_transport_aliases.lock().await.get(&key).cloned()
+    }
+
+    pub(crate) async fn unregister_stage_transport_alias(
+        &self,
+        topology_id: &str,
+        run_id: &str,
+        stage_id: &str,
+    ) {
+        let key = stage_runtime_status_key(topology_id, run_id, stage_id);
+        self.stage_transport_aliases.lock().await.remove(&key);
     }
 
     pub(crate) async fn stop_stage_transport_bridge(
@@ -3233,6 +3596,10 @@ impl Node {
         self.owner_summary.lock().await.clone()
     }
 
+    pub async fn release_attestation_summary(&self) -> crate::ReleaseAttestationSummary {
+        self.release_attestation_summary.lock().await.clone()
+    }
+
     pub async fn control_endpoint(&self) -> Option<String> {
         let guard = self.control_listener.lock().await;
         guard.as_ref().map(|listener| listener.token.clone())
@@ -3250,6 +3617,10 @@ impl Node {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "startup wires independent node/runtime subsystems; changing the public constructor shape is outside this rebase repair"
+    )]
     pub async fn start(
         role: NodeRole,
         relay: RelayConfig<'_>,
@@ -3258,20 +3629,20 @@ impl Node {
         enumerate_host: bool,
         owner_config: Option<OwnerRuntimeConfig>,
         config_path: Option<&std::path::Path>,
+        local_mesh_requirements: crate::MeshRequirements,
     ) -> Result<(Self, TunnelChannels)> {
-        let relay_urls = relay.urls;
-        let relay_auths = relay.auths;
         let secret_key = startup_secret_key(&role).await?;
-        let endpoint =
-            bind_mesh_endpoint(secret_key.clone(), relay_urls, relay_auths, quic_bind).await?;
-        // Wait briefly for relay connection so the invite token includes the relay URL.
-        // On sinkholed networks this times out and we proceed without relay (direct UDP only).
-        wait_for_endpoint_online(
-            &endpoint,
-            "Relay connected",
-            "Relay connection timed out (5s) — proceeding without relay",
-        )
-        .await;
+        let endpoint = bind_mesh_endpoint(secret_key.clone(), relay, quic_bind).await?;
+        if relay.policy.uses_relay() {
+            // Wait briefly for relay connection so the invite token includes the relay URL.
+            // On sinkholed networks this times out and we proceed without relay (direct UDP only).
+            wait_for_endpoint_online(
+                &endpoint,
+                "Relay connected",
+                "Relay connection timed out (5s) — proceeding without relay",
+            )
+            .await;
+        }
 
         // Discover public IP via STUN so the invite token includes it.
         // With --bind-port, the advertised port is the bound port (for port forwarding).
@@ -3279,7 +3650,12 @@ impl Node {
         // ephemeral port. The IP is still useful for hole-punching.
         // Relay STUN may not work on sinkholed networks, so we use raw STUN to Google/Cloudflare.
         let stun_port = quic_bind.port.unwrap_or(EPHEMERAL_QUIC_PORT);
-        let public_addr = stun_public_addr(stun_port).await;
+        let public_addr = if relay.policy.uses_raw_stun() {
+            stun_public_addr(stun_port).await
+        } else {
+            tracing::info!("Raw STUN: disabled by LAN-only discovery mode");
+            None
+        };
 
         let (peer_change_tx, peer_change_rx) = watch::channel(0usize);
         let (inflight_change_tx, _inflight_change_rx) = watch::channel(0u64);
@@ -3315,10 +3691,17 @@ impl Node {
                 plugin_endpoint_key: None,
             });
 
+        let owner_keypair = owner_config
+            .as_ref()
+            .and_then(|config| config.keypair.clone());
+
         let node = Node {
             endpoint,
+            endpoint_secret_key: secret_key.clone(),
             public_addr,
             quic_bind,
+            owner_keypair,
+            local_mesh_requirements,
             state: Arc::new(Mutex::new(MeshState {
                 peers: HashMap::new(),
                 connections: HashMap::new(),
@@ -3328,6 +3711,8 @@ impl Node {
                 seen_plugin_messages: HashMap::new(),
                 seen_plugin_message_order: VecDeque::new(),
                 policy_rejected_peers: HashMap::new(),
+                requirement_rejected_peers: HashSet::new(),
+                recent_mesh_rejections: VecDeque::new(),
             })),
             role: Arc::new(Mutex::new(role)),
             models: Arc::new(Mutex::new(Vec::new())),
@@ -3342,6 +3727,10 @@ impl Node {
             explicit_model_interests: Arc::new(Mutex::new(Vec::new())),
             model_demand: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mesh_id: Arc::new(Mutex::new(None)),
+            mesh_policy_hash: Arc::new(Mutex::new(None)),
+            genesis_policy: Arc::new(Mutex::new(None)),
+            signed_genesis_policy: Arc::new(Mutex::new(None)),
+            bootstrap_token: Arc::new(Mutex::new(None)),
             first_joined_mesh_ts: Arc::new(Mutex::new(None)),
             accepting: Arc::new((
                 tokio::sync::Notify::new(),
@@ -3362,10 +3751,15 @@ impl Node {
             stage_transport_tx,
             stage_control_tx: Arc::new(Mutex::new(None)),
             stage_transport_bridges: Arc::new(Mutex::new(HashMap::new())),
+            stage_transport_aliases: Arc::new(Mutex::new(HashMap::new())),
             stage_topologies: Arc::new(Mutex::new(StageTopologyState::default())),
             plugin_manager: Arc::new(Mutex::new(None)),
             display_name: Arc::new(Mutex::new(None)),
             owner_attestation: Arc::new(Mutex::new(owner_runtime.owner_attestation)),
+            release_attestation: Arc::new(Mutex::new(None)),
+            release_attestation_summary: Arc::new(Mutex::new(
+                crate::ReleaseAttestationSummary::default(),
+            )),
             owner_summary: Arc::new(Mutex::new(owner_summary)),
             control_listener: Arc::new(Mutex::new(None)),
             trust_store: Arc::new(Mutex::new(owner_runtime.trust_store)),
@@ -3392,8 +3786,7 @@ impl Node {
             owner_config
                 .as_ref()
                 .and_then(|config| config.control_advertise_addr),
-            Some(relay_urls),
-            relay_auths,
+            relay.policy.uses_relay().then_some(relay),
         )
         .await?;
 
@@ -3429,14 +3822,14 @@ impl Node {
                 .build();
             let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .secret_key(secret_key.clone())
-                .alpns(vec![ALPN.to_vec(), skippy_protocol::STAGE_ALPN_V1.to_vec()])
+                .alpns(vec![ALPN.to_vec(), skippy_protocol::STAGE_ALPN_V2.to_vec()])
                 .relay_mode(iroh::endpoint::RelayMode::Disabled)
                 .transport_config(transport_config)
                 .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
                 .bind()
                 .await?;
             (
-                Self::new_test_node_from_endpoint(role, endpoint),
+                Self::new_test_node_from_endpoint(role, endpoint, secret_key.clone()),
                 secret_key,
             )
         };
@@ -3444,7 +3837,11 @@ impl Node {
     }
 
     #[cfg(test)]
-    fn new_test_node_from_endpoint(role: NodeRole, endpoint: Endpoint) -> Self {
+    fn new_test_node_from_endpoint(
+        role: NodeRole,
+        endpoint: Endpoint,
+        secret_key: SecretKey,
+    ) -> Self {
         let (peer_change_tx, peer_change_rx) = watch::channel(0usize);
         let (inflight_change_tx, _inflight_change_rx) = watch::channel(0u64);
         let (tunnel_tx, _tunnel_rx) = tokio::sync::mpsc::channel(256);
@@ -3460,8 +3857,11 @@ impl Node {
 
         Node {
             endpoint,
+            endpoint_secret_key: secret_key,
             public_addr: None,
             quic_bind: QuicBindSelection::default(),
+            owner_keypair: None,
+            local_mesh_requirements: crate::MeshRequirements::unrestricted(),
             state: Arc::new(Mutex::new(MeshState {
                 peers: HashMap::new(),
                 connections: HashMap::new(),
@@ -3471,6 +3871,8 @@ impl Node {
                 seen_plugin_messages: HashMap::new(),
                 seen_plugin_message_order: VecDeque::new(),
                 policy_rejected_peers: HashMap::new(),
+                requirement_rejected_peers: HashSet::new(),
+                recent_mesh_rejections: VecDeque::new(),
             })),
             role: Arc::new(Mutex::new(role)),
             models: Arc::new(Mutex::new(Vec::new())),
@@ -3485,6 +3887,10 @@ impl Node {
             explicit_model_interests: Arc::new(Mutex::new(Vec::new())),
             model_demand: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mesh_id: Arc::new(Mutex::new(None)),
+            mesh_policy_hash: Arc::new(Mutex::new(None)),
+            genesis_policy: Arc::new(Mutex::new(None)),
+            signed_genesis_policy: Arc::new(Mutex::new(None)),
+            bootstrap_token: Arc::new(Mutex::new(None)),
             first_joined_mesh_ts: Arc::new(Mutex::new(None)),
             accepting: Arc::new((
                 tokio::sync::Notify::new(),
@@ -3505,10 +3911,15 @@ impl Node {
             stage_transport_tx,
             stage_control_tx: Arc::new(Mutex::new(None)),
             stage_transport_bridges: Arc::new(Mutex::new(HashMap::new())),
+            stage_transport_aliases: Arc::new(Mutex::new(HashMap::new())),
             stage_topologies: Arc::new(Mutex::new(StageTopologyState::default())),
             plugin_manager: Arc::new(Mutex::new(None)),
             display_name: Arc::new(Mutex::new(None)),
             owner_attestation: Arc::new(Mutex::new(None)),
+            release_attestation: Arc::new(Mutex::new(None)),
+            release_attestation_summary: Arc::new(Mutex::new(
+                crate::ReleaseAttestationSummary::default(),
+            )),
             owner_summary: Arc::new(Mutex::new(OwnershipSummary::default())),
             control_listener: Arc::new(Mutex::new(None)),
             trust_store: Arc::new(Mutex::new(TrustStore::default())),
@@ -3537,8 +3948,7 @@ impl Node {
         secret_key: SecretKey,
         bind_addr: Option<std::net::SocketAddr>,
         advertise_addr: Option<std::net::SocketAddr>,
-        relay_urls: Option<&[String]>,
-        relay_auths: &std::collections::HashMap<String, String>,
+        relay: Option<RelayConfig<'_>>,
     ) -> Result<()> {
         if self.local_verified_owner_id().await.is_none() {
             return Ok(());
@@ -3548,9 +3958,9 @@ impl Node {
             .secret_key(secret_key)
             .alpns(vec![ALPN_CONTROL_V1.to_vec()])
             .bind_addr(bind_addr.unwrap_or_else(default_control_bind_addr))?;
-        builder = configure_control_relay(builder, relay_urls, relay_auths);
+        builder = configure_control_relay(builder, relay);
         let endpoint = builder.bind().await?;
-        if relay_urls.is_some() {
+        if relay.is_some_and(|relay| relay.policy.uses_relay()) {
             wait_for_endpoint_online(
                 &endpoint,
                 "Owner-control relay connected",
@@ -3635,7 +4045,448 @@ impl Node {
         self.state.lock().await.peers.insert(peer.id, peer);
     }
 
-    pub fn invite_token(&self) -> String {
+    fn load_or_create_signed_genesis_policy(&self) -> Result<crate::SignedMeshGenesisPolicy> {
+        let owner = self.owner_keypair.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "requirement-aware meshes require an owner identity so the genesis policy and bootstrap token can be signed"
+            )
+        })?;
+        if let Ok(serialized) = std::fs::read(mesh_genesis_policy_path())
+            && let Ok(existing) =
+                serde_json::from_slice::<crate::SignedMeshGenesisPolicy>(&serialized)
+            && existing.verify().is_ok()
+            && existing.policy.origin_owner_id == owner.owner_id()
+            && existing.policy.requirements == self.local_mesh_requirements
+            && existing.origin_sign_public_key == owner.verifying_key().as_bytes().to_vec()
+        {
+            return Ok(existing);
+        }
+
+        let signed = crate::SignedMeshGenesisPolicy::sign(
+            crate::MeshGenesisPolicy::new(
+                owner.owner_id(),
+                current_time_unix_ms(),
+                self.local_mesh_requirements.clone(),
+            )
+            .map_err(|reason| anyhow::anyhow!("invalid local mesh genesis policy: {reason:?}"))?,
+            owner,
+        )
+        .map_err(|reason| anyhow::anyhow!("failed to sign mesh genesis policy: {reason:?}"))?;
+        let bytes = serde_json::to_vec_pretty(&signed).context("serialize mesh genesis policy")?;
+        let path = mesh_genesis_policy_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        crate::crypto::write_keystore_bytes_atomically(&path, &bytes)?;
+        Ok(signed)
+    }
+
+    async fn active_mesh_policy_state(&self) -> Option<ActiveMeshPolicyState> {
+        let mesh_id = self.mesh_id.lock().await.clone()?;
+        let policy_hash = self.mesh_policy_hash.lock().await.clone()?;
+        let policy = self.genesis_policy.lock().await.clone()?;
+        Some(ActiveMeshPolicyState {
+            mesh_id,
+            policy_hash,
+            policy,
+        })
+    }
+
+    fn mesh_requirement_rejection_event(
+        &self,
+        source: MeshRequirementRejectionSource,
+        peer_id: Option<EndpointId>,
+        reason: MeshRequirementRejectReason,
+    ) -> MeshRequirementRejectionEvent {
+        MeshRequirementRejectionEvent {
+            observed_at_unix_ms: current_time_unix_ms(),
+            source,
+            message: reason.message().to_string(),
+            reason,
+            peer_id: peer_id.map(|id| id.fmt_short().to_string()),
+        }
+    }
+
+    async fn record_mesh_requirement_rejection(
+        &self,
+        source: MeshRequirementRejectionSource,
+        peer_id: Option<EndpointId>,
+        reason: MeshRequirementRejectReason,
+    ) {
+        let event = self.mesh_requirement_rejection_event(source.clone(), peer_id, reason.clone());
+        let source_label = match source {
+            MeshRequirementRejectionSource::Join => "join",
+            MeshRequirementRejectionSource::Gossip => "gossip",
+            MeshRequirementRejectionSource::TopologyDisclosure => "topology disclosure",
+        };
+        if let Some(peer_id) = event.peer_id.as_deref() {
+            emit_mesh_warning(format!(
+                "mesh {source_label} rejected for peer {peer_id} [{}]: {}",
+                reason.code(),
+                event.message
+            ));
+        } else {
+            emit_mesh_warning(format!(
+                "mesh {source_label} rejected [{}]: {}",
+                reason.code(),
+                event.message
+            ));
+        }
+        tracing::warn!(
+            source = source_label,
+            reason = reason.code(),
+            peer_id = event.peer_id.as_deref().unwrap_or(""),
+            message = %event.message,
+            "mesh requirement rejection"
+        );
+        let mut state = self.state.lock().await;
+        state.recent_mesh_rejections.push_front(event);
+        while state.recent_mesh_rejections.len() > RECENT_MESH_REJECTION_LIMIT {
+            state.recent_mesh_rejections.pop_back();
+        }
+        drop(state);
+        self.runtime_data_producer.mark_status_dirty();
+    }
+
+    pub(crate) async fn mesh_requirement_policy_summary(
+        &self,
+    ) -> Option<MeshRequirementPolicySummary> {
+        self.active_mesh_policy_state()
+            .await
+            .map(|state| MeshRequirementPolicySummary {
+                policy_hash: state.policy_hash,
+                requirements: state.policy.requirements,
+            })
+    }
+
+    pub(crate) async fn recent_mesh_requirement_rejections(
+        &self,
+    ) -> Vec<MeshRequirementRejectionEvent> {
+        self.state
+            .lock()
+            .await
+            .recent_mesh_rejections
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_active_mesh_policy_for_tests(
+        &self,
+        policy: crate::MeshGenesisPolicy,
+    ) -> MeshRequirementPolicySummary {
+        let policy_hash = policy
+            .canonical_hash_hex()
+            .expect("policy hash should serialize");
+        let mesh_id = policy
+            .policy_derived_mesh_id()
+            .expect("policy-derived mesh id should serialize");
+        *self.mesh_id.lock().await = Some(mesh_id);
+        *self.mesh_policy_hash.lock().await = Some(policy_hash.clone());
+        *self.genesis_policy.lock().await = Some(policy.clone());
+        MeshRequirementPolicySummary {
+            policy_hash,
+            requirements: policy.requirements,
+        }
+    }
+
+    async fn install_requirement_aware_mesh_state(
+        &self,
+        mesh_id: String,
+        policy_hash: String,
+        policy: crate::MeshGenesisPolicy,
+        signed_policy: Option<crate::SignedMeshGenesisPolicy>,
+        bootstrap_token: Option<crate::SignedBootstrapToken>,
+    ) -> Result<()> {
+        let current_mesh_id = self.mesh_id().await;
+        if current_mesh_id
+            .as_deref()
+            .is_some_and(|current| current != mesh_id.as_str())
+        {
+            anyhow::bail!(
+                "mesh ID conflict: local mesh is '{}' but bootstrap token requires '{}'",
+                current_mesh_id.unwrap_or_default(),
+                mesh_id
+            );
+        }
+        *self.mesh_policy_hash.lock().await = Some(policy_hash);
+        *self.genesis_policy.lock().await = Some(policy);
+        *self.signed_genesis_policy.lock().await = signed_policy;
+        *self.bootstrap_token.lock().await = bootstrap_token;
+        self.set_mesh_id_force(mesh_id).await;
+        Ok(())
+    }
+
+    async fn validate_bootstrap_token(
+        &self,
+        token: &crate::SignedBootstrapToken,
+    ) -> std::result::Result<Vec<EndpointAddr>, MeshRequirementRejectReason> {
+        token.verify()?;
+        if !self.local_mesh_requirements.is_unrestricted() {
+            if let Some(active_policy) = self.active_mesh_policy_state().await {
+                if token.policy_hash.as_str() != active_policy.policy_hash
+                    || token.genesis_policy != active_policy.policy
+                {
+                    return Err(MeshRequirementRejectReason::MeshPolicyMismatch);
+                }
+            } else {
+                self.local_mesh_requirements.validate()?;
+                if token.genesis_policy.requirements != self.local_mesh_requirements {
+                    return Err(MeshRequirementRejectReason::MeshPolicyMismatch);
+                }
+            }
+        }
+        decode_signed_bootstrap_addrs(token)
+            .map_err(|_| MeshRequirementRejectReason::BootstrapTokenInvalid)
+    }
+
+    async fn validate_peer_announcement_against_active_policy(
+        &self,
+        _peer_id: EndpointId,
+        ann: &PeerAnnouncement,
+    ) -> std::result::Result<(), MeshRequirementRejectReason> {
+        let Some(active_policy) = self.active_mesh_policy_state().await else {
+            return Ok(());
+        };
+        if ann.mesh_id.as_deref() != Some(active_policy.mesh_id.as_str()) {
+            return Err(MeshRequirementRejectReason::MeshPolicyMismatch);
+        }
+        if ann.mesh_policy_hash.as_deref() != Some(active_policy.policy_hash.as_str()) {
+            return Err(MeshRequirementRejectReason::MeshPolicyMismatch);
+        }
+        if let Some(signed_policy) = ann.genesis_policy.as_ref() {
+            signed_policy.verify()?;
+            if signed_policy.policy != active_policy.policy {
+                return Err(MeshRequirementRejectReason::MeshPolicyMismatch);
+            }
+            if signed_policy.policy.canonical_hash_hex()? != active_policy.policy_hash {
+                return Err(MeshRequirementRejectReason::MeshPolicyMismatch);
+            }
+            *self.signed_genesis_policy.lock().await = Some(signed_policy.clone());
+        }
+        Ok(())
+    }
+
+    async fn validate_direct_peer_requirements(
+        &self,
+        peer_id: EndpointId,
+        ann: &PeerAnnouncement,
+        negotiated_protocol_generation: Option<u32>,
+    ) -> std::result::Result<(), MeshRequirementRejectReason> {
+        self.validate_peer_announcement_against_active_policy(peer_id, ann)
+            .await?;
+
+        let active_policy = self.active_mesh_policy_state().await;
+        let release_attestation = peer_release_attestation_status(ann.release_attestation.as_ref());
+        let direct_proof = match &active_policy {
+            None => DirectPeerProofStatus::NotChecked,
+            Some(active_policy) => match ann.direct_admission_proof.as_ref() {
+                None => DirectPeerProofStatus::Missing,
+                Some(proof) => match self.verify_direct_peer_admission_proof(
+                    peer_id,
+                    ann,
+                    active_policy,
+                    proof,
+                ) {
+                    Ok(()) => DirectPeerProofStatus::Verified,
+                    Err(
+                        err @ (MeshRequirementRejectReason::DirectProofStale
+                        | MeshRequirementRejectReason::DirectProofSenderIdMismatch),
+                    ) => return Err(err),
+                    Err(_) => DirectPeerProofStatus::Invalid,
+                },
+            },
+        };
+        let input = crate::MeshRequirementEvaluationInput {
+            advertised_node_version: ann.version.clone(),
+            negotiated_protocol_generation,
+            policy_hash: ann.mesh_policy_hash.clone(),
+            release_attestation,
+            direct_proof,
+            bootstrap: crate::BootstrapStatus::NotChecked,
+        };
+
+        if let Some(active_policy) = active_policy.as_ref()
+            && active_policy
+                .policy
+                .requirements
+                .release_attestation
+                .required
+            && let MeshRequirementDecision::Rejected(
+                reason @ (MeshRequirementRejectReason::CertifiedBinaryRequired
+                | MeshRequirementRejectReason::BuildProofInvalid
+                | MeshRequirementRejectReason::ReleaseSignerUntrusted
+                | MeshRequirementRejectReason::BuildProofMissing),
+            ) = active_policy.policy.evaluate(&input)
+        {
+            return Err(reason);
+        }
+
+        match evaluate_direct_peer_admission(
+            active_policy.as_ref().map(|state| &state.policy),
+            &input,
+        ) {
+            MeshRequirementDecision::Accepted => Ok(()),
+            MeshRequirementDecision::Rejected(reason) => Err(reason),
+        }
+    }
+
+    fn verify_direct_peer_admission_proof(
+        &self,
+        peer_id: EndpointId,
+        ann: &PeerAnnouncement,
+        active_policy: &ActiveMeshPolicyState,
+        proof: &crate::DirectNodeAdmissionProof,
+    ) -> std::result::Result<(), MeshRequirementRejectReason> {
+        proof.verify_for_live_sender(peer_id.as_bytes(), current_time_unix_ms())?;
+        if proof.mesh_id.trim() != active_policy.mesh_id
+            || proof.policy_hash.trim() != active_policy.policy_hash
+        {
+            return Err(MeshRequirementRejectReason::BuildProofInvalid);
+        }
+        if ann.mesh_id.as_deref() != Some(proof.mesh_id.as_str())
+            || ann.mesh_policy_hash.as_deref() != Some(proof.policy_hash.as_str())
+        {
+            return Err(MeshRequirementRejectReason::BuildProofInvalid);
+        }
+        let expected_attestation_hash =
+            direct_admission_attestation_hash(ann.release_attestation.as_ref());
+        if proof.attestation_hash.trim() != expected_attestation_hash {
+            return Err(MeshRequirementRejectReason::BuildProofInvalid);
+        }
+        Ok(())
+    }
+
+    fn build_self_direct_admission_proof(
+        &self,
+        mesh_id: &str,
+        policy_hash: &str,
+        release_attestation: Option<&crate::ReleaseBuildAttestation>,
+    ) -> Option<crate::DirectNodeAdmissionProof> {
+        let attestation_hash = direct_admission_attestation_hash(release_attestation);
+        let signing_key =
+            ed25519_dalek::SigningKey::from_bytes(&self.endpoint_secret_key.to_bytes());
+        let mut proof = crate::DirectNodeAdmissionProof {
+            version: 1,
+            sender_id: self.endpoint.id().as_bytes().to_vec(),
+            mesh_id: mesh_id.to_string(),
+            policy_hash: policy_hash.to_string(),
+            attestation_hash,
+            timestamp_unix_ms: current_time_unix_ms(),
+            signature_algorithm: "ed25519".to_string(),
+            signature: Vec::new(),
+        };
+        proof.signature = ed25519_dalek::Signer::sign(&signing_key, &proof.canonical_bytes().ok()?)
+            .to_bytes()
+            .to_vec();
+        Some(proof)
+    }
+}
+
+fn direct_admission_attestation_hash(
+    release_attestation: Option<&crate::ReleaseBuildAttestation>,
+) -> String {
+    release_attestation
+        .map(|attestation| {
+            attestation
+                .canonical_hash_hex()
+                .unwrap_or_else(|_| "invalid-release-attestation".to_string())
+        })
+        .unwrap_or_else(|| "missing-release-attestation".to_string())
+}
+
+fn signed_policy_matches_owner(
+    signed_policy: &crate::SignedMeshGenesisPolicy,
+    policy: &crate::MeshGenesisPolicy,
+    owner: &crate::crypto::OwnerKeypair,
+) -> bool {
+    signed_policy.policy == *policy
+        && signed_policy.origin_sign_public_key.as_slice() == owner.verifying_key().as_bytes()
+}
+
+fn sign_requirement_bootstrap_token(
+    addr: &EndpointAddr,
+    policy: &crate::MeshGenesisPolicy,
+    signed_policy: Option<&crate::SignedMeshGenesisPolicy>,
+    owner: &crate::crypto::OwnerKeypair,
+) -> Result<(crate::SignedMeshGenesisPolicy, crate::SignedBootstrapToken)> {
+    let signed_policy = if let Some(signed) =
+        signed_policy.filter(|signed| signed_policy_matches_owner(signed, policy, owner))
+    {
+        signed.clone()
+    } else {
+        crate::SignedMeshGenesisPolicy::sign(policy.clone(), owner)
+            .map_err(|reason| anyhow::anyhow!("failed to sign genesis policy: {reason:?}"))?
+    };
+    let token = crate::SignedBootstrapToken::sign(
+        vec![serde_json::to_vec(addr).expect("serializable endpoint addr")],
+        &signed_policy,
+        Some(current_time_unix_ms() + SIGNED_BOOTSTRAP_TOKEN_LIFETIME_MS),
+        owner,
+    )
+    .map_err(|reason| anyhow::anyhow!("failed to sign bootstrap token: {reason:?}"))?;
+    Ok((signed_policy, token))
+}
+
+fn encode_signed_bootstrap_token(token: &crate::SignedBootstrapToken) -> String {
+    let json = serde_json::to_vec(token).expect("serializable bootstrap token");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+}
+
+fn signed_bootstrap_token_matches_invite_context(
+    token: &crate::SignedBootstrapToken,
+    addr: &EndpointAddr,
+    mesh_id: &str,
+    policy_hash: &str,
+    policy: &crate::MeshGenesisPolicy,
+) -> bool {
+    if token.mesh_id != mesh_id
+        || token.policy_hash != policy_hash
+        || token.genesis_policy != *policy
+    {
+        return false;
+    }
+    match decode_signed_bootstrap_addrs(token) {
+        Ok(addrs) => addrs.iter().any(|cached_addr| cached_addr == addr),
+        Err(_) => false,
+    }
+}
+
+impl Node {
+    pub async fn initialize_mesh_identity_as_originator(
+        &self,
+        name: Option<&str>,
+        nostr_pubkey: Option<&str>,
+    ) -> Result<String> {
+        if self.local_mesh_requirements.is_unrestricted() {
+            let mesh_id = generate_mesh_id(name, nostr_pubkey);
+            self.set_mesh_id_force(mesh_id.clone()).await;
+            return Ok(mesh_id);
+        }
+
+        let signed_policy = self.load_or_create_signed_genesis_policy()?;
+        let policy_hash = signed_policy
+            .policy
+            .canonical_hash_hex()
+            .map_err(|reason| anyhow::anyhow!("invalid local mesh policy hash: {reason:?}"))?;
+        let mesh_id = signed_policy
+            .policy
+            .policy_derived_mesh_id()
+            .map_err(|reason| anyhow::anyhow!("invalid policy-derived mesh ID: {reason:?}"))?;
+        self.install_requirement_aware_mesh_state(
+            mesh_id.clone(),
+            policy_hash,
+            signed_policy.policy.clone(),
+            Some(signed_policy),
+            None,
+        )
+        .await?;
+        Ok(mesh_id)
+    }
+
+    pub async fn invite_token(&self) -> String {
         let mut addr = self.endpoint_addr_for_advertisement();
         // Inject STUN-discovered public address if relay STUN didn't provide one.
         if let Some(pub_addr) = self.public_addr
@@ -3644,8 +4495,138 @@ impl Node {
             addr.addrs.insert(TransportAddr::Ip(pub_addr));
         }
         addr = filter_endpoint_addr_for_bind_ip(addr, self.quic_bind.ip);
-        let json = serde_json::to_vec(&addr).expect("serializable");
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&json)
+        let mesh_id = self.mesh_id.lock().await.clone();
+        let policy_hash = self.mesh_policy_hash.lock().await.clone();
+        let policy = self.genesis_policy.lock().await.clone();
+        let signed_policy_guard = self.signed_genesis_policy.lock().await.clone();
+        let cached_token = self.bootstrap_token.lock().await.clone();
+
+        if let (Some(mesh_id), Some(policy_hash), Some(policy)) = (mesh_id, policy_hash, policy) {
+            return self
+                .requirement_aware_invite_token(
+                    &addr,
+                    mesh_id,
+                    policy_hash,
+                    policy,
+                    signed_policy_guard,
+                    cached_token,
+                )
+                .await;
+        }
+
+        if let Some(token) = self.valid_cached_bootstrap_token(cached_token).await {
+            return encode_signed_bootstrap_token(&token);
+        }
+        encode_endpoint_addr_token(&addr)
+    }
+
+    async fn requirement_aware_invite_token(
+        &self,
+        addr: &EndpointAddr,
+        mesh_id: String,
+        policy_hash: String,
+        policy: crate::MeshGenesisPolicy,
+        signed_policy: Option<crate::SignedMeshGenesisPolicy>,
+        cached_token: Option<crate::SignedBootstrapToken>,
+    ) -> String {
+        if let Some(token) = self
+            .matching_cached_invite_token(
+                cached_token.clone(),
+                addr,
+                &mesh_id,
+                &policy_hash,
+                &policy,
+            )
+            .await
+        {
+            return encode_signed_bootstrap_token(&token);
+        }
+
+        if let Some(invite_token) = self
+            .sign_requirement_invite_token(
+                addr,
+                &mesh_id,
+                &policy_hash,
+                &policy,
+                signed_policy.as_ref(),
+            )
+            .await
+        {
+            return invite_token;
+        }
+
+        if let Some(token) = self.valid_cached_bootstrap_token(cached_token).await {
+            return encode_signed_bootstrap_token(&token);
+        }
+
+        tracing::warn!(
+            "requirement-aware mesh has no valid signed bootstrap token; refusing to emit legacy invite token"
+        );
+        String::new()
+    }
+
+    async fn matching_cached_invite_token(
+        &self,
+        cached_token: Option<crate::SignedBootstrapToken>,
+        addr: &EndpointAddr,
+        mesh_id: &str,
+        policy_hash: &str,
+        policy: &crate::MeshGenesisPolicy,
+    ) -> Option<crate::SignedBootstrapToken> {
+        let token = self.valid_cached_bootstrap_token(cached_token).await?;
+        signed_bootstrap_token_matches_invite_context(&token, addr, mesh_id, policy_hash, policy)
+            .then_some(token)
+    }
+
+    async fn sign_requirement_invite_token(
+        &self,
+        addr: &EndpointAddr,
+        mesh_id: &str,
+        policy_hash: &str,
+        policy: &crate::MeshGenesisPolicy,
+        signed_policy: Option<&crate::SignedMeshGenesisPolicy>,
+    ) -> Option<String> {
+        let owner = self.requirement_origin_owner(policy, signed_policy)?;
+        match sign_requirement_bootstrap_token(addr, policy, signed_policy, owner) {
+            Ok((signed_policy, token)) => {
+                *self.signed_genesis_policy.lock().await = Some(signed_policy);
+                *self.bootstrap_token.lock().await = Some(token.clone());
+                debug_assert_eq!(mesh_id, token.mesh_id);
+                debug_assert_eq!(policy_hash, token.policy_hash);
+                Some(encode_signed_bootstrap_token(&token))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to sign requirement-aware bootstrap token; refusing to emit legacy invite token"
+                );
+                Some(String::new())
+            }
+        }
+    }
+
+    async fn valid_cached_bootstrap_token(
+        &self,
+        cached_token: Option<crate::SignedBootstrapToken>,
+    ) -> Option<crate::SignedBootstrapToken> {
+        if let Some(token) = cached_token {
+            if token.verify_at(current_time_unix_ms()).is_ok() {
+                return Some(token);
+            }
+            *self.bootstrap_token.lock().await = None;
+        }
+        None
+    }
+
+    fn requirement_origin_owner(
+        &self,
+        policy: &crate::MeshGenesisPolicy,
+        signed_policy: Option<&crate::SignedMeshGenesisPolicy>,
+    ) -> Option<&crate::crypto::OwnerKeypair> {
+        self.owner_keypair.as_ref().filter(|owner| {
+            signed_policy.is_some_and(|signed| signed_policy_matches_owner(signed, policy, owner))
+                || policy.origin_owner_id == owner.owner_id()
+        })
     }
 
     fn endpoint_addr_for_advertisement(&self) -> EndpointAddr {
@@ -3659,10 +4640,22 @@ impl Node {
     /// Decode an invite token into an [`EndpointAddr`] without connecting.
     /// Returns `Err` if the token is not valid base64 or not valid JSON.
     pub fn decode_invite_token(invite_token: &str) -> Result<EndpointAddr> {
-        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(invite_token)
-            .context("invalid invite token encoding")?;
-        serde_json::from_slice(&json).context("invalid invite token JSON")
+        match parse_invite_token(invite_token)
+            .map_err(|reason| anyhow::anyhow!("invite token rejected: {}", reason.code()))?
+        {
+            InviteTokenMaterial::Legacy(addr) => Ok(addr),
+            InviteTokenMaterial::Signed(token) => {
+                token.verify().map_err(|reason| {
+                    anyhow::anyhow!("invite token rejected: {}", reason.code())
+                })?;
+                decode_signed_bootstrap_addrs(&token)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("bootstrap token does not contain any endpoint addresses")
+                    })
+            }
+        }
     }
 
     #[cfg(test)]
@@ -3678,7 +4671,13 @@ impl Node {
                     self.set_mesh_id(their_id.clone()).await;
                 }
                 self.merge_remote_demand(&ann.model_demand);
-                self.add_peer(remote_id, ann.addr.clone(), ann).await;
+                self.add_peer(
+                    remote_id,
+                    ann.addr.clone(),
+                    ann,
+                    Some(NODE_PROTOCOL_GENERATION),
+                )
+                .await;
             } else {
                 self.update_transitive_peer(ann.addr.id, &ann.addr, ann, remote_id)
                     .await;
@@ -3727,8 +4726,36 @@ impl Node {
     }
 
     pub async fn join(&self, invite_token: &str) -> Result<()> {
-        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(invite_token)?;
-        let addr: EndpointAddr = serde_json::from_slice(&json)?;
+        let addr = match parse_invite_token(invite_token)
+            .map_err(|reason| anyhow::anyhow!("join rejected: {}", reason.code()))?
+        {
+            InviteTokenMaterial::Legacy(addr) => addr,
+            InviteTokenMaterial::Signed(token) => {
+                let addrs = match self.validate_bootstrap_token(&token).await {
+                    Ok(addrs) => addrs,
+                    Err(reason) => {
+                        self.record_mesh_requirement_rejection(
+                            MeshRequirementRejectionSource::Join,
+                            None,
+                            reason.clone(),
+                        )
+                        .await;
+                        return Err(anyhow::anyhow!("join rejected: {}", reason.code()));
+                    }
+                };
+                self.install_requirement_aware_mesh_state(
+                    token.mesh_id.clone(),
+                    token.policy_hash.clone(),
+                    token.genesis_policy.clone(),
+                    None,
+                    Some(*token),
+                )
+                .await?;
+                addrs.into_iter().next().ok_or_else(|| {
+                    anyhow::anyhow!("bootstrap token does not contain any endpoint addresses")
+                })?
+            }
+        };
         // Clear dead status — explicit join should always attempt connection
         self.state.lock().await.dead_peers.remove(&addr.id);
         self.connect_to_peer(addr).await
@@ -3737,12 +4764,36 @@ impl Node {
     /// Like [`join`], but retries once after a delay on transient (connect/timeout)
     /// errors.  Decode errors (invalid base64/JSON) fail immediately.
     pub async fn join_with_retry(&self, invite_token: &str) -> Result<()> {
-        // Decode first — bail immediately on bad tokens.
-        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(invite_token)
-            .context("invalid invite token encoding")?;
-        let addr: EndpointAddr =
-            serde_json::from_slice(&json).context("invalid invite token JSON")?;
+        let addr = match parse_invite_token(invite_token)
+            .map_err(|reason| anyhow::anyhow!("join rejected: {}", reason.code()))?
+        {
+            InviteTokenMaterial::Legacy(addr) => addr,
+            InviteTokenMaterial::Signed(token) => {
+                let addrs = match self.validate_bootstrap_token(&token).await {
+                    Ok(addrs) => addrs,
+                    Err(reason) => {
+                        self.record_mesh_requirement_rejection(
+                            MeshRequirementRejectionSource::Join,
+                            None,
+                            reason.clone(),
+                        )
+                        .await;
+                        return Err(anyhow::anyhow!("join rejected: {}", reason.code()));
+                    }
+                };
+                self.install_requirement_aware_mesh_state(
+                    token.mesh_id.clone(),
+                    token.policy_hash.clone(),
+                    token.genesis_policy.clone(),
+                    None,
+                    Some(*token),
+                )
+                .await?;
+                addrs.into_iter().next().ok_or_else(|| {
+                    anyhow::anyhow!("bootstrap token does not contain any endpoint addresses")
+                })?
+            }
+        };
 
         // Three attempts with increasing backoff.  Relay-only joins need
         // WebSocket setup + QUIC handshake at high RTT — two attempts at
@@ -3780,6 +4831,15 @@ impl Node {
 
     pub async fn set_role(&self, role: NodeRole) {
         *self.role.lock().await = role;
+    }
+
+    pub async fn set_release_attestation_report(
+        &self,
+        summary: crate::ReleaseAttestationSummary,
+        attestation: Option<crate::ReleaseBuildAttestation>,
+    ) {
+        *self.release_attestation.lock().await = attestation;
+        *self.release_attestation_summary.lock().await = summary;
     }
 
     pub async fn set_models(&self, models: Vec<String>) {
@@ -3909,6 +4969,34 @@ impl Node {
         self.served_model_descriptors.lock().await.clone()
     }
 
+    pub async fn all_served_model_descriptors(&self) -> Vec<ServedModelDescriptor> {
+        let mut descriptors = self.served_model_descriptors.lock().await.clone();
+        let peer_descriptors = {
+            let state = self.state.lock().await;
+            state
+                .peers
+                .values()
+                .flat_map(|peer| peer.served_model_descriptors.clone())
+                .collect::<Vec<_>>()
+        };
+        descriptors.extend(peer_descriptors);
+        descriptors
+    }
+
+    pub async fn all_model_runtime_descriptors(&self) -> Vec<ModelRuntimeDescriptor> {
+        let mut runtimes = self.model_runtime_descriptors.lock().await.clone();
+        let peer_runtimes = {
+            let state = self.state.lock().await;
+            state
+                .peers
+                .values()
+                .flat_map(|peer| peer.served_model_runtime.clone())
+                .collect::<Vec<_>>()
+        };
+        runtimes.extend(peer_runtimes);
+        runtimes
+    }
+
     pub async fn serving_models(&self) -> Vec<String> {
         self.serving_models.lock().await.clone()
     }
@@ -3943,11 +5031,18 @@ impl Node {
             Vec::new()
         };
         for descriptor in &mut descriptors {
+            if descriptor.metadata.is_none() {
+                descriptor.metadata =
+                    crate::models::served_model_metadata_for_model(&descriptor.identity.model_name);
+            }
             if let Some(existing) = existing_by_name.get(&descriptor.identity.model_name) {
                 descriptor.capabilities = existing.capabilities;
                 descriptor.capabilities_known = existing.capabilities_known;
                 if existing.topology.is_some() {
                     descriptor.topology = existing.topology.clone();
+                }
+                if existing.metadata.is_some() {
+                    descriptor.metadata = existing.metadata.clone();
                 }
             }
         }
@@ -4070,6 +5165,27 @@ impl Node {
         }
     }
 
+    async fn update_peer_selected_path(
+        &self,
+        id: EndpointId,
+        observation: SelectedPathObservation,
+    ) {
+        let direct_rtt_ms = if observation.path_type == "direct" {
+            observation.rtt_ms
+        } else {
+            None
+        };
+        {
+            let mut state = self.state.lock().await;
+            if let Some(peer) = state.peers.get_mut(&id) {
+                peer.selected_path = Some(observation);
+            }
+        }
+        if let Some(rtt_ms) = direct_rtt_ms {
+            self.update_peer_rtt(id, rtt_ms).await;
+        }
+    }
+
     /// Re-gossip our state to all connected peers.
     /// Call after changing assigned/hosted state, role, or configured models.
     pub async fn regossip(&self) {
@@ -4133,6 +5249,16 @@ impl Node {
     /// Set the mesh identity. If None was set, adopts the given ID (from gossip).
     /// If already set, ignores (originator's ID wins).
     pub async fn set_mesh_id(&self, id: String) {
+        if let Some(policy_hash) = self.mesh_policy_hash.lock().await.clone()
+            && policy_hash != id
+        {
+            tracing::warn!(
+                "ignoring conflicting mesh ID '{}' for requirement-aware mesh {}",
+                id,
+                policy_hash
+            );
+            return;
+        }
         let mut current = self.mesh_id.lock().await;
         if current.is_none() {
             *current = Some(id);
@@ -4148,6 +5274,12 @@ impl Node {
 
     /// Set mesh ID unconditionally (for originator).
     pub async fn set_mesh_id_force(&self, id: String) {
+        if let Some(policy_hash) = self.mesh_policy_hash.lock().await.clone() {
+            assert_eq!(
+                policy_hash, id,
+                "requirement-aware mesh state must keep mesh ID aligned with policy hash"
+            );
+        }
         *self.mesh_id.lock().await = Some(id);
         self.emit_plugin_mesh_event(
             crate::plugin::proto::mesh_event::Kind::MeshIdUpdated,
@@ -4309,6 +5441,17 @@ impl Node {
                     return Ok(());
                 }
                 self.broadcast_plugin_bulk_frame(&frame, None).await
+            }
+            crate::plugin::PluginMeshEvent::OpenStream {
+                plugin_id,
+                request,
+                response_tx,
+            } => {
+                let response = self
+                    .open_outbound_plugin_mesh_stream(plugin_id, request)
+                    .await;
+                let _ = response_tx.send(response);
+                Ok(())
             }
         }
     }
@@ -4724,6 +5867,7 @@ impl Node {
         let mut hosts: Vec<EndpointId> = state
             .peers
             .values()
+            .filter(|p| p.is_admitted())
             .filter(|p| p.routes_http_model(model))
             .map(|p| p.id)
             .collect();
@@ -4747,6 +5891,7 @@ impl Node {
         state
             .peers
             .values()
+            .filter(|p| p.is_admitted())
             .find(|p| !p.http_routable_models().is_empty())
             .cloned()
     }
@@ -4757,7 +5902,12 @@ impl Node {
         let my_role = self.role.lock().await.clone();
         let peer_data: Vec<_> = {
             let state = self.state.lock().await;
-            state.peers.values().cloned().collect()
+            state
+                .peers
+                .values()
+                .filter(|peer| peer.is_admitted())
+                .cloned()
+                .collect()
         };
         let mut hosts = Vec::new();
 
@@ -4794,7 +5944,14 @@ impl Node {
     }
 
     pub async fn peers(&self) -> Vec<PeerInfo> {
-        self.state.lock().await.peers.values().cloned().collect()
+        self.state
+            .lock()
+            .await
+            .peers
+            .values()
+            .filter(|peer| peer.is_admitted())
+            .cloned()
+            .collect()
     }
 
     async fn connection_to_peer(&self, peer_id: EndpointId) -> Result<Connection> {
@@ -4841,6 +5998,37 @@ impl Node {
                 Ok(conn)
             }
         }
+    }
+
+    pub(crate) async fn split_stage_path_snapshot(
+        &self,
+        peer_id: EndpointId,
+    ) -> SplitStagePathSnapshot {
+        let fallback = self.peer_stage_path_fallback(peer_id).await;
+        match self.stage_connection_to_peer(peer_id).await {
+            Ok(conn) => {
+                split_stage_path_snapshot_from_connection(&conn).with_peer_path_fallback(fallback)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    peer = %peer_id.fmt_short(),
+                    error = %error,
+                    "split stage path probe could not open stage connection"
+                );
+                SplitStagePathSnapshot::unknown().with_peer_path_fallback(fallback)
+            }
+        }
+    }
+
+    async fn peer_stage_path_fallback(
+        &self,
+        peer_id: EndpointId,
+    ) -> Option<SelectedPathObservation> {
+        let state = self.state.lock().await;
+        state
+            .peers
+            .get(&peer_id)
+            .and_then(PeerInfo::split_stage_path_fallback)
     }
 
     async fn open_mesh_subprotocol_stream(
@@ -4891,7 +6079,7 @@ impl Node {
         };
         let conn = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             self.endpoint
-                .connect(addr, skippy_protocol::STAGE_ALPN_V1)
+                .connect(addr, skippy_protocol::STAGE_ALPN_V2)
                 .await
         })
         .await
@@ -5049,7 +6237,7 @@ impl Node {
     }
 
     async fn handle_stage_alpn(&self, alpn: &[u8], conn: Connection, remote: EndpointId) -> bool {
-        if alpn != skippy_protocol::STAGE_ALPN_V1 {
+        if alpn != skippy_protocol::STAGE_ALPN_V2 {
             return false;
         }
         tracing::info!(
@@ -5267,7 +6455,7 @@ impl Node {
 
     async fn stage_stream_admitted(&self, remote: EndpointId) -> bool {
         let state = self.state.lock().await;
-        state.peers.contains_key(&remote)
+        state.peers.get(&remote).is_some_and(PeerInfo::is_admitted)
     }
 
     async fn dispatch_stage_stream_kind(
@@ -5332,19 +6520,19 @@ impl Node {
         }
     }
 
-    async fn accept_stage_stream(
+    async fn accept_admitted_stage_bi(
         &self,
         conn: &Connection,
         remote: EndpointId,
-    ) -> StageStreamAccept {
-        let (send, mut recv) = match conn.accept_bi().await {
+    ) -> StageBiAccept {
+        let (send, recv) = match conn.accept_bi().await {
             Ok(streams) => streams,
             Err(e) => {
                 tracing::info!(
                     "Skippy stage connection to {} closed: {e}",
                     remote.fmt_short()
                 );
-                return StageStreamAccept::Closed;
+                return StageBiAccept::Closed;
             }
         };
         if !self.stage_stream_admitted(remote).await {
@@ -5353,10 +6541,36 @@ impl Node {
                 remote.fmt_short()
             );
             drop((send, recv));
-            return StageStreamAccept::Continue;
+            return StageBiAccept::Continue;
         }
+        StageBiAccept::Streams((send, recv))
+    }
+
+    async fn accept_stage_stream(
+        &self,
+        conn: &Connection,
+        remote: EndpointId,
+    ) -> StageStreamAccept {
+        let (send, mut recv) = match self.accept_admitted_stage_bi(conn, remote).await {
+            StageBiAccept::Streams(streams) => streams,
+            StageBiAccept::Continue => return StageStreamAccept::Continue,
+            StageBiAccept::Closed => return StageStreamAccept::Closed,
+        };
         let mut type_buf = [0u8; 1];
         if recv.read_exact(&mut type_buf).await.is_err() {
+            return StageStreamAccept::Continue;
+        }
+        if let Some(rejection) = stage_transport_path_rejection(
+            conn,
+            type_buf[0],
+            self.peer_stage_path_fallback(remote).await,
+        ) {
+            tracing::warn!(
+                "Rejected skippy stage transport stream from {}: {}",
+                remote.fmt_short(),
+                rejection.as_str()
+            );
+            drop((send, recv));
             return StageStreamAccept::Continue;
         }
         StageStreamAccept::Dispatch((send, recv), type_buf[0])
@@ -5410,7 +6624,7 @@ impl Node {
         }
         let admitted = {
             let state = self.state.lock().await;
-            state.peers.contains_key(&remote)
+            state.peers.get(&remote).is_some_and(PeerInfo::is_admitted)
         };
         if capture_streams {
             self.capture_stream_observation(remote, stream_type, protocol, admitted);
@@ -5615,6 +6829,33 @@ impl Node {
                     return;
                 }
             }
+            if node
+                .state
+                .lock()
+                .await
+                .requirement_rejected_peers
+                .contains(&remote)
+            {
+                tracing::warn!(
+                    "Route request: refusing topology disclosure to requirement-rejected peer {}",
+                    remote.fmt_short()
+                );
+                return;
+            }
+            let is_admitted = node
+                .state
+                .lock()
+                .await
+                .peers
+                .get(&remote)
+                .is_some_and(PeerInfo::is_admitted);
+            if !is_admitted {
+                tracing::warn!(
+                    "Route request: refusing topology disclosure to unadmitted peer {}",
+                    remote.fmt_short()
+                );
+                return;
+            }
             use prost::Message as _;
             let mut send = send;
             let table = node.routing_table().await;
@@ -5659,6 +6900,23 @@ impl Node {
             if let Err(error) = node.handle_plugin_bulk_stream(remote, send, recv).await {
                 tracing::debug!(
                     "Plugin bulk stream error from {}: {error}",
+                    remote.fmt_short()
+                );
+            }
+        });
+    }
+
+    fn spawn_plugin_mesh_stream(
+        &self,
+        remote: EndpointId,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = node.handle_plugin_mesh_stream(remote, send, recv).await {
+                tracing::debug!(
+                    "Plugin mesh stream error from {}: {error}",
                     remote.fmt_short()
                 );
             }
@@ -5940,6 +7198,7 @@ impl Node {
             STREAM_PEER_LEAVING => self.spawn_peer_leaving_stream(remote, recv),
             STREAM_PLUGIN_CHANNEL => self.spawn_plugin_channel_stream(remote, send, recv),
             STREAM_PLUGIN_BULK_TRANSFER => self.spawn_plugin_bulk_stream(remote, send, recv),
+            STREAM_PLUGIN_MESH_STREAM => self.spawn_plugin_mesh_stream(remote, send, recv),
             STREAM_SUBPROTOCOL => self.spawn_subprotocol_stream(remote, send, recv),
             other => tracing::warn!("Unknown stream type {other} from {}", remote.fmt_short()),
         }
@@ -6105,7 +7364,7 @@ impl Node {
                     .await
             }
             skippy_protocol::STAGE_STREAM_TRANSPORT => {
-                anyhow::bail!("skippy activation transport stays on skippy-stage/1")
+                anyhow::bail!("skippy activation transport stays on skippy-stage/2")
             }
             other => anyhow::bail!("unknown skippy stage subprotocol stream kind {other:#04x}"),
         }
@@ -6308,24 +7567,16 @@ impl Node {
                         }
                     }
                 }
-                let Some(downstream) = load.downstream.as_mut() else {
-                    return Ok(());
-                };
-                let Some(downstream_node) = downstream.node_id else {
-                    return Ok(());
-                };
-                if downstream_node == self.endpoint.id() {
-                    return Ok(());
+                let topology_id = load.topology_id.clone();
+                let run_id = load.run_id.clone();
+                if let Some(upstream) = load.upstream.as_mut() {
+                    self.prepare_stage_peer_endpoint(&topology_id, &run_id, upstream)
+                        .await?;
                 }
-                let bridge_addr = self
-                    .ensure_stage_transport_bridge(
-                        downstream_node,
-                        load.topology_id.clone(),
-                        load.run_id.clone(),
-                        downstream.stage_id.clone(),
-                    )
-                    .await?;
-                downstream.endpoint = bridge_addr;
+                if let Some(downstream) = load.downstream.as_mut() {
+                    self.prepare_stage_peer_endpoint(&topology_id, &run_id, downstream)
+                        .await?;
+                }
             }
             crate::inference::skippy::StageControlRequest::Prepare(_) => {}
             crate::inference::skippy::StageControlRequest::Stop(stop) => {
@@ -6337,6 +7588,25 @@ impl Node {
             | crate::inference::skippy::StageControlRequest::CancelPrepare(_)
             | crate::inference::skippy::StageControlRequest::StatusUpdate(_) => {}
         }
+        Ok(())
+    }
+
+    async fn prepare_stage_peer_endpoint(
+        &self,
+        topology_id: &str,
+        run_id: &str,
+        peer: &mut crate::inference::skippy::StagePeerDescriptor,
+    ) -> anyhow::Result<()> {
+        let Some(peer_node) = peer.node_id else {
+            return Ok(());
+        };
+        if peer_node == self.endpoint.id() {
+            return Ok(());
+        }
+        let bridge_addr = self
+            .ensure_stage_transport_bridge(peer_node, topology_id, run_id, peer.stage_id.clone())
+            .await?;
+        peer.endpoint = bridge_addr;
         Ok(())
     }
 
@@ -7489,7 +8759,7 @@ impl Node {
 
         {
             let state = self.state.lock().await;
-            if state.peers.contains_key(&peer_id) {
+            if state.connections.contains_key(&peer_id) {
                 return Ok(());
             }
             if state
@@ -7542,6 +8812,17 @@ impl Node {
         // (high RTT) because direct holepunch hasn't completed yet. After a few
         // seconds the direct path is usually ready, so re-check path info to get
         // the real RTT and potentially trigger a re-election for split mode.
+        self.schedule_selected_path_recheck(peer_id);
+        Ok(())
+    }
+
+    /// Spawn a delayed task that re-reads the currently-selected QUIC path for
+    /// `peer_id` after the relay→direct transition typically completes, and
+    /// updates the tracked selected-path/RTT observation. The first gossip
+    /// round-trip often runs over the relay (inflated RTT) before holepunch
+    /// finishes; this refresh records the real direct RTT and can trigger a
+    /// re-election for split mode.
+    pub(super) fn schedule_selected_path_recheck(&self, peer_id: EndpointId) {
         let node_for_recheck = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -7552,30 +8833,41 @@ impl Node {
                 .connections
                 .get(&peer_id)
                 .cloned();
-            if let Some(conn) = conn {
-                let path_list = conn.paths();
-                for path_info in &path_list {
-                    if path_info.is_selected() {
-                        let rtt_ms = path_info.rtt().as_millis() as u32;
-                        if rtt_ms == 0 {
-                            continue;
-                        }
-                        let path_type = if path_info.is_ip() { "direct" } else { "relay" };
-                        if rtt_ms > 0 {
-                            emit_mesh_info(format!(
-                                "📡 Peer {} RTT recheck: {}ms ({})",
-                                peer_id.fmt_short(),
-                                rtt_ms,
-                                path_type
-                            ));
-                            node_for_recheck.update_peer_rtt(peer_id, rtt_ms).await;
-                        }
-                        break;
-                    }
+            let Some(conn) = conn else {
+                return;
+            };
+            let path_list = conn.paths();
+            for path_info in &path_list {
+                if !path_info.is_selected() {
+                    continue;
                 }
+                let rtt_ms = path_info.rtt().as_millis() as u32;
+                let rtt_ms = (rtt_ms != 0).then_some(rtt_ms);
+                let path_type = if path_info.is_ip() { "direct" } else { "relay" };
+                if let Some(rtt_ms) = rtt_ms {
+                    emit_mesh_info(format!(
+                        "📡 Peer {} RTT recheck: {}ms ({})",
+                        peer_id.fmt_short(),
+                        rtt_ms,
+                        path_type
+                    ));
+                }
+                node_for_recheck
+                    .update_peer_selected_path(
+                        peer_id,
+                        SelectedPathObservation {
+                            path_type,
+                            rtt_ms,
+                            observed_direct_remote_addr: match path_info.remote_addr() {
+                                TransportAddr::Ip(addr) => Some(*addr),
+                                _ => None,
+                            },
+                        },
+                    )
+                    .await;
+                break;
             }
         });
-        Ok(())
     }
 
     async fn handle_tunnel_map_stream(
@@ -8916,6 +10208,13 @@ fn mesh_id_path() -> std::path::PathBuf {
         .join("mesh-id")
 }
 
+fn mesh_genesis_policy_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".mesh-llm")
+        .join("mesh-genesis-policy.json")
+}
+
 /// Save the mesh ID of the last mesh we successfully joined.
 pub fn save_last_mesh_id(mesh_id: &str) {
     let path = dirs::home_dir()
@@ -9005,19 +10304,8 @@ pub fn clear_public_identity() {
 /// Load secret key from ~/.mesh-llm/key, or create a new one and save it.
 async fn load_or_create_key() -> Result<SecretKey> {
     let key_path = default_node_key_path()?;
-    let dir = key_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Invalid node key path {}", key_path.display()))?;
-    ensure_private_node_key_dir(dir)?;
-
     if key_path.exists() {
-        ensure_private_node_key_file(&key_path)?;
-        let hex = tokio::fs::read_to_string(&key_path).await?;
-        let bytes = hex::decode(hex.trim())?;
-        if bytes.len() != 32 {
-            anyhow::bail!("Invalid key length in {}", key_path.display());
-        }
-        let key = SecretKey::from_bytes(&bytes.try_into().unwrap());
+        let key = load_node_key_from_path(&key_path)?;
         tracing::info!("Loaded key from {}", key_path.display());
         return Ok(key);
     }
@@ -9029,81 +10317,25 @@ async fn load_or_create_key() -> Result<SecretKey> {
 }
 
 pub fn default_node_key_path() -> Result<std::path::PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    Ok(home.join(".mesh-llm").join("key"))
+    Ok(mesh_llm_identity::default_node_key_path()?)
 }
 
 pub fn load_node_key_from_path(path: &std::path::Path) -> Result<SecretKey> {
-    let hex = std::fs::read_to_string(path)?;
-    let bytes = hex::decode(hex.trim())?;
-    if bytes.len() != 32 {
-        anyhow::bail!("Invalid key length in {}", path.display());
-    }
-    Ok(SecretKey::from_bytes(&bytes.try_into().unwrap()))
+    Ok(SecretKey::from_bytes(
+        &mesh_llm_identity::load_node_key_bytes_from_path(path)?,
+    ))
 }
 
 pub fn save_node_key_to_path(path: &std::path::Path, key: &SecretKey) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Invalid node key path {}", path.display()))?;
-    ensure_private_node_key_dir(parent)?;
-    if path.exists() {
-        ensure_private_node_key_file(path)?;
-    }
-    crate::crypto::write_keystore_bytes_atomically(path, hex::encode(key.to_bytes()).as_bytes())?;
-    ensure_private_node_key_file(path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn ensure_private_node_key_dir(dir: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::create_dir_all(dir)?;
-    let metadata = std::fs::metadata(dir)?;
-    let mut perms = metadata.permissions();
-    if perms.mode() & 0o077 != 0 {
-        perms.set_mode(0o700);
-        std::fs::set_permissions(dir, perms)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_private_node_key_dir(dir: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn ensure_private_node_key_file(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() {
-        anyhow::bail!("Node key path is not a regular file");
-    }
-    let mut perms = metadata.permissions();
-    if perms.mode() & 0o077 != 0 {
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_private_node_key_file(path: &std::path::Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() {
-        anyhow::bail!("Node key path is not a regular file");
-    }
+    mesh_llm_identity::save_node_key_bytes_to_path(path, &key.to_bytes())?;
     Ok(())
 }
 
 mod artifact_transfer_io;
 mod gossip;
 mod heartbeat;
+mod plugin_streams;
+pub(crate) mod requirements;
 pub use gossip::backfill_legacy_descriptors;
 #[allow(unused_imports)]
 use gossip::{apply_transitive_ann, peer_meaningfully_changed};
@@ -9112,9 +10344,8 @@ use heartbeat::{HeartbeatFailurePolicy, heartbeat_failure_policy_for_peer};
 pub(crate) use heartbeat::{
     PeerDownReportDisposition, peer_down_report_disposition, resolve_peer_down,
 };
-
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod public_identity_tests;

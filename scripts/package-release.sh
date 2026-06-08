@@ -9,6 +9,8 @@ trap 'rm -rf "$_STAGING_DIR"' EXIT
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RELEASE_BIN_DIR="$REPO_ROOT/target/release"
+ATTESTATION_SIGNING_KEY_FILE="${MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE:-}"
+ATTESTATION_PUBLIC_KEY_FILE="${MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE:-}"
 
 python_bin() {
     if command -v python3 >/dev/null 2>&1; then
@@ -60,6 +62,15 @@ flavor_suffix() {
     case "$1" in
         ""|cpu|metal)
             printf '\n'
+            ;;
+        cuda)
+            # When MESH_CUDA_VERSION is set (CI matrix), include major version.
+            if [[ -n "${MESH_CUDA_VERSION:-}" ]]; then
+                local major="${MESH_CUDA_VERSION%%.*}"
+                printf -- '-%s-%s\n' "$1" "$major"
+            else
+                printf -- '-%s\n' "$1"
+            fi
             ;;
         *)
             printf -- '-%s\n' "$1"
@@ -134,6 +145,59 @@ else:
 PY
 }
 
+validate_attestation_env() {
+    if [[ -n "$ATTESTATION_SIGNING_KEY_FILE" && -z "$ATTESTATION_PUBLIC_KEY_FILE" ]]; then
+        echo "MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE is required when MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE is set" >&2
+        exit 1
+    fi
+    if [[ -z "$ATTESTATION_SIGNING_KEY_FILE" && -n "$ATTESTATION_PUBLIC_KEY_FILE" ]]; then
+        echo "MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE is required when MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE is set" >&2
+        exit 1
+    fi
+}
+
+stamp_bundle_binary() {
+    local binary_path="$1"
+    local inspect_json
+    local inspect_status
+    local py
+
+    if [[ -z "$ATTESTATION_SIGNING_KEY_FILE" ]]; then
+        echo "Release attestation: missing (packaged binary left unstamped)"
+        return 0
+    fi
+
+    if [[ ! -s "$ATTESTATION_SIGNING_KEY_FILE" ]]; then
+        echo "Release attestation: signing key file is empty ($ATTESTATION_SIGNING_KEY_FILE); leaving binary unstamped" >&2
+        return 0
+    fi
+
+    if [[ ! -s "$ATTESTATION_PUBLIC_KEY_FILE" ]]; then
+        echo "Release attestation: public key file is empty ($ATTESTATION_PUBLIC_KEY_FILE); leaving binary unstamped" >&2
+        return 0
+    fi
+
+    py="$(python_bin)"
+
+    inspect_json="$(
+        cd "$REPO_ROOT"
+        cargo run -q -p xtask -- release-attestation stamp \
+            --binary "$binary_path" \
+            --signing-key-file "$ATTESTATION_SIGNING_KEY_FILE" \
+            >/dev/null
+        cargo run -q -p xtask -- release-attestation inspect \
+            --binary "$binary_path" \
+            --public-key-file "$ATTESTATION_PUBLIC_KEY_FILE" \
+            --json
+    )"
+    printf '%s\n' "$inspect_json"
+    inspect_status="$(printf '%s' "$inspect_json" | "$py" -c 'import json,sys; print(json.load(sys.stdin)["status"])')"
+    if [[ "$inspect_status" != "valid" ]]; then
+        echo "release-attestation inspect reported status '$inspect_status' for $binary_path" >&2
+        exit 1
+    fi
+}
+
 normalized_release_platform() {
     local os_name
     local arch_name
@@ -180,10 +244,10 @@ supported_release_flavors() {
             printf 'metal\n'
             ;;
         linux/x86_64)
-            printf 'cpu cuda cuda-blackwell rocm vulkan\n'
+            printf 'cpu cuda rocm vulkan\n'
             ;;
         linux/aarch64)
-            printf 'cpu\n'
+            printf 'cpu cuda\n'
             ;;
         *)
             printf '\n'
@@ -263,7 +327,6 @@ resolve_release_target() {
     effective_flavor="$(effective_release_flavor)"
     BIN_EXT=""
     ARCHIVE_EXT="tar.gz"
-    LEGACY_ASSET=""
 
     case "$support" in
         recognized-unsupported)
@@ -277,7 +340,6 @@ resolve_release_target() {
     case "$normalized" in
         macos/aarch64)
             TARGET_TRIPLE="aarch64-apple-darwin"
-            LEGACY_ASSET="mesh-bundle.tar.gz"
             ;;
         linux/x86_64)
             TARGET_TRIPLE="x86_64-unknown-linux-gnu"
@@ -307,6 +369,91 @@ usage() {
     echo "usage: scripts/package-release.sh <version> [output_dir]" >&2
 }
 
+cuda_version_check_needs_stub() {
+    [[ "$(release_os_name)" == "Linux" ]] || return 1
+
+    case "$(effective_release_flavor)" in
+        cuda|cuda-blackwell)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+cuda_stub_library_path() {
+    local candidate
+    local candidates=()
+
+    if [[ -n "${CUDA_HOME:-}" ]]; then
+        candidates+=("$CUDA_HOME/lib64/stubs/libcuda.so")
+        candidates+=("$CUDA_HOME/targets/x86_64-linux/lib/stubs/libcuda.so")
+    fi
+    if [[ -n "${CUDA_PATH:-}" ]]; then
+        candidates+=("$CUDA_PATH/lib64/stubs/libcuda.so")
+        candidates+=("$CUDA_PATH/targets/x86_64-linux/lib/stubs/libcuda.so")
+    fi
+
+    candidates+=(
+        "/usr/local/cuda/lib64/stubs/libcuda.so"
+        "/usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so"
+    )
+
+    for candidate in "${candidates[@]}"; do
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+run_mesh_binary_version_check() {
+    local binary="$1"
+    local cuda_stub
+    local cuda_stub_dir
+
+    if ! cuda_version_check_needs_stub; then
+        "$binary" --version
+        return
+    fi
+
+    if ! cuda_stub="$(cuda_stub_library_path)"; then
+        echo "CUDA release binary needs libcuda.so.1 for version verification, but no CUDA stub libcuda.so was found." >&2
+        exit 1
+    fi
+
+    cuda_stub_dir="$_STAGING_DIR/cuda-version-stubs"
+    mkdir -p "$cuda_stub_dir"
+    ln -sf "$cuda_stub" "$cuda_stub_dir/libcuda.so.1"
+
+    LD_LIBRARY_PATH="$cuda_stub_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$binary" --version
+}
+
+verify_mesh_binary_version() {
+    local binary="$1"
+    local expected="$2"
+    local output
+    local actual
+
+    expected="${expected#v}"
+    if [[ ! -x "$binary" ]]; then
+        echo "Release binary is not executable: $binary" >&2
+        exit 1
+    fi
+
+    output="$(run_mesh_binary_version_check "$binary")"
+    actual="$(awk '{print $NF}' <<<"$output")"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Release binary version mismatch: expected $expected, got ${actual:-<empty>}" >&2
+        echo "Binary: $binary" >&2
+        echo "Output: $output" >&2
+        exit 1
+    fi
+}
+
 main() {
     if [[ $# -lt 1 || -z "${1:-}" ]]; then
         usage
@@ -317,7 +464,10 @@ main() {
     local output_dir="${2:-dist}"
     local os_name
     local bundle_dir
+    local bundle_binary
     local versioned_asset
+
+    validate_attestation_env
 
     if ! resolve_release_target; then
         release_target_error_message >&2
@@ -333,21 +483,17 @@ main() {
     bundle_dir="$_STAGING_DIR/mesh-bundle"
     mkdir -p "$bundle_dir"
 
-    cp "$RELEASE_BIN_DIR/mesh-llm${BIN_EXT}" "$bundle_dir/$(bundle_bin_name mesh-llm)"
+    bundle_binary="$bundle_dir/$(bundle_bin_name mesh-llm)"
+    cp "$RELEASE_BIN_DIR/mesh-llm${BIN_EXT}" "$bundle_binary"
 
-    if [[ "$os_name" == "Darwin" ]]; then
-        for bin in "$bundle_dir/$(bundle_bin_name mesh-llm)"; do
-            [[ -f "$bin" ]] || continue
-            install_name_tool -add_rpath @executable_path/ "$bin" 2>/dev/null || true
-        done
+    if [[ "$os_name" == "Darwin" && -f "$bundle_binary" ]]; then
+        install_name_tool -add_rpath @executable_path/ "$bundle_binary" 2>/dev/null || true
     fi
+
+    stamp_bundle_binary "$bundle_binary"
 
     create_archive "$bundle_dir" "$output_dir/$versioned_asset" "$ARCHIVE_EXT"
     create_archive "$bundle_dir" "$output_dir/$STABLE_ASSET" "$ARCHIVE_EXT"
-
-    if [[ -n "$LEGACY_ASSET" ]]; then
-        cp "$output_dir/$STABLE_ASSET" "$output_dir/$LEGACY_ASSET"
-    fi
 
     echo "Created release archives:"
     find "$output_dir" -maxdepth 1 -type f -print | sort

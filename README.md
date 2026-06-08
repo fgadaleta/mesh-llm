@@ -17,6 +17,12 @@ Install the latest release:
 curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | bash
 ```
 
+On Windows, use PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.ps1 | iex
+```
+
 Join the public mesh and start serving:
 
 ```bash
@@ -131,10 +137,12 @@ llama.cpp parity queue.
 ## Install and build notes
 
 Tagged releases publish macOS bundles plus Linux CPU, Linux ARM64 CPU, Linux
-CUDA, Linux CUDA Blackwell, Linux ROCm, Linux Vulkan, Windows CPU, Windows
-CUDA, Windows ROCm, and Windows Vulkan bundles. Metal is macOS-only. The Linux
-ARM64 artifact is `mesh-llm-aarch64-unknown-linux-gnu.tar.gz`; in install and
-release contexts, `arm64` and `aarch64` mean the same 64-bit ARM target.
+ARM64 CUDA, Linux CUDA, Linux CUDA Blackwell, Linux ROCm, Linux Vulkan, Windows
+CPU, Windows CUDA, Windows ROCm, and Windows Vulkan bundles. Metal is
+macOS-only. The Linux ARM64 CPU artifact is
+`mesh-llm-aarch64-unknown-linux-gnu.tar.gz`; the Linux ARM64 CUDA artifact is
+`mesh-llm-aarch64-unknown-linux-gnu-cuda.tar.gz`. In install and release
+contexts, `arm64` and `aarch64` mean the same 64-bit ARM target.
 
 Build from source with `just`:
 
@@ -147,6 +155,17 @@ just build
 Source builds require `just`, `cmake`, Rust, and Node.js 24 + npm. CUDA builds
 need `nvcc`, ROCm builds need ROCm/HIP, and Vulkan builds need Vulkan dev files
 plus `glslc`.
+
+The shipped `mesh-llm` executable uses embedded release attestation for
+provenance and admission hardening only. It does not apply to SDK, XCFramework,
+or other native artifacts, and it is not a runtime integrity proof. Verify a
+stamped packaged executable with `cargo run -p xtask -- release-attestation inspect --binary <path-to-packaged-mesh-llm> --public-key-file <release-signing-public-key.json>`.
+A packaged release binary reports `valid`, an unstamped local or dev build
+reports `missing`, and a binary that changed after packaging reports `invalid`.
+Bare `inspect --binary ...` is only enough to classify an unstamped binary as
+`missing`; stamped binaries require `--public-key-file` and otherwise report
+`invalid` with an explicit error. Post-download mutation can flip a stamped
+binary to `invalid`, but default startup still allows it.
 
 ## Documentation hub
 

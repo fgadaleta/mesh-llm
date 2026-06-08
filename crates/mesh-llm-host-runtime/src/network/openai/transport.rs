@@ -8,7 +8,9 @@ use crate::mesh;
 use crate::network::affinity::{
     AffinityRouter, PreparedTargets, TargetSelection, prepare_remote_targets_for_request,
 };
+use crate::network::openai::auto_route;
 use crate::network::openai::response_adapter;
+use crate::network::openai::response_quality::{self, ResponseQualityFailure};
 use crate::network::openai::tool_call_ids::{
     ChatStreamNormalizationState, normalize_chat_completion_json_body,
 };
@@ -111,7 +113,25 @@ enum RouteAttemptResult {
     RetryableTimeout,
     RetryableUnavailable,
     RetryableContextOverflow,
+    RetryableResponseQuality(ResponseQualityFailure),
     ClientDisconnected,
+}
+
+const REMOTE_UNCOMMITTED_RETRIES: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResponseRetryPolicy {
+    context_overflow: bool,
+    response_quality: bool,
+}
+
+impl ResponseRetryPolicy {
+    fn next_target_available(available: bool) -> Self {
+        Self {
+            context_overflow: available,
+            response_quality: available,
+        }
+    }
 }
 
 fn route_attempt_result_label(result: &RouteAttemptResult) -> &'static str {
@@ -120,6 +140,7 @@ fn route_attempt_result_label(result: &RouteAttemptResult) -> &'static str {
         RouteAttemptResult::RetryableTimeout => "retryable_timeout",
         RouteAttemptResult::RetryableUnavailable => "retryable_unavailable",
         RouteAttemptResult::RetryableContextOverflow => "retryable_context_overflow",
+        RouteAttemptResult::RetryableResponseQuality(_) => "retryable_response_quality",
         RouteAttemptResult::ClientDisconnected => "client_disconnected",
     }
 }
@@ -136,6 +157,7 @@ fn target_health_outcome_for_attempt(result: &RouteAttemptResult) -> TargetHealt
         RouteAttemptResult::RetryableTimeout => TargetHealthOutcome::Timeout,
         RouteAttemptResult::RetryableUnavailable => TargetHealthOutcome::Unavailable,
         RouteAttemptResult::RetryableContextOverflow => TargetHealthOutcome::ContextOverflow,
+        RouteAttemptResult::RetryableResponseQuality(_) => TargetHealthOutcome::Rejected,
         RouteAttemptResult::ClientDisconnected => TargetHealthOutcome::ClientDisconnected,
     }
 }
@@ -976,11 +998,21 @@ pub(crate) fn request_budget_tokens_from_parts(
         return None;
     }
     let prompt_tokens = ceil_div_u32(saturating_u32(body_len_bytes), 4);
+    let completion_tokens = completion_tokens.unwrap_or(0);
+    let requested_tokens = prompt_tokens.saturating_add(completion_tokens);
     Some(
         prompt_tokens
-            .saturating_add(completion_tokens.unwrap_or(0))
-            .saturating_add(REQUEST_TOKEN_MARGIN),
+            .saturating_add(completion_tokens)
+            .saturating_add(request_token_margin(requested_tokens)),
     )
+}
+
+fn request_token_margin(requested_tokens: u32) -> u32 {
+    const MIN_REQUEST_TOKEN_MARGIN: u32 = 16;
+    if requested_tokens == 0 {
+        return 0;
+    }
+    ceil_div_u32(requested_tokens, 4).clamp(MIN_REQUEST_TOKEN_MARGIN, REQUEST_TOKEN_MARGIN)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1061,23 +1093,7 @@ fn reorder_candidates_by_context_and_throughput<T: Clone>(
     }
 
     if adequate.is_empty() && unknown.is_empty() {
-        let mut fallback = candidates
-            .iter()
-            .enumerate()
-            .map(
-                |(index, (candidate, context_length, throughput))| RankedTarget {
-                    index,
-                    candidate: candidate.clone(),
-                    context_length: *context_length,
-                    throughput: *throughput,
-                },
-            )
-            .collect::<Vec<_>>();
-        sort_ranked_targets(&mut fallback);
-        return fallback
-            .into_iter()
-            .map(|ranked| ranked.candidate)
-            .collect();
+        return Vec::new();
     }
 
     sort_ranked_targets(&mut adequate);
@@ -1241,6 +1257,21 @@ fn parse_completion_tokens_from_json_body(body: &[u8]) -> Option<u64> {
         .and_then(|value| value.as_u64())
 }
 
+fn retryable_quality_result(
+    body: &[u8],
+    policy: ResponseRetryPolicy,
+) -> Option<RouteAttemptResult> {
+    if !policy.response_quality {
+        return None;
+    }
+    let failure = response_quality::failure_from_json_body(body)?;
+    tracing::warn!(
+        reason = failure.label(),
+        "API proxy: upstream returned retryable low-quality success response before commit"
+    );
+    Some(RouteAttemptResult::RetryableResponseQuality(failure))
+}
+
 fn response_is_event_stream(headers: &ParsedResponseHeaders) -> bool {
     headers
         .content_type
@@ -1260,9 +1291,9 @@ async fn relay_normalized_chat_completion_stream<R: AsyncRead + Unpin>(
     tcp_stream: &mut TcpStream,
     reader: &mut R,
     probe: ResponseProbe,
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
 ) -> Result<RouteAttemptResult> {
-    if retry_context_overflow && probe.retryable_context_overflow {
+    if retry_policy.context_overflow && probe.retryable_context_overflow {
         return Ok(RouteAttemptResult::RetryableContextOverflow);
     }
 
@@ -1273,7 +1304,7 @@ async fn relay_normalized_chat_completion_stream<R: AsyncRead + Unpin>(
     let parsed = try_parse_response_headers(&probe.buffered)?
         .ok_or_else(|| anyhow!("incomplete HTTP response"))?;
     if !response_is_event_stream(&parsed) {
-        return relay_success_response(tcp_stream, reader, probe, parsed).await;
+        return relay_success_response(tcp_stream, reader, probe, parsed, retry_policy).await;
     }
 
     let mut carry = String::from_utf8_lossy(&probe.buffered[parsed.header_end..]).to_string();
@@ -1362,7 +1393,7 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
     tcp_stream: &mut TcpStream,
     reader: &mut R,
     probe: ResponseProbe,
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
 ) -> Result<RouteAttemptResult> {
     fn should_parse_stream_chunk(data: &str, model_missing: bool, usage_missing: bool) -> bool {
         model_missing
@@ -1373,7 +1404,7 @@ async fn relay_translated_responses_stream<R: AsyncRead + Unpin>(
             || data.contains("\"usage\"")
     }
 
-    if retry_context_overflow && probe.retryable_context_overflow {
+    if retry_policy.context_overflow && probe.retryable_context_overflow {
         return Ok(RouteAttemptResult::RetryableContextOverflow);
     }
 
@@ -1714,9 +1745,9 @@ async fn relay_translated_responses_json<R: AsyncRead + Unpin>(
     tcp_stream: &mut TcpStream,
     reader: &mut R,
     probe: ResponseProbe,
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
 ) -> Result<RouteAttemptResult> {
-    if retry_context_overflow && probe.retryable_context_overflow {
+    if retry_policy.context_overflow && probe.retryable_context_overflow {
         return Ok(RouteAttemptResult::RetryableContextOverflow);
     }
 
@@ -1728,8 +1759,11 @@ async fn relay_translated_responses_json<R: AsyncRead + Unpin>(
 
     let parsed = try_parse_response_headers(&buffered)?
         .ok_or_else(|| anyhow!("incomplete HTTP response"))?;
-    let translated_body =
-        response_adapter::translate_chat_completion_to_responses(&buffered[parsed.header_end..])?;
+    let body = &buffered[parsed.header_end..];
+    if let Some(result) = retryable_quality_result(body, retry_policy) {
+        return Ok(result);
+    }
+    let translated_body = response_adapter::translate_chat_completion_to_responses(body)?;
     let completion_tokens = parse_completion_tokens_from_json_body(&translated_body);
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1748,9 +1782,9 @@ async fn relay_normalized_chat_completion_json<R: AsyncRead + Unpin>(
     tcp_stream: &mut TcpStream,
     reader: &mut R,
     probe: ResponseProbe,
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
 ) -> Result<RouteAttemptResult> {
-    if retry_context_overflow && probe.retryable_context_overflow {
+    if retry_policy.context_overflow && probe.retryable_context_overflow {
         return Ok(RouteAttemptResult::RetryableContextOverflow);
     }
 
@@ -1773,6 +1807,9 @@ async fn relay_normalized_chat_completion_json<R: AsyncRead + Unpin>(
     let body = &buffered[parsed.header_end..body_end];
     let normalized_body =
         normalize_chat_completion_json_body(body).unwrap_or_else(|| body.to_vec());
+    if let Some(result) = retryable_quality_result(&normalized_body, retry_policy) {
+        return Ok(result);
+    }
     let completion_tokens = parse_completion_tokens_from_json_body(&normalized_body);
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2126,6 +2163,7 @@ async fn relay_success_response<R: AsyncRead + Unpin>(
     reader: &mut R,
     probe: ResponseProbe,
     parsed: ParsedResponseHeaders,
+    retry_policy: ResponseRetryPolicy,
 ) -> Result<RouteAttemptResult> {
     if let Some(content_length) = parsed.content_length {
         const MAX_SUCCESS_METRICS_BODY_BYTES: usize = 1024 * 1024;
@@ -2133,6 +2171,11 @@ async fn relay_success_response<R: AsyncRead + Unpin>(
             let mut buffered = probe.buffered;
             while buffered.len() < parsed.header_end + content_length {
                 read_response_chunk(reader, &mut buffered).await?;
+            }
+            if let Some(result) =
+                retryable_quality_result(&buffered[parsed.header_end..], retry_policy)
+            {
+                return Ok(result);
             }
             let completion_tokens =
                 parse_completion_tokens_from_json_body(&buffered[parsed.header_end..]);
@@ -2160,14 +2203,14 @@ async fn relay_probed_response<R: AsyncRead + Unpin>(
     tcp_stream: &mut TcpStream,
     reader: &mut R,
     probe: ResponseProbe,
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
 ) -> Result<RouteAttemptResult> {
     if let Some(result) = relay_adapted_response(
         tcp_stream,
         reader,
         probe.clone(),
-        retry_context_overflow,
+        retry_policy,
         response_adapter,
     )
     .await?
@@ -2175,7 +2218,7 @@ async fn relay_probed_response<R: AsyncRead + Unpin>(
         return Ok(result);
     }
 
-    if retry_context_overflow && probe.retryable_context_overflow {
+    if retry_policy.context_overflow && probe.retryable_context_overflow {
         return Ok(RouteAttemptResult::RetryableContextOverflow);
     }
     if !(200..300).contains(&probe.status_code) {
@@ -2184,42 +2227,29 @@ async fn relay_probed_response<R: AsyncRead + Unpin>(
 
     let parsed = try_parse_response_headers(&probe.buffered)?
         .ok_or_else(|| anyhow!("incomplete HTTP response"))?;
-    relay_success_response(tcp_stream, reader, probe, parsed).await
+    relay_success_response(tcp_stream, reader, probe, parsed, retry_policy).await
 }
 
 async fn relay_adapted_response<R: AsyncRead + Unpin>(
     tcp_stream: &mut TcpStream,
     reader: &mut R,
     probe: ResponseProbe,
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
 ) -> Result<Option<RouteAttemptResult>> {
     match response_adapter {
         ResponseAdapter::OpenAiChatCompletionsJson => Ok(Some(
-            relay_normalized_chat_completion_json(
-                tcp_stream,
-                reader,
-                probe,
-                retry_context_overflow,
-            )
-            .await?,
+            relay_normalized_chat_completion_json(tcp_stream, reader, probe, retry_policy).await?,
         )),
         ResponseAdapter::OpenAiChatCompletionsStream => Ok(Some(
-            relay_normalized_chat_completion_stream(
-                tcp_stream,
-                reader,
-                probe,
-                retry_context_overflow,
-            )
-            .await?,
+            relay_normalized_chat_completion_stream(tcp_stream, reader, probe, retry_policy)
+                .await?,
         )),
         ResponseAdapter::OpenAiResponsesJson => Ok(Some(
-            relay_translated_responses_json(tcp_stream, reader, probe, retry_context_overflow)
-                .await?,
+            relay_translated_responses_json(tcp_stream, reader, probe, retry_policy).await?,
         )),
         ResponseAdapter::OpenAiResponsesStream => Ok(Some(
-            relay_translated_responses_stream(tcp_stream, reader, probe, retry_context_overflow)
-                .await?,
+            relay_translated_responses_stream(tcp_stream, reader, probe, retry_policy).await?,
         )),
         ResponseAdapter::None => Ok(None),
     }
@@ -2230,7 +2260,7 @@ async fn route_local_attempt(
     tcp_stream: &mut TcpStream,
     port: u16,
     prefetched: &[u8],
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
 ) -> RouteAttemptResult {
     match TcpStream::connect(format!("127.0.0.1:{port}")).await {
@@ -2247,7 +2277,7 @@ async fn route_local_attempt(
                 tcp_stream,
                 &mut upstream,
                 port,
-                retry_context_overflow,
+                retry_policy,
                 response_adapter,
             )
             .await
@@ -2263,7 +2293,7 @@ async fn route_local_attempt_after_forward(
     tcp_stream: &mut TcpStream,
     upstream: &mut TcpStream,
     port: u16,
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
 ) -> RouteAttemptResult {
     match probe_http_response_local(upstream).await {
@@ -2272,7 +2302,7 @@ async fn route_local_attempt_after_forward(
                 tcp_stream,
                 upstream,
                 probe,
-                retry_context_overflow,
+                retry_policy,
                 response_adapter,
                 "API proxy (local): downstream client disconnected during relay",
                 "API proxy (local) ended after commit",
@@ -2297,7 +2327,7 @@ async fn route_remote_attempt(
     tcp_stream: &mut TcpStream,
     host_id: iroh::EndpointId,
     prefetched: &[u8],
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
 ) -> RouteAttemptResult {
     match node.open_http_tunnel(host_id).await {
@@ -2313,7 +2343,7 @@ async fn route_remote_attempt(
                 tcp_stream,
                 &mut quic_recv,
                 host_id,
-                retry_context_overflow,
+                retry_policy,
                 response_adapter,
             )
             .await
@@ -2332,7 +2362,7 @@ async fn route_remote_attempt_after_forward(
     tcp_stream: &mut TcpStream,
     quic_recv: &mut iroh::endpoint::RecvStream,
     host_id: iroh::EndpointId,
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
 ) -> RouteAttemptResult {
     match probe_http_response(quic_recv).await {
@@ -2341,7 +2371,7 @@ async fn route_remote_attempt_after_forward(
                 tcp_stream,
                 quic_recv,
                 probe,
-                retry_context_overflow,
+                retry_policy,
                 response_adapter,
                 "API proxy (remote): downstream client disconnected during relay",
                 "API proxy (remote) ended after commit",
@@ -2363,7 +2393,7 @@ async fn route_http_endpoint_attempt(
     base_url: &str,
     prefetched: &[u8],
     request_path: &str,
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
 ) -> RouteAttemptResult {
     let target = match build_external_endpoint_target(base_url, request_path, prefetched) {
@@ -2381,7 +2411,7 @@ async fn route_http_endpoint_attempt(
         tcp_stream,
         &mut upstream,
         base_url,
-        retry_context_overflow,
+        retry_policy,
         response_adapter,
     )
     .await
@@ -2431,7 +2461,7 @@ async fn route_http_endpoint_attempt_after_forward(
     tcp_stream: &mut TcpStream,
     upstream: &mut TcpStream,
     base_url: &str,
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
 ) -> RouteAttemptResult {
     match probe_http_response(upstream).await {
@@ -2440,7 +2470,7 @@ async fn route_http_endpoint_attempt_after_forward(
                 tcp_stream,
                 upstream,
                 probe,
-                retry_context_overflow,
+                retry_policy,
                 response_adapter,
                 "API proxy (external endpoint): downstream client disconnected during relay",
                 "API proxy (external endpoint) ended after commit",
@@ -2466,21 +2496,13 @@ async fn relay_attempted_response<R: AsyncRead + Unpin>(
     tcp_stream: &mut TcpStream,
     reader: &mut R,
     probe: ResponseProbe,
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
     disconnect_message: &str,
     commit_message: &str,
 ) -> RouteAttemptResult {
     let status_code = probe.status_code;
-    match relay_probed_response(
-        tcp_stream,
-        reader,
-        probe,
-        retry_context_overflow,
-        response_adapter,
-    )
-    .await
-    {
+    match relay_probed_response(tcp_stream, reader, probe, retry_policy, response_adapter).await {
         Ok(result) => result,
         Err(err) => {
             if is_client_disconnect_error(&err) {
@@ -2517,6 +2539,9 @@ fn attempt_outcome_for_result(
         }
         RouteAttemptResult::RetryableContextOverflow => {
             crate::network::metrics::AttemptOutcome::ContextOverflow
+        }
+        RouteAttemptResult::RetryableResponseQuality(_) => {
+            crate::network::metrics::AttemptOutcome::Rejected
         }
         RouteAttemptResult::ClientDisconnected => {
             crate::network::metrics::AttemptOutcome::Unavailable
@@ -2739,6 +2764,13 @@ pub(crate) fn capabilities_for_model(
         .unwrap_or_else(|| crate::models::installed_model_capabilities(model))
 }
 
+pub(crate) fn descriptor_metadata_for_model<'a>(
+    model: &str,
+    descriptors: &'a [mesh::ServedModelDescriptor],
+) -> Option<&'a mesh::ServedModelMetadata> {
+    descriptor_for_model(descriptors, model).and_then(|descriptor| descriptor.metadata.as_ref())
+}
+
 fn capture_path_for_request(request: &BufferedHttpRequest) -> &str {
     &request.client_path
 }
@@ -2785,8 +2817,10 @@ pub async fn handle_mesh_request(
     // Handle /v1/models
     if is_models_list_request(&request.method, &request.path) {
         let served = node.models_being_served().await;
-        let descriptors = node.served_model_descriptors().await;
-        let _ = send_models_list_with_descriptors(tcp_stream, &served, &descriptors).await;
+        let descriptors = node.all_served_model_descriptors().await;
+        let runtimes = node.all_model_runtime_descriptors().await;
+        let _ =
+            send_models_list_with_descriptors(tcp_stream, &served, &descriptors, &runtimes).await;
         return;
     }
 
@@ -2801,12 +2835,15 @@ pub async fn handle_mesh_request(
     // back unchanged if this isn't a MoA request, so we can call it
     // unconditionally here.
     let moa_model_name = request.model_name.clone();
+    let moa_required_tokens =
+        request_budget_tokens_from_parts(request.body_len_bytes, request.completion_tokens);
     let tcp_stream = match crate::network::openai::moa_gateway::try_handle_moa(
         &node,
         tcp_stream,
         &mut request,
         moa_model_name.as_deref(),
         None, // passive path has no local targets table
+        moa_required_tokens,
     )
     .await
     {
@@ -2847,21 +2884,24 @@ async fn build_mesh_request_plan(
     affinity: &AffinityRouter,
 ) -> std::result::Result<MeshRequestPlan, MeshRequestFailure> {
     let served = node.models_being_served().await;
-    let descriptors = node.served_model_descriptors().await;
+    let descriptors = node.all_served_model_descriptors().await;
     rewrite_public_model_alias(request, &served, &descriptors);
 
     let is_auto_request =
         request.model_name.is_none() || request.model_name.as_deref() == Some("auto");
     let auto_session_key = auto_session_key_for_request(request, is_auto_request);
-    let effective_model = match resolve_auto_model_request(
+    let required_tokens =
+        request_budget_tokens_from_parts(request.body_len_bytes, request.completion_tokens);
+    let effective_model = match resolve_auto_model_request(AutoModelRequestArgs {
         node,
         request,
-        &served,
-        &descriptors,
+        served: &served,
+        descriptors: &descriptors,
         is_auto_request,
         auto_session_key,
+        required_tokens,
         affinity,
-    )
+    })
     .await
     {
         AutoModelResolution::Model(model) => model.or(request.model_name.clone()),
@@ -2883,8 +2923,6 @@ async fn build_mesh_request_plan(
         MeshTargetResolution::NoHostsAvailable => return Err(MeshRequestFailure::NoHostsAvailable),
     };
 
-    let required_tokens =
-        request_budget_tokens_from_parts(request.body_len_bytes, request.completion_tokens);
     let prepared = prepare_mesh_targets(
         request,
         effective_model.as_deref(),
@@ -3046,12 +3084,12 @@ async fn route_mesh_request_attempts(
     for (idx, target_host) in target_hosts.iter().enumerate() {
         state.attempts += 1;
         let attempt_started = Instant::now();
-        let attempt_result = route_remote_attempt(
+        let attempt_result = route_remote_attempt_with_retry(
             node,
             &mut tcp_stream,
             *target_host,
             &request.raw,
-            idx + 1 < total_targets,
+            ResponseRetryPolicy::next_target_available(idx + 1 < total_targets),
             request.response_adapter,
         )
         .await;
@@ -3142,6 +3180,9 @@ fn handle_mesh_attempt_result(
             handle_delivered_mesh_attempt(context, status_code)
         }
         RouteAttemptResult::RetryableContextOverflow => handle_retryable_context_overflow(context),
+        RouteAttemptResult::RetryableResponseQuality(failure) => {
+            handle_retryable_mesh_response_quality(context, failure)
+        }
         RouteAttemptResult::RetryableTimeout => handle_retryable_mesh_timeout(context),
         RouteAttemptResult::RetryableUnavailable => handle_retryable_mesh_unavailable(context),
         RouteAttemptResult::ClientDisconnected => {
@@ -3194,6 +3235,25 @@ fn handle_retryable_context_overflow(
     );
     tracing::warn!(
         "Host {} rejected request with context overflow-style 400, trying next",
+        context.target_host.fmt_short()
+    );
+    context.state.last_retryable = true;
+    MeshAttemptDisposition::Continue
+}
+
+fn handle_retryable_mesh_response_quality(
+    context: &mut MeshAttemptResultContext<'_>,
+    failure: ResponseQualityFailure,
+) -> MeshAttemptDisposition {
+    forget_mesh_cached_target(
+        context.effective_model,
+        context.prepared,
+        context.attempt_target,
+        context.affinity,
+    );
+    tracing::warn!(
+        reason = failure.label(),
+        "Host {} returned low-quality success response, trying next",
         context.target_host.fmt_short()
     );
     context.state.last_retryable = true;
@@ -3287,15 +3347,28 @@ fn auto_session_key_for_request(
         .and_then(|body| crate::network::affinity::auto_model_session_key(Some(body)))
 }
 
-async fn resolve_auto_model_request(
-    node: &mesh::Node,
-    request: &mut BufferedHttpRequest,
-    served: &[String],
-    descriptors: &[mesh::ServedModelDescriptor],
+struct AutoModelRequestArgs<'a> {
+    node: &'a mesh::Node,
+    request: &'a mut BufferedHttpRequest,
+    served: &'a [String],
+    descriptors: &'a [mesh::ServedModelDescriptor],
     is_auto_request: bool,
     auto_session_key: Option<u64>,
-    affinity: &AffinityRouter,
-) -> AutoModelResolution {
+    required_tokens: Option<u32>,
+    affinity: &'a AffinityRouter,
+}
+
+async fn resolve_auto_model_request(args: AutoModelRequestArgs<'_>) -> AutoModelResolution {
+    let AutoModelRequestArgs {
+        node,
+        request,
+        served,
+        descriptors,
+        is_auto_request,
+        auto_session_key,
+        required_tokens,
+        affinity,
+    } = args;
     if !is_auto_request {
         return AutoModelResolution::Model(None);
     }
@@ -3304,13 +3377,6 @@ async fn resolve_auto_model_request(
         return AutoModelResolution::Model(None);
     };
     let media = router::media_requirements(body_json);
-    if let Some(model) =
-        lookup_cached_auto_model(node, descriptors, affinity, auto_session_key, &media).await
-    {
-        return AutoModelResolution::Model(Some(model));
-    }
-
-    let cl = router::classify(body_json);
     // Build candidates with observed throughput so pick_model_classified
     // can weight by locally-measured tok/s where samples exist.
     let routing_metrics = node.routing_metrics();
@@ -3325,14 +3391,37 @@ async fn resolve_auto_model_request(
             router::RoutingCandidate {
                 name: name.as_str(),
                 caps,
+                parameter_count_b: descriptor_metadata_for_model(name, descriptors)
+                    .and_then(|metadata| metadata.parameter_count_b),
                 tps_hint,
                 throughput_samples,
             }
         })
         .collect();
-    let Some(available) = router::filter_media_compatible_candidates(&with_caps, &media) else {
+    let available = router::filter_media_compatible_candidates(&with_caps, &media);
+    let ready_models = if let Some(available) = available.as_ref() {
+        auto_route::ready_remote_models(node, required_tokens, available, affinity).await
+    } else {
+        Vec::new()
+    };
+    if let Some(model) = lookup_cached_auto_model(
+        node,
+        descriptors,
+        affinity,
+        auto_session_key,
+        &media,
+        &ready_models,
+    )
+    .await
+    {
+        return AutoModelResolution::Model(Some(model));
+    }
+
+    let Some(available) = available else {
         return AutoModelResolution::UnsupportedMedia;
     };
+    let available = auto_route::pool_for_ready_models(&available, &ready_models);
+    let cl = router::classify(body_json);
     let picked = router::pick_model_classified(&cl, &available).map(str::to_string);
     if let Some(name) = picked.as_deref() {
         tracing::info!(
@@ -3355,11 +3444,12 @@ async fn lookup_cached_auto_model(
     affinity: &AffinityRouter,
     auto_session_key: Option<u64>,
     media: &router::MediaRequirements,
+    ready_models: &[&str],
 ) -> Option<String> {
     let key = auto_session_key?;
     let model = affinity.lookup_auto_model(key)?;
     if let Some(reason) =
-        cached_auto_model_reclassify_reason(node, &model, media, descriptors).await
+        cached_auto_model_reclassify_reason(node, &model, media, descriptors, ready_models).await
     {
         tracing::debug!("auto: cached model {model} {reason}, reclassifying");
         affinity.forget_auto_model(key);
@@ -3374,12 +3464,18 @@ async fn cached_auto_model_reclassify_reason(
     model: &str,
     media: &router::MediaRequirements,
     descriptors: &[mesh::ServedModelDescriptor],
+    ready_models: &[&str],
 ) -> Option<&'static str> {
     if cached_auto_model_missing(node, model).await {
         return Some("no longer served");
     }
-    cached_auto_model_needs_reclassify(model, media, descriptors)
-        .then_some("cannot satisfy media requirements")
+    if cached_auto_model_needs_reclassify(model, media, descriptors) {
+        return Some("cannot satisfy media requirements");
+    }
+    if !ready_models.is_empty() && !ready_models.contains(&model) {
+        return Some("has no eligible target for this request");
+    }
+    None
 }
 
 async fn cached_auto_model_missing(node: &mesh::Node, model: &str) -> bool {
@@ -3420,7 +3516,7 @@ async fn route_attempt_for_target(
     tcp_stream: &mut TcpStream,
     target: &election::InferenceTarget,
     prefetched: &[u8],
-    retry_context_overflow: bool,
+    retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
 ) -> RouteAttemptResult {
     match target {
@@ -3430,24 +3526,71 @@ async fn route_attempt_for_target(
                 tcp_stream,
                 *port,
                 prefetched,
-                retry_context_overflow,
+                retry_policy,
                 response_adapter,
             )
             .await
         }
         election::InferenceTarget::Remote(host_id) => {
-            route_remote_attempt(
+            route_remote_attempt_with_retry(
                 node,
                 tcp_stream,
                 *host_id,
                 prefetched,
-                retry_context_overflow,
+                retry_policy,
                 response_adapter,
             )
             .await
         }
         election::InferenceTarget::None => RouteAttemptResult::RetryableUnavailable,
     }
+}
+
+async fn route_remote_attempt_with_retry(
+    node: &mesh::Node,
+    tcp_stream: &mut TcpStream,
+    host_id: iroh::EndpointId,
+    prefetched: &[u8],
+    retry_policy: ResponseRetryPolicy,
+    response_adapter: ResponseAdapter,
+) -> RouteAttemptResult {
+    let mut result = route_remote_attempt(
+        node,
+        tcp_stream,
+        host_id,
+        prefetched,
+        retry_policy,
+        response_adapter,
+    )
+    .await;
+    for retry in 1..=REMOTE_UNCOMMITTED_RETRIES {
+        if !should_retry_uncommitted_remote_attempt(result) {
+            return result;
+        }
+        tracing::warn!(
+            host = %host_id.fmt_short(),
+            retry,
+            outcome = route_attempt_result_label(&result),
+            "API proxy: retrying remote target on fresh tunnel before committing response"
+        );
+        result = route_remote_attempt(
+            node,
+            tcp_stream,
+            host_id,
+            prefetched,
+            retry_policy,
+            response_adapter,
+        )
+        .await;
+    }
+    result
+}
+
+fn should_retry_uncommitted_remote_attempt(result: RouteAttemptResult) -> bool {
+    matches!(
+        result,
+        RouteAttemptResult::RetryableTimeout | RouteAttemptResult::RetryableUnavailable
+    )
 }
 
 pub async fn route_model_request(
@@ -3492,6 +3635,15 @@ enum RouteModelDisposition {
     Return(bool),
 }
 
+fn no_context_eligible_target_reason(model: &str, required_tokens: Option<u32>) -> String {
+    match required_tokens {
+        Some(tokens) => format!(
+            "no context-compatible target for model '{model}' can fit approximately {tokens} tokens"
+        ),
+        None => format!("no eligible target for model '{model}'"),
+    }
+}
+
 async fn route_model_request_inner(args: RouteModelRequestArgs<'_>) -> bool {
     let RouteModelRequestArgs {
         node,
@@ -3509,7 +3661,9 @@ async fn route_model_request_inner(args: RouteModelRequestArgs<'_>) -> bool {
     let ordered_candidates = affinity.route_eligible_candidates(model, &ordered_candidates);
     if ordered_candidates.is_empty() {
         record_route_model_unavailable(&node, model, 0);
-        return false;
+        let reason = no_context_eligible_target_reason(model, required_tokens);
+        let _ = send_503(tcp_stream, &reason).await;
+        return true;
     }
 
     let selection = crate::network::affinity::select_model_target_from_candidates(
@@ -3535,13 +3689,13 @@ async fn route_model_request_inner(args: RouteModelRequestArgs<'_>) -> bool {
     for (idx, target) in ordered.into_iter().enumerate() {
         state.attempts += 1;
         let attempt_started = Instant::now();
-        let retry_context_overflow = idx + 1 < total_targets;
+        let retry_policy = ResponseRetryPolicy::next_target_available(idx + 1 < total_targets);
         let attempt_result = route_attempt_for_target(
             &node,
             &mut tcp_stream,
             &target,
             &request.raw,
-            retry_context_overflow,
+            retry_policy,
             request.response_adapter,
         )
         .await;
@@ -3689,6 +3843,11 @@ fn handle_route_model_attempt_result(
         RouteAttemptResult::RetryableContextOverflow => {
             handle_retryable_route_model_context(model, target, selection, affinity)
         }
+        RouteAttemptResult::RetryableResponseQuality(failure) => {
+            handle_retryable_route_model_response_quality(
+                model, target, selection, affinity, failure,
+            )
+        }
         RouteAttemptResult::RetryableTimeout => {
             handle_retryable_route_model_timeout(node, model, target, selection, state, affinity)
         }
@@ -3745,6 +3904,21 @@ fn handle_retryable_route_model_context(
     forget_selected_route_model_target(model, target, selection, affinity);
     tracing::warn!(
         "Target {target:?} rejected request with context overflow-style 400, trying next"
+    );
+    RouteModelDisposition::Continue
+}
+
+fn handle_retryable_route_model_response_quality(
+    model: &str,
+    target: &election::InferenceTarget,
+    selection: &TargetSelection,
+    affinity: &AffinityRouter,
+    failure: ResponseQualityFailure,
+) -> RouteModelDisposition {
+    forget_selected_route_model_target(model, target, selection, affinity);
+    tracing::warn!(
+        reason = failure.label(),
+        "Target {target:?} returned low-quality success response, trying next"
     );
     RouteModelDisposition::Continue
 }
@@ -3844,7 +4018,7 @@ pub async fn route_to_target(
         &mut tcp_stream,
         &target,
         prefetched,
-        false,
+        ResponseRetryPolicy::next_target_available(false),
         response_adapter,
     )
     .await;
@@ -3873,6 +4047,7 @@ pub async fn route_to_target(
         }
         RouteAttemptResult::RetryableTimeout
         | RouteAttemptResult::RetryableContextOverflow
+        | RouteAttemptResult::RetryableResponseQuality(_)
         | RouteAttemptResult::RetryableUnavailable => {
             node.record_routed_request(
                 model,
@@ -3905,7 +4080,7 @@ pub async fn route_http_endpoint_request(
         base_url,
         prefetched,
         request_path,
-        false,
+        ResponseRetryPolicy::next_target_available(false),
         response_adapter,
     )
     .await;
@@ -3941,6 +4116,7 @@ pub async fn route_http_endpoint_request(
         }
         RouteAttemptResult::RetryableTimeout
         | RouteAttemptResult::RetryableContextOverflow
+        | RouteAttemptResult::RetryableResponseQuality(_)
         | RouteAttemptResult::RetryableUnavailable => {
             node.record_routed_request(
                 model,
@@ -3959,8 +4135,9 @@ pub async fn send_models_list_with_descriptors(
     mut stream: TcpStream,
     models: &[String],
     descriptors: &[mesh::ServedModelDescriptor],
+    runtimes: &[mesh::ModelRuntimeDescriptor],
 ) -> std::io::Result<()> {
-    let body = models_list_json(models, descriptors).to_string();
+    let body = models_list_json(models, descriptors, runtimes).to_string();
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
         body.len(),
@@ -3974,9 +4151,10 @@ pub async fn send_models_list_with_descriptors(
 fn models_list_json(
     models: &[String],
     descriptors: &[mesh::ServedModelDescriptor],
+    runtimes: &[mesh::ModelRuntimeDescriptor],
 ) -> serde_json::Value {
     let mut seen = std::collections::HashSet::new();
-    let data: Vec<serde_json::Value> = models
+    let mut data: Vec<serde_json::Value> = models
         .iter()
         .filter_map(|m| {
             let descriptor = descriptor_for_model(descriptors, m);
@@ -4006,7 +4184,7 @@ fn models_list_json(
             } else {
                 public_id.clone()
             };
-            Some(serde_json::json!({
+            let mut model = serde_json::json!({
                 "id": public_id,
                 "display_name": display_name,
                 "object": "model",
@@ -4016,11 +4194,128 @@ fn models_list_json(
                 "vision_status": capabilities.vision_status(),
                 "audio_status": capabilities.audio_status(),
                 "reasoning_status": capabilities.reasoning_status(),
-            }))
+            });
+            if let Some(metadata) = model_metadata_json(m, descriptor, runtimes)
+                && let Some(object) = model.as_object_mut()
+            {
+                object.insert("metadata".to_string(), metadata);
+            }
+            Some(model)
         })
         .collect();
 
+    if crate::network::openai::moa_gateway::context_selection::should_advertise_virtual_mesh(models)
+        && seen.insert(mesh_mixture_of_agents::VIRTUAL_MODEL_NAME.to_string())
+    {
+        let mut model = serde_json::json!({
+            "id": mesh_mixture_of_agents::VIRTUAL_MODEL_NAME,
+            "display_name": "Mesh (MoA)",
+            "object": "model",
+            "owned_by": "mesh-llm",
+            "capabilities": ["text"],
+            "multimodal_status": "unsupported",
+            "vision_status": "unsupported",
+            "audio_status": "unsupported",
+            "reasoning_status": "unknown",
+        });
+        if let Some(context_length) =
+            crate::network::openai::moa_gateway::context_selection::virtual_mesh_context_length(
+                models, runtimes,
+            )
+            && let Some(object) = model.as_object_mut()
+        {
+            object.insert(
+                "metadata".to_string(),
+                serde_json::json!({ "context_length": context_length }),
+            );
+        }
+        data.push(model);
+    }
+
     serde_json::json!({ "object": "list", "data": data })
+}
+
+fn model_metadata_json(
+    model_name: &str,
+    descriptor: Option<&mesh::ServedModelDescriptor>,
+    runtimes: &[mesh::ModelRuntimeDescriptor],
+) -> Option<serde_json::Value> {
+    let mut metadata = serde_json::Map::new();
+    let descriptor_metadata = descriptor.and_then(|descriptor| descriptor.metadata.as_ref());
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.architecture.as_ref()) {
+        metadata.insert("architecture".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.parameter_size.as_ref()) {
+        metadata.insert("parameter_size".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.parameter_count_b)
+        && value.is_finite()
+    {
+        metadata.insert("parameter_count_b".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.quant.as_ref()) {
+        metadata.insert("quant".to_string(), serde_json::json!(value));
+    }
+    if let Some(contexts) = runtime_context_lengths_for_model(model_name, runtimes) {
+        metadata.insert(
+            "context_length".to_string(),
+            serde_json::json!(contexts.min),
+        );
+        if contexts.max != contexts.min {
+            metadata.insert(
+                "max_context_length".to_string(),
+                serde_json::json!(contexts.max),
+            );
+        }
+    }
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.native_context_length) {
+        metadata.insert(
+            "native_context_length".to_string(),
+            serde_json::json!(value),
+        );
+    }
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.tokenizer.as_ref()) {
+        metadata.insert("tokenizer".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.layer_count) {
+        metadata.insert("layer_count".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.embedding_size) {
+        metadata.insert("embedding_size".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.head_count) {
+        metadata.insert("head_count".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.kv_head_count) {
+        metadata.insert("kv_head_count".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.expert_count) {
+        metadata.insert("expert_count".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = descriptor_metadata.and_then(|metadata| metadata.active_expert_count) {
+        metadata.insert("active_expert_count".to_string(), serde_json::json!(value));
+    }
+    (!metadata.is_empty()).then_some(serde_json::Value::Object(metadata))
+}
+
+struct RuntimeContextLengths {
+    min: u32,
+    max: u32,
+}
+
+fn runtime_context_lengths_for_model(
+    model_name: &str,
+    runtimes: &[mesh::ModelRuntimeDescriptor],
+) -> Option<RuntimeContextLengths> {
+    let mut lengths = runtimes
+        .iter()
+        .filter(|runtime| runtime.model_name == model_name)
+        .filter_map(mesh::ModelRuntimeDescriptor::advertised_context_length);
+    let first = lengths.next()?;
+    let (min, max) = lengths.fold((first, first), |(min, max), value| {
+        (min.min(value), max.max(value))
+    });
+    Some(RuntimeContextLengths { min, max })
 }
 
 pub fn rewrite_public_model_alias(
@@ -4268,8 +4563,7 @@ pub async fn send_json_with_status_and_headers(
 }
 
 pub async fn send_400(mut stream: TcpStream, msg: &str) -> std::io::Result<()> {
-    let body = serde_json::to_vec(&serde_json::json!({ "error": msg }))
-        .expect("serializing JSON error response should not fail");
+    let body = openai_error_body(400, msg);
     let headers = format!(
         "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
@@ -4282,13 +4576,20 @@ pub async fn send_400(mut stream: TcpStream, msg: &str) -> std::io::Result<()> {
 
 pub async fn send_error(mut stream: TcpStream, code: u16, msg: &str) -> std::io::Result<()> {
     let status = match code {
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Payload Too Large",
         422 => "Unprocessable Content",
         429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Bad Request",
     };
-    let body = serde_json::json!({"error": msg}).to_string();
+    let body = openai_error_body(code, msg);
     let retry_after = if code == 429 {
         "Retry-After: 5\r\n"
     } else {
@@ -4297,7 +4598,7 @@ pub async fn send_error(mut stream: TcpStream, code: u16, msg: &str) -> std::io:
     let resp = format!(
         "HTTP/1.1 {code} {status}\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\n\r\n{}",
         body.len(),
-        body
+        String::from_utf8_lossy(&body)
     );
     stream.write_all(resp.as_bytes()).await?;
     stream.shutdown().await?;
@@ -4310,15 +4611,57 @@ pub async fn send_503(stream: TcpStream, reason: &str) -> std::io::Result<()> {
 }
 
 async fn send_503_inner(mut stream: TcpStream, reason: &str) -> std::io::Result<()> {
-    let body = serde_json::json!({"error": reason}).to_string();
+    let body = openai_error_body(503, reason);
     let resp = format!(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         body.len(),
-        body
+        String::from_utf8_lossy(&body)
     );
     stream.write_all(resp.as_bytes()).await?;
     stream.shutdown().await?;
     Ok(())
+}
+
+fn openai_error_body(status_code: u16, message: &str) -> Vec<u8> {
+    let status =
+        http::StatusCode::from_u16(status_code).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+    let kind = openai_error_kind_for_status(status_code);
+    let error = openai_frontend::OpenAiError::from_kind(status, kind, message)
+        .with_code(openai_error_code_for_status(status_code));
+    serde_json::to_vec(&error.body()).expect("serializing JSON error response should not fail")
+}
+
+const fn openai_error_kind_for_status(status_code: u16) -> openai_frontend::OpenAiErrorKind {
+    match status_code {
+        401 => openai_frontend::OpenAiErrorKind::Authentication,
+        403 => openai_frontend::OpenAiErrorKind::Permission,
+        404 => openai_frontend::OpenAiErrorKind::NotFound,
+        413 => openai_frontend::OpenAiErrorKind::PayloadTooLarge,
+        429 => openai_frontend::OpenAiErrorKind::RateLimit,
+        500 => openai_frontend::OpenAiErrorKind::Internal,
+        502 => openai_frontend::OpenAiErrorKind::ServiceUnavailable,
+        503 => openai_frontend::OpenAiErrorKind::ServiceUnavailable,
+        504 => openai_frontend::OpenAiErrorKind::Timeout,
+        _ => openai_frontend::OpenAiErrorKind::InvalidRequest,
+    }
+}
+
+const fn openai_error_code_for_status(status_code: u16) -> &'static str {
+    match status_code {
+        400 => "bad_request",
+        401 => "invalid_api_key",
+        403 => "permission_denied",
+        404 => "model_not_found",
+        409 => "conflict",
+        413 => "payload_too_large",
+        422 => "unprocessable_content",
+        429 => "rate_limit_exceeded",
+        500 => "internal_server_error",
+        502 => "service_unavailable",
+        503 => "service_unavailable",
+        504 => "timeout",
+        _ => "invalid_request",
+    }
 }
 
 /// Pipeline-aware HTTP proxy for local targets.
@@ -4498,6 +4841,7 @@ async fn relay_pipeline_non_streaming_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use tokio::net::TcpListener;
 
     // ── Header-name validation ──────────────────────────────────────
@@ -4593,6 +4937,92 @@ mod tests {
         }
     }
 
+    fn test_peer_serving_model(peer_id: iroh::EndpointId, model: &str) -> mesh::PeerInfo {
+        mesh::PeerInfo {
+            id: peer_id,
+            addr: iroh::EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            mesh_id: None,
+            mesh_policy_hash: None,
+            genesis_policy: None,
+            role: mesh::NodeRole::Host { http_port: 9337 },
+            first_joined_mesh_ts: None,
+            models: vec![model.to_string()],
+            vram_bytes: 16 * 1024 * 1024 * 1024,
+            rtt_ms: None,
+            model_source: None,
+            admitted: true,
+            serving_models: vec![model.to_string()],
+            hosted_models: vec![model.to_string()],
+            hosted_models_known: true,
+            available_models: vec![],
+            requested_models: vec![],
+            explicit_model_interests: vec![],
+            last_seen: std::time::Instant::now(),
+            last_mentioned: std::time::Instant::now(),
+            version: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![local_gguf_descriptor(model)],
+            served_model_runtime: vec![],
+            owner_attestation: None,
+            release_attestation_summary: crate::ReleaseAttestationSummary::default(),
+            artifact_transfer_supported: false,
+            stage_protocol_generation_supported: false,
+            stage_status_list_supported: false,
+            advertised_model_throughput: vec![],
+            display_rtt: None,
+            selected_path: None,
+            propagated_latency: None,
+            owner_summary: crate::crypto::OwnershipSummary::default(),
+        }
+    }
+
+    async fn test_node_with_remote_models(models: &[(&str, iroh::EndpointId)]) -> mesh::Node {
+        let node = mesh::Node::new_for_tests(mesh::NodeRole::Client)
+            .await
+            .expect("test node should start");
+        for (model, peer_id) in models {
+            node.insert_test_peer(test_peer_serving_model(*peer_id, model))
+                .await;
+        }
+        node
+    }
+
+    fn text_auto_request() -> BufferedHttpRequest {
+        let body = serde_json::json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let body_bytes = serde_json::to_vec(&body).expect("request body should serialize");
+        BufferedHttpRequest {
+            raw: Vec::new(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            client_path: "/v1/chat/completions".to_string(),
+            body_json: Some(body),
+            body_json_attempted: true,
+            body_bytes: Some(body_bytes),
+            body_len_bytes: 0,
+            completion_tokens: None,
+            model_name: Some("auto".to_string()),
+            stream: None,
+            request_object_request_ids: Vec::new(),
+            response_adapter: ResponseAdapter::None,
+        }
+    }
+
     async fn read_request_from_parts_with_limits(
         parts: Vec<Vec<u8>>,
         limits: HttpReadLimits,
@@ -4627,7 +5057,7 @@ mod tests {
         let models = vec!["Falcon-H1-1.5B-Instruct-Q4_K_M".to_string()];
         let descriptors = vec![hf_descriptor(&models[0])];
 
-        let body = models_list_json(&models, &descriptors);
+        let body = models_list_json(&models, &descriptors, &[]);
 
         assert_eq!(
             body["data"][0]["id"],
@@ -4678,7 +5108,7 @@ mod tests {
         };
         let descriptors = vec![descriptor];
 
-        let body = models_list_json(&models, &descriptors);
+        let body = models_list_json(&models, &descriptors, &[]);
         let public_id = body["data"][0]["id"].as_str().unwrap_or_default();
 
         // The public ID must NOT silently drop the quant suffix that the
@@ -4701,7 +5131,7 @@ mod tests {
         let models = vec!["Falcon-H1-1.5B-Instruct-Q4_K_M".to_string()];
         let descriptors = vec![catalog_model_ref_descriptor(&models[0])];
 
-        let body = models_list_json(&models, &descriptors);
+        let body = models_list_json(&models, &descriptors, &[]);
 
         assert_eq!(
             body["data"][0]["id"],
@@ -4714,10 +5144,123 @@ mod tests {
         let models = vec!["smollm2-a".to_string()];
         let descriptors = vec![local_gguf_descriptor(&models[0])];
 
-        let body = models_list_json(&models, &descriptors);
+        let body = models_list_json(&models, &descriptors, &[]);
 
         assert_eq!(body["data"][0]["id"], "smollm2-a");
         assert_eq!(body["data"][0]["display_name"], "smollm2-a");
+    }
+
+    #[test]
+    fn models_list_reports_model_metadata() {
+        let models = vec!["Qwen3-32B-Q4_K_M".to_string()];
+        let mut descriptor = local_gguf_descriptor(&models[0]);
+        descriptor.metadata = Some(mesh::ServedModelMetadata {
+            architecture: Some("qwen3".to_string()),
+            parameter_size: Some("32B".to_string()),
+            parameter_count_b: Some(32.0),
+            quant: Some("Q4_K_M".to_string()),
+            native_context_length: Some(32_768),
+            tokenizer: Some("gpt2".to_string()),
+            layer_count: Some(64),
+            embedding_size: Some(5120),
+            head_count: Some(40),
+            kv_head_count: Some(8),
+            expert_count: Some(128),
+            active_expert_count: Some(8),
+        });
+        let runtimes = vec![mesh::ModelRuntimeDescriptor {
+            model_name: models[0].clone(),
+            identity_hash: None,
+            context_length: Some(65_536),
+            ready: true,
+        }];
+
+        let body = models_list_json(&models, &[descriptor], &runtimes);
+        let metadata = &body["data"][0]["metadata"];
+
+        assert_eq!(metadata["architecture"], "qwen3");
+        assert_eq!(metadata["parameter_size"], "32B");
+        assert_eq!(metadata["parameter_count_b"], 32.0);
+        assert_eq!(metadata["quant"], "Q4_K_M");
+        assert_eq!(metadata["context_length"], 65_536);
+        assert_eq!(metadata["native_context_length"], 32_768);
+        assert_eq!(metadata["tokenizer"], "gpt2");
+        assert_eq!(metadata["layer_count"], 64);
+        assert_eq!(metadata["embedding_size"], 5120);
+        assert_eq!(metadata["head_count"], 40);
+        assert_eq!(metadata["kv_head_count"], 8);
+        assert_eq!(metadata["expert_count"], 128);
+        assert_eq!(metadata["active_expert_count"], 8);
+    }
+
+    #[test]
+    fn models_list_uses_route_safe_context_for_duplicate_runtimes() {
+        let models = vec!["Qwen3.5-9B-Q4_K_M".to_string()];
+        let runtimes = vec![
+            mesh::ModelRuntimeDescriptor {
+                model_name: models[0].clone(),
+                identity_hash: None,
+                context_length: Some(32_768),
+                ready: true,
+            },
+            mesh::ModelRuntimeDescriptor {
+                model_name: models[0].clone(),
+                identity_hash: None,
+                context_length: Some(131_072),
+                ready: true,
+            },
+        ];
+
+        let body = models_list_json(&models, &[], &runtimes);
+        let metadata = &body["data"][0]["metadata"];
+
+        assert_eq!(metadata["context_length"], 32_768);
+        assert_eq!(metadata["max_context_length"], 131_072);
+    }
+
+    #[test]
+    fn models_list_advertises_virtual_mesh_when_moa_has_two_models() {
+        let models = vec!["fast-8b".to_string(), "strong-32b".to_string()];
+        let runtimes = vec![
+            mesh::ModelRuntimeDescriptor {
+                model_name: "fast-8b".to_string(),
+                identity_hash: None,
+                context_length: Some(16_384),
+                ready: true,
+            },
+            mesh::ModelRuntimeDescriptor {
+                model_name: "strong-32b".to_string(),
+                identity_hash: None,
+                context_length: Some(65_536),
+                ready: true,
+            },
+        ];
+
+        let body = models_list_json(&models, &[], &runtimes);
+        let mesh = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == mesh_mixture_of_agents::VIRTUAL_MODEL_NAME)
+            .expect("virtual mesh model should be listed");
+
+        assert_eq!(mesh["display_name"], "Mesh (MoA)");
+        assert_eq!(mesh["metadata"]["context_length"], 16_384);
+    }
+
+    #[test]
+    fn models_list_does_not_invent_virtual_mesh_context() {
+        let models = vec!["unknown-a".to_string(), "unknown-b".to_string()];
+
+        let body = models_list_json(&models, &[], &[]);
+        let mesh = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == mesh_mixture_of_agents::VIRTUAL_MODEL_NAME)
+            .expect("virtual mesh model should be listed");
+
+        assert!(mesh.get("metadata").is_none());
     }
 
     #[test]
@@ -4728,7 +5271,7 @@ mod tests {
             crate::models::ModelCapabilities::default(),
         )];
 
-        let body = models_list_json(&models, &descriptors);
+        let body = models_list_json(&models, &descriptors, &[]);
 
         assert_eq!(body["data"][0]["capabilities"], serde_json::json!(["text"]));
         assert_eq!(body["data"][0]["vision_status"], "none");
@@ -4740,7 +5283,7 @@ mod tests {
         let models = vec!["Qwen3VL-2B-Instruct-Q4_K_M".to_string()];
         let descriptors = vec![local_gguf_descriptor(&models[0])];
 
-        let body = models_list_json(&models, &descriptors);
+        let body = models_list_json(&models, &descriptors, &[]);
         let capabilities = body["data"][0]["capabilities"].as_array().unwrap();
 
         assert!(capabilities.iter().any(|cap| cap == "multimodal"));
@@ -4761,7 +5304,7 @@ mod tests {
             },
         )];
 
-        let body = models_list_json(&models, &descriptors);
+        let body = models_list_json(&models, &descriptors, &[]);
         let capabilities = body["data"][0]["capabilities"].as_array().unwrap();
 
         assert!(capabilities.iter().any(|cap| cap == "multimodal"));
@@ -4875,6 +5418,12 @@ mod tests {
             "retryable_context_overflow"
         );
         assert_eq!(
+            route_attempt_result_label(&RouteAttemptResult::RetryableResponseQuality(
+                ResponseQualityFailure::EmptyAssistantOutput
+            )),
+            "retryable_response_quality"
+        );
+        assert_eq!(
             route_attempt_result_label(&RouteAttemptResult::ClientDisconnected),
             "client_disconnected"
         );
@@ -4908,9 +5457,42 @@ mod tests {
             TargetHealthOutcome::ContextOverflow
         );
         assert_eq!(
+            target_health_outcome_for_attempt(&RouteAttemptResult::RetryableResponseQuality(
+                ResponseQualityFailure::LengthFinishReason
+            )),
+            TargetHealthOutcome::Rejected
+        );
+        assert_eq!(
             target_health_outcome_for_attempt(&RouteAttemptResult::RetryableTimeout),
             TargetHealthOutcome::Timeout
         );
+    }
+
+    #[test]
+    fn test_remote_retry_policy_only_retries_uncommitted_failures() {
+        assert!(should_retry_uncommitted_remote_attempt(
+            RouteAttemptResult::RetryableUnavailable
+        ));
+        assert!(should_retry_uncommitted_remote_attempt(
+            RouteAttemptResult::RetryableTimeout
+        ));
+        assert!(!should_retry_uncommitted_remote_attempt(
+            RouteAttemptResult::RetryableContextOverflow
+        ));
+        assert!(!should_retry_uncommitted_remote_attempt(
+            RouteAttemptResult::RetryableResponseQuality(
+                ResponseQualityFailure::EmptyAssistantOutput
+            )
+        ));
+        assert!(!should_retry_uncommitted_remote_attempt(
+            RouteAttemptResult::ClientDisconnected
+        ));
+        assert!(!should_retry_uncommitted_remote_attempt(
+            RouteAttemptResult::Delivered {
+                status_code: 200,
+                completion_tokens: None,
+            }
+        ));
     }
 
     #[test]
@@ -4983,6 +5565,111 @@ mod tests {
             &media,
             &descriptors
         ));
+    }
+
+    #[tokio::test]
+    async fn cached_auto_model_stays_sticky_when_no_ready_remote_model_exists() -> Result<()> {
+        let cached_model = "cached-cooling-model-31B";
+        let alternate_model = "alternate-cooling-model-31B";
+        let cached_peer = iroh::EndpointId::from(iroh::SecretKey::generate().public());
+        let alternate_peer = iroh::EndpointId::from(iroh::SecretKey::generate().public());
+        let node = test_node_with_remote_models(&[
+            (cached_model, cached_peer),
+            (alternate_model, alternate_peer),
+        ])
+        .await;
+        let affinity = AffinityRouter::new();
+        let key = 0xA11CE;
+        affinity.remember_auto_model(key, cached_model);
+        affinity.record_target_outcome(
+            Some(cached_model),
+            &election::InferenceTarget::Remote(cached_peer),
+            TargetHealthOutcome::Unavailable,
+        );
+        affinity.record_target_outcome(
+            Some(alternate_model),
+            &election::InferenceTarget::Remote(alternate_peer),
+            TargetHealthOutcome::Unavailable,
+        );
+        let descriptors = vec![
+            local_gguf_descriptor(cached_model),
+            local_gguf_descriptor(alternate_model),
+        ];
+        let media = router::MediaRequirements::default();
+        let caps = crate::models::ModelCapabilities::default();
+        let available = vec![
+            router::RoutingCandidate::unscored(cached_model, caps),
+            router::RoutingCandidate::unscored(alternate_model, caps),
+        ];
+        let ready_models =
+            auto_route::ready_remote_models(&node, None, &available, &affinity).await;
+        assert!(ready_models.is_empty());
+
+        let cached = lookup_cached_auto_model(
+            &node,
+            &descriptors,
+            &affinity,
+            Some(key),
+            &media,
+            &ready_models,
+        )
+        .await;
+
+        assert_eq!(cached.as_deref(), Some(cached_model));
+        assert_eq!(
+            affinity.lookup_auto_model(key).as_deref(),
+            Some(cached_model)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_model_cache_switches_when_ready_alternate_exists() -> Result<()> {
+        let cached_model = "cached-cooling-model-31B";
+        let alternate_model = "ready-alternate-model-31B";
+        let cached_peer = iroh::EndpointId::from(iroh::SecretKey::generate().public());
+        let alternate_peer = iroh::EndpointId::from(iroh::SecretKey::generate().public());
+        let node = test_node_with_remote_models(&[
+            (cached_model, cached_peer),
+            (alternate_model, alternate_peer),
+        ])
+        .await;
+        let affinity = AffinityRouter::new();
+        let key = 0xB0B;
+        affinity.remember_auto_model(key, cached_model);
+        affinity.record_target_outcome(
+            Some(cached_model),
+            &election::InferenceTarget::Remote(cached_peer),
+            TargetHealthOutcome::Unavailable,
+        );
+        let served = vec![cached_model.to_string(), alternate_model.to_string()];
+        let descriptors = vec![
+            local_gguf_descriptor(cached_model),
+            local_gguf_descriptor(alternate_model),
+        ];
+        let mut request = text_auto_request();
+
+        let resolved = resolve_auto_model_request(AutoModelRequestArgs {
+            node: &node,
+            request: &mut request,
+            served: &served,
+            descriptors: &descriptors,
+            is_auto_request: true,
+            auto_session_key: Some(key),
+            required_tokens: None,
+            affinity: &affinity,
+        })
+        .await;
+
+        assert!(matches!(
+            resolved,
+            AutoModelResolution::Model(Some(model)) if model == alternate_model
+        ));
+        assert_eq!(
+            affinity.lookup_auto_model(key).as_deref(),
+            Some(alternate_model)
+        );
+        Ok(())
     }
 
     #[test]
@@ -5127,7 +5814,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_budget_tokens_includes_output_budget_and_margin() {
+    fn test_request_budget_tokens_includes_output_budget_and_scaled_margin() {
         let body = serde_json::json!({
             "model": "qwen",
             "max_tokens": 512,
@@ -5135,7 +5822,28 @@ mod tests {
         });
 
         let budget = request_budget_tokens(&body).unwrap();
-        assert!(budget >= 512 + REQUEST_TOKEN_MARGIN);
+        let prompt_tokens = ceil_div_u32(serde_json::to_vec(&body).unwrap().len() as u32, 4);
+        assert_eq!(
+            budget,
+            prompt_tokens + 512 + request_token_margin(prompt_tokens + 512)
+        );
+    }
+
+    #[test]
+    fn test_request_budget_tokens_uses_bounded_margin_for_small_requests() {
+        let budget = request_budget_tokens_from_parts(128, Some(4)).unwrap();
+
+        assert!(
+            budget <= 256,
+            "small smoke requests should fit a tiny CI context: {budget}"
+        );
+    }
+
+    #[test]
+    fn test_request_budget_tokens_keeps_full_margin_for_large_requests() {
+        let budget = request_budget_tokens_from_parts(10_000, Some(512)).unwrap();
+
+        assert_eq!(budget, 2_500 + 512 + REQUEST_TOKEN_MARGIN);
     }
 
     #[test]
@@ -5166,13 +5874,23 @@ mod tests {
     }
 
     #[test]
-    fn test_reorder_candidates_by_context_falls_back_when_all_known_too_small() {
+    fn test_reorder_candidates_by_context_rejects_all_known_too_small() {
         let ordered = reorder_candidates_by_context_and_throughput(
             &[(1u8, Some(4096), None), (2u8, Some(6144), None)],
             Some(8192),
         );
 
-        assert_eq!(ordered, vec![1, 2]);
+        assert!(ordered.is_empty());
+    }
+
+    #[test]
+    fn test_reorder_candidates_by_context_keeps_unknown_when_known_too_small() {
+        let ordered = reorder_candidates_by_context_and_throughput(
+            &[(1u8, Some(4096), None), (2u8, None, None)],
+            Some(8192),
+        );
+
+        assert_eq!(ordered, vec![2]);
     }
 
     #[test]
@@ -5645,7 +6363,7 @@ mod tests {
                 &mut client_socket,
                 &mut upstream_reader,
                 probe,
-                false,
+                ResponseRetryPolicy::next_target_available(false),
             )
             .await
             .expect("relay")
@@ -5728,36 +6446,63 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_error_429_includes_retry_after() {
-        use tokio::io::AsyncReadExt;
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            super::send_error(stream, 429, "model not available")
-                .await
-                .unwrap();
-        });
-
-        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut buf = vec![0u8; 4096];
-        let mut total = 0;
-        loop {
-            let n = client.read(&mut buf[total..]).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            total += n;
-        }
-        let response = String::from_utf8_lossy(&buf[..total]);
+        let response = capture_proxy_error_response(|stream| async move {
+            super::send_error(stream, 429, "model not available").await
+        })
+        .await;
+        let body = response_json_body(&response);
 
         assert!(response.starts_with("HTTP/1.1 429 Too Many Requests\r\n"));
         assert!(response.contains("Retry-After: 5\r\n"));
-        assert!(response.contains("model not available"));
+        assert_eq!(body["error"]["message"], "model not available");
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+    }
 
+    #[tokio::test]
+    async fn test_send_503_uses_openai_error_shape() {
+        let response = capture_proxy_error_response(|stream| async move {
+            super::send_503(stream, "skippy ABI call failed: Unsupported").await
+        })
+        .await;
+        let body = response_json_body(&response);
+
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert_eq!(
+            body["error"]["message"],
+            "skippy ABI call failed: Unsupported"
+        );
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["code"], "service_unavailable");
+    }
+
+    async fn capture_proxy_error_response<F, Fut>(send: F) -> String
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: Future<Output = std::io::Result<()>> + Send + 'static,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            send(stream).await.unwrap();
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut output = Vec::new();
+        client.read_to_end(&mut output).await.unwrap();
         server.await.unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    fn response_json_body(response: &str) -> serde_json::Value {
+        let body_start = response
+            .find("\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("response contains header terminator");
+        serde_json::from_str(&response[body_start..]).unwrap()
     }
 
     #[test]
@@ -5871,7 +6616,7 @@ mod tests {
                 &mut client_socket,
                 &mut upstream_reader,
                 probe,
-                false,
+                ResponseRetryPolicy::next_target_available(false),
             )
             .await
             .expect("relay")

@@ -7,7 +7,6 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,7 +29,7 @@ use openai_frontend::{
     GuardedOpenAiBackend, GuardrailMode, GuardrailPolicy, GuardrailPolicyHandle, MessageContent,
     MessageContentPart, ModelId, ModelObject, OpenAiBackend, OpenAiError, OpenAiErrorKind,
     OpenAiHookPolicy, OpenAiRequestContext, OpenAiResult, PrefillHookSignals, ReasoningEffort,
-    StreamingGuardrailMode, Usage, chat_mesh_hooks_enabled, inject_text_into_chat_messages,
+    StreamingGuardrailMode, Usage, apply_chat_hook_outcome, chat_mesh_hooks_enabled,
     normalize_reasoning_template_options,
 };
 use serde::Serialize;
@@ -58,18 +57,19 @@ use tokio::{
 
 use crate::{
     binary_transport::{
-        WireCondition, connect_binary_downstream, forwarded_stage_message,
-        forwarded_stage_message_timed, run_binary_stage_message, write_stage_message_conditioned,
+        PredictionReturnHub, PredictionReturnReceiver, WireCondition, connect_binary_downstream,
+        forwarded_stage_message, forwarded_stage_message_timed, run_binary_stage_message,
+        stage_output_activation_capacity, write_stage_message_conditioned,
     },
     cli::ServeOpenAiArgs,
     config::{load_json, validate_config},
-    kv_integration::KvStageIntegration,
+    kv_integration::{KvStageIntegration, proactive_eviction_attrs, proactive_eviction_error_kind},
     runtime_state::{RuntimeSessionStats, RuntimeState, load_runtime},
     telemetry::{Telemetry, lifecycle_attrs, now_unix_nanos},
 };
 
+mod admission;
 mod backend;
-mod binary_chain_generation;
 mod embedded_execution;
 mod embedded_generation;
 mod generation_flow;
@@ -82,7 +82,14 @@ mod speculative;
 mod util;
 mod wire_messages;
 
-use self::{prefill::*, request::*, speculative::*, util::*, wire_messages::*};
+use self::{
+    admission::{GenerationTokenBudget, GenerationTokenBudgetRequest},
+    prefill::*,
+    request::*,
+    speculative::*,
+    util::*,
+    wire_messages::*,
+};
 
 static OPENAI_GENERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -107,6 +114,7 @@ pub const CONTEXT_BUDGET_MAX_TOKENS: u32 = u32::MAX;
 pub const DEFAULT_EMBEDDED_MAX_TOKENS: u32 = 4096;
 const GENERATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 const GENERATION_RETRY_AFTER_SECS: u64 = 1;
+const MAX_EXACT_REPLAY_TOKENS: usize = 8;
 
 pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
     let config = load_json::<StageConfig>(&args.config)
@@ -135,24 +143,12 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
     let model_id = ModelId::new(args.model_id.unwrap_or_else(|| config.model_id.clone()))
         .map_err(|error| anyhow!("invalid OpenAI model id: {error}"))?
         .into_string();
-    let mode = match args.first_stage_addr {
-        Some(first_stage_addr) => OpenAiBackendMode::BinaryChain {
-            first_stage_addr,
-            wire_dtype: parse_wire_dtype(&args.activation_wire_dtype)?,
-            prefill_chunk_policy: PrefillChunkPolicy::parse(PrefillChunkPolicyArgs {
-                policy: &args.prefill_chunk_policy,
-                schedule: args.prefill_chunk_schedule.as_deref(),
-                fixed_chunk_size: args.prefill_chunk_size,
-                adaptive_start: args.prefill_adaptive_start,
-                adaptive_step: args.prefill_adaptive_step,
-                adaptive_max: args.prefill_adaptive_max,
-                schedule_arg: "--prefill-chunk-schedule",
-                policy_arg: "--prefill-chunk-policy",
-            })?,
-            startup_timeout_secs: args.startup_timeout_secs,
-        },
-        None => OpenAiBackendMode::LocalRuntime,
-    };
+    if args.first_stage_addr.is_some() {
+        bail!(
+            "--first-stage-addr is no longer supported; direct prediction return requires embedded stage-0 OpenAI serving via serve-binary --openai-bind-addr"
+        );
+    }
+    let mode = OpenAiBackendMode::LocalRuntime;
     let mode_label = mode.label();
     let telemetry = Telemetry::new(
         args.metrics_otlp_grpc,
@@ -193,6 +189,7 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
+        generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: None,
         kv,
     });
@@ -232,6 +229,7 @@ pub struct EmbeddedOpenAiArgs {
     pub reply_credit_limit: Option<usize>,
     pub downstream_connect_timeout_secs: u64,
     pub downstream_wire_condition: WireCondition,
+    pub prediction_returns: Option<Arc<PredictionReturnHub>>,
     pub telemetry: Telemetry,
     pub hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
     pub openai_guardrails: Option<OpenAiGuardrailsConfig>,
@@ -507,6 +505,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         downstream_wire_condition: args.downstream_wire_condition,
         prefill_reply_credit_limit,
         lane_pool,
+        prediction_returns: args.prediction_returns.clone(),
     };
     args.telemetry
         .emit("stage.openai_server_start", lifecycle_attrs(&args.config));
@@ -535,6 +534,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
+        generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: args.hook_policy,
         kv,
     });
@@ -573,6 +573,7 @@ struct StageOpenAiBackend {
     generation_limit: Arc<Semaphore>,
     generation_queue_depth: Arc<AtomicUsize>,
     generation_queue_limit: usize,
+    generation_token_budget: Arc<GenerationTokenBudget>,
     hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
     kv: Option<Arc<KvStageIntegration>>,
 }
@@ -803,12 +804,6 @@ async fn openai_http_telemetry(
 #[allow(clippy::large_enum_variant)]
 enum OpenAiBackendMode {
     LocalRuntime,
-    BinaryChain {
-        first_stage_addr: String,
-        wire_dtype: WireActivationDType,
-        prefill_chunk_policy: PrefillChunkPolicy,
-        startup_timeout_secs: u64,
-    },
     EmbeddedStageZero {
         config: StageConfig,
         wire_dtype: WireActivationDType,
@@ -817,6 +812,7 @@ enum OpenAiBackendMode {
         downstream_wire_condition: WireCondition,
         prefill_reply_credit_limit: usize,
         lane_pool: Option<Arc<PersistentStageLanePool>>,
+        prediction_returns: Option<Arc<PredictionReturnHub>>,
     },
 }
 
@@ -825,6 +821,7 @@ struct PersistentStageLanePool {
     timeout_secs: u64,
     telemetry: Telemetry,
     lanes: Mutex<Vec<PersistentStageLane>>,
+    prefill_transport: Mutex<PrefillTransportEstimate>,
     next_lane_id: AtomicU64,
     capacity: usize,
 }
@@ -834,7 +831,20 @@ struct PersistentStageLane {
     stream: TcpStream,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PrefillTransportEstimate {
+    write_ms: f64,
+    wait_ms: f64,
+    write_to_compute: f64,
+    wait_to_compute: f64,
+    stage_index: i64,
+    activation_bytes: i64,
+    observations: u64,
+}
+
 impl PersistentStageLanePool {
+    const PREFILL_TRANSPORT_EWMA_ALPHA: f64 = 0.25;
+
     fn new(
         config: &StageConfig,
         capacity: usize,
@@ -849,6 +859,7 @@ impl PersistentStageLanePool {
             timeout_secs,
             telemetry,
             lanes: Mutex::new(Vec::with_capacity(capacity)),
+            prefill_transport: Mutex::new(PrefillTransportEstimate::default()),
             next_lane_id: AtomicU64::new(0),
             capacity,
         });
@@ -921,6 +932,56 @@ impl PersistentStageLanePool {
             now_unix_nanos() as u64,
         );
         Ok(lane)
+    }
+
+    fn prefill_transport_seed(&self) -> Option<PrefillChunkObservation> {
+        let estimate = *self.prefill_transport.lock().ok()?;
+        if estimate.observations == 0 {
+            return None;
+        }
+        Some(PrefillChunkObservation {
+            compute_ms: 1.0,
+            forward_write_ms: estimate.write_to_compute,
+            downstream_wait_ms: estimate.wait_to_compute,
+        })
+    }
+
+    fn observe_prefill_transport(
+        &self,
+        stats: &StageReplyStats,
+        stage0_compute_ms: f64,
+        prefill_chunks: usize,
+    ) {
+        if stats.prefill_edge_observation_count == 0 || prefill_chunks == 0 {
+            return;
+        }
+        let compute_ms = (stage0_compute_ms / prefill_chunks as f64).max(0.001);
+        let write_ms = us_to_ms(stats.prefill_edge_write_us_max);
+        let wait_ms = us_to_ms(stats.prefill_edge_wait_us_max);
+        let sample = PrefillTransportEstimate {
+            write_ms,
+            wait_ms,
+            write_to_compute: write_ms / compute_ms,
+            wait_to_compute: wait_ms / compute_ms,
+            stage_index: stats.prefill_edge_stage_index,
+            activation_bytes: stats.prefill_edge_activation_bytes_max,
+            observations: u64::try_from(stats.prefill_edge_observation_count).unwrap_or(0),
+        };
+        let mut estimate = match self.prefill_transport.lock() {
+            Ok(estimate) => estimate,
+            Err(_) => return,
+        };
+        if estimate.observations == 0 {
+            *estimate = sample;
+        } else {
+            estimate.write_ms = ewma(estimate.write_ms, sample.write_ms);
+            estimate.wait_ms = ewma(estimate.wait_ms, sample.wait_ms);
+            estimate.write_to_compute = ewma(estimate.write_to_compute, sample.write_to_compute);
+            estimate.wait_to_compute = ewma(estimate.wait_to_compute, sample.wait_to_compute);
+            estimate.stage_index = sample.stage_index;
+            estimate.activation_bytes = sample.activation_bytes;
+            estimate.observations = estimate.observations.saturating_add(sample.observations);
+        }
     }
 
     fn return_lane(&self, lane: PersistentStageLane) {
@@ -1009,6 +1070,13 @@ impl PersistentStageLanePool {
             stream,
         })
     }
+}
+
+fn ewma(old: f64, sample: f64) -> f64 {
+    old.mul_add(
+        1.0 - PersistentStageLanePool::PREFILL_TRANSPORT_EWMA_ALPHA,
+        sample * PersistentStageLanePool::PREFILL_TRANSPORT_EWMA_ALPHA,
+    )
 }
 
 #[derive(Clone)]
@@ -1249,8 +1317,13 @@ impl OpenAiBackendMode {
     fn label(&self) -> &'static str {
         match self {
             Self::LocalRuntime => "local-runtime",
-            Self::BinaryChain { .. } => "binary-chain",
             Self::EmbeddedStageZero { .. } => "embedded-stage0",
+        }
+    }
+
+    fn reserves_local_kv_tokens(&self) -> bool {
+        match self {
+            Self::LocalRuntime | Self::EmbeddedStageZero { .. } => true,
         }
     }
 }
@@ -1283,24 +1356,15 @@ fn strip_default_revision(id: &str) -> String {
     id.to_string()
 }
 
-fn apply_chat_hook_outcome(request: &mut ChatCompletionRequest, outcome: &ChatHookOutcome) {
-    for action in &outcome.actions {
-        match action {
-            ChatHookAction::InjectText { text } => {
-                inject_text_into_chat_messages(&mut request.messages, text.clone());
-            }
-            ChatHookAction::None => {}
-        }
-    }
-}
-
 fn hook_injected_text(outcome: &ChatHookOutcome) -> Option<String> {
     let text = outcome
         .actions
         .iter()
         .filter_map(|action| match action {
             ChatHookAction::InjectText { text } if !text.is_empty() => Some(text.as_str()),
-            ChatHookAction::InjectText { .. } | ChatHookAction::None => None,
+            ChatHookAction::InjectText { .. }
+            | ChatHookAction::ConsumeMedia { .. }
+            | ChatHookAction::None => None,
         })
         .collect::<Vec<_>>()
         .join("");
@@ -1623,19 +1687,6 @@ struct LocalGeneration<'a> {
     ids: &'a OpenAiGenerationIds,
 }
 
-struct BinaryChainGeneration<'a> {
-    first_stage_addr: &'a str,
-    wire_dtype: WireActivationDType,
-    prefill_chunk_policy: &'a PrefillChunkPolicy,
-    startup_timeout_secs: u64,
-    prompt_token_ids: &'a [i32],
-    max_tokens: u32,
-    sampling: &'a SamplingConfig,
-    chat_sampling_metadata: Option<&'a str>,
-    cancellation: Option<&'a openai_frontend::CancellationToken>,
-    ids: &'a OpenAiGenerationIds,
-}
-
 struct EmbeddedStageZeroGeneration<'a> {
     config: &'a StageConfig,
     wire_dtype: WireActivationDType,
@@ -1644,6 +1695,7 @@ struct EmbeddedStageZeroGeneration<'a> {
     downstream_wire_condition: WireCondition,
     prefill_reply_credit_limit: usize,
     lane_pool: Option<Arc<PersistentStageLanePool>>,
+    prediction_return: Option<PredictionReturnReceiver>,
     draft: Option<Arc<Mutex<DraftRunner>>>,
     speculative_window: usize,
     adaptive_speculative_window: bool,
@@ -1669,6 +1721,7 @@ struct SplitMultimodalGeneration<'a> {
     activation_width: i32,
     downstream_wire_condition: WireCondition,
     lane_pool: Arc<PersistentStageLanePool>,
+    prediction_return: Option<PredictionReturnReceiver>,
 }
 
 struct EmbeddedLocalOutput {
@@ -1677,6 +1730,7 @@ struct EmbeddedLocalOutput {
     runtime_lock_hold_ms: f64,
 }
 
+#[derive(Default)]
 struct EmbeddedExecutionStats {
     stage0_compute_ms: f64,
     runtime_lock_wait_ms: f64,
@@ -1696,9 +1750,12 @@ struct EmbeddedStageExecution {
 
 struct EmbeddedFusedFirstDecode {
     predicted: i32,
+    predicted_tokens: Vec<i32>,
     reply_stats: StageReplyStats,
     execution: EmbeddedExecutionStats,
     elapsed_ms: f64,
+    token_phase: &'static str,
+    message_kind: &'static str,
 }
 
 struct EmbeddedSessionControl {

@@ -6,7 +6,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -169,6 +169,59 @@ fn stage0_full_prefill_record_plan_includes_shared_prefix_candidate() {
         .iter()
         .find(|identity| identity.identity.token_count == 2214)
         .expect("record plan should keep exact first prompt");
+    let lookup_exact = lookup_plan
+        .iter()
+        .find(|identity| identity.identity.token_count == 2231)
+        .expect("lookup plan should probe exact second prompt");
+
+    assert_eq!(recorded_shared.page_id, lookup_shared.page_id);
+    assert_ne!(recorded_exact.page_id, lookup_exact.page_id);
+}
+
+#[test]
+fn stage0_chunked_prefill_record_plan_includes_shared_prefix_candidate() {
+    let config = prefix_cache_test_config();
+    let kv = KvStageIntegration::from_config(&config)
+        .unwrap()
+        .expect("resident prefix cache enabled");
+    let base = prefix_cache_test_base();
+    let recorded_tokens = (0..2214).collect::<Vec<_>>();
+    let mut lookup_tokens = recorded_tokens.clone();
+    lookup_tokens.extend(100_000..100_017);
+
+    let record_plan = super::prefix_cache::stage0_prefill_record_identities(
+        &kv,
+        &config,
+        &base,
+        0,
+        &recorded_tokens,
+    );
+    let lookup_plan = kv.lookup_identities(&config, &base, 0, &lookup_tokens);
+
+    let record_counts = record_plan
+        .iter()
+        .map(|identity| identity.identity.token_count)
+        .collect::<Vec<_>>();
+    let lookup_counts = lookup_plan
+        .iter()
+        .map(|identity| identity.identity.token_count)
+        .collect::<Vec<_>>();
+
+    assert_eq!(record_counts, vec![2214, 2176]);
+    assert!(lookup_counts.contains(&2176));
+
+    let recorded_shared = record_plan
+        .iter()
+        .find(|identity| identity.identity.token_count == 2176)
+        .expect("chunked record plan should include shared grid prefix");
+    let lookup_shared = lookup_plan
+        .iter()
+        .find(|identity| identity.identity.token_count == 2176)
+        .expect("lookup plan should probe shared grid prefix");
+    let recorded_exact = record_plan
+        .iter()
+        .find(|identity| identity.identity.token_count == 2214)
+        .expect("chunked record plan should keep exact first prompt");
     let lookup_exact = lookup_plan
         .iter()
         .find(|identity| identity.identity.token_count == 2231)
@@ -1052,6 +1105,7 @@ fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
         generation_limit: Arc::new(Semaphore::new(1)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: 1,
+        generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: None,
         kv: None,
     })
@@ -1227,6 +1281,7 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
             downstream_wire_condition: WireCondition::new(0.0, None)?,
             prefill_reply_credit_limit: 0,
             lane_pool: Some(lane_pool),
+            prediction_returns: None,
         },
         draft: None,
         speculative_window: 0,
@@ -1234,6 +1289,7 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
         generation_limit: Arc::new(Semaphore::new(1)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: 1,
+        generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: None,
         kv: None,
     };
@@ -1291,6 +1347,81 @@ fn message_content_to_generation_text_rejects_remote_media_urls() {
     assert_eq!(
         error.body().error.code.as_deref(),
         Some("unsupported_model_feature")
+    );
+}
+
+#[test]
+fn rescued_audio_media_becomes_text_only_before_prompt_media_extraction() {
+    let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "auto",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "please transcribe this"},
+                {"type": "input_audio", "input_audio": {
+                    "data": "YWJj",
+                    "format": "wav"
+                }}
+            ]
+        }],
+        "mesh_hooks": true
+    }))
+    .unwrap();
+    let media = openai_frontend::first_chat_media(&request.messages).expect("media");
+
+    apply_chat_hook_outcome(
+        &mut request,
+        &ChatHookOutcome::injected_with_consumed_media("[Audio context: hello]\n\n", media),
+    );
+
+    let content = request.messages[0].content.as_ref().expect("content");
+    let mut media = Vec::new();
+    let text = message_content_to_generation_text(content, "<__media__>", &mut media)
+        .expect("generation text");
+
+    assert!(media.is_empty());
+    assert!(!text.contains("<__media__>"));
+    assert!(text.contains("[Audio context: hello]"));
+    assert!(text.contains("please transcribe this"));
+}
+
+#[test]
+fn rescued_media_leaves_unhandled_second_media_in_prompt_media() {
+    let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "auto",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "compare these"},
+                {"type": "input_audio", "input_audio": {
+                    "data": "YXVkaW8=",
+                    "format": "wav"
+                }},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64,aW1hZ2U="
+                }}
+            ]
+        }],
+        "mesh_hooks": true
+    }))
+    .unwrap();
+    let media = openai_frontend::first_chat_media(&request.messages).expect("media");
+
+    apply_chat_hook_outcome(
+        &mut request,
+        &ChatHookOutcome::injected_with_consumed_media("[Audio context: hello]\n\n", media),
+    );
+
+    let content = request.messages[0].content.as_ref().expect("content");
+    let mut media = Vec::new();
+    let text = message_content_to_generation_text(content, "<__media__>", &mut media)
+        .expect("generation text");
+
+    assert_eq!(media.len(), 1);
+    assert_eq!(media[0].bytes, b"image");
+    assert_eq!(
+        text,
+        "[Audio context: hello]\n\n\ncompare these\n<__media__>"
     );
 }
 
@@ -1361,6 +1492,55 @@ fn restore_prefill_decode_message_carries_chat_sampling_metadata() {
     assert_eq!(decoded.tokens, vec![101, 102, 103, 104]);
     assert_eq!(decoded.sampling, Some(sampling));
     assert_eq!(decoded.chat_sampling_metadata.as_deref(), Some(metadata));
+}
+
+#[test]
+fn reusable_decode_message_updates_hot_path_fields() {
+    let sampling = WireSamplingConfig {
+        flags: 1,
+        seed: 7,
+        ..WireSamplingConfig::default()
+    };
+    let mut message = ReusableDecodeMessage::new(
+        WireActivationDType::F16,
+        ReusableDecodeMessageArgs {
+            request_id: 11,
+            session_id: 13,
+            prompt_token_count: 4,
+            base_pos_start: 4,
+            sampling: Some(sampling.clone()),
+            sideband_capacity: 4,
+        },
+    )
+    .unwrap();
+
+    let first = message.update(0, 104).unwrap();
+    assert_eq!(first.kind, WireMessageKind::DecodeEmbd);
+    assert_eq!(first.request_id, 11);
+    assert_eq!(first.session_id, 13);
+    assert_eq!(first.sampling, Some(sampling.clone()));
+    assert_eq!(first.pos_start, 4);
+    assert_eq!(first.token_count, 1);
+    assert_eq!(first.state.prompt_token_count, 4);
+    assert_eq!(first.state.decode_step, 0);
+    assert_eq!(first.state.current_token, 104);
+    assert_eq!(first.tokens, vec![104]);
+
+    let second = message
+        .update_with_tokens(1, 105, &[101, 102, 104, 105])
+        .unwrap();
+    assert_eq!(second.request_id, 11);
+    assert_eq!(second.session_id, 13);
+    assert_eq!(second.sampling, Some(sampling));
+    assert_eq!(second.pos_start, 5);
+    assert_eq!(second.token_count, 1);
+    assert_eq!(second.state.prompt_token_count, 4);
+    assert_eq!(second.state.decode_step, 1);
+    assert_eq!(second.state.current_token, 105);
+    assert_eq!(second.tokens, vec![101, 102, 104, 105]);
+    assert!(second.positions.is_empty());
+    assert!(second.activation.is_empty());
+    assert!(second.raw_bytes.is_empty());
 }
 
 #[test]
@@ -1934,10 +2114,10 @@ fn prefill_chunk_policy_keeps_legacy_schedule_behavior() {
     })
     .unwrap();
     let mut planner = policy.planner();
-    assert_eq!(planner.chunk_size_for(0), 128);
-    assert_eq!(planner.chunk_size_for(1), 256);
-    assert_eq!(planner.chunk_size_for(2), 384);
-    assert_eq!(planner.chunk_size_for(3), 384);
+    assert_eq!(planner.chunk_size_for(0, 512), 128);
+    assert_eq!(planner.chunk_size_for(1, 512), 256);
+    assert_eq!(planner.chunk_size_for(2, 512), 384);
+    assert_eq!(planner.chunk_size_for(3, 512), 384);
 }
 
 #[test]
@@ -1954,19 +2134,19 @@ fn prefill_adaptive_ramp_grows_when_downstream_wait_is_hidden() {
     })
     .unwrap();
     let mut planner = policy.planner();
-    assert_eq!(planner.chunk_size_for(0), 128);
+    assert_eq!(planner.chunk_size_for(0, 512), 128);
     planner.observe(PrefillChunkObservation {
         compute_ms: 100.0,
         forward_write_ms: 5.0,
         downstream_wait_ms: 20.0,
     });
-    assert_eq!(planner.chunk_size_for(1), 256);
+    assert_eq!(planner.chunk_size_for(1, 512), 256);
     planner.observe(PrefillChunkObservation {
         compute_ms: 100.0,
         forward_write_ms: 5.0,
         downstream_wait_ms: 20.0,
     });
-    assert_eq!(planner.chunk_size_for(2), 384);
+    assert_eq!(planner.chunk_size_for(2, 512), 384);
 }
 
 #[test]
@@ -1983,13 +2163,13 @@ fn prefill_adaptive_ramp_can_advance_without_observations() {
     })
     .unwrap();
     let mut planner = policy.planner();
-    assert_eq!(planner.chunk_size_for(0), 128);
+    assert_eq!(planner.chunk_size_for(0, 512), 128);
     planner.advance_without_observation();
-    assert_eq!(planner.chunk_size_for(1), 256);
+    assert_eq!(planner.chunk_size_for(1, 512), 256);
     planner.advance_without_observation();
-    assert_eq!(planner.chunk_size_for(2), 384);
+    assert_eq!(planner.chunk_size_for(2, 512), 384);
     planner.advance_without_observation();
-    assert_eq!(planner.chunk_size_for(3), 384);
+    assert_eq!(planner.chunk_size_for(3, 512), 384);
 }
 
 #[test]
@@ -2011,13 +2191,89 @@ fn prefill_adaptive_ramp_backs_off_when_wait_is_exposed() {
         forward_write_ms: 5.0,
         downstream_wait_ms: 10.0,
     });
-    assert_eq!(planner.chunk_size_for(1), 256);
+    assert_eq!(planner.chunk_size_for(1, 512), 256);
     planner.observe(PrefillChunkObservation {
         compute_ms: 100.0,
         forward_write_ms: 5.0,
         downstream_wait_ms: 150.0,
     });
-    assert_eq!(planner.chunk_size_for(2), 128);
+    assert_eq!(planner.chunk_size_for(2, 512), 128);
+}
+
+#[test]
+fn prefill_adaptive_ramp_backs_off_when_write_is_exposed() {
+    let policy = PrefillChunkPolicy::parse(PrefillChunkPolicyArgs {
+        policy: "adaptive-ramp",
+        schedule: None,
+        fixed_chunk_size: 256,
+        adaptive_start: 128,
+        adaptive_step: 128,
+        adaptive_max: 384,
+        schedule_arg: "--prefill-chunk-schedule",
+        policy_arg: "--prefill-chunk-policy",
+    })
+    .unwrap();
+    let mut planner = policy.planner();
+    planner.advance_without_observation();
+    assert_eq!(planner.chunk_size_for(1, 512), 256);
+    planner.observe(PrefillChunkObservation {
+        compute_ms: 100.0,
+        forward_write_ms: 90.0,
+        downstream_wait_ms: 0.0,
+    });
+    assert_eq!(planner.chunk_size_for(2, 512), 128);
+}
+
+#[test]
+fn prefill_adaptive_ramp_keeps_short_prompts_fixed() {
+    let policy = PrefillChunkPolicy::parse(PrefillChunkPolicyArgs {
+        policy: "adaptive-ramp",
+        schedule: None,
+        fixed_chunk_size: 256,
+        adaptive_start: 128,
+        adaptive_step: 128,
+        adaptive_max: 384,
+        schedule_arg: "--prefill-chunk-schedule",
+        policy_arg: "--prefill-chunk-policy",
+    })
+    .unwrap();
+    let mut planner = policy.planner();
+
+    assert_eq!(planner.chunk_size_for(0, 256), 256);
+    assert_eq!(planner.chunk_size_for(0, 257), 128);
+}
+
+#[test]
+fn prefill_transport_ewma_seeds_adaptive_ramp() {
+    let config = prefix_cache_test_config();
+    let pool = PersistentStageLanePool {
+        config: config.clone(),
+        timeout_secs: 5,
+        telemetry: Telemetry::new(None, 1, config, crate::telemetry::TelemetryLevel::Off),
+        lanes: Mutex::new(Vec::new()),
+        prefill_transport: Mutex::new(PrefillTransportEstimate::default()),
+        next_lane_id: AtomicU64::new(0),
+        capacity: 1,
+    };
+    let mut stats = StageReplyStats::default();
+    stats.observe_prefill_edge_transport(1, 1_000, 0, 1_048_576);
+    pool.observe_prefill_transport(&stats, 10.0, 1);
+
+    let policy = PrefillChunkPolicy::parse(PrefillChunkPolicyArgs {
+        policy: "adaptive-ramp",
+        schedule: None,
+        fixed_chunk_size: 256,
+        adaptive_start: 128,
+        adaptive_step: 128,
+        adaptive_max: 384,
+        schedule_arg: "--prefill-chunk-schedule",
+        policy_arg: "--prefill-chunk-policy",
+    })
+    .unwrap();
+    let mut planner = policy.planner();
+    planner.observe(pool.prefill_transport_seed().unwrap());
+
+    assert_eq!(planner.chunk_size_for(0, 512), 256);
 }
 
 #[test]

@@ -42,6 +42,12 @@ impl StageOpenAiBackend {
                 token_ids,
                 None,
                 false,
+                stage_output_activation_capacity(
+                    request.config,
+                    message.token_count,
+                    request.activation_width,
+                )
+                .map_err(openai_backend_error)?,
             )
             .map_err(openai_backend_error)?
             .2;
@@ -71,14 +77,13 @@ impl StageOpenAiBackend {
         .map_err(openai_io_error)?;
         let forward_write_ms = write_timer.elapsed_ms();
         let wait_timer = PhaseTimer::start();
-        let reply = recv_reply(&mut *downstream).map_err(openai_io_error)?;
+        let reply = request
+            .prediction_return
+            .as_ref()
+            .ok_or_else(|| OpenAiError::backend("missing direct prediction return receiver"))?
+            .recv_expected(expected_reply)
+            .map_err(openai_backend_error)?;
         let downstream_wait_ms = wait_timer.elapsed_ms();
-        if reply.kind != expected_reply {
-            return Err(OpenAiError::backend(format!(
-                "expected {expected_reply:?} reply from downstream, got {:?}",
-                reply.kind
-            )));
-        }
         stats.merge(reply.stats);
         if message.kind == WireMessageKind::VerifySpan {
             stats.verify_span_compute_us += ms_to_us(stage0_compute_ms);

@@ -611,11 +611,15 @@ fn make_test_state_peer(seed: u8, role: mesh::NodeRole) -> mesh::PeerInfo {
             id,
             addrs: Default::default(),
         },
+        mesh_id: None,
+        mesh_policy_hash: None,
+        genesis_policy: None,
         role,
         models: vec![],
         vram_bytes: 0,
         rtt_ms: None,
         model_source: None,
+        admitted: true,
         serving_models: vec![],
         hosted_models: vec![],
         hosted_models_known: false,
@@ -639,6 +643,7 @@ fn make_test_state_peer(seed: u8, role: mesh::NodeRole) -> mesh::PeerInfo {
         served_model_descriptors: vec![],
         served_model_runtime: vec![],
         owner_attestation: None,
+        release_attestation_summary: crate::ReleaseAttestationSummary::default(),
         artifact_transfer_supported: false,
         stage_protocol_generation_supported: false,
         stage_status_list_supported: false,
@@ -647,6 +652,7 @@ fn make_test_state_peer(seed: u8, role: mesh::NodeRole) -> mesh::PeerInfo {
         advertised_model_throughput: vec![],
 
         display_rtt: None,
+        selected_path: None,
         propagated_latency: None,
     }
 }
@@ -806,6 +812,159 @@ async fn build_test_mesh_api() -> MeshApi {
     build_test_mesh_api_with_api_port(3131).await
 }
 
+fn mesh_requirements_test_policy_for_owner(
+    origin_owner_id: impl Into<String>,
+) -> crate::MeshGenesisPolicy {
+    crate::MeshGenesisPolicy::new(
+        origin_owner_id,
+        1_717_171_717_000,
+        crate::MeshRequirements {
+            release_attestation: crate::ReleaseAttestationRequirement {
+                required: true,
+                allowed_signer_keys: vec!["trusted-release".into()],
+            },
+            ..crate::MeshRequirements::unrestricted()
+        },
+    )
+    .expect("test policy should be valid")
+}
+
+fn mesh_requirements_test_policy() -> crate::MeshGenesisPolicy {
+    mesh_requirements_test_policy_for_owner("owner-123")
+}
+
+pub(crate) fn assert_mesh_requirements_status_excludes_rejected_peers_from_admitted_list() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let state = build_test_mesh_api().await;
+            let node = state.node().await;
+            let remote = mesh::Node::new_for_tests(mesh::NodeRole::Worker)
+                .await
+                .unwrap();
+            let policy = mesh_requirements_test_policy();
+            node.set_active_mesh_policy_for_tests(policy.clone()).await;
+            remote.set_active_mesh_policy_for_tests(policy).await;
+
+            node.sync_from_peer_for_tests(&remote).await;
+
+            let status = state.status().await;
+            assert!(
+                status.peers.is_empty(),
+                "rejected peers must not appear admitted"
+            );
+            assert_eq!(status.recent_mesh_rejections.len(), 1);
+            assert_eq!(
+                status.recent_mesh_rejections[0].reason,
+                crate::MeshRequirementRejectReason::CertifiedBinaryRequired
+            );
+        });
+}
+
+pub(crate) fn assert_mesh_requirements_status_reports_policy_hash_read_only() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let state = build_test_mesh_api().await;
+            let node = state.node().await;
+            let expected = node
+                .set_active_mesh_policy_for_tests(mesh_requirements_test_policy())
+                .await;
+
+            let payload = serde_json::to_value(state.status().await).unwrap();
+            assert_eq!(
+                payload["mesh_requirements"]["policy_hash"],
+                serde_json::Value::String(expected.policy_hash.clone())
+            );
+            assert_eq!(
+                payload["mesh_requirements"]["requirements"]["release_attestation"]["required"],
+                serde_json::Value::Bool(true)
+            );
+            let payload_text = payload.to_string();
+            assert!(!payload_text.contains("signature"));
+            assert!(!payload_text.contains("serialized_addrs"));
+            assert!(!payload_text.contains("origin_sign_public_key"));
+        });
+}
+
+pub(crate) fn assert_mesh_requirements_certified_binary_required_event_text() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let state = build_test_mesh_api().await;
+            let node = state.node().await;
+            let remote = mesh::Node::new_for_tests(mesh::NodeRole::Worker)
+                .await
+                .unwrap();
+            let policy = mesh_requirements_test_policy();
+            node.set_active_mesh_policy_for_tests(policy.clone()).await;
+            remote.set_active_mesh_policy_for_tests(policy).await;
+
+            node.sync_from_peer_for_tests(&remote).await;
+
+            let status = state.status().await;
+            assert_eq!(
+                status.recent_mesh_rejections[0].message,
+                "this mesh requires a certified mesh-llm binary; use a certified compiled binary to join."
+            );
+        });
+}
+
+pub(crate) fn assert_mesh_requirements_rejection_events_do_not_expose_tokens() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let state = build_test_mesh_api().await;
+            let node = state.node().await;
+            let owner = OwnerKeypair::generate();
+            let signed_policy = crate::SignedMeshGenesisPolicy::sign(
+                mesh_requirements_test_policy_for_owner(owner.owner_id()),
+                &owner,
+            )
+            .unwrap();
+            let mut token = crate::SignedBootstrapToken::sign(
+                vec![
+                    serde_json::to_vec(
+                        &mesh::Node::decode_invite_token(&node.invite_token().await).unwrap(),
+                    )
+                    .unwrap(),
+                ],
+                &signed_policy,
+                Some(1),
+                &owner,
+            )
+            .unwrap();
+            token.signature[0] ^= 0xFF;
+            let invite_token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&token).unwrap());
+
+            let err = node
+                .join(&invite_token)
+                .await
+                .expect_err("join should reject tampered token");
+            assert!(
+                err.to_string().contains("bootstrap_token_invalid")
+                    || err.to_string().contains("join rejected")
+            );
+
+            let payload = serde_json::to_value(state.status().await).unwrap();
+            let payload_text = payload.to_string();
+            assert!(!payload_text.contains(&invite_token));
+            assert!(
+                !payload_text
+                    .contains(&base64::engine::general_purpose::STANDARD.encode(&token.signature))
+            );
+        });
+}
+
 async fn build_test_mesh_api_with_plugin_manager(
     api_port: u16,
     plugin_manager: plugin::PluginManager,
@@ -830,6 +989,32 @@ async fn build_test_mesh_api_with_plugin_manager(
         runtime_data_collector,
         runtime_data_producer,
     })
+}
+
+async fn build_inference_endpoint_plugin_manager(models: &[&str]) -> plugin::PluginManager {
+    let resolved_plugins = plugin::ResolvedPlugins {
+        externals: vec![],
+        inactive: vec![],
+    };
+    let (mesh_tx, _mesh_rx) = mpsc::channel(1);
+    let plugin_manager = plugin::PluginManager::start(
+        &resolved_plugins,
+        plugin::PluginHostMode {
+            mesh_visibility: MeshVisibility::Private,
+        },
+        mesh_tx,
+    )
+    .await
+    .unwrap();
+    plugin_manager
+        .set_test_inference_endpoints(vec![plugin::InferenceEndpointRoute {
+            plugin_name: "endpoint-plugin".into(),
+            endpoint_id: "endpoint-plugin".into(),
+            address: "http://127.0.0.1:8000/v1".into(),
+            models: models.iter().map(|model| (*model).to_string()).collect(),
+        }])
+        .await;
+    plugin_manager
 }
 
 #[tokio::test]
@@ -1375,6 +1560,7 @@ async fn spawn_owner_control_test_server() -> OwnerControlTestServer {
                             models: Vec::new(),
                             plugins: Vec::new(),
                             config_toml: None,
+                            mesh_requirements: None,
                         }),
                         hostname: Some("control-target".to_string()),
                     }),
@@ -1646,12 +1832,16 @@ fn make_test_peer(
             id: peer_id,
             addrs: Default::default(),
         },
+        mesh_id: None,
+        mesh_policy_hash: None,
+        genesis_policy: None,
         role,
         first_joined_mesh_ts: None,
         models: Vec::new(),
         vram_bytes: 24_000_000_000,
         rtt_ms: None,
         model_source: None,
+        admitted: true,
         serving_models: serving_models.into_iter().map(str::to_string).collect(),
         hosted_models: hosted_models.into_iter().map(str::to_string).collect(),
         hosted_models_known,
@@ -1675,6 +1865,7 @@ fn make_test_peer(
         served_model_descriptors: Vec::new(),
         served_model_runtime: Vec::new(),
         owner_attestation: None,
+        release_attestation_summary: crate::ReleaseAttestationSummary::default(),
         artifact_transfer_supported: false,
         stage_protocol_generation_supported: false,
         stage_status_list_supported: false,
@@ -1682,6 +1873,7 @@ fn make_test_peer(
         advertised_model_throughput: vec![],
 
         display_rtt: None,
+        selected_path: None,
         propagated_latency: None,
     }
 }
@@ -2214,6 +2406,18 @@ async fn request_management_json(state: MeshApi, path: &str) -> serde_json::Valu
     json_body(&response)
 }
 
+fn response_header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+    response
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            header_name.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+}
+
 fn assert_runtime_status_payload(status_body: &serde_json::Value) {
     assert_eq!(status_body["model_name"], json!("collector-model"));
     assert_eq!(status_body["llama_ready"], json!(true));
@@ -2391,6 +2595,83 @@ async fn runtime_data_api_routes_remain_payload_stable() {
         request_management_json(state, "/api/plugins/collector-plugin/manifest").await;
     assert_eq!(manifest_body["capabilities"], json!(["chat"]));
     assert_eq!(manifest_body["endpoints"].as_array().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn status_includes_external_inference_endpoint_models() {
+    let plugin_manager =
+        build_inference_endpoint_plugin_manager(&["lemonade-small", "lemonade-large"]).await;
+    let state = build_test_mesh_api_with_plugin_manager(3131, plugin_manager).await;
+
+    let status_body = request_management_json(state, "/api/status").await;
+
+    for field in ["models", "serving_models", "hosted_models"] {
+        let models = status_body[field]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} should be an array"));
+        assert!(
+            models.iter().any(|model| model == "lemonade-small"),
+            "{field} should include plugin endpoint model: {status_body}"
+        );
+        assert!(
+            models.iter().any(|model| model == "lemonade-large"),
+            "{field} should include plugin endpoint model: {status_body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn management_mcp_endpoint_initializes_streamable_http_session() {
+    let state = build_test_mesh_api().await;
+    let (addr, handle) = spawn_management_test_server(state).await;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "mesh-api-test",
+                "version": "0.1.0"
+            }
+        }
+    })
+    .to_string();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /mcp HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Accept: application/json, text/event-stream\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response =
+        read_until_contains(&mut stream, b"\"serverInfo\"", Duration::from_secs(2)).await;
+    let response = String::from_utf8(response).unwrap();
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected MCP response: {response}"
+    );
+    assert_eq!(
+        response_header(&response, "content-type"),
+        Some("text/event-stream")
+    );
+    assert!(
+        response_header(&response, "mcp-session-id").is_some(),
+        "MCP initialize response should include a session id: {response}"
+    );
+    assert!(response.contains("\"serverInfo\""));
+    handle.abort();
 }
 
 #[tokio::test]
@@ -3679,6 +3960,58 @@ data: [DONE]
 
     handle.abort();
     let _ = upstream_handle.await;
+}
+
+#[tokio::test]
+async fn lan_details_uses_same_publication_metadata_as_mdns_advertisement() {
+    let state = build_test_mesh_api().await;
+    state
+        .set_mesh_discovery_mode(crate::network::discovery::MeshDiscoveryMode::Mdns)
+        .await;
+    state
+        .set_mesh_publication_metadata(
+            Some("garage-mesh".to_string()),
+            Some("workshop".to_string()),
+            Some(7),
+        )
+        .await;
+
+    let invite_token = state.node().await.invite_token().await;
+    let token_fingerprint = crate::network::discovery::lan_token_fingerprint(&invite_token);
+    let challenge = crate::network::discovery::lan_details_challenge(
+        &token_fingerprint,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
+    let proof = crate::network::discovery::lan_details_token_proof(&invite_token, &challenge);
+    let body = serde_json::json!({
+        "token_fingerprint": token_fingerprint,
+        "challenge": challenge,
+        "proof": proof,
+    })
+    .to_string();
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        crate::network::discovery::LAN_DETAILS_PATH,
+        body.len(),
+        body,
+    );
+    let (addr, handle) = spawn_management_test_server(state).await;
+    let response = send_management_request(addr, request).await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "expected LAN details success, got: {response}"
+    );
+    let payload = json_body(&response);
+    assert_eq!(payload["listing"]["name"], "garage-mesh");
+    assert_eq!(payload["listing"]["region"], "workshop");
+    assert_eq!(payload["listing"]["max_clients"], 7);
+    assert_eq!(payload["listing"]["invite_token"], "");
+
+    handle.await.unwrap().unwrap();
 }
 
 #[tokio::test]

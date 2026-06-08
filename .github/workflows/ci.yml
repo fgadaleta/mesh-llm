@@ -14,12 +14,14 @@ env:
   MODEL_URL: https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/9e6855bc4be717fca1ef21360a1db4b29d5c559a/SmolLM2-135M-Instruct-Q8_0.gguf
   MODEL_FILE: SmolLM2-135M-Instruct-Q8_0.gguf
   CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
   SCCACHE_GHA_ENABLED: "true"
   LLAMA_STAGE_BUILD_DIR: .deps/llama.cpp/build-stage-abi-static
 
 jobs:
   changes:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: read
@@ -70,17 +72,30 @@ jobs:
               - 'crates/mesh-llm-api-client/**'
               - 'crates/mesh-llm-api-server/**'
               - 'crates/mesh-llm-config/**'
+              - 'crates/mesh-llm-commands/**'
+              - 'crates/mesh-llm-events/**'
+              - 'crates/mesh-llm-hardware-profile/**'
+              - 'crates/mesh-llm-runtime-install/**'
+              - 'crates/mesh-llm-sdk/**'
+              - 'crates/mesh-llm-cli/**'
+              - 'crates/mesh-llm-embedded-runtime/**'
+              - 'crates/mesh-llm-tui/**'
               - 'crates/mesh-llm-console-server/**'
               - 'crates/mesh-llm-ffi/**'
               - 'crates/mesh-llm-nodejs/**'
               - 'crates/mesh-client/**'
               - 'crates/mesh-llm-identity/**'
+              - 'crates/mesh-llm-native-runtime/**'
               - 'crates/mesh-llm-protocol/**'
               - 'crates/mesh-llm-routing/**'
               - 'crates/mesh-llm-types/**'
               - 'sdk/**'
               - 'Package.swift'
-              - 'scripts/ci-native-sdk-smoke.sh'
+              - 'scripts/ci-rust-sdk-smoke.sh'
+              - 'scripts/ci-prepare-native-runtime.sh'
+              - 'scripts/ci-install-native-runtime.sh'
+              - 'scripts/package-sdk-console-assets.sh'
+              - 'scripts/verify-sdk-console-assets.sh'
               - 'scripts/ci-kotlin-sdk-smoke.sh'
               - 'scripts/ci-swift-sdk-smoke.sh'
               - 'scripts/ci-sdk-fixture.sh'
@@ -139,7 +154,7 @@ jobs:
   linux:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ui == 'true') && needs.changes.outputs.docs_only != 'true' }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -245,7 +260,7 @@ jobs:
         run: scripts/build-llama.sh
 
       - name: SDK and API crate tests
-        if: ${{ needs.changes.outputs.all_rust == 'true' || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-client') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-api-client') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-api-server') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-config') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-console-server') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-ffi') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-nodejs') }}
+        if: ${{ needs.changes.outputs.all_rust == 'true' || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-client') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-api-client') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-api-server') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-config') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-commands') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-events') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-hardware-profile') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-runtime-install') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-sdk') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-cli') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-tui') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-embedded-runtime') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-console-server') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-ffi') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-nodejs') }}
         env:
           AFFECTED: ${{ needs.changes.outputs.affected_crates }}
           ALL_RUST: ${{ needs.changes.outputs.all_rust }}
@@ -255,7 +270,7 @@ jobs:
             [ "$ALL_RUST" = "true" ] || jq -e --arg crate "$crate" 'index($crate) != null' <<<"$AFFECTED" >/dev/null
           }
 
-          for c in mesh-llm-client mesh-llm-api-client mesh-llm-api-server mesh-llm-config mesh-llm-console-server mesh-llm-ffi mesh-llm-nodejs; do
+          for c in mesh-llm-client mesh-llm-api-client mesh-llm-api-server mesh-llm-config mesh-llm-commands mesh-llm-events mesh-llm-hardware-profile mesh-llm-runtime-install mesh-llm-cli mesh-llm-tui mesh-llm-embedded-runtime mesh-llm-sdk mesh-llm-console-server mesh-llm-ffi mesh-llm-nodejs; do
             if should_test "$c"; then
               cargo test -p "$c"
             else
@@ -299,6 +314,15 @@ jobs:
       - name: Build mesh-llm binary (debug)
         run: cargo build -p mesh-llm --bin mesh-llm
 
+      - name: Restore Skippy smoke model cache
+        id: skippy_smoke_model_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/skippy-ci-smoke-models
+          key: ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-skippy-ci-smoke-models-SmolLM2-135M-Instruct.Q4_K_M.gguf-Falcon-H1-0.5B-Instruct-Q4_K_M.gguf-${{ hashFiles('.github/cache-version.txt') }}
+          restore-keys: |
+            ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-skippy-ci-smoke-models-
+
       - name: Unit tests
         if: ${{ needs.changes.outputs.all_rust == 'true' || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'model-artifact') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-host-runtime') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm') }}
         env:
@@ -321,8 +345,18 @@ jobs:
       - name: Skippy smoke tests
         timeout-minutes: 45
         env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
           WORK_DIR: ${{ runner.temp }}/skippy-ci-smoke
+          MODEL_DIR: ${{ runner.temp }}/skippy-ci-smoke-models
         run: scripts/skippy-ci-smoke.sh
+
+      - name: Save Skippy smoke model cache
+        if: ${{ github.ref == 'refs/heads/main' && steps.skippy_smoke_model_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/skippy-ci-smoke-models
+          key: ${{ steps.skippy_smoke_model_cache.outputs.cache-primary-key }}
 
       - name: Protocol compatibility matrix
         if: ${{ needs.changes.outputs.all_rust == 'true' || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-protocol') }}
@@ -357,6 +391,8 @@ jobs:
     uses: ./.github/workflows/hf-download-smoke.yml
     with:
       timeout_minutes: 15
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
   inference_smoke_tests:
     needs: [changes, linux]
@@ -366,11 +402,13 @@ jobs:
       artifact_name: ci-linux-inference-binaries
       mesh_binary_target: target/debug/mesh-llm
       cache_key_prefix: ''
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
   agent_live_smokes:
     needs: [changes, linux]
     if: ${{ (vars.MESH_AGENT_BASE_URL != '' || vars.MESH_OPENCODE_BASE_URL != '') && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.all_rust == 'true' || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'openai-frontend') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-client')) && needs.changes.outputs.docs_only != 'true' }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       MESH_AGENT_BASE_URL: ${{ vars.MESH_AGENT_BASE_URL || vars.MESH_OPENCODE_BASE_URL }}
@@ -383,8 +421,8 @@ jobs:
       OPENCODE_DISABLE_PRUNE: "true"
       OPENCODE_DISABLE_LSP_DOWNLOAD: "true"
     steps:
-      # Keep the self-hosted live-agent smoke on Node 20 actions so CI does not
-      # depend on the runner being upgraded in lockstep with GitHub-hosted images.
+      # Keep live-agent smoke on an explicit Node version so CI does not depend
+      # on GitHub-hosted image defaults.
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -424,18 +462,22 @@ jobs:
       model_cache_scope: two-node-smoke-model
       smoke_script: scripts/ci-two-node-client-serving-smoke.sh
       timeout_minutes: 20
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
-  native_sdk_smoke:
+  rust_sdk_smoke:
     needs: [changes, linux, inference_smoke_tests]
     if: ${{ needs.inference_smoke_tests.result == 'success' && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.sdk == 'true') && needs.changes.outputs.docs_only != 'true' }}
     uses: ./.github/workflows/sdk-smoke.yml
     with:
-      sdk_kind: native
+      sdk_kind: rust
       artifact_name: ci-linux-inference-binaries
       artifact_path: ci-artifacts/linux
       staged_binary_path: target/debug/mesh-llm
       model_cache_scope: sdk-smoke-model
-      runs_on: '"blacksmith-4vcpu-ubuntu-2404"'
+      runs_on: '"ubuntu-24.04"'
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
   kotlin_sdk_smoke:
     needs: [changes, linux, inference_smoke_tests]
@@ -447,7 +489,9 @@ jobs:
       artifact_path: ci-artifacts/linux
       staged_binary_path: target/debug/mesh-llm
       model_cache_scope: sdk-smoke-model
-      runs_on: '"blacksmith-4vcpu-ubuntu-2404"'
+      runs_on: '"ubuntu-24.04"'
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
   swift_sdk_smoke:
     needs: [changes, macos]
@@ -459,13 +503,15 @@ jobs:
       artifact_path: ci-artifacts/macos
       staged_binary_path: target/debug/mesh-llm
       model_cache_scope: sdk-smoke-model
-      runs_on: '"blacksmith-12vcpu-macos-latest"'
+      runs_on: '"macos-latest"'
       timeout_minutes: 40
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
   macos:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ui == 'true' || needs.changes.outputs.benchmarks == 'true') && needs.changes.outputs.docs_only != 'true' }}
-    runs-on: blacksmith-12vcpu-macos-latest
+    runs-on: macos-latest
     env:
       LLAMA_STAGE_BACKEND: metal
       LLAMA_STAGE_BUILD_DIR: .deps/llama.cpp/build-stage-abi-metal
@@ -539,7 +585,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .deps/llama.cpp/build-stage-abi-metal
-          key: ${{ env.CACHE_NAMESPACE }}-blacksmith-macos-latest-skippy-abi-metal-${{ hashFiles('scripts/build-mac.sh', 'scripts/build-llama.sh', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', 'Justfile', '.github/cache-version.txt') }}
+          key: ${{ env.CACHE_NAMESPACE }}-github-macos-latest-skippy-abi-metal-${{ hashFiles('scripts/build-mac.sh', 'scripts/build-llama.sh', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', 'Justfile', '.github/cache-version.txt') }}
       - name: Prepare patched llama.cpp ABI checkout
         if: steps.llama_cache.outputs.cache-hit != 'true'
         run: scripts/prepare-llama.sh pinned
@@ -582,13 +628,10 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.benchmarks == 'true') && needs.changes.outputs.docs_only != 'true' }}
     name: Linux CUDA slim
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     container:
       image: nvidia/cuda:${{ vars.CUDA_VERSION || '12.6.3' }}-devel-ubuntu22.04
     env:
-      LLAMA_STAGE_BUILD_DIR: .deps/llama-build/build-stage-abi-cuda-sm89
-      LLAMA_STAGE_BACKEND: cuda
-      LLAMA_STAGE_CUDA_ARCHITECTURES: "89"
       MESH_LLM_SKIP_UI: "1"
       # CI containers have no GPU driver (libcuda.so.1). Disable VMM and NCCL
       # to avoid linking libraries that require the CUDA driver at runtime.
@@ -629,7 +672,9 @@ jobs:
         run: mkdir -p crates/mesh-llm-ui/dist && printf '<html></html>' > crates/mesh-llm-ui/dist/index.html
 
       - name: Build Linux CUDA backend
-        run: just --shell bash --shell-arg -lc release-build-cuda 89
+        env:
+          MESH_CUDA_VERSION: "12.9.2"
+        run: just --shell bash --shell-arg -lc release-build-cuda
       - name: CLI smoke test
         run: |
           cuda_stub_runtime="$(mktemp -d)"
@@ -641,7 +686,7 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.benchmarks == 'true') && needs.changes.outputs.docs_only != 'true' }}
     name: Linux ROCm slim
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     container:
       image: rocm/dev-ubuntu-24.04:7.0-complete
     env:
@@ -694,7 +739,7 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.docs_only != 'true' }}
     name: Linux Vulkan
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     env:
       LLAMA_STAGE_BACKEND: vulkan
       LLAMA_STAGE_BUILD_DIR: .deps/llama-build/build-stage-abi-vulkan
@@ -742,7 +787,7 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.docs_only != 'true' }}
     name: Windows CPU
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: windows-2025
     env:
       RUN_WINDOWS_CPU_FULL: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.windows_cpu == 'true' }}
       LLAMA_STAGE_BACKEND: cpu
@@ -794,7 +839,7 @@ jobs:
       - name: Check mesh-llm binary on Windows
         if: ${{ env.RUN_WINDOWS_CPU_FULL != 'true' }}
         shell: pwsh
-        run: cargo check --locked -p mesh-llm --bin mesh-llm
+        run: cargo check --locked -p mesh-llm --bin mesh-llm --features dynamic-native-runtime
       - name: Check Node SDK addon on Windows
         shell: pwsh
         run: cargo check --locked -p mesh-llm-nodejs
@@ -813,7 +858,7 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.docs_only != 'true' }}
     name: Windows ${{ matrix.name }}
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: windows-2025
     env:
       RUN_WINDOWS_GPU: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.windows_gpu == 'true' }}
       LLAMA_STAGE_BUILD_DIR: .deps/llama.cpp/build-stage-abi-${{ matrix.backend }}

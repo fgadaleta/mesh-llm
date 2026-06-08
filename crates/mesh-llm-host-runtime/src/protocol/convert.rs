@@ -14,7 +14,7 @@ fn skippy_stage_subprotocols(
     let mut features = vec![skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_CONTROL.to_string()];
     if stage_protocol_generation_supported {
         features.push(
-            skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2.to_string(),
+            skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V3.to_string(),
         );
     }
     if artifact_transfer_supported {
@@ -47,7 +47,7 @@ fn supports_skippy_status_list(subprotocols: &[crate::proto::node::MeshSubprotoc
 fn supports_skippy_stage_generation(subprotocols: &[crate::proto::node::MeshSubprotocol]) -> bool {
     supports_skippy_stage_feature(
         subprotocols,
-        skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2,
+        skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V3,
     ) && supports_skippy_stage_feature(
         subprotocols,
         skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_CONTROL,
@@ -163,6 +163,24 @@ fn proto_owner_attestation_to_local(
     }
 }
 
+fn proto_release_attestation_to_local(
+    attestation: &crate::proto::node::ReleaseBuildAttestation,
+) -> crate::ReleaseBuildAttestation {
+    crate::ReleaseBuildAttestation {
+        version: attestation.version,
+        node_version: attestation.node_version.clone(),
+        build_id: attestation.build_id.clone(),
+        commit: attestation.commit.clone(),
+        target_triple: attestation.target_triple.clone(),
+        supported_protocol_generation_min: attestation.supported_protocol_generation_min,
+        supported_protocol_generation_max: attestation.supported_protocol_generation_max,
+        artifact_digest: attestation.artifact_digest.clone(),
+        signer_key_id: attestation.signer_key_id.clone(),
+        signature_algorithm: attestation.signature_algorithm.clone(),
+        signature: attestation.signature.clone(),
+    }
+}
+
 fn local_source_kind_to_proto(kind: crate::mesh::ModelSourceKind) -> i32 {
     match kind {
         crate::mesh::ModelSourceKind::Catalog => {
@@ -261,6 +279,45 @@ fn legacy_descriptor_from_identity(
         capabilities_known: false,
         capabilities: crate::models::ModelCapabilities::default(),
         topology: None,
+        metadata: None,
+    }
+}
+
+fn local_model_metadata_to_proto(
+    metadata: &crate::mesh::ServedModelMetadata,
+) -> crate::proto::node::ServedModelMetadata {
+    crate::proto::node::ServedModelMetadata {
+        architecture: metadata.architecture.clone(),
+        parameter_size: metadata.parameter_size.clone(),
+        parameter_count_b: metadata.parameter_count_b,
+        quant: metadata.quant.clone(),
+        native_context_length: metadata.native_context_length,
+        tokenizer: metadata.tokenizer.clone(),
+        layer_count: metadata.layer_count,
+        embedding_size: metadata.embedding_size,
+        head_count: metadata.head_count,
+        kv_head_count: metadata.kv_head_count,
+        expert_count: metadata.expert_count,
+        active_expert_count: metadata.active_expert_count,
+    }
+}
+
+fn proto_model_metadata_to_local(
+    metadata: &crate::proto::node::ServedModelMetadata,
+) -> crate::mesh::ServedModelMetadata {
+    crate::mesh::ServedModelMetadata {
+        architecture: metadata.architecture.clone(),
+        parameter_size: metadata.parameter_size.clone(),
+        parameter_count_b: metadata.parameter_count_b,
+        quant: metadata.quant.clone(),
+        native_context_length: metadata.native_context_length,
+        tokenizer: metadata.tokenizer.clone(),
+        layer_count: metadata.layer_count,
+        embedding_size: metadata.embedding_size,
+        head_count: metadata.head_count,
+        kv_head_count: metadata.kv_head_count,
+        expert_count: metadata.expert_count,
+        active_expert_count: metadata.active_expert_count,
     }
 }
 
@@ -552,6 +609,10 @@ pub(crate) fn local_ann_to_proto_ann(
                         }),
                 }
             }),
+            metadata: descriptor
+                .metadata
+                .as_ref()
+                .map(local_model_metadata_to_proto),
         })
         .collect();
     let served_model_runtime = ann
@@ -581,6 +642,7 @@ pub(crate) fn local_ann_to_proto_ann(
         model_source: ann.model_source.clone(),
         primary_serving: ann.serving_models.first().cloned(),
         mesh_id: ann.mesh_id.clone(),
+        mesh_policy_hash: ann.mesh_policy_hash.clone(),
         demand,
         available_model_sizes: ann.available_model_sizes.clone(),
         serialized_addr,
@@ -593,6 +655,18 @@ pub(crate) fn local_ann_to_proto_ann(
             .owner_attestation
             .as_ref()
             .and_then(local_owner_attestation_to_proto),
+        genesis_policy: ann
+            .genesis_policy
+            .as_ref()
+            .map(crate::SignedMeshGenesisPolicy::to_proto),
+        release_attestation: ann
+            .release_attestation
+            .as_ref()
+            .map(crate::ReleaseBuildAttestation::to_proto),
+        direct_admission_proof: ann
+            .direct_admission_proof
+            .as_ref()
+            .map(crate::DirectNodeAdmissionProof::to_proto),
         // Legacy GPU metric fields (29-32) are populated alongside `hardware` so that
         // pre-v0.60.0 peers that do not decode the new `hardware` block can still read
         // bandwidth/tflops/reserved data from the flat fields they already know.
@@ -693,6 +767,7 @@ pub(crate) fn proto_ann_to_local(
         version: pa.version.clone(),
         model_demand,
         mesh_id: pa.mesh_id.clone(),
+        mesh_policy_hash: pa.mesh_policy_hash.clone(),
         gpu_name: legacy_gpu_fields.gpu_name.or_else(|| pa.gpu_name.clone()),
         hostname: hardware
             .and_then(|hardware| hardware.hostname.clone())
@@ -765,6 +840,10 @@ pub(crate) fn proto_ann_to_local(
                                     }),
                                 }
                             }),
+                            metadata: descriptor
+                                .metadata
+                                .as_ref()
+                                .map(proto_model_metadata_to_local),
                         }
                     })
                     .collect();
@@ -787,6 +866,18 @@ pub(crate) fn proto_ann_to_local(
             .owner_attestation
             .as_ref()
             .map(proto_owner_attestation_to_local),
+        genesis_policy: pa
+            .genesis_policy
+            .as_ref()
+            .and_then(|policy| crate::SignedMeshGenesisPolicy::from_proto(policy).ok()),
+        release_attestation: pa
+            .release_attestation
+            .as_ref()
+            .map(proto_release_attestation_to_local),
+        direct_admission_proof: pa
+            .direct_admission_proof
+            .as_ref()
+            .and_then(|proof| crate::DirectNodeAdmissionProof::from_proto(proof).ok()),
         artifact_transfer_supported: supports_skippy_artifact_transfer(&pa.subprotocols),
         stage_protocol_generation_supported: supports_skippy_stage_generation(&pa.subprotocols),
         stage_status_list_supported: supports_skippy_status_list(&pa.subprotocols),
@@ -862,12 +953,22 @@ pub(crate) fn mesh_config_to_proto(
             args: p.args.clone(),
         })
         .collect();
+    let mesh_requirements = {
+        let runtime_requirements =
+            crate::plugin::mesh_requirements_config_to_runtime(&config.mesh_requirements);
+        if runtime_requirements == crate::MeshRequirements::unrestricted() {
+            None
+        } else {
+            Some(runtime_requirements.to_proto())
+        }
+    };
     crate::proto::node::NodeConfigSnapshot {
         version: config.version.unwrap_or(1),
         gpu: Some(crate::proto::node::NodeGpuConfig { assignment }),
         models,
         plugins,
         config_toml: crate::plugin::config_to_toml(config).ok(),
+        mesh_requirements,
     }
 }
 
@@ -956,14 +1057,22 @@ fn legacy_proto_config_to_mesh(
             command: p.command.clone(),
             args: p.args.clone(),
             url: None,
+            startup: Default::default(),
         })
         .collect();
+    let mesh_requirements = snapshot
+        .mesh_requirements
+        .as_ref()
+        .and_then(|proto| crate::MeshRequirements::from_proto(proto).ok())
+        .map(|requirements| crate::plugin::mesh_requirements_config_from_runtime(&requirements))
+        .unwrap_or_default();
     MeshConfig {
         version: Some(snapshot.version),
         gpu: GpuConfig {
             assignment,
             parallel: None,
         },
+        mesh_requirements,
         owner_control: Default::default(),
         telemetry: Default::default(),
         defaults: None,
@@ -1002,5 +1111,60 @@ pub(crate) fn proto_route_table_to_local(table: &crate::proto::node::RouteTable)
     RoutingTable {
         hosts,
         mesh_id: table.mesh_id.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::requirements::peer_release_attestation_status;
+
+    #[test]
+    fn proto_ann_to_local_preserves_malformed_release_attestation_for_later_rejection() {
+        let proto = crate::proto::node::PeerAnnouncement {
+            endpoint_id: vec![1; 32],
+            role: crate::proto::node::NodeRole::Worker as i32,
+            release_attestation: Some(crate::proto::node::ReleaseBuildAttestation {
+                version: 0,
+                node_version: String::new(),
+                build_id: String::new(),
+                commit: String::new(),
+                target_triple: String::new(),
+                supported_protocol_generation_min: None,
+                supported_protocol_generation_max: None,
+                artifact_digest: None,
+                signer_key_id: String::new(),
+                signature_algorithm: String::new(),
+                signature: vec![],
+            }),
+            ..Default::default()
+        };
+
+        let (_addr, ann) = proto_ann_to_local(&proto).expect("announcement should decode");
+        let attestation = ann
+            .release_attestation
+            .as_ref()
+            .expect("malformed attestation should still be preserved");
+
+        assert_eq!(
+            peer_release_attestation_status(Some(attestation)),
+            crate::PeerReleaseAttestationStatus::Invalid
+        );
+    }
+
+    #[test]
+    fn proto_ann_to_local_preserves_missing_release_attestation_as_none() {
+        let proto = crate::proto::node::PeerAnnouncement {
+            endpoint_id: vec![1; 32],
+            role: crate::proto::node::NodeRole::Worker as i32,
+            ..Default::default()
+        };
+
+        let (_addr, ann) = proto_ann_to_local(&proto).expect("announcement should decode");
+        assert!(ann.release_attestation.is_none());
+        assert_eq!(
+            peer_release_attestation_status(ann.release_attestation.as_ref()),
+            crate::PeerReleaseAttestationStatus::Unsigned
+        );
     }
 }

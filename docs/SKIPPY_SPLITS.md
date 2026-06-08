@@ -97,10 +97,29 @@ consistent without requiring you to publish a package repository first.
 ```bash
 curl -s http://localhost:3131/api/status | jq .
 curl -s http://localhost:9337/v1/models | jq '.data[].id'
+mesh-llm doctor split --model-ref meshllm/Qwen3-8B-Q4_K_M-layers --port 3131
 ```
 
 The stage runtime status is exposed through the management API and web console.
 The OpenAI model list should include the full model id once stage 0 is ready.
+The split doctor explains which peers are eligible, which peers were excluded,
+and the exact next step when the coordinator sees only itself as a valid split
+participant.
+
+For maintainer debugging, add `--output-dir <dir>`. The doctor bundle includes
+`split-readiness.json`, management API snapshots for runtime/stage/llama status,
+plugin startup/provider/endpoint snapshots, `skippy-diagnostics.json`, and the
+active instance's `skippy-native.log` when the local runtime directory can be
+matched to the console port.
+
+On Windows, collect a shareable diagnostic bundle from already-running nodes:
+
+```powershell
+.\contrib\windows\CollectSplitDiagnostics.ps1 `
+  -Model meshllm/Qwen3-8B-Q4_K_M-layers `
+  -ConsoleUrls http://127.0.0.1:3131 `
+  -ApiUrls http://127.0.0.1:9337/v1
+```
 
 ## Cache behavior
 
@@ -142,6 +161,16 @@ materialization:
 mesh-llm models certify hf://meshllm/Qwen3-8B-Q4_K_M-layers --package-only --report-out cert.json
 ```
 
+Use package-only certification as the rollout preflight for published package
+refs. It should fail before a split model becomes routable when package
+resolution, manifest shape, artifact size/SHA, missing stage files,
+tokenizer/projector sidecars, or local materialization are not clean enough for
+serving. For a local package directory, run the package-local preflight first:
+
+```bash
+skippy-model-package preflight ./model-package --stages 2 --verify-sha256
+```
+
 Runtime verification additionally checks a running OpenAI-compatible endpoint:
 
 ```bash
@@ -176,4 +205,4 @@ transfer. Received artifacts are size/SHA-256 verified and installed atomically.
 - [LAYER_PACKAGE_REPOS.md](LAYER_PACKAGE_REPOS.md) explains how to contribute packages.
 - [specs/layer-package-repos.md](specs/layer-package-repos.md) is the manifest spec.
 - [skippy/FAMILY_STATUS.md](skippy/FAMILY_STATUS.md) lists certified families.
-- [skippy/TOPOLOGY_PLANNER.md](skippy/TOPOLOGY_PLANNER.md) documents topology planning.
+- [skippy/TOPOLOGY_PLANNER.md](skippy/TOPOLOGY_PLANNER.md) documents topology planning, including latency-aware physical stage counts.

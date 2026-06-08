@@ -21,9 +21,89 @@ fi
 
 mkdir -p "$(dirname "$LLAMA_WORKDIR")"
 
-if [[ ! -d "$LLAMA_WORKDIR/.git" ]]; then
-  rm -rf "$LLAMA_WORKDIR"
-  git clone --filter=blob:none "$LLAMA_UPSTREAM_URL" "$LLAMA_WORKDIR"
+# All git operations below run as `git -C "$LLAMA_WORKDIR"`. `git -C` only
+# changes directory; it does NOT pin git to that directory. If $LLAMA_WORKDIR
+# has no valid .git (e.g. an interrupted/partial clone), git's normal upward
+# repository discovery walks PAST it to the nearest enclosing .git. When
+# mesh-llm is vendored inside another git repo's working tree (cargo/hermit git
+# checkouts do exactly this), that enclosing repo gets mutated instead -- its
+# origin rewritten by `remote set-url`, its HEAD clobbered by `git am`. Pin the
+# ceiling to the workdir's parent so discovery can never escape upward: a
+# missing .git then errors loudly here instead of corrupting the parent repo.
+# This is transparent to a normal build, where $LLAMA_WORKDIR has its own .git
+# at or below this ceiling.
+#
+# Resolve to a physical path (pwd -P): git compares GIT_CEILING_DIRECTORIES
+# against symlink-resolved paths, so a logical path could silently fail to
+# match and let discovery escape. Fail loudly if resolution fails rather than
+# exporting an empty ceiling, which would disable the guard entirely.
+LLAMA_WORKDIR_PARENT="$(cd "$(dirname "$LLAMA_WORKDIR")" && pwd -P)" || {
+  echo "error: cannot resolve parent directory of LLAMA_WORKDIR ($LLAMA_WORKDIR)" >&2
+  exit 1
+}
+export GIT_CEILING_DIRECTORIES="$LLAMA_WORKDIR_PARENT"
+
+git_retry() {
+  local attempt=1
+  local max_attempts="${LLAMA_GIT_MAX_ATTEMPTS:-4}"
+  local delay="${LLAMA_GIT_RETRY_DELAY_SECONDS:-10}"
+  local status=0
+
+  while (( attempt <= max_attempts )); do
+    if "$@"; then
+      return 0
+    else
+      status=$?
+    fi
+
+    if (( attempt == max_attempts )); then
+      return "$status"
+    fi
+
+    echo "git command failed (attempt $attempt/$max_attempts): $*" >&2
+    echo "retrying in ${delay}s..." >&2
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+}
+
+clone_llama_workdir() {
+  local attempt=1
+  local max_attempts="${LLAMA_GIT_MAX_ATTEMPTS:-4}"
+  local delay="${LLAMA_GIT_RETRY_DELAY_SECONDS:-10}"
+  local status=0
+
+  while (( attempt <= max_attempts )); do
+    rm -rf "$LLAMA_WORKDIR"
+    if git clone --filter=blob:none "$LLAMA_UPSTREAM_URL" "$LLAMA_WORKDIR"; then
+      return 0
+    else
+      status=$?
+    fi
+
+    if (( attempt == max_attempts )); then
+      return "$status"
+    fi
+
+    echo "llama.cpp clone failed (attempt $attempt/$max_attempts)" >&2
+    echo "retrying in ${delay}s..." >&2
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+}
+
+# Re-clone unless $LLAMA_WORKDIR is genuinely its own git repository. A bare
+# `[[ ! -d "$LLAMA_WORKDIR/.git" ]]` check passes a partial/corrupt checkout
+# (dir present, .git missing or incomplete) straight through to the `git -C`
+# operations below; combined with discovery walking upward, that is what lets
+# this script escape into an enclosing repo. `rev-parse --git-dir` only
+# succeeds for a real repo rooted at the workdir (discovery cannot escape past
+# GIT_CEILING_DIRECTORIES set above). clone_llama_workdir rm -rf's first, so
+# re-cloning a partial dir is safe.
+if ! git -C "$LLAMA_WORKDIR" rev-parse --git-dir >/dev/null 2>&1; then
+  clone_llama_workdir
 fi
 
 case "$MODE" in
@@ -32,7 +112,7 @@ case "$MODE" in
     ;;
   latest)
     git -C "$LLAMA_WORKDIR" remote set-url origin "$LLAMA_UPSTREAM_URL"
-    git -C "$LLAMA_WORKDIR" fetch origin master --tags
+    git_retry git -C "$LLAMA_WORKDIR" fetch origin master --tags
     TARGET_SHA="$(git -C "$LLAMA_WORKDIR" rev-parse origin/master)"
     ;;
   *)
@@ -82,7 +162,7 @@ fi
 git -C "$LLAMA_WORKDIR" am --abort >/dev/null 2>&1 || true
 git -C "$LLAMA_WORKDIR" remote set-url origin "$LLAMA_UPSTREAM_URL"
 if [[ "$MODE" != "latest" ]]; then
-  git -C "$LLAMA_WORKDIR" fetch origin master --tags
+  git_retry git -C "$LLAMA_WORKDIR" fetch origin master --tags
 fi
 git -C "$LLAMA_WORKDIR" config user.name "${GIT_AUTHOR_NAME:-Mesh-LLM CI}"
 git -C "$LLAMA_WORKDIR" config user.email "${GIT_AUTHOR_EMAIL:-ci@mesh-llm.local}"

@@ -27,11 +27,10 @@ use skippy_protocol::{
     MessageBase, SCHEMA_VERSION, StageConfig, StageTopology,
     binary::{
         STAGE_LOGIT_BIAS_WIRE_BYTES, STAGE_SAMPLING_CONFIG_BASE_BYTES,
-        STAGE_WIRE_FIXED_HEADER_BYTES, StageReplyStats, StageSamplingConfig, StageStateHeader,
-        StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
+        STAGE_WIRE_FIXED_HEADER_BYTES, StageReply, StageReplyStats, StageSamplingConfig,
+        StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
         activation_frame_flags_from_state_flags, read_stage_message, recv_reply, send_ready,
-        send_reply_ack, send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
-        send_reply_predicted_with_stats, state_flags,
+        send_reply_ack, send_reply_ack_with_stats, state_flags,
     },
 };
 use skippy_runtime::{
@@ -40,12 +39,23 @@ use skippy_runtime::{
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+pub(crate) mod direct_return;
 pub(crate) mod forwarding;
+mod kv_eviction;
 mod options;
 mod socket;
 mod wire;
 
+pub use self::direct_return::PredictionReturnHub;
+pub use self::direct_return::PredictionReturnListener;
+pub(crate) use self::direct_return::PredictionReturnReceiver;
 pub(crate) use self::forwarding::{forwarded_stage_message, forwarded_stage_message_timed};
+#[cfg(test)]
+use self::kv_eviction::BinaryProactiveEviction;
+use self::kv_eviction::{
+    BinaryProactiveEvictionPlan, binary_proactive_eviction_plan,
+    evict_binary_resident_prefix_for_decode,
+};
 pub use self::options::{BinaryStageOptions, EmbeddedOpenAiStageOptions, parse_wire_dtype};
 use self::socket::*;
 pub use self::wire::WireCondition;
@@ -222,6 +232,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         telemetry.emit("stage.binary_runtime_prewarm", attrs);
     }
     let kv = KvStageIntegration::from_config(&config)?.map(Arc::new);
+    let prediction_returns = Arc::new(PredictionReturnHub::default());
     let listener = TcpListener::bind(bind_addr)?;
     listener.set_nonblocking(true)?;
     if let Some(openai_options) = openai {
@@ -231,6 +242,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         let openai_config = config.clone();
         let openai_runtime = runtime.clone();
         let openai_telemetry = telemetry.clone();
+        let openai_prediction_returns = prediction_returns.clone();
         tokio::spawn(async move {
             if let Err(error) = frontend::serve_embedded_openai(EmbeddedOpenAiArgs {
                 bind_addr: openai_options.bind_addr,
@@ -255,6 +267,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                 reply_credit_limit,
                 downstream_connect_timeout_secs,
                 downstream_wire_condition,
+                prediction_returns: Some(openai_prediction_returns),
                 telemetry: openai_telemetry,
                 hook_policy: None,
                 openai_guardrails: Some(frontend::OpenAiGuardrailsConfig::disabled_for_skippy()),
@@ -291,8 +304,18 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         let runtime = runtime.clone();
         let kv = kv.clone();
         let telemetry = telemetry.clone();
+        let prediction_returns = prediction_returns.clone();
         thread::spawn(move || {
             let connection_result = (|| -> Result<()> {
+                send_ready(&mut upstream).context("failed to send binary ready")?;
+                let first_message = match read_stage_message(&mut upstream, activation_width) {
+                    Ok(message) => message,
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(error) => return Err(error.into()),
+                };
+                if first_message.kind == WireMessageKind::PredictionReturnOpen {
+                    return prediction_returns.handle_return_connection(first_message, upstream);
+                }
                 let downstream =
                     connect_binary_downstream(&config, downstream_connect_timeout_secs)?;
                 handle_binary_connection(
@@ -309,6 +332,8 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                     reply_credit_limit,
                     async_prefill_forward,
                     downstream_wire_condition,
+                    downstream_connect_timeout_secs,
+                    first_message,
                 )
             })()
             .context("binary stage connection failed");
@@ -349,12 +374,13 @@ fn handle_binary_connection(
     reply_credit_limit: Option<usize>,
     async_prefill_forward: bool,
     downstream_wire_condition: WireCondition,
+    downstream_connect_timeout_secs: u64,
+    first_message: StageWireMessage,
 ) -> Result<()> {
     if let Some(downstream) = downstream.as_mut() {
         skippy_protocol::binary::recv_ready(&mut *downstream)
             .context("downstream binary stage did not become ready")?;
     }
-    send_ready(&mut *upstream).context("failed to send binary ready")?;
 
     let connection_session_id = BINARY_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
     let max_deferred_prefill_replies =
@@ -363,6 +389,8 @@ fn handle_binary_connection(
     let mut pending_reply_stats = StageReplyStats::default();
     let mut request_summary = BinaryRequestSummary::default();
     let mut accumulated_prefill_tokens: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+    let mut prediction_return_streams: BTreeMap<(u64, u64), TcpStream> = BTreeMap::new();
+    let mut next_message = Some(first_message);
     let mut async_forwarder = if async_prefill_forward {
         downstream
             .as_ref()
@@ -376,16 +404,20 @@ fn handle_binary_connection(
     loop {
         let recv_start_unix_nanos = now_unix_nanos() as u64;
         let recv_started = Instant::now();
-        let message = match read_stage_message(&mut *upstream, activation_width) {
-            Ok(message) => message,
-            Err(error)
-                if error.kind() == io::ErrorKind::UnexpectedEof
-                    && pending_prefill_replies == 0
-                    && request_summary.message_count == 0 =>
-            {
-                return Ok(());
+        let mut message = if let Some(message) = next_message.take() {
+            message
+        } else {
+            match read_stage_message(&mut *upstream, activation_width) {
+                Ok(message) => message,
+                Err(error)
+                    if error.kind() == io::ErrorKind::UnexpectedEof
+                        && pending_prefill_replies == 0
+                        && request_summary.message_count == 0 =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error).context("read binary stage message"),
             }
-            Err(error) => return Err(error).context("read binary stage message"),
         };
         let recv_end_unix_nanos = now_unix_nanos() as u64;
         let recv_read_ms = elapsed_ms(recv_started);
@@ -393,38 +425,40 @@ fn handle_binary_connection(
         let message_started = Instant::now();
         let session_id = binary_message_session_id(connection_session_id, &message);
         let session_key = session_id.to_string();
-        let mut recv_attrs = binary_message_attrs(config, session_id, &message);
-        recv_attrs.insert(
-            "llama_stage.recv_start_unix_nanos".to_string(),
-            json!(recv_start_unix_nanos),
-        );
-        recv_attrs.insert(
-            "llama_stage.recv_end_unix_nanos".to_string(),
-            json!(recv_end_unix_nanos),
-        );
-        recv_attrs.insert("llama_stage.recv_read_ms".to_string(), json!(recv_read_ms));
-        recv_attrs.insert(
-            "llama_stage.source_stage_index".to_string(),
-            json!(message.state.source_stage_index),
-        );
-        recv_attrs.insert(
-            "llama_stage.configured_upstream_stage_index".to_string(),
-            json!(config.upstream.as_ref().map(|peer| peer.stage_index)),
-        );
-        recv_attrs.insert(
-            "llama_stage.message_wire_bytes".to_string(),
-            json!(estimated_stage_message_wire_bytes(&message)),
-        );
-        recv_attrs.insert(
-            "skippy.activation_bytes".to_string(),
-            json!(message.activation.len()),
-        );
-        telemetry.emit_debug_span(
-            "stage.binary_recv",
-            recv_attrs,
-            recv_start_unix_nanos,
-            recv_end_unix_nanos,
-        );
+        if telemetry.is_debug_enabled() {
+            let mut recv_attrs = binary_message_attrs(config, session_id, &message);
+            recv_attrs.insert(
+                "llama_stage.recv_start_unix_nanos".to_string(),
+                json!(recv_start_unix_nanos),
+            );
+            recv_attrs.insert(
+                "llama_stage.recv_end_unix_nanos".to_string(),
+                json!(recv_end_unix_nanos),
+            );
+            recv_attrs.insert("llama_stage.recv_read_ms".to_string(), json!(recv_read_ms));
+            recv_attrs.insert(
+                "llama_stage.source_stage_index".to_string(),
+                json!(message.state.source_stage_index),
+            );
+            recv_attrs.insert(
+                "llama_stage.configured_upstream_stage_index".to_string(),
+                json!(config.upstream.as_ref().map(|peer| peer.stage_index)),
+            );
+            recv_attrs.insert(
+                "llama_stage.message_wire_bytes".to_string(),
+                json!(estimated_stage_message_wire_bytes(&message)),
+            );
+            recv_attrs.insert(
+                "skippy.activation_bytes".to_string(),
+                json!(message.activation.len()),
+            );
+            telemetry.emit_debug_span(
+                "stage.binary_recv",
+                recv_attrs,
+                recv_start_unix_nanos,
+                recv_end_unix_nanos,
+            );
+        }
 
         if message.kind == WireMessageKind::Stop {
             if pending_prefill_replies != 0 {
@@ -621,17 +655,28 @@ fn handle_binary_connection(
                     bail!("generation config expected downstream ACK");
                 }
                 generation_stats.merge(reply.stats);
-            } else if let Some(metadata) = message.chat_sampling_metadata.as_deref() {
-                let sampling = runtime_sampling_config(message.sampling.as_ref());
-                let mut runtime = runtime.lock().expect("runtime lock poisoned");
-                runtime
-                    .configure_chat_sampling(
-                        &session_key,
-                        metadata,
-                        message.state.prompt_token_count.max(0) as u64,
-                        sampling.as_ref(),
-                    )
-                    .context("configure binary stage generation")?;
+            } else {
+                if let Some(metadata) = message.chat_sampling_metadata.as_deref() {
+                    let sampling = runtime_sampling_config(message.sampling.as_ref());
+                    let mut runtime = runtime.lock().expect("runtime lock poisoned");
+                    runtime
+                        .configure_chat_sampling(
+                            &session_key,
+                            metadata,
+                            message.state.prompt_token_count.max(0) as u64,
+                            sampling.as_ref(),
+                        )
+                        .context("configure binary stage generation")?;
+                }
+                let stream = direct_return::open_prediction_return_stream(
+                    config,
+                    topology,
+                    message.request_id,
+                    message.session_id,
+                    wire_dtype,
+                    downstream_connect_timeout_secs,
+                )?;
+                prediction_return_streams.insert((message.request_id, message.session_id), stream);
             }
             send_reply_ack_with_stats(&mut *upstream, generation_stats)
                 .context("generation config ack")?;
@@ -661,14 +706,15 @@ fn handle_binary_connection(
                     telemetry,
                     &session_key,
                     session_id,
-                    &message,
+                    message,
                     downstream.as_mut(),
-                    upstream,
                     wire_dtype,
                     downstream_wire_condition,
                     activation_width,
                     control_started,
                     control_stats,
+                    &mut prediction_return_streams,
+                    downstream_connect_timeout_secs,
                 )
                 .context("handle restore-prefill-decode control")?;
                 continue;
@@ -787,6 +833,8 @@ fn handle_binary_connection(
         let mut runtime_lock_acquires = 0usize;
         let mut runtime_sessions_before = None;
         let mut runtime_sessions_after = None;
+        let input_activation_bytes = message.activation.len();
+        let mut proactive_eviction = None;
         let (predicted_token, predicted_tokens, output, compute_ms) = if restored_prefill {
             let now = now_unix_nanos() as u64;
             compute_start_unix_nanos = now;
@@ -802,8 +850,8 @@ fn handle_binary_connection(
             )
         } else {
             let input_decode_started = Instant::now();
-            let input = input_activation_frame(config, topology, &message, activation_width)?;
-            input_activation_decode_ms = if message.activation.is_empty() {
+            let input = input_activation_frame(config, topology, &mut message, activation_width)?;
+            input_activation_decode_ms = if input_activation_bytes == 0 {
                 0.0
             } else {
                 elapsed_ms(input_decode_started)
@@ -842,6 +890,19 @@ fn handle_binary_connection(
                 runtime_lock_acquires = 1;
                 let lock_hold_started = Instant::now();
                 runtime_sessions_before = Some(runtime.session_stats());
+                let eviction_plan = binary_proactive_eviction_plan(
+                    message.kind,
+                    restored_prefill,
+                    executable_token_ids.len(),
+                );
+                if eviction_plan.required {
+                    proactive_eviction = Some(evict_binary_resident_prefix_for_decode(
+                        &mut runtime,
+                        kv,
+                        &session_key,
+                        eviction_plan,
+                    )?);
+                }
                 let result = run_binary_stage_message(
                     &mut runtime,
                     &session_key,
@@ -849,6 +910,11 @@ fn handle_binary_connection(
                     executable_token_ids,
                     input.as_ref(),
                     message.kind == WireMessageKind::PrefillFinalEmbd && downstream.is_none(),
+                    stage_output_activation_capacity(
+                        config,
+                        message.token_count,
+                        activation_width,
+                    )?,
                 )
                 .context("execute binary stage message")?;
                 runtime_sessions_after = Some(runtime.session_stats());
@@ -859,60 +925,68 @@ fn handle_binary_connection(
             compute_end_unix_nanos = now_unix_nanos() as u64;
             (result.0, result.1, result.2, compute_ms)
         };
-        let mut decode_attrs = binary_message_attrs(config, session_id, &message);
-        decode_attrs.insert(
-            "skippy.output_activation_bytes".to_string(),
-            json!(output.payload.len()),
-        );
-        decode_attrs.insert("skippy.compute_ms".to_string(), json!(compute_ms));
-        decode_attrs.insert(
-            "llama_stage.input_activation_decode_ms".to_string(),
-            json!(input_activation_decode_ms),
-        );
-        decode_attrs.insert(
-            "llama_stage.runtime_lock_wait_ms".to_string(),
-            json!(runtime_lock_wait_ms),
-        );
-        decode_attrs.insert(
-            "llama_stage.runtime_lock_hold_ms".to_string(),
-            json!(runtime_lock_hold_ms),
-        );
-        decode_attrs.insert(
-            "llama_stage.runtime_lock_acquires".to_string(),
-            json!(runtime_lock_acquires),
-        );
-        if let Some(stats) = runtime_sessions_before.as_ref() {
-            insert_runtime_session_stats(
-                &mut decode_attrs,
-                "llama_stage.runtime_sessions_before",
-                stats,
+        if telemetry.is_debug_enabled() {
+            let mut decode_attrs = binary_message_attrs(config, session_id, &message);
+            decode_attrs.insert(
+                "skippy.output_activation_bytes".to_string(),
+                json!(output.payload.len()),
+            );
+            decode_attrs.insert("skippy.compute_ms".to_string(), json!(compute_ms));
+            decode_attrs.insert(
+                "llama_stage.input_activation_decode_ms".to_string(),
+                json!(input_activation_decode_ms),
+            );
+            decode_attrs.insert(
+                "llama_stage.runtime_lock_wait_ms".to_string(),
+                json!(runtime_lock_wait_ms),
+            );
+            decode_attrs.insert(
+                "llama_stage.runtime_lock_hold_ms".to_string(),
+                json!(runtime_lock_hold_ms),
+            );
+            decode_attrs.insert(
+                "llama_stage.runtime_lock_acquires".to_string(),
+                json!(runtime_lock_acquires),
+            );
+            if let Some(stats) = runtime_sessions_before.as_ref() {
+                insert_runtime_session_stats(
+                    &mut decode_attrs,
+                    "llama_stage.runtime_sessions_before",
+                    stats,
+                );
+            }
+            if let Some(stats) = runtime_sessions_after.as_ref() {
+                insert_runtime_session_stats(
+                    &mut decode_attrs,
+                    "llama_stage.runtime_sessions_after",
+                    stats,
+                );
+            }
+            if let Some(eviction) = proactive_eviction.as_ref() {
+                eviction.insert_attrs(&mut decode_attrs);
+            }
+            decode_attrs.insert(
+                "skippy.kv.restored_prefill".to_string(),
+                json!(restored_prefill),
+            );
+            decode_attrs.insert(
+                "llama_stage.compute_start_unix_nanos".to_string(),
+                json!(compute_start_unix_nanos),
+            );
+            decode_attrs.insert(
+                "llama_stage.compute_end_unix_nanos".to_string(),
+                json!(compute_end_unix_nanos),
+            );
+            telemetry.emit_debug_span(
+                "stage.binary_llama_decode",
+                decode_attrs,
+                compute_start_unix_nanos,
+                compute_end_unix_nanos,
             );
         }
-        if let Some(stats) = runtime_sessions_after.as_ref() {
-            insert_runtime_session_stats(
-                &mut decode_attrs,
-                "llama_stage.runtime_sessions_after",
-                stats,
-            );
+        if let Some(eviction) = proactive_eviction {
+            telemetry.emit("stage.binary_kv_record_decision", eviction.attrs());
         }
-        decode_attrs.insert(
-            "skippy.kv.restored_prefill".to_string(),
-            json!(restored_prefill),
-        );
-        decode_attrs.insert(
-            "llama_stage.compute_start_unix_nanos".to_string(),
-            json!(compute_start_unix_nanos),
-        );
-        decode_attrs.insert(
-            "llama_stage.compute_end_unix_nanos".to_string(),
-            json!(compute_end_unix_nanos),
-        );
-        telemetry.emit_debug_span(
-            "stage.binary_llama_decode",
-            decode_attrs,
-            compute_start_unix_nanos,
-            compute_end_unix_nanos,
-        );
 
         if message.kind.is_prefill() && !restored_prefill {
             let record = if let Some(tokens) = accumulated_prefill_tokens.get(&session_key).cloned()
@@ -978,8 +1052,24 @@ fn handle_binary_connection(
             }
         }
 
+        if let Some(full_prompt_tokens) = decode_record_tokens_sideband(&message) {
+            let mut runtime = runtime.lock().expect("runtime lock poisoned");
+            let record = maybe_record_binary_full_prefill(
+                config,
+                &mut runtime,
+                kv,
+                telemetry,
+                &session_key,
+                &message,
+                full_prompt_tokens,
+            );
+            drop(runtime);
+            add_binary_record_stats(&mut message_reply_stats, config, &record);
+        }
+
         let mut forward_write_ms = 0.0;
         let mut forward_activation_encode_ms = 0.0;
+        let mut forward_activation_bytes = 0usize;
         let mut downstream_wait_ms = 0.0;
         let mut upstream_reply_ms = early_reply_ms;
         let mut forward_write_start_unix_nanos = None;
@@ -1003,28 +1093,34 @@ fn handle_binary_connection(
                 activation_width,
             )?;
             forward_activation_encode_ms += forwarded.activation_encode_ms;
-            let mut downstream_write_attrs = binary_message_attrs(config, session_id, &message);
-            downstream_write_attrs.insert(
-                "llama_stage.forward_activation_bytes".to_string(),
-                json!(forwarded.message.activation.len()),
-            );
-            downstream_write_attrs.insert(
-                "llama_stage.activation_encode_ms".to_string(),
-                json!(forwarded.activation_encode_ms),
-            );
-            downstream_write_attrs.insert(
-                "llama_stage.output_activation_bytes".to_string(),
-                json!(output.payload.len()),
-            );
+            forward_activation_bytes = forwarded.message.activation.len();
+            let mut downstream_write_attrs = BTreeMap::new();
+            if telemetry.is_debug_enabled() {
+                downstream_write_attrs = binary_message_attrs(config, session_id, &message);
+                downstream_write_attrs.insert(
+                    "llama_stage.forward_activation_bytes".to_string(),
+                    json!(forward_activation_bytes),
+                );
+                downstream_write_attrs.insert(
+                    "llama_stage.activation_encode_ms".to_string(),
+                    json!(forwarded.activation_encode_ms),
+                );
+                downstream_write_attrs.insert(
+                    "llama_stage.output_activation_bytes".to_string(),
+                    json!(output.payload.len()),
+                );
+            }
             let forward_start_unix_nanos = now_unix_nanos() as u64;
             forward_write_start_unix_nanos = Some(forward_start_unix_nanos);
             let forward_started = Instant::now();
             if async_prefill_forward && early_prefill_ack && max_deferred_prefill_replies > 0 {
                 forward_mode = "async_enqueue";
-                downstream_write_attrs.insert(
-                    "llama_stage.forward_mode".to_string(),
-                    json!("async_writer"),
-                );
+                if telemetry.is_debug_enabled() {
+                    downstream_write_attrs.insert(
+                        "llama_stage.forward_mode".to_string(),
+                        json!("async_writer"),
+                    );
+                }
                 let forwarder = async_forwarder
                     .as_mut()
                     .context("missing async activation forwarder")?;
@@ -1038,8 +1134,10 @@ fn handle_binary_connection(
                     .context("queue async activation frame downstream")?;
             } else {
                 forward_mode = "sync_write";
-                downstream_write_attrs
-                    .insert("llama_stage.forward_mode".to_string(), json!("sync_write"));
+                if telemetry.is_debug_enabled() {
+                    downstream_write_attrs
+                        .insert("llama_stage.forward_mode".to_string(), json!("sync_write"));
+                }
                 if let Some(forwarder) = async_forwarder.as_mut() {
                     forwarder.flush().context("flush async activation frames")?;
                 }
@@ -1053,16 +1151,18 @@ fn handle_binary_connection(
                 )
                 .context("forward activation frame downstream")?;
                 let downstream_write_end_unix_nanos = now_unix_nanos() as u64;
-                downstream_write_attrs.insert(
-                    "llama_stage.forward_write_ms".to_string(),
-                    json!(elapsed_ms(downstream_write_started)),
-                );
-                telemetry.emit_debug_span(
-                    "stage.binary_downstream_write",
-                    downstream_write_attrs,
-                    downstream_write_start_unix_nanos,
-                    downstream_write_end_unix_nanos,
-                );
+                if telemetry.is_debug_enabled() {
+                    downstream_write_attrs.insert(
+                        "llama_stage.forward_write_ms".to_string(),
+                        json!(elapsed_ms(downstream_write_started)),
+                    );
+                    telemetry.emit_debug_span(
+                        "stage.binary_downstream_write",
+                        downstream_write_attrs,
+                        downstream_write_start_unix_nanos,
+                        downstream_write_end_unix_nanos,
+                    );
+                }
             }
             forward_write_end_unix_nanos = Some(now_unix_nanos() as u64);
             forward_write_ms += elapsed_ms(forward_started);
@@ -1082,64 +1182,6 @@ fn handle_binary_connection(
                     pending_prefill_replies -= 1;
                     deferred_prefill_replies_drained += 1;
                 }
-                let wait_start_unix_nanos = now_unix_nanos() as u64;
-                downstream_wait_start_unix_nanos.get_or_insert(wait_start_unix_nanos);
-                let wait_started = Instant::now();
-                let reply = recv_reply(&mut *downstream).context("downstream predicted reply")?;
-                downstream_wait_end_unix_nanos = Some(now_unix_nanos() as u64);
-                downstream_wait_ms += elapsed_ms(wait_started);
-                if message.kind == WireMessageKind::VerifySpan {
-                    if reply.kind != WireReplyKind::PredictedTokens {
-                        bail!("expected downstream predicted-tokens reply");
-                    }
-                } else if reply.kind != WireReplyKind::PredictedToken {
-                    bail!("expected downstream predicted-token reply");
-                }
-                message_reply_stats.merge(reply.stats);
-                message_reply_stats.merge(pending_reply_stats);
-                pending_reply_stats = StageReplyStats::default();
-                record_verify_span_timing(
-                    &mut message_reply_stats,
-                    &message,
-                    compute_ms,
-                    forward_write_ms,
-                    downstream_wait_ms,
-                );
-                let reply_start_unix_nanos = now_unix_nanos() as u64;
-                upstream_reply_start_unix_nanos.get_or_insert(reply_start_unix_nanos);
-                let reply_started = Instant::now();
-                if message.kind == WireMessageKind::VerifySpan {
-                    send_reply_predicted_tokens_with_stats(
-                        &mut *upstream,
-                        &reply.predicted_tokens,
-                        message_reply_stats,
-                    )
-                    .context("relay predicted-tokens reply")?;
-                } else {
-                    send_reply_predicted_with_stats(
-                        &mut *upstream,
-                        reply.predicted,
-                        message_reply_stats,
-                    )
-                    .context("relay predicted-token reply")?;
-                }
-                upstream_reply_end_unix_nanos = Some(now_unix_nanos() as u64);
-                let reply_write_ms = elapsed_ms(reply_started);
-                upstream_reply_ms += reply_write_ms;
-                emit_upstream_reply_write_span(
-                    telemetry,
-                    config,
-                    session_id,
-                    &message,
-                    UpstreamReplyWriteSpan {
-                        reply_kind: reply.kind,
-                        predicted_token_count: reply.predicted_tokens.len(),
-                        start_unix_nanos: reply_start_unix_nanos,
-                        end_unix_nanos: upstream_reply_end_unix_nanos
-                            .unwrap_or(reply_start_unix_nanos),
-                        write_ms: reply_write_ms,
-                    },
-                );
             } else if max_deferred_prefill_replies == 0 {
                 let wait_start_unix_nanos = now_unix_nanos() as u64;
                 downstream_wait_start_unix_nanos.get_or_insert(wait_start_unix_nanos);
@@ -1223,6 +1265,14 @@ fn handle_binary_connection(
                 }
             }
         } else if requires_predicted {
+            record_prefill_edge_transport(
+                &mut message_reply_stats,
+                config,
+                &message,
+                forward_write_ms,
+                downstream_wait_ms,
+                forward_activation_bytes,
+            );
             message_reply_stats.merge(pending_reply_stats);
             pending_reply_stats = StageReplyStats::default();
             record_verify_span_timing(
@@ -1232,24 +1282,31 @@ fn handle_binary_connection(
                 forward_write_ms,
                 downstream_wait_ms,
             );
+            let reply_kind = if message.kind == WireMessageKind::VerifySpan {
+                WireReplyKind::PredictedTokens
+            } else {
+                WireReplyKind::PredictedToken
+            };
+            let predicted_token_count = if message.kind == WireMessageKind::VerifySpan {
+                predicted_tokens.len()
+            } else {
+                1
+            };
+            let return_stream = prediction_return_streams
+                .get_mut(&(message.request_id, message.session_id))
+                .ok_or_else(|| anyhow!("missing direct prediction return stream"))?;
             let reply_start_unix_nanos = now_unix_nanos() as u64;
             upstream_reply_start_unix_nanos.get_or_insert(reply_start_unix_nanos);
             let reply_started = Instant::now();
-            if message.kind == WireMessageKind::VerifySpan {
-                send_reply_predicted_tokens_with_stats(
-                    &mut *upstream,
-                    &predicted_tokens,
-                    message_reply_stats,
-                )
-                .context("send predicted tokens")?;
-            } else {
-                send_reply_predicted_with_stats(
-                    &mut *upstream,
-                    predicted_token,
-                    message_reply_stats,
-                )
-                .context("send predicted token")?;
-            }
+            direct_return::send_direct_prediction_return(
+                return_stream,
+                StageReply {
+                    kind: reply_kind,
+                    predicted: predicted_token,
+                    predicted_tokens,
+                    stats: message_reply_stats,
+                },
+            )?;
             upstream_reply_end_unix_nanos = Some(now_unix_nanos() as u64);
             let reply_write_ms = elapsed_ms(reply_started);
             upstream_reply_ms += reply_write_ms;
@@ -1259,22 +1316,22 @@ fn handle_binary_connection(
                 session_id,
                 &message,
                 UpstreamReplyWriteSpan {
-                    reply_kind: if message.kind == WireMessageKind::VerifySpan {
-                        WireReplyKind::PredictedTokens
-                    } else {
-                        WireReplyKind::PredictedToken
-                    },
-                    predicted_token_count: if message.kind == WireMessageKind::VerifySpan {
-                        predicted_tokens.len()
-                    } else {
-                        1
-                    },
+                    reply_kind,
+                    predicted_token_count,
                     start_unix_nanos: reply_start_unix_nanos,
                     end_unix_nanos: upstream_reply_end_unix_nanos.unwrap_or(reply_start_unix_nanos),
                     write_ms: reply_write_ms,
                 },
             );
         } else if !early_prefill_ack {
+            record_prefill_edge_transport(
+                &mut message_reply_stats,
+                config,
+                &message,
+                forward_write_ms,
+                downstream_wait_ms,
+                forward_activation_bytes,
+            );
             let reply_start_unix_nanos = now_unix_nanos() as u64;
             upstream_reply_start_unix_nanos.get_or_insert(reply_start_unix_nanos);
             let reply_started = Instant::now();
@@ -1296,6 +1353,14 @@ fn handle_binary_connection(
                 },
             );
         } else {
+            record_prefill_edge_transport(
+                &mut message_reply_stats,
+                config,
+                &message,
+                forward_write_ms,
+                downstream_wait_ms,
+                forward_activation_bytes,
+            );
             pending_reply_stats.merge(message_reply_stats);
         }
 
@@ -1310,7 +1375,7 @@ fn handle_binary_connection(
             downstream_wait_ms,
             upstream_reply_ms,
             message_elapsed_ms,
-            input_activation_bytes: message.activation.len(),
+            input_activation_bytes,
             output_activation_bytes: output.payload.len(),
             input_activation_decode_ms,
             forward_activation_encode_ms,
@@ -1322,148 +1387,150 @@ fn handle_binary_connection(
             deferred_prefill_replies_drained,
         });
 
-        let mut timing_attrs = binary_message_attrs(config, session_id, &message);
-        timing_attrs.insert(
-            "llama_stage.message_start_unix_nanos".to_string(),
-            json!(message_start_unix_nanos),
-        );
-        timing_attrs.insert(
-            "llama_stage.message_end_unix_nanos".to_string(),
-            json!(message_end_unix_nanos),
-        );
-        timing_attrs.insert(
-            "llama_stage.compute_start_unix_nanos".to_string(),
-            json!(compute_start_unix_nanos),
-        );
-        timing_attrs.insert(
-            "llama_stage.compute_end_unix_nanos".to_string(),
-            json!(compute_end_unix_nanos),
-        );
-        timing_attrs.insert("llama_stage.compute_ms".to_string(), json!(compute_ms));
-        timing_attrs.insert(
-            "llama_stage.input_activation_decode_ms".to_string(),
-            json!(input_activation_decode_ms),
-        );
-        timing_attrs.insert(
-            "llama_stage.runtime_lock_wait_ms".to_string(),
-            json!(runtime_lock_wait_ms),
-        );
-        timing_attrs.insert(
-            "llama_stage.runtime_lock_hold_ms".to_string(),
-            json!(runtime_lock_hold_ms),
-        );
-        timing_attrs.insert(
-            "llama_stage.runtime_lock_acquires".to_string(),
-            json!(runtime_lock_acquires),
-        );
-        if let Some(stats) = runtime_sessions_before.as_ref() {
-            insert_runtime_session_stats(
+        if telemetry.is_debug_enabled() {
+            let mut timing_attrs = binary_message_attrs(config, session_id, &message);
+            timing_attrs.insert(
+                "llama_stage.message_start_unix_nanos".to_string(),
+                json!(message_start_unix_nanos),
+            );
+            timing_attrs.insert(
+                "llama_stage.message_end_unix_nanos".to_string(),
+                json!(message_end_unix_nanos),
+            );
+            timing_attrs.insert(
+                "llama_stage.compute_start_unix_nanos".to_string(),
+                json!(compute_start_unix_nanos),
+            );
+            timing_attrs.insert(
+                "llama_stage.compute_end_unix_nanos".to_string(),
+                json!(compute_end_unix_nanos),
+            );
+            timing_attrs.insert("llama_stage.compute_ms".to_string(), json!(compute_ms));
+            timing_attrs.insert(
+                "llama_stage.input_activation_decode_ms".to_string(),
+                json!(input_activation_decode_ms),
+            );
+            timing_attrs.insert(
+                "llama_stage.runtime_lock_wait_ms".to_string(),
+                json!(runtime_lock_wait_ms),
+            );
+            timing_attrs.insert(
+                "llama_stage.runtime_lock_hold_ms".to_string(),
+                json!(runtime_lock_hold_ms),
+            );
+            timing_attrs.insert(
+                "llama_stage.runtime_lock_acquires".to_string(),
+                json!(runtime_lock_acquires),
+            );
+            if let Some(stats) = runtime_sessions_before.as_ref() {
+                insert_runtime_session_stats(
+                    &mut timing_attrs,
+                    "llama_stage.runtime_sessions_before",
+                    stats,
+                );
+            }
+            if let Some(stats) = runtime_sessions_after.as_ref() {
+                insert_runtime_session_stats(
+                    &mut timing_attrs,
+                    "llama_stage.runtime_sessions_after",
+                    stats,
+                );
+            }
+            timing_attrs.insert(
+                "llama_stage.forward_write_ms".to_string(),
+                json!(forward_write_ms),
+            );
+            timing_attrs.insert(
+                "llama_stage.activation_encode_ms".to_string(),
+                json!(forward_activation_encode_ms),
+            );
+            timing_attrs.insert(
+                "llama_stage.downstream_wait_ms".to_string(),
+                json!(downstream_wait_ms),
+            );
+            timing_attrs.insert("skippy.compute_ms".to_string(), json!(compute_ms));
+            timing_attrs.insert(
+                "skippy.forward_write_ms".to_string(),
+                json!(forward_write_ms),
+            );
+            timing_attrs.insert(
+                "skippy.downstream_wait_ms".to_string(),
+                json!(downstream_wait_ms),
+            );
+            timing_attrs.insert(
+                "skippy.upstream_reply_ms".to_string(),
+                json!(upstream_reply_ms),
+            );
+            timing_attrs.insert("llama_stage.forward_mode".to_string(), json!(forward_mode));
+            insert_optional_unix_nanos(
                 &mut timing_attrs,
-                "llama_stage.runtime_sessions_before",
-                stats,
+                "llama_stage.forward_write_start_unix_nanos",
+                forward_write_start_unix_nanos,
+            );
+            insert_optional_unix_nanos(
+                &mut timing_attrs,
+                "llama_stage.forward_write_end_unix_nanos",
+                forward_write_end_unix_nanos,
+            );
+            insert_optional_unix_nanos(
+                &mut timing_attrs,
+                "llama_stage.downstream_wait_start_unix_nanos",
+                downstream_wait_start_unix_nanos,
+            );
+            insert_optional_unix_nanos(
+                &mut timing_attrs,
+                "llama_stage.downstream_wait_end_unix_nanos",
+                downstream_wait_end_unix_nanos,
+            );
+            insert_optional_unix_nanos(
+                &mut timing_attrs,
+                "llama_stage.upstream_reply_start_unix_nanos",
+                upstream_reply_start_unix_nanos,
+            );
+            insert_optional_unix_nanos(
+                &mut timing_attrs,
+                "llama_stage.upstream_reply_end_unix_nanos",
+                upstream_reply_end_unix_nanos,
+            );
+            timing_attrs.insert(
+                "skippy.message_elapsed_ms".to_string(),
+                json!(message_elapsed_ms),
+            );
+            timing_attrs.insert(
+                "skippy.input_activation_bytes".to_string(),
+                json!(input_activation_bytes),
+            );
+            timing_attrs.insert(
+                "skippy.output_activation_bytes".to_string(),
+                json!(output.payload.len()),
+            );
+            timing_attrs.insert(
+                "skippy.prefill_credit_limit".to_string(),
+                json!(max_deferred_prefill_replies),
+            );
+            timing_attrs.insert(
+                "skippy.prefill_pending_replies_before".to_string(),
+                json!(pending_prefill_replies_before),
+            );
+            timing_attrs.insert(
+                "skippy.prefill_pending_replies_after".to_string(),
+                json!(pending_prefill_replies),
+            );
+            timing_attrs.insert(
+                "skippy.prefill_credit_wait_count".to_string(),
+                json!(credit_wait_count),
+            );
+            timing_attrs.insert(
+                "skippy.prefill_deferred_replies_drained".to_string(),
+                json!(deferred_prefill_replies_drained),
+            );
+            telemetry.emit_debug_span(
+                "stage.binary_message_timing",
+                timing_attrs,
+                message_start_unix_nanos,
+                message_end_unix_nanos,
             );
         }
-        if let Some(stats) = runtime_sessions_after.as_ref() {
-            insert_runtime_session_stats(
-                &mut timing_attrs,
-                "llama_stage.runtime_sessions_after",
-                stats,
-            );
-        }
-        timing_attrs.insert(
-            "llama_stage.forward_write_ms".to_string(),
-            json!(forward_write_ms),
-        );
-        timing_attrs.insert(
-            "llama_stage.activation_encode_ms".to_string(),
-            json!(forward_activation_encode_ms),
-        );
-        timing_attrs.insert(
-            "llama_stage.downstream_wait_ms".to_string(),
-            json!(downstream_wait_ms),
-        );
-        timing_attrs.insert("skippy.compute_ms".to_string(), json!(compute_ms));
-        timing_attrs.insert(
-            "skippy.forward_write_ms".to_string(),
-            json!(forward_write_ms),
-        );
-        timing_attrs.insert(
-            "skippy.downstream_wait_ms".to_string(),
-            json!(downstream_wait_ms),
-        );
-        timing_attrs.insert(
-            "skippy.upstream_reply_ms".to_string(),
-            json!(upstream_reply_ms),
-        );
-        timing_attrs.insert("llama_stage.forward_mode".to_string(), json!(forward_mode));
-        insert_optional_unix_nanos(
-            &mut timing_attrs,
-            "llama_stage.forward_write_start_unix_nanos",
-            forward_write_start_unix_nanos,
-        );
-        insert_optional_unix_nanos(
-            &mut timing_attrs,
-            "llama_stage.forward_write_end_unix_nanos",
-            forward_write_end_unix_nanos,
-        );
-        insert_optional_unix_nanos(
-            &mut timing_attrs,
-            "llama_stage.downstream_wait_start_unix_nanos",
-            downstream_wait_start_unix_nanos,
-        );
-        insert_optional_unix_nanos(
-            &mut timing_attrs,
-            "llama_stage.downstream_wait_end_unix_nanos",
-            downstream_wait_end_unix_nanos,
-        );
-        insert_optional_unix_nanos(
-            &mut timing_attrs,
-            "llama_stage.upstream_reply_start_unix_nanos",
-            upstream_reply_start_unix_nanos,
-        );
-        insert_optional_unix_nanos(
-            &mut timing_attrs,
-            "llama_stage.upstream_reply_end_unix_nanos",
-            upstream_reply_end_unix_nanos,
-        );
-        timing_attrs.insert(
-            "skippy.message_elapsed_ms".to_string(),
-            json!(message_elapsed_ms),
-        );
-        timing_attrs.insert(
-            "skippy.input_activation_bytes".to_string(),
-            json!(message.activation.len()),
-        );
-        timing_attrs.insert(
-            "skippy.output_activation_bytes".to_string(),
-            json!(output.payload.len()),
-        );
-        timing_attrs.insert(
-            "skippy.prefill_credit_limit".to_string(),
-            json!(max_deferred_prefill_replies),
-        );
-        timing_attrs.insert(
-            "skippy.prefill_pending_replies_before".to_string(),
-            json!(pending_prefill_replies_before),
-        );
-        timing_attrs.insert(
-            "skippy.prefill_pending_replies_after".to_string(),
-            json!(pending_prefill_replies),
-        );
-        timing_attrs.insert(
-            "skippy.prefill_credit_wait_count".to_string(),
-            json!(credit_wait_count),
-        );
-        timing_attrs.insert(
-            "skippy.prefill_deferred_replies_drained".to_string(),
-            json!(deferred_prefill_replies_drained),
-        );
-        telemetry.emit_debug_span(
-            "stage.binary_message_timing",
-            timing_attrs,
-            message_start_unix_nanos,
-            message_end_unix_nanos,
-        );
     }
 }
 
@@ -1495,6 +1562,22 @@ fn estimated_stage_message_wire_bytes(message: &StageWireMessage) -> usize {
     };
 
     STAGE_WIRE_FIXED_HEADER_BYTES + sampling_bytes + chat_metadata_bytes + payload_bytes
+}
+
+pub(crate) fn stage_output_activation_capacity(
+    config: &StageConfig,
+    token_count: i32,
+    activation_width: i32,
+) -> Result<usize> {
+    if config.downstream.is_none() || token_count <= 0 {
+        return Ok(0);
+    }
+    skippy_protocol::binary::activation_wire_bytes(
+        WireActivationDType::F32,
+        token_count,
+        activation_width,
+    )
+    .context("estimate output activation capacity")
 }
 
 fn estimated_reply_wire_bytes(reply_kind: WireReplyKind, predicted_token_count: usize) -> usize {
@@ -1677,6 +1760,25 @@ fn record_session_control_timing(
         }
         _ => {}
     }
+}
+
+fn record_prefill_edge_transport(
+    stats: &mut StageReplyStats,
+    config: &StageConfig,
+    message: &StageWireMessage,
+    forward_write_ms: f64,
+    downstream_wait_ms: f64,
+    activation_bytes: usize,
+) {
+    if !message.kind.is_prefill() || config.downstream.is_none() {
+        return;
+    }
+    stats.observe_prefill_edge_transport(
+        config.stage_index,
+        ms_to_us(forward_write_ms),
+        ms_to_us(downstream_wait_ms),
+        activation_bytes,
+    );
 }
 
 fn record_verify_span_timing(
@@ -1989,42 +2091,55 @@ fn handle_binary_restore_prefill_decode_control(
     telemetry: &Telemetry,
     session_id: &str,
     wire_session_id: u64,
-    message: &StageWireMessage,
+    mut message: StageWireMessage,
     downstream: Option<&mut TcpStream>,
-    upstream: &mut TcpStream,
     wire_dtype: WireActivationDType,
     downstream_wire_condition: WireCondition,
     activation_width: i32,
     control_started: Instant,
     mut control_stats: StageReplyStats,
+    prediction_return_streams: &mut BTreeMap<(u64, u64), TcpStream>,
+    downstream_connect_timeout_secs: u64,
 ) -> Result<()> {
-    let (prefix_tokens, current_token) = restore_decode_sideband(message)?;
+    let (prefix_tokens, current_token) = restore_decode_sideband(&message)?;
     let local = maybe_prefix_cache_control(
         config,
         runtime,
         kv,
         telemetry,
         session_id,
-        message,
+        &message,
         prefix_tokens,
     );
     control_stats.merge(local.stats);
     if !local.hit {
-        let mut attrs = binary_message_attrs(config, wire_session_id, message);
+        let mut attrs = binary_message_attrs(config, wire_session_id, &message);
         attrs.insert("skippy.kv.control_hit".to_string(), json!(false));
         attrs.insert(
             "llama_stage.elapsed_ms".to_string(),
             json!(elapsed_ms(control_started)),
         );
         telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
-        send_reply_ack_with_stats(upstream, control_stats).context("restore-decode miss ACK")?;
+        send_one_off_direct_return(
+            config,
+            topology,
+            &message,
+            wire_dtype,
+            downstream_connect_timeout_secs,
+            StageReply {
+                kind: WireReplyKind::Ack,
+                predicted: 0,
+                predicted_tokens: Vec::new(),
+                stats: control_stats,
+            },
+        )?;
         return Ok(());
     }
 
-    let input = input_activation_frame(config, topology, message, activation_width)?;
-    let decode_message = restore_prefill_decode_as_decode_message(message, current_token);
+    let input = input_activation_frame(config, topology, &mut message, activation_width)?;
+    let decode_message = restore_prefill_decode_as_decode_message(&message, current_token);
     let compute_started = Instant::now();
-    let (predicted_token, output, runtime_lock_wait_ms, runtime_lock_hold_ms) = {
+    let (predicted_token, output, runtime_lock_wait_ms, runtime_lock_hold_ms, proactive_eviction) = {
         let lock_started = Instant::now();
         let mut runtime = runtime.lock().expect("runtime lock poisoned");
         let runtime_lock_wait_ms = elapsed_ms(lock_started);
@@ -2040,6 +2155,15 @@ fn handle_binary_restore_prefill_decode_control(
                 )
                 .context("configure restore-decode chat sampling")?;
         }
+        let proactive_eviction = evict_binary_resident_prefix_for_decode(
+            &mut runtime,
+            kv,
+            session_id,
+            BinaryProactiveEvictionPlan {
+                required: true,
+                ensure_session_before_eviction: false,
+            },
+        )?;
         let (predicted, _, output) = run_binary_stage_message(
             &mut runtime,
             session_id,
@@ -2047,6 +2171,7 @@ fn handle_binary_restore_prefill_decode_control(
             &[current_token],
             input.as_ref(),
             downstream.is_none(),
+            stage_output_activation_capacity(config, decode_message.token_count, activation_width)?,
         )
         .context("execute restore-decode stage message")?;
         (
@@ -2054,13 +2179,18 @@ fn handle_binary_restore_prefill_decode_control(
             output,
             runtime_lock_wait_ms,
             elapsed_ms(lock_hold_started),
+            proactive_eviction,
         )
     };
     let compute_ms = elapsed_ms(compute_started);
+    telemetry.emit(
+        "stage.binary_kv_record_decision",
+        proactive_eviction.attrs(),
+    );
 
     if let Some(downstream) = downstream {
         let forwarded =
-            forwarded_stage_message_timed(config, message, &output, wire_dtype, activation_width)
+            forwarded_stage_message_timed(config, &message, &output, wire_dtype, activation_width)
                 .context("forward restore-decode activation")?;
         write_stage_message_conditioned(
             &mut *downstream,
@@ -2069,36 +2199,7 @@ fn handle_binary_restore_prefill_decode_control(
             downstream_wire_condition,
         )
         .context("forward restore-decode downstream")?;
-        let reply = recv_reply(&mut *downstream).context("restore-decode downstream reply")?;
-        let downstream_missed = reply.kind != WireReplyKind::PredictedToken
-            || reply.stats.kv_lookup_misses > 0
-            || reply.stats.kv_lookup_errors > 0
-            || reply.stats.kv_lookup_hits == 0;
-        control_stats.merge(reply.stats);
-        if downstream_missed {
-            let mut runtime = runtime.lock().expect("runtime lock poisoned");
-            let _ = runtime.drop_session_timed(session_id);
-            let mut attrs = binary_message_attrs(config, wire_session_id, message);
-            attrs.insert("skippy.kv.control_hit".to_string(), json!(false));
-            attrs.insert(
-                "llama_stage.elapsed_ms".to_string(),
-                json!(elapsed_ms(control_started)),
-            );
-            attrs.insert("llama_stage.compute_ms".to_string(), json!(compute_ms));
-            attrs.insert(
-                "llama_stage.runtime_lock_wait_ms".to_string(),
-                json!(runtime_lock_wait_ms),
-            );
-            attrs.insert(
-                "llama_stage.runtime_lock_hold_ms".to_string(),
-                json!(runtime_lock_hold_ms),
-            );
-            telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
-            send_reply_ack_with_stats(upstream, control_stats)
-                .context("restore-decode downstream miss ACK")?;
-            return Ok(());
-        }
-        let mut attrs = binary_message_attrs(config, wire_session_id, message);
+        let mut attrs = binary_message_attrs(config, wire_session_id, &message);
         attrs.insert("skippy.kv.control_hit".to_string(), json!(true));
         attrs.insert(
             "llama_stage.elapsed_ms".to_string(),
@@ -2113,6 +2214,7 @@ fn handle_binary_restore_prefill_decode_control(
             "llama_stage.runtime_lock_hold_ms".to_string(),
             json!(runtime_lock_hold_ms),
         );
+        proactive_eviction.insert_attrs(&mut attrs);
         attrs.insert(
             "llama_stage.forward_activation_bytes".to_string(),
             json!(forwarded.message.activation.len()),
@@ -2122,12 +2224,23 @@ fn handle_binary_restore_prefill_decode_control(
             json!(forwarded.activation_encode_ms),
         );
         telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
-        send_reply_predicted_with_stats(upstream, reply.predicted, control_stats)
-            .context("restore-decode predicted-token reply")?;
         return Ok(());
     }
 
-    let mut attrs = binary_message_attrs(config, wire_session_id, message);
+    {
+        let mut runtime = runtime.lock().expect("runtime lock poisoned");
+        let record = maybe_record_binary_full_prefill(
+            config,
+            &mut runtime,
+            kv,
+            telemetry,
+            session_id,
+            &message,
+            message.tokens.as_slice(),
+        );
+        add_binary_record_stats(&mut control_stats, config, &record);
+    }
+    let mut attrs = binary_message_attrs(config, wire_session_id, &message);
     attrs.insert("skippy.kv.control_hit".to_string(), json!(true));
     attrs.insert(
         "llama_stage.elapsed_ms".to_string(),
@@ -2142,10 +2255,40 @@ fn handle_binary_restore_prefill_decode_control(
         "llama_stage.runtime_lock_hold_ms".to_string(),
         json!(runtime_lock_hold_ms),
     );
+    proactive_eviction.insert_attrs(&mut attrs);
     telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
-    send_reply_predicted_with_stats(upstream, predicted_token, control_stats)
-        .context("restore-decode final predicted-token reply")?;
+    let return_stream = prediction_return_streams
+        .get_mut(&(message.request_id, message.session_id))
+        .ok_or_else(|| anyhow!("missing direct prediction return stream"))?;
+    direct_return::send_direct_prediction_return(
+        return_stream,
+        StageReply {
+            kind: WireReplyKind::PredictedToken,
+            predicted: predicted_token,
+            predicted_tokens: vec![predicted_token],
+            stats: control_stats,
+        },
+    )?;
     Ok(())
+}
+
+fn send_one_off_direct_return(
+    config: &StageConfig,
+    topology: Option<&StageTopology>,
+    message: &StageWireMessage,
+    wire_dtype: WireActivationDType,
+    downstream_connect_timeout_secs: u64,
+    reply: StageReply,
+) -> Result<()> {
+    let mut stream = direct_return::open_prediction_return_stream(
+        config,
+        topology,
+        message.request_id,
+        message.session_id,
+        wire_dtype,
+        downstream_connect_timeout_secs,
+    )?;
+    direct_return::send_direct_prediction_return(&mut stream, reply)
 }
 
 fn restore_decode_sideband(message: &StageWireMessage) -> Result<(&[i32], i32)> {
@@ -2624,57 +2767,81 @@ fn maybe_record_binary_full_prefill(
     if !kv.should_record() || token_ids.is_empty() {
         return result;
     }
-    let base = binary_message_base(config, session_id, message);
-    let identity = kv.prefill_identity(config, &base, 0, token_ids);
+    let identities =
+        binary_full_prefill_record_identities(kv, config, session_id, message, token_ids);
     let mut attrs = binary_message_kv_attrs(config, kv, session_id, message, token_ids.len());
-    attrs.insert("skippy.kv.record_candidates".to_string(), json!(1));
+    attrs.insert(
+        "skippy.kv.record_candidates".to_string(),
+        json!(identities.len()),
+    );
     attrs.insert(
         "skippy.kv.decision".to_string(),
         json!("full_prefill_record"),
     );
     let started = Instant::now();
-    match kv.record_exact_state(runtime, session_id, &identity) {
-        Ok(Some(record)) => {
-            result.recorded_pages = 1;
-            result.recorded_tokens = record.token_count as u64;
-            result.evicted_entries = record.evicted_entries;
-            result.evicted_tokens = record.evicted_logical_bytes;
-            attrs.insert(
-                "skippy.exact_cache.recorded_page_id".to_string(),
-                json!(record.page_id),
-            );
-            attrs.insert(
-                "skippy.exact_cache.payload_kind".to_string(),
-                json!(record.payload_kind.to_string()),
-            );
-            attrs.insert(
-                "skippy.exact_cache.logical_bytes".to_string(),
-                json!(record.logical_bytes),
-            );
-            attrs.insert(
-                "skippy.exact_cache.physical_bytes".to_string(),
-                json!(record.physical_bytes),
-            );
-            attrs.insert(
-                "skippy.exact_cache.entries".to_string(),
-                json!(record.entries),
-            );
+    for identity in identities {
+        let token_count_usize = usize::try_from(identity.identity.token_count)
+            .unwrap_or(usize::MAX)
+            .min(token_ids.len());
+        if token_count_usize == token_ids.len() {
+            match kv.record_exact_state(runtime, session_id, &identity) {
+                Ok(Some(record)) => {
+                    result.recorded_pages = result.recorded_pages.saturating_add(1);
+                    result.recorded_tokens = result
+                        .recorded_tokens
+                        .saturating_add(record.token_count as u64);
+                    result.evicted_entries = result
+                        .evicted_entries
+                        .saturating_add(record.evicted_entries);
+                    result.evicted_tokens = result
+                        .evicted_tokens
+                        .saturating_add(record.evicted_logical_bytes);
+                    attrs.insert(
+                        "skippy.exact_cache.recorded_page_id".to_string(),
+                        json!(record.page_id),
+                    );
+                    attrs.insert(
+                        "skippy.exact_cache.payload_kind".to_string(),
+                        json!(record.payload_kind.to_string()),
+                    );
+                    attrs.insert(
+                        "skippy.exact_cache.logical_bytes".to_string(),
+                        json!(record.logical_bytes),
+                    );
+                    attrs.insert(
+                        "skippy.exact_cache.physical_bytes".to_string(),
+                        json!(record.physical_bytes),
+                    );
+                    attrs.insert(
+                        "skippy.exact_cache.entries".to_string(),
+                        json!(record.entries),
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    attrs.insert(
+                        "skippy.exact_cache.record_error".to_string(),
+                        json!(error.to_string()),
+                    );
+                }
+            }
         }
-        Ok(None) => {}
-        Err(error) => {
-            attrs.insert(
-                "skippy.exact_cache.record_error".to_string(),
-                json!(error.to_string()),
-            );
-        }
-    }
-    if result.recorded_pages == 0 {
-        match kv.record_resident_prefix(runtime, session_id, &identity, token_ids) {
+        match kv.record_resident_prefix(
+            runtime,
+            session_id,
+            &identity,
+            &token_ids[..token_count_usize],
+        ) {
             Ok(Some(record)) => {
-                result.recorded_pages = 1;
-                result.recorded_tokens = record.token_count as u64;
-                result.evicted_entries = record.evicted_entries;
-                result.evicted_tokens = record.evicted_tokens;
+                result.recorded_pages = result.recorded_pages.saturating_add(1);
+                result.recorded_tokens = result
+                    .recorded_tokens
+                    .saturating_add(record.token_count as u64);
+                result.evicted_entries = result
+                    .evicted_entries
+                    .saturating_add(record.evicted_entries);
+                result.evicted_tokens = result.evicted_tokens.saturating_add(record.evicted_tokens);
                 attrs.insert(
                     "skippy.kv.recorded_page_id".to_string(),
                     json!(record.page_id),
@@ -2690,6 +2857,7 @@ fn maybe_record_binary_full_prefill(
                     "skippy.kv.record_error".to_string(),
                     json!(error.to_string()),
                 );
+                break;
             }
         }
     }
@@ -2707,6 +2875,17 @@ fn maybe_record_binary_full_prefill(
     );
     telemetry.emit("stage.binary_kv_record_decision", attrs);
     result
+}
+
+fn binary_full_prefill_record_identities(
+    kv: &KvStageIntegration,
+    config: &StageConfig,
+    session_id: &str,
+    message: &StageWireMessage,
+    token_ids: &[i32],
+) -> Vec<PrefillKvIdentity> {
+    let base = binary_message_base(config, session_id, message);
+    kv.record_identities(config, &base, 0, token_ids)
 }
 
 #[derive(Default)]
@@ -3105,6 +3284,7 @@ pub(crate) fn run_binary_stage_message(
     token_ids: &[i32],
     input: Option<&ActivationFrame>,
     sample_final_prefill: bool,
+    output_capacity: usize,
 ) -> Result<(i32, Vec<i32>, ActivationFrame)> {
     match message.kind {
         WireMessageKind::PrefillEmbd => {
@@ -3146,12 +3326,18 @@ pub(crate) fn run_binary_stage_message(
                 .copied()
                 .unwrap_or(message.state.current_token);
             let sampling = runtime_sampling_config(message.sampling.as_ref());
-            let (predicted, output) =
-                runtime.decode_frame_sampled(session_id, token_id, sampling.as_ref(), input)?;
+            let (predicted, output) = runtime.decode_frame_sampled(
+                session_id,
+                token_id,
+                sampling.as_ref(),
+                input,
+                output_capacity,
+            )?;
             Ok((predicted, Vec::new(), output))
         }
         WireMessageKind::VerifySpan => {
-            let (predicted_tokens, output) = runtime.verify_frame(session_id, token_ids, input)?;
+            let (predicted_tokens, output) =
+                runtime.verify_frame(session_id, token_ids, input, output_capacity)?;
             let predicted = predicted_tokens.first().copied().unwrap_or(0);
             Ok((predicted, predicted_tokens, output))
         }
@@ -3165,7 +3351,8 @@ pub(crate) fn run_binary_stage_message(
         | WireMessageKind::ProbePrefill
         | WireMessageKind::RestorePrefill
         | WireMessageKind::TryRestorePrefill
-        | WireMessageKind::TryRestorePrefillDecode => {
+        | WireMessageKind::TryRestorePrefillDecode
+        | WireMessageKind::PredictionReturnOpen => {
             bail!("message kind is not executable")
         }
     }
@@ -3201,14 +3388,14 @@ fn runtime_sampling_config(sampling: Option<&StageSamplingConfig>) -> Option<Sam
 fn input_activation_frame(
     config: &StageConfig,
     topology: Option<&StageTopology>,
-    message: &StageWireMessage,
+    message: &mut StageWireMessage,
     activation_width: i32,
 ) -> Result<Option<ActivationFrame>> {
     if message.activation.is_empty() {
         return Ok(None);
     }
     let payload = message
-        .activation_f32_payload(activation_width)
+        .take_activation_f32_payload(activation_width)
         .context("decode wire activation payload")?;
     let (layer_start, layer_end) = upstream_layer_range(config, topology, message);
     Ok(Some(ActivationFrame {
@@ -3267,6 +3454,9 @@ fn token_sideband_or_fill(message: &StageWireMessage) -> Result<Vec<i32>> {
         .token_count
         .try_into()
         .context("negative token_count")?;
+    if let Some(token) = decode_execution_token(message, token_count) {
+        return Ok(vec![token]);
+    }
     if message.tokens.len() == token_count {
         return Ok(message.tokens.clone());
     }
@@ -3279,6 +3469,56 @@ fn token_sideband_or_fill(message: &StageWireMessage) -> Result<Vec<i32>> {
         0
     };
     Ok(vec![fill; token_count])
+}
+
+fn decode_execution_token(message: &StageWireMessage, token_count: usize) -> Option<i32> {
+    if !matches!(
+        message.kind,
+        WireMessageKind::DecodeEmbd
+            | WireMessageKind::DecodeReadout
+            | WireMessageKind::DecodeLightCtx
+            | WireMessageKind::DecodeReplayEmbd
+            | WireMessageKind::DecodeReplayFinalEmbd
+    ) || token_count != 1
+        || message.state.current_token == skippy_protocol::binary::LLAMA_TOKEN_NULL
+    {
+        return None;
+    }
+    Some(message.state.current_token)
+}
+
+fn decode_record_tokens_sideband(message: &StageWireMessage) -> Option<&[i32]> {
+    if message.kind != WireMessageKind::DecodeEmbd
+        || message.token_count != 1
+        || message.state.prompt_token_count <= 0
+    {
+        return None;
+    }
+    let prompt_token_count = usize::try_from(message.state.prompt_token_count).ok()?;
+    let decode_step = usize::try_from(message.state.decode_step).ok()?;
+    let expected_token_count = prompt_token_count.checked_add(decode_step)?;
+    if message.tokens.len() != expected_token_count
+        || message.tokens.last().copied() != Some(message.state.current_token)
+    {
+        return None;
+    }
+    Some(message.tokens.as_slice())
+}
+
+fn add_binary_record_stats(
+    reply_stats: &mut StageReplyStats,
+    config: &StageConfig,
+    record: &BinaryKvRecordResult,
+) {
+    if record.recorded_pages > 0 {
+        reply_stats.kv_recorded_pages += record.recorded_pages as i64;
+        reply_stats.kv_record_stage_mask |= stage_mask(config.stage_index);
+    }
+    if record.recorded_activations > 0 {
+        reply_stats.kv_recorded_bytes = reply_stats
+            .kv_recorded_bytes
+            .saturating_add(record.recorded_activation_bytes as i64);
+    }
 }
 
 #[cfg(test)]

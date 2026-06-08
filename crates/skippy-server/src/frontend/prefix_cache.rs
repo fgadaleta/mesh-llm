@@ -1,12 +1,136 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ChainPrefixCacheSavings {
+    pub(super) hit_stage_count: u32,
+    pub(super) stage0_activation_bytes_avoided: usize,
+    pub(super) interstage_activation_bytes_avoided_estimate: usize,
+}
+
+pub(super) fn chain_prefix_cache_savings(
+    stats: &StageReplyStats,
+    restored_tokens: usize,
+    wire_dtype: WireActivationDType,
+    activation_width: i32,
+) -> ChainPrefixCacheSavings {
+    let hit_stage_count = prefix_cache_hit_stage_count(stats.kv_hit_stage_mask);
+    let stage0_activation_bytes_avoided =
+        estimated_activation_bytes(wire_dtype, restored_tokens, activation_width);
+    let interstage_activation_bytes_avoided_estimate =
+        stage0_activation_bytes_avoided.saturating_mul(hit_stage_count.saturating_sub(1) as usize);
+    ChainPrefixCacheSavings {
+        hit_stage_count,
+        stage0_activation_bytes_avoided,
+        interstage_activation_bytes_avoided_estimate,
+    }
+}
+
+pub(super) fn insert_chain_prefix_cache_savings_attrs(
+    attrs: &mut BTreeMap<String, Value>,
+    savings: ChainPrefixCacheSavings,
+) {
+    attrs.insert(
+        "skippy.kv.chain_cache_hit_stage_count".to_string(),
+        json!(savings.hit_stage_count),
+    );
+    attrs.insert(
+        "skippy.kv.chain_cache_stage0_activation_bytes_avoided".to_string(),
+        json!(savings.stage0_activation_bytes_avoided),
+    );
+    attrs.insert(
+        "skippy.kv.chain_cache_interstage_activation_bytes_avoided_estimate".to_string(),
+        json!(savings.interstage_activation_bytes_avoided_estimate),
+    );
+}
+
+fn prefix_cache_hit_stage_count(hit_stage_mask: i64) -> u32 {
+    if hit_stage_mask <= 0 {
+        return 0;
+    }
+    (hit_stage_mask as u64).count_ones()
+}
+
+fn estimated_activation_bytes(
+    wire_dtype: WireActivationDType,
+    token_count: usize,
+    activation_width: i32,
+) -> usize {
+    let Ok(token_count) = i32::try_from(token_count) else {
+        return 0;
+    };
+    skippy_protocol::binary::activation_wire_bytes(wire_dtype, token_count, activation_width)
+        .unwrap_or(0)
+}
+
+pub(super) fn request_allows_exact_replay(request: &EmbeddedStageZeroGeneration<'_>) -> bool {
+    request.draft.is_none() && request.sampling.temperature <= 0.0
+}
+
+fn exact_replay_cache_key(
+    identity: &crate::kv_integration::PrefillKvIdentity,
+    sampling: &SamplingConfig,
+    chat_sampling_metadata: Option<&str>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut digest = Sha256::new();
+    digest.update(b"skippy-exact-replay-v1");
+    digest.update(identity.page_id.as_bytes());
+    digest.update([u8::from(sampling.enabled)]);
+    digest.update(sampling.seed.to_le_bytes());
+    digest.update(sampling.temperature.to_bits().to_le_bytes());
+    digest.update(sampling.top_p.to_bits().to_le_bytes());
+    digest.update(sampling.top_k.to_le_bytes());
+    digest.update(sampling.min_p.to_bits().to_le_bytes());
+    digest.update(sampling.presence_penalty.to_bits().to_le_bytes());
+    digest.update(sampling.frequency_penalty.to_bits().to_le_bytes());
+    digest.update(sampling.repeat_penalty.to_bits().to_le_bytes());
+    digest.update(sampling.penalty_last_n.to_le_bytes());
+    for bias in &sampling.logit_bias {
+        digest.update(b"logit-bias");
+        digest.update(bias.token_id.to_le_bytes());
+        digest.update(bias.bias.to_bits().to_le_bytes());
+    }
+    if let Some(metadata) = chat_sampling_metadata {
+        digest.update(b"chat-sampling-metadata");
+        digest.update(metadata.as_bytes());
+    }
+    let digest = digest.finalize();
+    let mut suffix = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut suffix, "{byte:02x}");
+    }
+    format!("{}:replay:{suffix}", identity.page_id)
+}
+
+pub(super) fn stage0_prefill_record_identities(
+    kv: &KvStageIntegration,
+    config: &StageConfig,
+    base: &MessageBase,
+    token_start: u64,
+    token_ids: &[i32],
+) -> Vec<crate::kv_integration::PrefillKvIdentity> {
+    kv.record_identities(config, base, token_start, token_ids)
+}
+
 pub(super) fn stage0_full_prefill_record_identities(
     kv: &KvStageIntegration,
     config: &StageConfig,
     base: &MessageBase,
     token_ids: &[i32],
 ) -> Vec<crate::kv_integration::PrefillKvIdentity> {
-    kv.record_identities(config, base, 0, token_ids)
+    stage0_prefill_record_identities(kv, config, base, 0, token_ids)
+}
+
+pub(super) struct EmbeddedReplayCheckpointRecord<'a> {
+    pub(super) session_id: &'a str,
+    pub(super) ids: &'a OpenAiGenerationIds,
+    pub(super) prompt_token_ids: &'a [i32],
+    pub(super) checkpoint_token_ids: &'a [i32],
+    pub(super) predicted_tokens: &'a [i32],
+    pub(super) predicted: i32,
+    pub(super) sampling: &'a SamplingConfig,
+    pub(super) chat_sampling_metadata: Option<&'a str>,
 }
 
 impl StageOpenAiBackend {
@@ -146,14 +270,32 @@ impl StageOpenAiBackend {
             return Ok(());
         };
         let base = self.local_kv_message_base(session_id, ids);
-        let identity = kv.prefill_identity(&self.config, &base, token_start, token_ids);
-        let resident_record = {
+        let identities =
+            stage0_prefill_record_identities(kv, &self.config, &base, token_start, token_ids);
+        let record_candidate_count = identities.len();
+        let resident_records = {
             let mut runtime = self
                 .runtime
                 .lock()
                 .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-            kv.record_resident_prefix(&mut runtime, session_id, &identity, token_ids)
-                .map_err(openai_backend_error)?
+            identities
+                .iter()
+                .map(|identity| {
+                    let token_count = identity
+                        .identity
+                        .token_count
+                        .try_into()
+                        .unwrap_or(usize::MAX)
+                        .min(token_ids.len());
+                    kv.record_resident_prefix(
+                        &mut runtime,
+                        session_id,
+                        identity,
+                        &token_ids[..token_count],
+                    )
+                    .map_err(openai_backend_error)
+                })
+                .collect::<OpenAiResult<Vec<_>>>()?
         };
         let activation_record = kv.record_resident_activation(
             &self.config,
@@ -163,11 +305,17 @@ impl StageOpenAiBackend {
             activation_width,
             output,
         );
-        let mut attrs = self.openai_attrs(ids);
-        attrs.insert("skippy.kv.decision".to_string(), json!("stage0_record"));
-        attrs.insert("skippy.kv.token_start".to_string(), json!(token_start));
-        attrs.insert("skippy.kv.token_count".to_string(), json!(token_ids.len()));
-        if let Some(record) = resident_record {
+        let mut recorded_any = false;
+        for record in resident_records.into_iter().flatten() {
+            recorded_any = true;
+            let mut attrs = self.openai_attrs(ids);
+            attrs.insert("skippy.kv.decision".to_string(), json!("stage0_record"));
+            attrs.insert(
+                "skippy.kv.record_candidates".to_string(),
+                json!(record_candidate_count),
+            );
+            attrs.insert("skippy.kv.token_start".to_string(), json!(token_start));
+            attrs.insert("skippy.kv.token_count".to_string(), json!(token_ids.len()));
             attrs.insert(
                 "skippy.kv.recorded_page_id".to_string(),
                 json!(record.page_id),
@@ -180,8 +328,21 @@ impl StageOpenAiBackend {
                 "skippy.kv.resident_seq_id".to_string(),
                 json!(record.seq_id),
             );
+            self.telemetry
+                .emit("stage.openai_kv_record_decision", attrs);
         }
         if let Some(record) = activation_record {
+            let mut attrs = self.openai_attrs(ids);
+            attrs.insert(
+                "skippy.kv.decision".to_string(),
+                json!("stage0_activation_record"),
+            );
+            attrs.insert(
+                "skippy.kv.record_candidates".to_string(),
+                json!(record_candidate_count),
+            );
+            attrs.insert("skippy.kv.token_start".to_string(), json!(token_start));
+            attrs.insert("skippy.kv.token_count".to_string(), json!(token_ids.len()));
             attrs.insert(
                 "skippy.activation_cache.recorded_page_id".to_string(),
                 json!(record.page_id),
@@ -190,9 +351,20 @@ impl StageOpenAiBackend {
                 "skippy.activation_cache.payload_bytes".to_string(),
                 json!(record.payload_bytes),
             );
+            self.telemetry
+                .emit("stage.openai_kv_record_decision", attrs);
+        } else if !recorded_any {
+            let mut attrs = self.openai_attrs(ids);
+            attrs.insert("skippy.kv.decision".to_string(), json!("stage0_record"));
+            attrs.insert(
+                "skippy.kv.record_candidates".to_string(),
+                json!(record_candidate_count),
+            );
+            attrs.insert("skippy.kv.token_start".to_string(), json!(token_start));
+            attrs.insert("skippy.kv.token_count".to_string(), json!(token_ids.len()));
+            self.telemetry
+                .emit("stage.openai_kv_record_decision", attrs);
         }
-        self.telemetry
-            .emit("stage.openai_kv_record_decision", attrs);
         Ok(())
     }
 
@@ -219,8 +391,22 @@ impl StageOpenAiBackend {
             identities
                 .iter()
                 .map(|identity| {
-                    kv.record_resident_prefix(&mut runtime, session_id, identity, token_ids)
-                        .map_err(openai_backend_error)
+                    let token_count = identity
+                        .identity
+                        .token_count
+                        .try_into()
+                        .unwrap_or(usize::MAX)
+                        .min(token_ids.len());
+                    if token_count == token_ids.len() {
+                        let _ = kv.record_exact_state(&mut runtime, session_id, identity);
+                    }
+                    kv.record_resident_prefix(
+                        &mut runtime,
+                        session_id,
+                        identity,
+                        &token_ids[..token_count],
+                    )
+                    .map_err(openai_backend_error)
                 })
                 .collect::<OpenAiResult<Vec<_>>>()?
         };
@@ -267,6 +453,293 @@ impl StageOpenAiBackend {
                 .emit("stage.openai_kv_record_decision", attrs);
         }
         Ok(recorded_any)
+    }
+
+    pub(super) fn record_embedded_stage0_full_prompt_first_token(
+        &self,
+        session_id: &str,
+        ids: &OpenAiGenerationIds,
+        token_ids: &[i32],
+        predicted: i32,
+    ) -> OpenAiResult<bool> {
+        let Some(kv) = self.kv.as_ref() else {
+            return Ok(false);
+        };
+        if token_ids.is_empty() || !kv.should_record() {
+            return Ok(false);
+        }
+        let base = self.local_kv_message_base(session_id, ids);
+        let identity = kv.prefill_identity(&self.config, &base, 0, token_ids);
+        let recorded_state =
+            self.record_embedded_stage0_full_prefill(session_id, ids, token_ids)?;
+        let recorded_token = kv.record_cached_first_token(&identity, predicted);
+        let mut attrs = self.openai_attrs(ids);
+        attrs.insert(
+            "skippy.kv.decision".to_string(),
+            json!("stage0_full_prompt_first_token_record"),
+        );
+        attrs.insert("skippy.kv.token_count".to_string(), json!(token_ids.len()));
+        attrs.insert("skippy.kv.predicted_token".to_string(), json!(predicted));
+        attrs.insert(
+            "skippy.kv.recorded_page_id".to_string(),
+            json!(identity.page_id),
+        );
+        attrs.insert(
+            "skippy.kv.recorded_state".to_string(),
+            json!(recorded_state),
+        );
+        attrs.insert(
+            "skippy.kv.recorded_first_token".to_string(),
+            json!(recorded_token),
+        );
+        self.telemetry
+            .emit("stage.openai_kv_record_decision", attrs);
+        Ok(recorded_state || recorded_token)
+    }
+
+    pub(super) fn record_embedded_stage0_replay_checkpoint(
+        &self,
+        record: EmbeddedReplayCheckpointRecord<'_>,
+    ) -> OpenAiResult<bool> {
+        let Some(kv) = self.kv.as_ref() else {
+            return Ok(false);
+        };
+        if record.prompt_token_ids.is_empty()
+            || record.checkpoint_token_ids.is_empty()
+            || record.predicted_tokens.len() >= MAX_EXACT_REPLAY_TOKENS
+            || !kv.should_record()
+        {
+            return Ok(false);
+        }
+        let base = self.local_kv_message_base(record.session_id, record.ids);
+        let prompt_identity = kv.prefill_identity(&self.config, &base, 0, record.prompt_token_ids);
+        let replay_cache_key = exact_replay_cache_key(
+            &prompt_identity,
+            record.sampling,
+            record.chat_sampling_metadata,
+        );
+        let recorded_state = self.record_embedded_stage0_full_prefill(
+            record.session_id,
+            record.ids,
+            record.checkpoint_token_ids,
+        )?;
+        let recorded_replay = kv.record_cached_replay_tokens(
+            &replay_cache_key,
+            &prompt_identity,
+            record.predicted_tokens,
+            record.predicted,
+            MAX_EXACT_REPLAY_TOKENS,
+        );
+        let mut attrs = self.openai_attrs(record.ids);
+        attrs.insert(
+            "skippy.kv.decision".to_string(),
+            json!("stage0_exact_replay_record"),
+        );
+        attrs.insert(
+            "skippy.kv.prompt_token_count".to_string(),
+            json!(record.prompt_token_ids.len()),
+        );
+        attrs.insert(
+            "skippy.kv.checkpoint_token_count".to_string(),
+            json!(record.checkpoint_token_ids.len()),
+        );
+        attrs.insert(
+            "skippy.kv.replay_token_count".to_string(),
+            json!(recorded_replay.unwrap_or(record.predicted_tokens.len())),
+        );
+        attrs.insert(
+            "skippy.kv.predicted_token".to_string(),
+            json!(record.predicted),
+        );
+        attrs.insert(
+            "skippy.kv.recorded_page_id".to_string(),
+            json!(prompt_identity.page_id),
+        );
+        attrs.insert(
+            "skippy.kv.recorded_state".to_string(),
+            json!(recorded_state),
+        );
+        attrs.insert(
+            "skippy.kv.recorded_replay".to_string(),
+            json!(recorded_replay.is_some()),
+        );
+        self.telemetry
+            .emit("stage.openai_kv_record_decision", attrs);
+        Ok(recorded_state || recorded_replay.is_some())
+    }
+
+    pub(super) fn try_restore_embedded_split_exact_replay(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        session_key: &str,
+        downstream: &mut TcpStream,
+    ) -> OpenAiResult<Option<EmbeddedFusedFirstDecode>> {
+        let Some(kv) = self.kv.as_ref() else {
+            return Ok(None);
+        };
+        if request.prompt_token_ids.is_empty()
+            || !kv.should_lookup()
+            || !request_allows_exact_replay(request)
+        {
+            return Ok(None);
+        }
+        let timer = PhaseTimer::start();
+        let base = self.local_kv_message_base(session_key, request.ids);
+        let prompt_identity =
+            kv.prefill_identity(request.config, &base, 0, request.prompt_token_ids);
+        let replay_cache_key = exact_replay_cache_key(
+            &prompt_identity,
+            request.sampling,
+            request.chat_sampling_metadata,
+        );
+        let replay_tokens =
+            kv.lookup_cached_replay_tokens(&replay_cache_key, request.max_tokens as usize);
+        if replay_tokens.len() < 2 {
+            return Ok(None);
+        }
+
+        for replay_len in (2..=replay_tokens.len()).rev() {
+            let mut checkpoint_tokens = request.prompt_token_ids.to_vec();
+            checkpoint_tokens.extend_from_slice(&replay_tokens[..replay_len - 1]);
+            let Some(restore) = self.try_restore_embedded_split_prefill(
+                request,
+                session_key,
+                downstream,
+                &checkpoint_tokens,
+            )?
+            else {
+                continue;
+            };
+            if restore.restored_tokens < checkpoint_tokens.len() {
+                continue;
+            }
+            let replay = replay_tokens[..replay_len].to_vec();
+            let mut attrs = self.openai_attrs(request.ids);
+            attrs.insert(
+                "skippy.kv.decision".to_string(),
+                json!("chain_exact_replay_hit"),
+            );
+            attrs.insert(
+                "skippy.kv.prompt_token_count".to_string(),
+                json!(request.prompt_token_ids.len()),
+            );
+            attrs.insert(
+                "skippy.kv.checkpoint_token_count".to_string(),
+                json!(checkpoint_tokens.len()),
+            );
+            attrs.insert(
+                "skippy.kv.replay_token_count".to_string(),
+                json!(replay.len()),
+            );
+            attrs.insert(
+                "skippy.kv.restored_tokens".to_string(),
+                json!(restore.restored_tokens),
+            );
+            attrs.insert(
+                "skippy.kv.hit_page_id".to_string(),
+                json!(prompt_identity.page_id),
+            );
+            attrs.insert(
+                "skippy.kv.lookup_hits".to_string(),
+                json!(restore.stats.kv_lookup_hits),
+            );
+            attrs.insert(
+                "skippy.kv.hit_stage_mask".to_string(),
+                json!(restore.stats.kv_hit_stage_mask),
+            );
+            insert_chain_prefix_cache_savings_attrs(
+                &mut attrs,
+                chain_prefix_cache_savings(
+                    &restore.stats,
+                    checkpoint_tokens.len(),
+                    request.wire_dtype,
+                    request.activation_width,
+                ),
+            );
+            self.telemetry
+                .emit("stage.openai_kv_lookup_decision", attrs);
+            return Ok(Some(EmbeddedFusedFirstDecode {
+                predicted: *replay.last().expect("checked replay length"),
+                predicted_tokens: replay,
+                reply_stats: restore.stats,
+                execution: EmbeddedExecutionStats::default(),
+                elapsed_ms: timer.elapsed_ms(),
+                token_phase: "exact-replay-cache",
+                message_kind: "TryRestorePrefill",
+            }));
+        }
+        Ok(None)
+    }
+
+    pub(super) fn try_restore_embedded_split_full_prompt_first_token(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        session_key: &str,
+        downstream: &mut TcpStream,
+    ) -> OpenAiResult<Option<EmbeddedFusedFirstDecode>> {
+        let Some(kv) = self.kv.as_ref() else {
+            return Ok(None);
+        };
+        if request.prompt_token_ids.is_empty() || !kv.should_lookup() {
+            return Ok(None);
+        }
+        let timer = PhaseTimer::start();
+        let base = self.local_kv_message_base(session_key, request.ids);
+        let identity = kv.prefill_identity(request.config, &base, 0, request.prompt_token_ids);
+        let Some(predicted) = kv.lookup_cached_first_token(&identity) else {
+            return Ok(None);
+        };
+        let Some(restore) = self.try_restore_embedded_split_prefill(
+            request,
+            session_key,
+            downstream,
+            request.prompt_token_ids,
+        )?
+        else {
+            return Ok(None);
+        };
+        if restore.restored_tokens < request.prompt_token_ids.len() {
+            return Ok(None);
+        }
+        let mut attrs = self.openai_attrs(request.ids);
+        attrs.insert(
+            "skippy.kv.decision".to_string(),
+            json!("chain_full_prompt_first_token_hit"),
+        );
+        attrs.insert(
+            "skippy.kv.restored_tokens".to_string(),
+            json!(restore.restored_tokens),
+        );
+        attrs.insert("skippy.kv.predicted_token".to_string(), json!(predicted));
+        attrs.insert("skippy.kv.hit_page_id".to_string(), json!(identity.page_id));
+        attrs.insert(
+            "skippy.kv.lookup_hits".to_string(),
+            json!(restore.stats.kv_lookup_hits),
+        );
+        attrs.insert(
+            "skippy.kv.hit_stage_mask".to_string(),
+            json!(restore.stats.kv_hit_stage_mask),
+        );
+        insert_chain_prefix_cache_savings_attrs(
+            &mut attrs,
+            chain_prefix_cache_savings(
+                &restore.stats,
+                restore.restored_tokens,
+                request.wire_dtype,
+                request.activation_width,
+            ),
+        );
+        self.telemetry
+            .emit("stage.openai_kv_lookup_decision", attrs);
+        Ok(Some(EmbeddedFusedFirstDecode {
+            predicted,
+            predicted_tokens: vec![predicted],
+            reply_stats: restore.stats,
+            execution: EmbeddedExecutionStats::default(),
+            elapsed_ms: timer.elapsed_ms(),
+            token_phase: "full-prompt-cache",
+            message_kind: "TryRestorePrefill",
+        }))
     }
 
     pub(super) fn try_restore_embedded_split_prefill(
@@ -359,6 +832,15 @@ impl StageOpenAiBackend {
             "skippy.kv.hit_stage_mask".to_string(),
             json!(restore_stats.kv_hit_stage_mask),
         );
+        insert_chain_prefix_cache_savings_attrs(
+            &mut attrs,
+            chain_prefix_cache_savings(
+                &restore_stats,
+                restored_tokens,
+                request.wire_dtype,
+                request.activation_width,
+            ),
+        );
         self.telemetry
             .emit("stage.openai_kv_lookup_decision", attrs);
         Ok(Some(ChainPrefixRestore {
@@ -450,6 +932,12 @@ impl StageOpenAiBackend {
                 &[current],
                 None,
                 false,
+                stage_output_activation_capacity(
+                    request.config,
+                    decode_message.token_count,
+                    request.activation_width,
+                )
+                .map_err(openai_backend_error)?,
             )
             .map_err(openai_backend_error)?
             .2;
@@ -490,7 +978,12 @@ impl StageOpenAiBackend {
         .map_err(openai_io_error)?;
         let forward_write_ms = write_timer.elapsed_ms();
         let wait_timer = PhaseTimer::start();
-        let downstream_reply = recv_reply(&mut *downstream).map_err(openai_io_error)?;
+        let downstream_reply = request
+            .prediction_return
+            .as_ref()
+            .ok_or_else(|| OpenAiError::backend("missing direct prediction return receiver"))?
+            .recv()
+            .map_err(openai_backend_error)?;
         let downstream_wait_ms = wait_timer.elapsed_ms();
         let downstream_missed = downstream_reply.kind != WireReplyKind::PredictedToken
             || downstream_reply.stats.kv_lookup_errors > 0
@@ -518,10 +1011,26 @@ impl StageOpenAiBackend {
             "skippy.kv.hit_stage_mask".to_string(),
             json!(reply_stats.kv_hit_stage_mask),
         );
+        insert_chain_prefix_cache_savings_attrs(
+            &mut attrs,
+            chain_prefix_cache_savings(
+                &reply_stats,
+                prefill_tokens.len(),
+                request.wire_dtype,
+                request.activation_width,
+            ),
+        );
         self.telemetry
             .emit("stage.openai_kv_lookup_decision", attrs);
+        self.record_embedded_stage0_full_prompt_first_token(
+            session_key,
+            request.ids,
+            request.prompt_token_ids,
+            downstream_reply.predicted,
+        )?;
         Ok(Some(EmbeddedFusedFirstDecode {
             predicted: downstream_reply.predicted,
+            predicted_tokens: vec![downstream_reply.predicted],
             reply_stats,
             execution: EmbeddedExecutionStats {
                 stage0_compute_ms,
@@ -534,6 +1043,8 @@ impl StageOpenAiBackend {
                 downstream_wait_ms,
             },
             elapsed_ms: timer.elapsed_ms(),
+            token_phase: "fused-restore",
+            message_kind: "TryRestorePrefillDecode",
         }))
     }
 
@@ -561,5 +1072,46 @@ impl StageOpenAiBackend {
         {
             let _ = recv_reply(&mut *downstream);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_prefix_cache_savings_counts_confirmed_stage_hits() {
+        let stats = StageReplyStats {
+            kv_hit_stage_mask: openai_stage_mask(0)
+                | openai_stage_mask(1)
+                | openai_stage_mask(2)
+                | openai_stage_mask(3),
+            ..Default::default()
+        };
+
+        let savings = chain_prefix_cache_savings(&stats, 256, WireActivationDType::F16, 5120);
+
+        assert_eq!(savings.hit_stage_count, 4);
+        assert_eq!(savings.stage0_activation_bytes_avoided, 2_621_440);
+        assert_eq!(
+            savings.interstage_activation_bytes_avoided_estimate,
+            7_864_320
+        );
+    }
+
+    #[test]
+    fn chain_prefix_cache_savings_uses_wire_dtype() {
+        let stats = StageReplyStats {
+            kv_hit_stage_mask: openai_stage_mask(0) | openai_stage_mask(1),
+            ..Default::default()
+        };
+
+        let q8 = chain_prefix_cache_savings(&stats, 256, WireActivationDType::Q8, 5120);
+        let f32 = chain_prefix_cache_savings(&stats, 256, WireActivationDType::F32, 5120);
+
+        assert_eq!(q8.stage0_activation_bytes_avoided, 1_311_744);
+        assert_eq!(q8.interstage_activation_bytes_avoided_estimate, 1_311_744);
+        assert_eq!(f32.stage0_activation_bytes_avoided, 5_242_880);
+        assert_eq!(f32.interstage_activation_bytes_avoided_estimate, 5_242_880);
     }
 }
