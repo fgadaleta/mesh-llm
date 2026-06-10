@@ -24,6 +24,8 @@ if (Test-Truthy $env:MESH_LLM_INSTALL_PRERELEASE) {
     $PreRelease = $true
 }
 
+$RequireChecksum = Test-Truthy $env:MESH_LLM_REQUIRE_CHECKSUM
+
 if (-not $InstallDir) {
     $localAppData = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME "AppData\Local" }
     $InstallDir = Join-Path $localAppData "mesh-llm\bin"
@@ -45,6 +47,7 @@ Environment overrides:
   MESH_LLM_INSTALL_FLAVOR
   MESH_LLM_INSTALL_PRERELEASE=1
   MESH_LLM_INSTALL_REPO=Mesh-LLM/mesh-llm
+  MESH_LLM_REQUIRE_CHECKSUM=1
 "@
 }
 
@@ -282,6 +285,65 @@ function Get-ReleaseUrl {
     return "https://github.com/$Repo/releases/latest/download/$Asset"
 }
 
+function Get-ChecksumUrl {
+    param([string]$Url)
+    return "$Url.sha256"
+}
+
+function Read-ExpectedSha256 {
+    param([string]$Path)
+    $content = Get-Content -Path $Path -Raw
+    $match = [regex]::Match($content, "[A-Fa-f0-9]{64}")
+    if (-not $match.Success) {
+        throw "checksum sidecar did not contain a SHA-256 digest: $Path"
+    }
+    return $match.Value.ToLowerInvariant()
+}
+
+function Test-MissingChecksumResponse {
+    param([object]$ErrorRecord)
+
+    $response = $ErrorRecord.Exception.Response
+    if (-not $response) {
+        return $false
+    }
+
+    $statusCode = [int]$response.StatusCode
+    return $statusCode -eq 404 -or $statusCode -eq 410
+}
+
+function Assert-DownloadedFileChecksum {
+    param(
+        [string]$Path,
+        [string]$Url,
+        [bool]$RequireSidecar = $RequireChecksum
+    )
+
+    $checksumPath = "$Path.sha256"
+    $checksumUrl = Get-ChecksumUrl $Url
+    try {
+        Invoke-WebRequest -Uri $checksumUrl -OutFile $checksumPath
+    } catch {
+        if (Test-Path $checksumPath) {
+            Remove-Item $checksumPath -Force
+        }
+        if (Test-MissingChecksumResponse $_) {
+            if ($RequireSidecar) {
+                throw "checksum sidecar is required but missing: $checksumUrl"
+            }
+            Write-Warning "Checksum sidecar not found; continuing without archive verification: $checksumUrl"
+            return
+        }
+        throw "could not download checksum sidecar: $checksumUrl"
+    }
+    $expected = Read-ExpectedSha256 $checksumPath
+    $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) {
+        throw "checksum mismatch for $(Split-Path -Leaf $Path): expected $expected, got $actual"
+    }
+    Write-Host "Verified checksum: $(Split-Path -Leaf $Path)"
+}
+
 function Get-StaleBinaryNames {
     $names = @(
         "mesh-llm",
@@ -336,8 +398,9 @@ function Install-RecommendedNativeRuntime {
     $manifestUrl = Get-ReleaseUrl "native-runtimes.json"
     try {
         Invoke-WebRequest -Uri $manifestUrl -OutFile $manifestPath
+        Assert-DownloadedFileChecksum -Path $manifestPath -Url $manifestUrl -RequireSidecar $true
     } catch {
-        Write-Host "Native runtime manifest was not available for this release; skipping runtime install."
+        Write-Warning "Native runtime manifest was not available or could not be verified; skipping runtime install. $_"
         return
     }
 
@@ -395,6 +458,7 @@ try {
     }
     Write-Host "Downloading $url"
     Invoke-WebRequest -Uri $url -OutFile $archive
+    Assert-DownloadedFileChecksum -Path $archive -Url $url
 
     Expand-Archive -Path $archive -DestinationPath $tmpRoot -Force
 
