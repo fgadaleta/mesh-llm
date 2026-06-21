@@ -444,6 +444,38 @@ fn default_control_bind_addr() -> std::net::SocketAddr {
     std::net::SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
+/// Detect this host's primary **private LAN** IPv4 without sending any packets.
+///
+/// Returns a genuine RFC1918 LAN address (`10/8`, `172.16/12`, `192.168/16`)
+/// or `None`. It deliberately never returns a public, CGNAT (`100.64/10`), or
+/// VPN/tunnel address, so the caller can safely pin QUIC's bind to it.
+///
+/// Detection has two phases:
+///
+/// 1. **Default-route source probe.** Open an unconnected UDP socket and
+///    `connect()` it to a routable target so the kernel fills in the source IP
+///    it would use to reach that target. No datagrams are sent. This is the
+///    fast, accurate answer on a normal single-LAN host — but on a full-tunnel
+///    VPN host the default route points at the tunnel, so the source is a
+///    VPN/utun address. We therefore accept this result **only if it is a
+///    private LAN IPv4**.
+/// 2. **Interface scan fallback.** If the probe yields a non-private address
+///    (VPN default route) or fails (no default route on an isolated LAN), scan
+///    local interfaces and pick the first private, operational, non-loopback,
+///    non-link-local, non-point-to-point IPv4. Point-to-point interfaces are
+///    skipped because VPN/tunnel interfaces present as p2p.
+///
+/// Used to auto-pin QUIC's bind address to the real LAN interface on
+/// multi-homed hosts (e.g. macOS with several `utun`/VPN interfaces). Binding
+/// `0.0.0.0` on such hosts lets the kernel pick a wrong source for an
+/// unconnected QUIC `sendmsg` (yielding `EHOSTUNREACH` or a slow WAN-hairpin
+/// path) and breaks/degrades direct LAN connectivity in either dial direction.
+/// Returning only a private LAN IPv4 (or `None`) means a wrong default route
+/// can never hard-pin relay-less QUIC off-LAN; we fall back to `0.0.0.0`
+/// instead. Public-relay (Nostr) mode keeps its IPv6/relay paths regardless, so
+/// long-haul reachability to a remote mesh is never sacrificed for the LAN hint.
+pub use lan_bootstrap::detect_primary_lan_ipv4;
+
 fn is_public_ipv4_candidate(socket: &SocketAddr) -> bool {
     match socket.ip() {
         IpAddr::V4(ip) => is_global_ipv4_candidate(ip),
@@ -2086,6 +2118,19 @@ async fn bind_mesh_endpoint(
 
     if let Some(addr) = quic_bind_addr(quic_bind) {
         tracing::info!("Binding QUIC to {addr}");
+        if !relay.policy.uses_relay() && addr.is_ipv4() {
+            // LAN-only (relay-disabled) mode with a specific IPv4 bind: clear the
+            // pre-configured default sockets first. `bind_addr` only replaces the
+            // default for the *same* address family, so binding a specific IPv4
+            // would otherwise leave the default IPv6 `[::]` socket in place. That
+            // extra local IPv6 path becomes a second candidate, and with no relay
+            // iroh's multipath negotiation across the IPv4+IPv6 locals fails with
+            // `MultipathNotNegotiated`, stalling the connection with no fallback.
+            // Pinning a single IPv4 socket keeps one local path family so the LAN
+            // direct path establishes cleanly. In relay (public) mode we keep the
+            // defaults so relay/IPv6 reachability is unaffected.
+            builder = builder.clear_ip_transports();
+        }
         builder = builder.bind_addr(addr)?;
     }
 
@@ -2266,6 +2311,10 @@ pub struct Node {
     genesis_policy: Arc<Mutex<Option<crate::MeshGenesisPolicy>>>,
     signed_genesis_policy: Arc<Mutex<Option<crate::SignedMeshGenesisPolicy>>>,
     bootstrap_token: Arc<Mutex<Option<crate::SignedBootstrapToken>>>,
+    /// Addresses we have been asked to join (from invite tokens), retained so
+    /// the LAN beacon can unicast a dial-back hint to them even before a direct
+    /// connection forms (relay-less multi-homed-initiator case).
+    join_targets: Arc<Mutex<Vec<EndpointAddr>>>,
     first_joined_mesh_ts: Arc<Mutex<Option<u64>>>,
     accepting: Arc<(tokio::sync::Notify, std::sync::atomic::AtomicBool)>,
     vram_bytes: u64,
@@ -3760,6 +3809,7 @@ impl Node {
             genesis_policy: Arc::new(Mutex::new(None)),
             signed_genesis_policy: Arc::new(Mutex::new(None)),
             bootstrap_token: Arc::new(Mutex::new(None)),
+            join_targets: Arc::new(Mutex::new(Vec::new())),
             first_joined_mesh_ts: Arc::new(Mutex::new(None)),
             accepting: Arc::new((
                 tokio::sync::Notify::new(),
@@ -3922,6 +3972,7 @@ impl Node {
             genesis_policy: Arc::new(Mutex::new(None)),
             signed_genesis_policy: Arc::new(Mutex::new(None)),
             bootstrap_token: Arc::new(Mutex::new(None)),
+            join_targets: Arc::new(Mutex::new(Vec::new())),
             first_joined_mesh_ts: Arc::new(Mutex::new(None)),
             accepting: Arc::new((
                 tokio::sync::Notify::new(),
@@ -4676,6 +4727,49 @@ impl Node {
         addr
     }
 
+    /// The local node's reachable [`EndpointAddr`], filtered to the bound LAN
+    /// interface in the same way the invite token is. Used by mDNS reverse-dial
+    /// so a host can advertise (and peers can learn) a direct address to dial
+    /// back on the working direction.
+    pub fn advertised_endpoint_addr(&self) -> EndpointAddr {
+        self.endpoint_addr_for_advertisement()
+    }
+
+    /// Dial a peer by its [`EndpointAddr`] directly (no token decode).
+    ///
+    /// Used by mDNS reverse-dial: when a relay-less direct connection cannot be
+    /// established in one direction (multi-homed initiator), the other side
+    /// dials back on the direction that works.
+    pub async fn dial_peer_addr(&self, addr: EndpointAddr) -> Result<()> {
+        self.state.lock().await.dead_peers.remove(&addr.id);
+        self.connect_to_peer(addr).await
+    }
+
+    /// The set of peer endpoint IDs we currently hold a connection to.
+    ///
+    /// Used by mDNS reverse-dial to avoid redialing already-connected peers.
+    pub async fn connected_peer_ids(&self) -> std::collections::HashSet<EndpointId> {
+        self.state
+            .lock()
+            .await
+            .connections
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// LAN IPv4 socket addresses of all known peers (from gossip/tokens),
+    /// regardless of connection state. Used by the LAN beacon to unicast a
+    /// dial-back hint directly to peers when multicast is unavailable.
+    pub async fn known_peer_lan_ipv4(&self) -> Vec<std::net::SocketAddrV4> {
+        let state = self.state.lock().await;
+        let mut out = Vec::new();
+        for peer in state.peers.values() {
+            out.extend(lan_bootstrap::lan_ipv4_candidates(&peer.addr));
+        }
+        out
+    }
+
     /// Decode an invite token into an [`EndpointAddr`] without connecting.
     /// Returns `Err` if the token is not valid base64 or not valid JSON.
     pub fn decode_invite_token(invite_token: &str) -> Result<EndpointAddr> {
@@ -4797,7 +4891,35 @@ impl Node {
         };
         // Clear dead status — explicit join should always attempt connection
         self.state.lock().await.dead_peers.remove(&addr.id);
+        self.remember_join_target(addr.clone()).await;
         self.connect_to_peer(addr).await
+    }
+
+    /// Record a join target address so the LAN beacon can unicast a dial-back
+    /// hint to it even before a direct connection forms.
+    ///
+    /// If a target with the same endpoint id is already recorded, its address
+    /// is replaced with the newer one. A peer that restarts or rebinds to a new
+    /// QUIC port advertises a fresh `EndpointAddr` under the same id, and the
+    /// beacon must dial that rather than keep unicasting to the stale socket.
+    async fn remember_join_target(&self, addr: EndpointAddr) {
+        let mut targets = self.join_targets.lock().await;
+        if let Some(existing) = targets.iter_mut().find(|t| t.id == addr.id) {
+            *existing = addr;
+        } else {
+            targets.push(addr);
+        }
+    }
+
+    /// LAN IPv4 socket addresses of recorded join targets (from invite tokens),
+    /// used by the LAN beacon for dial-back unicast before peers are connected.
+    pub async fn join_target_lan_ipv4(&self) -> Vec<std::net::SocketAddrV4> {
+        let targets = self.join_targets.lock().await;
+        let mut out = Vec::new();
+        for addr in targets.iter() {
+            out.extend(lan_bootstrap::lan_ipv4_candidates(addr));
+        }
+        out
     }
 
     /// Like [`join`], but retries once after a delay on transient (connect/timeout)
@@ -4840,6 +4962,7 @@ impl Node {
         // total budget which covers all but the worst relay conditions.
         let backoffs = [5, 10];
         self.state.lock().await.dead_peers.remove(&addr.id);
+        self.remember_join_target(addr.clone()).await;
         let mut last_err = match self.connect_to_peer(addr.clone()).await {
             Ok(()) => return Ok(()),
             Err(e) => e,
@@ -10363,6 +10486,7 @@ mod artifact_transfer_io;
 mod direct_path;
 mod gossip;
 mod heartbeat;
+mod lan_bootstrap;
 mod owner_control_response;
 mod plugin_streams;
 pub(crate) mod requirements;

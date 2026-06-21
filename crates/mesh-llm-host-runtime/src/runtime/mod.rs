@@ -52,7 +52,11 @@ use crate::inference::{election, skippy};
 use crate::mesh;
 use crate::mesh::NodeRole;
 use crate::models;
-use crate::network::{affinity, discovery as mesh_discovery, nostr, tunnel};
+use crate::network::{
+    affinity, discovery as mesh_discovery,
+    lan_bootstrap::{LanBootstrapTasks, effective_quic_bind_ip, spawn_mdns_reverse_dial},
+    nostr, tunnel,
+};
 use crate::plugin;
 use crate::system::{autoupdate, backend, benchmark, hardware};
 use anyhow::{Context, Result};
@@ -134,6 +138,7 @@ struct AutoRuntimeNodeSetup {
     channels: mesh::TunnelChannels,
     plugin_manager: plugin::PluginManager,
     survey_telemetry: survey::SurveyTelemetry,
+    lan_bootstrap_tasks: LanBootstrapTasks,
 }
 
 #[derive(Default)]
@@ -5778,7 +5783,7 @@ pub(crate) async fn run_plugin_mcp(options: &RuntimeOptions) -> Result<()> {
             policy: relay_policy_for_runtime_options(options),
         },
         mesh::QuicBindSelection {
-            ip: options.bind_ip,
+            ip: effective_quic_bind_ip(options),
             port: options.bind_port,
         },
         Some(0.0),
@@ -6023,7 +6028,7 @@ async fn start_run_auto_node_and_plugins(
             policy: relay_policy_for_runtime_options(options),
         },
         mesh::QuicBindSelection {
-            ip: options.bind_ip,
+            ip: effective_quic_bind_ip(options),
             port: options.bind_port,
         },
         max_vram,
@@ -6165,6 +6170,7 @@ async fn build_run_auto_node_setup(
     node.start_rtt_refresh();
     node.start_direct_path_maintenance();
     start_relay_health_monitor_for_discovery_mode(&node, options.mesh_discovery_mode);
+    let lan_bootstrap_tasks = spawn_mdns_reverse_dial(options, &node);
 
     if !is_client {
         spawn_node_benchmark_task(&node, bin_dir);
@@ -6181,6 +6187,7 @@ async fn build_run_auto_node_setup(
         channels,
         plugin_manager,
         survey_telemetry,
+        lan_bootstrap_tasks,
     })
 }
 
@@ -6624,6 +6631,7 @@ struct RunAutoShutdownContext<'a> {
     api_proxy_handle: tokio::task::JoinHandle<()>,
     console_server_handle: Option<tokio::task::JoinHandle<()>>,
     discovery_publisher: Option<tokio::task::JoinHandle<()>>,
+    lan_bootstrap_tasks: LanBootstrapTasks,
     runtime_models: &'a mut HashMap<String, RuntimeModelHandleEntry>,
     runtime_survey_models: &'a mut HashMap<String, survey::SurveyLoadedModel>,
     managed_models: &'a mut HashMap<String, ManagedModelController>,
@@ -6656,6 +6664,7 @@ struct RunAutoRuntimeLifecycleContext<'a> {
     api_proxy_handle: tokio::task::JoinHandle<()>,
     console_server_handle: Option<tokio::task::JoinHandle<()>>,
     discovery_publisher: Option<tokio::task::JoinHandle<()>>,
+    lan_bootstrap_tasks: LanBootstrapTasks,
     runtime: Option<std::sync::Arc<crate::runtime::instance::InstanceRuntime>>,
 }
 
@@ -6972,6 +6981,7 @@ async fn run_auto_runtime_loop_and_shutdown(ctx: RunAutoRuntimeLifecycleContext<
         api_proxy_handle,
         console_server_handle,
         discovery_publisher,
+        lan_bootstrap_tasks,
         runtime,
     } = ctx;
     let mut loop_ctx = RunAutoRuntimeLoopContext {
@@ -7007,6 +7017,7 @@ async fn run_auto_runtime_loop_and_shutdown(ctx: RunAutoRuntimeLifecycleContext<
         api_proxy_handle,
         console_server_handle,
         discovery_publisher,
+        lan_bootstrap_tasks,
         runtime_models: &mut runtime_state.runtime_models,
         runtime_survey_models: &mut runtime_state.runtime_survey_models,
         managed_models: &mut runtime_state.managed_models,
@@ -7030,6 +7041,7 @@ async fn shutdown_run_auto_runtime(ctx: RunAutoShutdownContext<'_>) {
         api_proxy_handle,
         console_server_handle,
         discovery_publisher,
+        lan_bootstrap_tasks,
         runtime_models,
         runtime_survey_models,
         managed_models,
@@ -7048,6 +7060,9 @@ async fn shutdown_run_auto_runtime(ctx: RunAutoShutdownContext<'_>) {
     if let Some(handle) = discovery_publisher {
         handle.abort();
     }
+    // Stop the relay-less LAN bootstrap loops (mDNS publisher, reverse-dial,
+    // and beacon) so they release their sockets and stop dialing on shutdown.
+    lan_bootstrap_tasks.abort();
 
     shutdown_run_auto_services(
         node,
@@ -8335,6 +8350,7 @@ async fn run_auto(ctx: RunAutoContext) -> Result<()> {
         channels,
         plugin_manager,
         survey_telemetry,
+        lan_bootstrap_tasks,
     } = build_run_auto_node_setup(
         &options,
         &config,
@@ -8516,6 +8532,7 @@ async fn run_auto(ctx: RunAutoContext) -> Result<()> {
         api_proxy_handle,
         console_server_handle,
         discovery_publisher,
+        lan_bootstrap_tasks,
         runtime,
     })
     .await;
