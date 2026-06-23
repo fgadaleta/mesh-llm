@@ -147,12 +147,13 @@ describe('ReservesPageContent', () => {
         },
         {
           node_id: 'peer-gpu',
-          gpus: [{ idx: 0, name: 'GPU', total_vram_gb: 12 }]
+          vram_gb: 12,
+          gpus: [{ idx: 0, name: 'GPU', total_vram_gb: 11.2, rated_vram_gb: 16 }]
         }
       ],
       models: [],
       my_vram_gb: 10,
-      gpus: [],
+      gpus: [{ idx: 0, name: 'Local GPU', total_vram_gb: 30.15, rated_vram_gb: 32 }],
       serving_models: [],
       wakeable_nodes: []
     }
@@ -163,7 +164,7 @@ describe('ReservesPageContent', () => {
       />
     )
 
-    expect(screen.getByText('vs 44 GB on the live mesh')).toBeInTheDocument()
+    expect(screen.getByText('vs 70 GB on the live mesh')).toBeInTheDocument()
   })
 
   it('does not show preview reserve providers in live mode when wakeable nodes are unavailable', () => {

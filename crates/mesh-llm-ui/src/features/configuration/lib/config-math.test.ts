@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   canFitModelInContainer,
   containerAvailableGB,
+  containerTotalGB,
   findModel,
   findPreferredModelFitContainerIdx,
   hasConfigurablePlacement,
@@ -30,6 +31,22 @@ describe('configuration memory math', () => {
     expect(nodeUsableGB(node)).toBe(2.5)
     expect(containerAvailableGB([], node, 0)).toBe(2.5)
     expect(canFitModelInContainer(model, node, [], 0, 4096)).toBe(false)
+  })
+
+  it('uses system-reported capacity for fit math while preserving rated total separately', () => {
+    const node: ConfigNode = {
+      id: 'node-test',
+      hostname: 'test-node',
+      region: 'lab',
+      status: 'online',
+      cpu: 'test cpu',
+      ramGB: 64,
+      placement: 'separate',
+      gpus: [{ idx: 0, name: 'RTX 5090', totalGB: 32, systemTotalGB: 34.36, reservedGB: 0.54 }]
+    }
+
+    expect(containerTotalGB(node, 0)).toBe(34.36)
+    expect(nodeUsableGB(node)).toBeCloseTo(33.82)
   })
 
   it('only allows placement changes for discrete multi-GPU nodes', () => {

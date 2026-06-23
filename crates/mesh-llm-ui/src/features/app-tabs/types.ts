@@ -217,7 +217,14 @@ export type ChatHarnessData = {
   actionMetrics: ChatActionMetric[]
   modelLabel: string
 }
-export type ConfigGpu = { idx: number; name: string; totalGB: number; reservedGB?: number }
+export type ConfigGpu = {
+  idx: number
+  name: string
+  totalGB: number
+  systemTotalGB?: number
+  reservedGB?: number
+  allocatableGB?: number
+}
 export type Placement = 'separate' | 'pooled'
 export type ConfigNode = {
   id: string

@@ -40,6 +40,68 @@ const STATUS_PAYLOAD: StatusPayload = {
 }
 
 describe('adaptStatusToConfiguration', () => {
+  it('includes the local status node in model deployment data when there are no peers', () => {
+    const configuration = adaptStatusToConfiguration(
+      {
+        ...STATUS_PAYLOAD,
+        hostname: 'carrack.local',
+        region: 'tor-1',
+        gpus: [
+          {
+            idx: 0,
+            name: 'RTX 5090',
+            total_vram_gb: 34.2,
+            reserved_bytes: 1073741824
+          }
+        ],
+        peers: []
+      },
+      []
+    )
+
+    expect(configuration.nodes).toHaveLength(1)
+    expect(configuration.nodes[0]).toEqual(
+      expect.objectContaining({
+        id: 'self',
+        hostname: 'carrack.local',
+        region: 'tor-1',
+        status: 'online',
+        gpus: [{ idx: 0, name: 'RTX 5090', totalGB: 34.2, systemTotalGB: 34.2, reservedGB: 1.073741824 }]
+      })
+    )
+  })
+
+  it('maps live Apple SOC status to unified-memory placement data', () => {
+    const configuration = adaptStatusToConfiguration(
+      {
+        ...STATUS_PAYLOAD,
+        my_is_soc: true,
+        gpus: [
+          {
+            name: 'Apple M4 Pro',
+            vram_bytes: 40200896512
+          }
+        ],
+        peers: []
+      },
+      []
+    )
+
+    expect(configuration.nodes[0]).toEqual(
+      expect.objectContaining({
+        memoryTopology: 'unified',
+        gpus: [
+          expect.objectContaining({
+            idx: 0,
+            name: 'Apple M4 Pro',
+            totalGB: 40,
+            systemTotalGB: 40200896512 / 1_000_000_000
+          })
+        ]
+      })
+    )
+  })
+
   it('accepts public status peers without node_id', () => {
     const configuration = adaptStatusToConfiguration(
       {
@@ -58,7 +120,7 @@ describe('adaptStatusToConfiguration', () => {
       []
     )
 
-    expect(configuration.nodes[0]).toEqual(
+    expect(configuration.nodes[1]).toEqual(
       expect.objectContaining({
         id: 'aeac0d8e53',
         hostname: '1266a345aeb9',

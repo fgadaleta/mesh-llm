@@ -249,7 +249,11 @@ pub(crate) struct GpuEntry {
     pub(crate) name: String,
     pub(crate) vram_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rated_vram_gb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reserved_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) allocatable_vram_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mem_bandwidth_gbps: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -327,7 +331,14 @@ pub(crate) fn build_gpus(
         .map(|(i, name)| GpuEntry {
             name,
             vram_bytes: vrams.get(i).copied().flatten().unwrap_or(0),
+            rated_vram_gb: mesh_llm_system::vram::rated_capacity_gb(
+                vrams.get(i).copied().flatten().unwrap_or(0),
+            ),
             reserved_bytes: reserved.get(i).copied().flatten(),
+            allocatable_vram_bytes: Some(mesh_llm_system::vram::allocatable_bytes(
+                vrams.get(i).copied().flatten().unwrap_or(0),
+                reserved.get(i).copied().flatten(),
+            )),
             mem_bandwidth_gbps: bandwidths.get(i).copied().flatten(),
             compute_tflops_fp32: compute_fp32.get(i).copied().flatten(),
             compute_tflops_fp16: compute_fp16.get(i).copied().flatten(),

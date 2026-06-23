@@ -1,4 +1,4 @@
-import type { StatusPayload, MeshModelRaw, PeerInfo } from '@/lib/api/types'
+import type { StatusPayload, MeshModelRaw, PeerInfo, GpuInfo } from '@/lib/api/types'
 import type {
   ConfigurationDefaultsHarnessData,
   ConfigurationDefaultsSetting,
@@ -11,6 +11,7 @@ import { CONFIGURATION_DEFAULTS, CONFIGURATION_HARNESS } from '@/features/app-ta
 import { getSettingBaselineValue, isSettingDisabled } from '@/features/configuration/lib/settings-utils'
 import { ApiError, parseApiErrorBody } from '@/lib/api/errors'
 import { env } from '@/lib/env'
+import { gpuAllocatableVramGB, gpuRatedVramGB, gpuReservedVramGB, gpuSystemReportedVramGB } from '@/lib/vram'
 
 export type RuntimeControlBootstrapPayload = {
   enabled: boolean
@@ -119,6 +120,39 @@ function resolvePeerId(peer: PeerInfo, fallbackIndex: number): string {
   return peer.node_id ?? peer.id ?? peer.hostname ?? `peer-${fallbackIndex}`
 }
 
+function finiteNumber(value: number | undefined, fallback = 0): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+function adaptGpuToConfigGpu(gpu: GpuInfo, fallbackIndex: number) {
+  const systemTotalGB = gpuSystemReportedVramGB(gpu) ?? 0
+  const totalGB = gpuRatedVramGB(gpu) ?? systemTotalGB
+  const reservedGB = gpuReservedVramGB(gpu)
+
+  return {
+    idx: finiteNumber(gpu.idx, fallbackIndex),
+    name: gpu.name,
+    totalGB,
+    systemTotalGB,
+    reservedGB: reservedGB > 0 ? reservedGB : undefined,
+    allocatableGB: gpuAllocatableVramGB(gpu) ?? undefined
+  }
+}
+
+function adaptLocalStatusToConfigNode(payload: StatusPayload): ConfigNode {
+  return {
+    id: payload.node_id,
+    hostname: payload.hostname ?? payload.my_hostname ?? payload.node_id,
+    region: payload.region ?? 'local',
+    status: mapNodeState(payload.node_state),
+    cpu: 'Local runtime',
+    ramGB: 0,
+    gpus: payload.gpus.map(adaptGpuToConfigGpu),
+    placement: 'separate',
+    memoryTopology: payload.my_is_soc ? 'unified' : 'discrete'
+  }
+}
+
 function adaptPeerToConfigNode(peer: PeerInfo, fallbackIndex: number): ConfigNode {
   const id = resolvePeerId(peer, fallbackIndex)
 
@@ -129,7 +163,7 @@ function adaptPeerToConfigNode(peer: PeerInfo, fallbackIndex: number): ConfigNod
     status: mapNodeState(peer.node_state ?? peer.state ?? peer.role?.toLowerCase()),
     cpu: peer.hardware_label ?? 'Unknown CPU',
     ramGB: 0,
-    gpus: [],
+    gpus: peer.gpus?.map(adaptGpuToConfigGpu) ?? [],
     placement: 'separate'
   }
 }
@@ -383,7 +417,7 @@ export function adaptStatusToConfiguration(
   models: MeshModelRaw[],
   defaultsValues?: ConfigurationDefaultsValues
 ): ConfigurationHarnessData {
-  const nodes: ConfigNode[] = payload.peers.map(adaptPeerToConfigNode)
+  const nodes: ConfigNode[] = [adaptLocalStatusToConfigNode(payload), ...payload.peers.map(adaptPeerToConfigNode)]
   const catalog: ConfigModel[] = models.map(adaptModelToConfigModel)
   const defaults = defaultsValues
     ? overlayDefaultsValues(CONFIGURATION_HARNESS.defaults, defaultsValues)

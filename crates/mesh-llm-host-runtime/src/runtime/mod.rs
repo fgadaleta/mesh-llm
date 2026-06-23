@@ -2172,7 +2172,7 @@ async fn startup_prepare_launch(
 ) -> Option<StartupPreparedLaunch> {
     let local_capacity = ctx
         .pinned_gpu
-        .map(|gpu| gpu.vram_bytes)
+        .map(|gpu| gpu.allocatable_vram_bytes())
         .unwrap_or_else(|| ctx.node.vram_bytes());
     let model_bytes = startup_planning_model_bytes(&ctx).await?;
     let runtime_plan = startup_runtime_plan(ctx.split, local_capacity, model_bytes);
@@ -2826,6 +2826,13 @@ pub(crate) struct StartupPinnedGpuTarget {
     pub(crate) stable_id: String,
     pub(crate) backend_device: String,
     pub(crate) vram_bytes: u64,
+    pub(crate) reserved_bytes: Option<u64>,
+}
+
+impl StartupPinnedGpuTarget {
+    pub(crate) fn allocatable_vram_bytes(&self) -> u64 {
+        mesh_llm_system::vram::allocatable_bytes(self.vram_bytes, self.reserved_bytes)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4334,6 +4341,7 @@ fn preflight_config_owned_startup_models_with_gpus(
             stable_id,
             backend_device,
             vram_bytes: resolved_gpu.vram_bytes,
+            reserved_bytes: resolved_gpu.reserved_bytes,
         });
     }
 
@@ -4771,6 +4779,7 @@ fn startup_model_plan_fixture() -> Vec<StartupModelPlan> {
                 stable_id: "gpu-b".to_string(),
                 backend_device: "CUDA1".to_string(),
                 vram_bytes: 24 * 1024 * 1024 * 1024,
+                reserved_bytes: None,
             }),
             parallel: None,
             cache_type_k: None,
@@ -10390,6 +10399,7 @@ mod tests {
                 stable_id: "pci:0000:65:00.0".into(),
                 backend_device: "CUDA0".into(),
                 vram_bytes: 24_000_000_000,
+                reserved_bytes: None,
             })
         );
     }
@@ -10673,7 +10683,8 @@ mod tests {
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
         }];
-        let gpus = vec![synthetic_gpu(3, Some("uuid:GPU-123"), Some("CUDA3"))];
+        let mut gpus = vec![synthetic_gpu(3, Some("uuid:GPU-123"), Some("CUDA3"))];
+        gpus[0].reserved_bytes = Some(500_000_000);
 
         preflight_config_owned_startup_models_with_gpus(&config, &specs, &mut plans, &gpus, None)
             .unwrap();
@@ -10683,6 +10694,7 @@ mod tests {
         assert_eq!(pinned_gpu.stable_id, "uuid:GPU-123");
         assert_eq!(pinned_gpu.backend_device, "CUDA3");
         assert_eq!(pinned_gpu.vram_bytes, 24_000_000_000);
+        assert_eq!(pinned_gpu.reserved_bytes, Some(500_000_000));
     }
 
     #[test]

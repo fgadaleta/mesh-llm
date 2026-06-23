@@ -10,6 +10,7 @@ import {
   hasConfigurablePlacement,
   isUnifiedMemoryNode,
   nodeReservedGB,
+  nodeSystemTotalGB,
   nodeTotalGB,
   nodeUsableGB
 } from '@/features/configuration/lib/config-math'
@@ -55,6 +56,7 @@ export function NodeSection({
   const [dragKey, setDragKey] = useState<string | null>(null)
   const open = !collapsed
   const totalNodeGB = nodeTotalGB(node)
+  const systemTotalNodeGB = nodeSystemTotalGB(node)
   const reservedNodeGB = nodeReservedGB(node)
   const usableNodeGB = nodeUsableGB(node)
   const usedNodeGB = nodeUsedGB(node, assigns, models)
@@ -206,7 +208,7 @@ export function NodeSection({
                   main: `${node.hostname} · unified memory`,
                   sub: nodeGpuCountLabel(node)
                 }}
-                totalGB={totalNodeGB}
+                totalGB={systemTotalNodeGB}
                 reservedGB={node.gpus.reduce((sum, gpu) => sum + (gpu.reservedGB ?? 0), 0)}
                 containerIdx={0}
                 assigns={assigns}
@@ -246,7 +248,7 @@ export function NodeSection({
                 <VRAMBar
                   node={node}
                   label={{ prefix: `GPU ${gpu.idx}`, main: gpu.name, sub: `${formatGB(gpu.totalGB)} GB` }}
-                  totalGB={gpu.totalGB}
+                  totalGB={gpu.systemTotalGB ?? gpu.totalGB}
                   reservedGB={gpu.reservedGB}
                   containerIdx={gpu.idx}
                   assigns={assigns}

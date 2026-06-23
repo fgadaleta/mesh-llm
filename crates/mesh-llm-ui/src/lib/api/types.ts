@@ -7,11 +7,13 @@ import type { WakeableNode } from '@/features/app-shell/lib/status-types'
 export type { WakeableNode }
 
 export interface GpuInfo {
-  idx: number
+  idx?: number
   name: string
-  total_vram_gb: number
+  rated_vram_gb?: number
+  total_vram_gb?: number
   vram_bytes?: number
   reserved_bytes?: number
+  allocatable_vram_bytes?: number
   used_vram_gb?: number
   free_vram_gb?: number
   temperature?: number
@@ -138,6 +140,7 @@ export interface StatusPayload {
   serving_models: ServingModelEntry[]
   hostname?: string
   my_hostname?: string
+  my_is_soc?: boolean
   region?: string
   version?: string
   token?: string
