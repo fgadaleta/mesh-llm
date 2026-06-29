@@ -1,9 +1,9 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher},
     fs,
     hash::{Hash, Hasher},
     io::{self, BufRead, BufReader, IsTerminal, Read, Write},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{Shutdown, SocketAddr, TcpStream},
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -23,8 +23,8 @@ use rustyline::{DefaultEditor, error::ReadlineError};
 use serde_json::Value;
 use skippy_protocol::binary::{
     LLAMA_TOKEN_NULL, READY_MAGIC, StageReply, StageReplyStats, StageStateHeader, StageWireMessage,
-    WireActivationDType, WireMessageKind, WireReplyKind, read_stage_message, recv_reply,
-    send_ready, state_flags, write_stage_message,
+    WireActivationDType, WireMessageKind, WireReplyKind, recv_reply, state_flags,
+    write_stage_message,
 };
 use skippy_protocol::{
     FlashAttentionType as StageFlashAttentionType, LoadMode, PeerConfig, StageConfig,
@@ -57,7 +57,6 @@ include!("args.rs");
 include!("command.rs");
 include!("launch.rs");
 include!("interrupt.rs");
-include!("direct_return.rs");
 include!("binary_repl.rs");
 include!("logs.rs");
 include!("prompt_format.rs");

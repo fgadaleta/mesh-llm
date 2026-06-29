@@ -1,8 +1,9 @@
+use mesh_llm_native_runtime::host::HostGpuProbe;
 use mesh_llm_native_runtime::{
     HostCudaProfile, HostGpuProfile, HostRocmProfile, HostRuntimeProfile, HostVulkanProfile,
     NativeRuntimeBackendKind,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 pub fn host_runtime_profile() -> HostRuntimeProfile {
@@ -57,20 +58,242 @@ pub fn detected_native_runtime_flavors(
 }
 
 fn detect_gpus() -> Vec<HostGpuProfile> {
-    let labels = gpu_labels();
-    labels
+    merge_nvidia_and_fallback_gpus(detect_nvidia_gpu_profiles(), fallback_gpu_profiles())
+}
+
+fn merge_nvidia_and_fallback_gpus(
+    mut nvidia_gpus: Vec<HostGpuProfile>,
+    mut fallback_gpus: Vec<HostGpuProfile>,
+) -> Vec<HostGpuProfile> {
+    if nvidia_gpus.is_empty() {
+        return fallback_gpus;
+    }
+
+    fallback_gpus.retain(|gpu| !looks_like_nvidia_gpu_label(&gpu.display_name));
+    nvidia_gpus.extend(fallback_gpus);
+    nvidia_gpus
+}
+
+fn fallback_gpu_profiles() -> Vec<HostGpuProfile> {
+    gpu_labels()
         .into_iter()
-        .enumerate()
-        .map(|(index, label)| HostGpuProfile {
-            display_name: label,
-            backend_device: None,
-            stable_id: Some(format!("detected-{index}")),
-            vram_bytes: None,
-            unified_memory: cfg!(target_os = "macos"),
-            cuda_sm: None,
-            rocm_gfx: None,
+        .map(fallback_gpu_profile_from_label)
+        .collect()
+}
+
+fn fallback_gpu_profile_from_label(label: String) -> HostGpuProfile {
+    HostGpuProfile {
+        display_name: label,
+        backend_device: None,
+        stable_id: None,
+        vram_bytes: None,
+        unified_memory: cfg!(target_os = "macos"),
+        probe: None,
+        cuda_sm: None,
+        rocm_gfx: None,
+    }
+}
+
+fn looks_like_nvidia_gpu_label(label: &str) -> bool {
+    let label = label.to_ascii_lowercase();
+    label.contains("nvidia") || label.contains("cuda")
+}
+
+fn detect_nvidia_gpu_profiles() -> Vec<HostGpuProfile> {
+    let Some(nvidia_smi) = command_output("nvidia-smi", &["-L"]) else {
+        return Vec::new();
+    };
+    let compute_caps = command_output(
+        "nvidia-smi",
+        &[
+            "--query-gpu=index,compute_cap",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+    .map(|output| nvidia_compute_caps_by_index(&output))
+    .unwrap_or_default();
+    let lspci = command_output("lspci", &[]).unwrap_or_default();
+    let proc_entries = linux_nvidia_proc_information_entries();
+    let borrowed_entries: Vec<(&str, &str)> = proc_entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.info.as_str()))
+        .collect();
+    nvidia_gpu_profiles_from_probe_outputs(&nvidia_smi, &compute_caps, &lspci, &borrowed_entries)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NvidiaSmiGpu {
+    index: usize,
+    name: String,
+    vendor_uuid: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NvidiaProcInformationEntry {
+    path: String,
+    info: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NvidiaProcProbe {
+    pci_bdf: Option<String>,
+    vendor_uuid: Option<String>,
+    probe: HostGpuProbe,
+}
+
+fn nvidia_gpu_profiles_from_probe_outputs(
+    nvidia_smi_output: &str,
+    compute_caps: &BTreeMap<usize, String>,
+    lspci_output: &str,
+    proc_entries: &[(&str, &str)],
+) -> Vec<HostGpuProfile> {
+    let mut proc_probes = proc_entries
+        .iter()
+        .map(|(path, info)| nvidia_proc_probe(path, info))
+        .collect::<Vec<_>>();
+
+    parse_nvidia_smi_list(nvidia_smi_output)
+        .into_iter()
+        .map(|gpu| {
+            let pci_bdf = nvidia_lspci_bdf_for_name(lspci_output, &gpu.name);
+            let probe = take_matching_nvidia_probe(
+                &mut proc_probes,
+                gpu.vendor_uuid.as_deref(),
+                pci_bdf.as_deref(),
+            );
+            HostGpuProfile {
+                display_name: gpu.name,
+                backend_device: Some(format!("CUDA{}", gpu.index)),
+                stable_id: gpu
+                    .vendor_uuid
+                    .as_ref()
+                    .map(|uuid| format!("uuid:{uuid}"))
+                    .or_else(|| pci_bdf.as_ref().map(|bdf| format!("pci:{bdf}"))),
+                vram_bytes: None,
+                unified_memory: false,
+                probe,
+                cuda_sm: compute_caps.get(&gpu.index).cloned(),
+                rocm_gfx: None,
+            }
         })
         .collect()
+}
+
+fn nvidia_compute_caps_by_index(output: &str) -> BTreeMap<usize, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (index, compute_cap) = line.split_once(',')?;
+            let index = index.trim().parse::<usize>().ok()?;
+            let cuda_sm = cuda_sm_from_compute_cap(compute_cap.trim())?;
+            Some((index, cuda_sm))
+        })
+        .collect()
+}
+
+fn cuda_sm_from_compute_cap(value: &str) -> Option<String> {
+    let (major, minor) = value.split_once('.')?;
+    let major = major.trim();
+    let minor = minor.trim();
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.chars().all(|ch| ch.is_ascii_digit())
+        || !minor.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!("{major}{minor}"))
+}
+
+fn parse_nvidia_smi_list(output: &str) -> Vec<NvidiaSmiGpu> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let body = line.strip_prefix("GPU ")?;
+            let (index, rest) = body.split_once(':')?;
+            let index = index.trim().parse::<usize>().ok()?;
+            let rest = rest.trim();
+            let (name, vendor_uuid) = match rest.rsplit_once(" (UUID: ") {
+                Some((name, uuid)) => (name.trim(), uuid.strip_suffix(')').map(str::trim)),
+                None => (rest, None),
+            };
+            (!name.is_empty()).then(|| NvidiaSmiGpu {
+                index,
+                name: name.to_string(),
+                vendor_uuid: vendor_uuid.map(ToOwned::to_owned),
+            })
+        })
+        .collect()
+}
+
+fn nvidia_lspci_bdf_for_name(output: &str, name: &str) -> Option<String> {
+    let name = name.to_ascii_lowercase();
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        if !looks_like_display_controller(line) {
+            return None;
+        }
+        let lower = line.to_ascii_lowercase();
+        if !name
+            .split_whitespace()
+            .filter(|token| *token != "nvidia" && *token != "geforce")
+            .all(|token| lower.contains(token))
+        {
+            return None;
+        }
+        line.split_whitespace().next().map(normalize_pci_bdf)
+    })
+}
+
+fn normalize_pci_bdf(bdf: &str) -> String {
+    if bdf.matches(':').count() == 1 {
+        format!("0000:{bdf}")
+    } else {
+        bdf.to_ascii_lowercase()
+    }
+}
+
+fn nvidia_proc_probe(path: &str, info: &str) -> NvidiaProcProbe {
+    let fields = nvidia_proc_fields(info);
+    NvidiaProcProbe {
+        pci_bdf: fields
+            .get("Bus Location")
+            .map(String::as_str)
+            .map(normalize_pci_bdf),
+        vendor_uuid: fields.get("GPU UUID").cloned(),
+        probe: HostGpuProbe {
+            source: "linux_nvidia_proc".to_string(),
+            path: Some(path.to_string()),
+            fields,
+            raw_lines: info.lines().map(str::to_string).collect(),
+        },
+    }
+}
+
+fn nvidia_proc_fields(info: &str) -> BTreeMap<String, String> {
+    info.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn take_matching_nvidia_probe(
+    probes: &mut Vec<NvidiaProcProbe>,
+    vendor_uuid: Option<&str>,
+    pci_bdf: Option<&str>,
+) -> Option<HostGpuProbe> {
+    let index = probes.iter().position(|probe| {
+        vendor_uuid.is_some_and(|uuid| probe.vendor_uuid.as_deref() == Some(uuid))
+            || pci_bdf.is_some_and(|bdf| probe.pci_bdf.as_deref() == Some(bdf))
+    })?;
+    Some(probes.remove(index).probe)
 }
 
 fn detect_cuda_profile(gpus: &[HostGpuProfile]) -> Option<HostCudaProfile> {
@@ -129,19 +352,36 @@ fn apply_gpu_arch_overrides(gpus: &mut [HostGpuProfile]) {
     let cuda_arches = env_string_vec("MESH_LLM_CUDA_GPU_ARCHES");
     let rocm_arches = env_string_vec("MESH_LLM_ROCM_GPU_ARCHES");
     for (index, gpu) in gpus.iter_mut().enumerate() {
-        gpu.cuda_sm = cuda_arches.get(index).cloned();
-        gpu.rocm_gfx = rocm_arches.get(index).cloned();
+        if let Some(cuda_sm) = cuda_arches.get(index) {
+            gpu.cuda_sm = Some(cuda_sm.clone());
+        }
+        if let Some(rocm_gfx) = rocm_arches.get(index) {
+            gpu.rocm_gfx = Some(rocm_gfx.clone());
+        }
     }
 }
 
 fn cuda_majors_from_nvidia_smi() -> BTreeSet<u32> {
-    let mut majors = BTreeSet::new();
     let Some(output) = command_output("nvidia-smi", &[]) else {
-        return majors;
+        return BTreeSet::new();
     };
+    cuda_majors_from_nvidia_smi_output(&output)
+}
+
+fn cuda_majors_from_nvidia_smi_output(output: &str) -> BTreeSet<u32> {
+    let mut majors = BTreeSet::new();
     for token in output.split_whitespace() {
         if let Some(major) = cuda_major_from_token(token) {
             majors.insert(major);
+        }
+    }
+    for line in output.lines() {
+        for marker in ["CUDA Version:", "CUDA UMD Version:"] {
+            if let Some((_, version)) = line.split_once(marker)
+                && let Some(major) = leading_major_version(version)
+            {
+                majors.insert(major);
+            }
         }
     }
     majors
@@ -157,9 +397,17 @@ fn cuda_major_from_token(token: &str) -> Option<u32> {
         .and_then(|value| value.parse::<u32>().ok())
 }
 
+fn leading_major_version(value: &str) -> Option<u32> {
+    value
+        .trim()
+        .trim_start_matches(|ch: char| !ch.is_ascii_digit())
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
 fn gpu_labels() -> Vec<String> {
     let mut labels = Vec::new();
-    append_command_lines(&mut labels, "nvidia-smi", &["-L"]);
     append_command_lines(&mut labels, "rocminfo", &[]);
     append_command_lines(&mut labels, "vulkaninfo", &["--summary"]);
     append_platform_gpu_labels(&mut labels);
@@ -171,21 +419,29 @@ fn gpu_labels() -> Vec<String> {
 #[cfg(target_os = "linux")]
 fn append_platform_gpu_labels(labels: &mut Vec<String>) {
     append_command_lines(labels, "lspci", &[]);
-    append_linux_nvidia_proc_labels(labels);
 }
 
 #[cfg(target_os = "linux")]
-fn append_linux_nvidia_proc_labels(labels: &mut Vec<String>) {
+fn linux_nvidia_proc_information_entries() -> Vec<NvidiaProcInformationEntry> {
     let Ok(entries) = std::fs::read_dir("/proc/driver/nvidia/gpus") else {
-        return;
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        let path = entry.path().join("information");
-        let Ok(info) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        labels.extend(info.lines().map(str::to_string));
-    }
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path().join("information");
+            let info = std::fs::read_to_string(&path).ok()?;
+            Some(NvidiaProcInformationEntry {
+                path: path.display().to_string(),
+                info,
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_nvidia_proc_information_entries() -> Vec<NvidiaProcInformationEntry> {
+    Vec::new()
 }
 
 #[cfg(target_os = "windows")]
@@ -213,13 +469,64 @@ fn append_command_lines(labels: &mut Vec<String>, program: &str, args: &[&str]) 
     let Some(output) = command_output(program, args) else {
         return;
     };
-    labels.extend(
-        output
+    labels.extend(gpu_labels_from_command_output(program, args, &output));
+}
+
+fn gpu_labels_from_command_output(program: &str, args: &[&str], output: &str) -> Vec<String> {
+    match (program, args) {
+        ("nvidia-smi", ["-L"]) => output
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("GPU ") && line.contains(':'))
+            .map(str::to_string)
+            .collect(),
+        ("vulkaninfo", ["--summary"]) => vulkaninfo_device_names(output),
+        ("lspci", []) => output
+            .lines()
+            .map(str::trim)
+            .filter(|line| looks_like_display_controller(line))
+            .map(str::to_string)
+            .collect(),
+        _ => output
             .lines()
             .map(str::trim)
             .filter(|line| looks_like_gpu_label(line))
-            .map(str::to_string),
-    );
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
+fn vulkaninfo_device_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("deviceName"))
+        .filter_map(|line| line.split_once('=').map(|(_, value)| value.trim()))
+        .filter(|value| !value.is_empty())
+        .filter(|value| !looks_like_software_vulkan_adapter(value))
+        .map(str::to_string)
+        .collect()
+}
+
+fn looks_like_software_vulkan_adapter(value: &str) -> bool {
+    let label = value.to_ascii_lowercase();
+    [
+        "llvmpipe",
+        "swiftshader",
+        "lavapipe",
+        "softpipe",
+        "software rasterizer",
+    ]
+    .iter()
+    .any(|marker| label.contains(marker))
+}
+
+fn looks_like_display_controller(line: &str) -> bool {
+    let label = line.to_ascii_lowercase();
+    (label.contains("vga compatible controller")
+        || label.contains("3d controller")
+        || label.contains("display controller"))
+        && looks_like_gpu_label(line)
 }
 
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
@@ -293,6 +600,31 @@ fn env_string_vec(name: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn clear(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: this test module only mutates these override vars inside scoped guards.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                // SAFETY: restore the scoped test mutation before the guard leaves scope.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: restore the scoped test mutation before the guard leaves scope.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     fn profile(label: &str) -> HostGpuProfile {
         HostGpuProfile {
             display_name: label.to_string(),
@@ -300,9 +632,41 @@ mod tests {
             stable_id: None,
             vram_bytes: None,
             unified_memory: false,
+            probe: None,
             cuda_sm: None,
             rocm_gfx: None,
         }
+    }
+
+    struct ExpectedNvidiaProcGpu<'a> {
+        display_name: &'a str,
+        backend_device: &'a str,
+        cuda_sm: &'a str,
+        stable_id: &'a str,
+        probe_path: &'a str,
+        irq: &'a str,
+        dma_mask: &'a str,
+    }
+
+    fn assert_nvidia_proc_gpu(gpu: &HostGpuProfile, expected: ExpectedNvidiaProcGpu<'_>) {
+        assert_eq!(gpu.display_name, expected.display_name);
+        assert_eq!(gpu.backend_device.as_deref(), Some(expected.backend_device));
+        assert_eq!(gpu.cuda_sm.as_deref(), Some(expected.cuda_sm));
+        assert_eq!(gpu.stable_id.as_deref(), Some(expected.stable_id));
+        let probe = gpu
+            .probe
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} probe details", expected.display_name));
+        assert_eq!(probe.source, "linux_nvidia_proc");
+        assert_eq!(probe.path.as_deref(), Some(expected.probe_path));
+        assert_eq!(
+            probe.fields.get("IRQ").map(String::as_str),
+            Some(expected.irq)
+        );
+        assert_eq!(
+            probe.fields.get("DMA Mask").map(String::as_str),
+            Some(expected.dma_mask)
+        );
     }
 
     #[test]
@@ -324,5 +688,223 @@ mod tests {
             detected_native_runtime_flavors(&[profile("AMD Radeon PRO W7900")], None, None, None);
 
         assert!(flavors.contains(&NativeRuntimeBackendKind::Rocm));
+    }
+
+    #[test]
+    fn fallback_profiles_do_not_synthesize_backend_ordinals() {
+        let gpu = fallback_gpu_profile_from_label("AMD Radeon PRO W7900".to_string());
+
+        assert_eq!(gpu.display_name, "AMD Radeon PRO W7900");
+        assert_eq!(gpu.backend_device, None);
+        assert_eq!(gpu.stable_id, None);
+        assert!(
+            detected_native_runtime_flavors(&[gpu], None, None, None)
+                .contains(&NativeRuntimeBackendKind::Rocm)
+        );
+    }
+
+    #[test]
+    fn parses_cuda_version_label_from_nvidia_smi_banner() {
+        let output = "| NVIDIA-SMI 595.78 Driver Version: 595.78 CUDA Version: 13.2 |\n";
+
+        assert_eq!(
+            cuda_majors_from_nvidia_smi_output(output),
+            BTreeSet::from([13])
+        );
+    }
+
+    #[test]
+    fn parses_cuda_umd_version_label_from_nvidia_smi_banner() {
+        let output = "| NVIDIA-SMI 610.43.02 KMD Version: 610.43.02 CUDA UMD Version: 13.3 |\n";
+
+        assert_eq!(
+            cuda_majors_from_nvidia_smi_output(output),
+            BTreeSet::from([13])
+        );
+    }
+
+    #[test]
+    fn parses_nvidia_compute_caps_as_cuda_arches() {
+        let output = "\
+0, 12.0
+1, 8.6
+";
+
+        assert_eq!(
+            nvidia_compute_caps_by_index(output),
+            BTreeMap::from([(0, "120".to_string()), (1, "86".to_string())])
+        );
+    }
+
+    #[test]
+    fn empty_gpu_arch_overrides_preserve_detected_arches() {
+        let _cuda_arches = EnvVarGuard::clear("MESH_LLM_CUDA_GPU_ARCHES");
+        let _rocm_arches = EnvVarGuard::clear("MESH_LLM_ROCM_GPU_ARCHES");
+        let mut gpus = vec![HostGpuProfile {
+            cuda_sm: Some("120".to_string()),
+            rocm_gfx: Some("gfx1200".to_string()),
+            ..profile("NVIDIA GeForce RTX 5090")
+        }];
+
+        apply_gpu_arch_overrides(&mut gpus);
+
+        assert_eq!(gpus[0].cuda_sm.as_deref(), Some("120"));
+        assert_eq!(gpus[0].rocm_gfx.as_deref(), Some("gfx1200"));
+    }
+
+    #[test]
+    fn vulkaninfo_labels_keep_only_device_names() {
+        let output = "\
+VULKANINFO
+Vulkan Instance Version: 1.4.321
+GPU0:
+deviceName         = NVIDIA Tegra Orin (nvgpu)
+deviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+driverName         = NVIDIA
+";
+
+        assert_eq!(
+            gpu_labels_from_command_output("vulkaninfo", &["--summary"], output),
+            vec!["NVIDIA Tegra Orin (nvgpu)".to_string()]
+        );
+    }
+
+    #[test]
+    fn vulkaninfo_labels_ignore_software_adapters() {
+        let output = "\
+GPU0:
+deviceName         = llvmpipe (LLVM 18.1.8, 256 bits)
+GPU1:
+deviceName         = SwiftShader Device (Subzero)
+GPU2:
+deviceName         = AMD Radeon PRO W7900
+";
+
+        assert_eq!(
+            gpu_labels_from_command_output("vulkaninfo", &["--summary"], output),
+            vec!["AMD Radeon PRO W7900".to_string()]
+        );
+    }
+
+    #[test]
+    fn lspci_labels_ignore_nvidia_pci_bridges() {
+        let output = "\
+0004:00:00.0 PCI bridge: NVIDIA Corporation Device 229c (rev a1)
+0008:01:00.0 3D controller: NVIDIA Corporation GA102GL [RTX A6000] (rev a1)
+";
+
+        assert_eq!(
+            gpu_labels_from_command_output("lspci", &[], output),
+            vec![
+                "0008:01:00.0 3D controller: NVIDIA Corporation GA102GL [RTX A6000] (rev a1)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn nvidia_probe_results_merge_with_fallback_labels() {
+        let nvidia_smi = "\
+GPU 0: NVIDIA GeForce RTX 5090 (UUID: GPU-80ded6bd-1a89-2628-3d94-902187dbab1d)
+";
+        let lspci = "\
+01:00.0 VGA compatible controller: NVIDIA Corporation GB202 [GeForce RTX 5090] (rev a1)
+";
+        let compute_caps = BTreeMap::from([(0, "120".to_string())]);
+        let nvidia_gpus =
+            nvidia_gpu_profiles_from_probe_outputs(nvidia_smi, &compute_caps, lspci, &[]);
+        let fallback_gpus = vec![
+            profile("NVIDIA Corporation GB202 [GeForce RTX 5090]"),
+            profile("AMD Radeon PRO W7900"),
+        ];
+        let merged = merge_nvidia_and_fallback_gpus(nvidia_gpus, fallback_gpus);
+
+        let names = merged
+            .iter()
+            .map(|gpu| gpu.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["NVIDIA GeForce RTX 5090", "AMD Radeon PRO W7900"]);
+        assert_eq!(merged[0].cuda_sm.as_deref(), Some("120"));
+    }
+
+    #[test]
+    fn nvidia_proc_details_are_nested_under_matching_gpus() {
+        let nvidia_smi = "\
+GPU 0: NVIDIA GeForce RTX 5090 (UUID: GPU-80ded6bd-1a89-2628-3d94-902187dbab1d)
+GPU 1: NVIDIA GeForce RTX 3080 (UUID: GPU-6b7fe24c-5f15-4ac5-88d6-c8934135a4ea)
+";
+        let lspci = "\
+01:00.0 VGA compatible controller: NVIDIA Corporation GB202 [GeForce RTX 5090] (rev a1)
+06:00.0 VGA compatible controller: NVIDIA Corporation GA102 [GeForce RTX 3080] (rev a1)
+";
+        let proc_entries = vec![
+            (
+                "/proc/driver/nvidia/gpus/0000:01:00.0/information",
+                "\
+Model: \t\t NVIDIA GeForce RTX 5090
+IRQ:   \t\t 16
+GPU UUID: \t GPU-80ded6bd-1a89-2628-3d94-902187dbab1d
+Video BIOS: \t 98.02.2e.40.7f
+Bus Type: \t PCIe
+DMA Size: \t 52 bits
+DMA Mask: \t 0xfffffffffffff
+Bus Location: \t 0000:01:00.0
+Device Minor: \t 0
+GPU Firmware: \t 610.43.02
+GPU Excluded:\t No
+",
+            ),
+            (
+                "/proc/driver/nvidia/gpus/0000:06:00.0/information",
+                "\
+Model: \t\t NVIDIA GeForce RTX 3080
+IRQ:   \t\t 184
+GPU UUID: \t GPU-6b7fe24c-5f15-4ac5-88d6-c8934135a4ea
+Video BIOS: \t 94.02.42.80.31
+Bus Type: \t PCIe
+DMA Size: \t 47 bits
+DMA Mask: \t 0x7fffffffffff
+Bus Location: \t 0000:06:00.0
+Device Minor: \t 1
+GPU Firmware: \t 610.43.02
+GPU Excluded:\t No
+",
+            ),
+        ];
+
+        let compute_caps = BTreeMap::from([(0, "120".to_string()), (1, "86".to_string())]);
+        let gpus =
+            nvidia_gpu_profiles_from_probe_outputs(nvidia_smi, &compute_caps, lspci, &proc_entries);
+
+        assert_eq!(gpus.len(), 2);
+        assert_nvidia_proc_gpu(
+            &gpus[0],
+            ExpectedNvidiaProcGpu {
+                display_name: "NVIDIA GeForce RTX 5090",
+                backend_device: "CUDA0",
+                cuda_sm: "120",
+                stable_id: "uuid:GPU-80ded6bd-1a89-2628-3d94-902187dbab1d",
+                probe_path: "/proc/driver/nvidia/gpus/0000:01:00.0/information",
+                irq: "16",
+                dma_mask: "0xfffffffffffff",
+            },
+        );
+        assert_nvidia_proc_gpu(
+            &gpus[1],
+            ExpectedNvidiaProcGpu {
+                display_name: "NVIDIA GeForce RTX 3080",
+                backend_device: "CUDA1",
+                cuda_sm: "86",
+                stable_id: "uuid:GPU-6b7fe24c-5f15-4ac5-88d6-c8934135a4ea",
+                probe_path: "/proc/driver/nvidia/gpus/0000:06:00.0/information",
+                irq: "184",
+                dma_mask: "0x7fffffffffff",
+            },
+        );
+
+        let names: Vec<&str> = gpus.iter().map(|gpu| gpu.display_name.as_str()).collect();
+        assert!(!names.iter().any(|name| name.contains("DMA Mask")));
+        assert!(!names.iter().any(|name| name.contains("IRQ")));
+        assert!(!names.iter().any(|name| name.contains("Bus Location")));
     }
 }

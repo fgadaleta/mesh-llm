@@ -128,6 +128,7 @@ pub(super) struct VerifySpanMessageArgs<'a> {
     pub(super) pos_start: usize,
     pub(super) decode_step: usize,
     pub(super) tokens: &'a [i32],
+    pub(super) sampling: Option<WireSamplingConfig>,
     pub(super) checkpoint: bool,
 }
 
@@ -160,7 +161,7 @@ pub(super) fn embedded_verify_message(
         state,
         request_id: args.request_id,
         session_id: args.session_id,
-        sampling: None,
+        sampling: args.sampling,
         chat_sampling_metadata: None,
         tokens: args.tokens.to_vec(),
         positions: Vec::new(),
@@ -189,6 +190,23 @@ pub(super) fn embedded_session_control_message(
         activation: Vec::new(),
         raw_bytes: Vec::new(),
     }
+}
+
+pub(super) fn embedded_trim_session_message(
+    wire_dtype: WireActivationDType,
+    request_id: u64,
+    session_id: u64,
+    token_count: usize,
+) -> OpenAiResult<StageWireMessage> {
+    let mut message = embedded_session_control_message(
+        wire_dtype,
+        WireMessageKind::TrimSession,
+        request_id,
+        session_id,
+    );
+    message.token_count = i32::try_from(token_count)
+        .map_err(|_| OpenAiError::backend("trim token count exceeds i32"))?;
+    Ok(message)
 }
 
 pub(super) fn generation_config_message(

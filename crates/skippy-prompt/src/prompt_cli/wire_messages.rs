@@ -28,7 +28,6 @@ fn send_decode_step(
     prefill_token_count: usize,
     decode_index: usize,
     current: i32,
-    direct_return: &PromptDirectReturnReceiver,
 ) -> Result<DecodeStepReply> {
     let decode_started = Instant::now();
     let mut state = StageStateHeader::new(WireMessageKind::DecodeEmbd, wire_dtype);
@@ -55,9 +54,9 @@ fn send_decode_step(
     };
     write_stage_message(&mut *stream, &message, wire_dtype)
         .with_context(|| format!("send decode step {decode_index}"))?;
-    let reply = direct_return
-        .recv_expected(WireReplyKind::PredictedToken)
+    let reply = recv_reply(&mut *stream)
         .with_context(|| format!("receive decode step {decode_index} reply"))?;
+    ensure_reply_kind(&reply, WireReplyKind::PredictedToken)?;
     Ok(DecodeStepReply {
         predicted: reply.predicted,
         stats: reply.stats,
@@ -77,7 +76,6 @@ fn send_verify_span(
     decode_index: usize,
     tokens: &[i32],
     checkpoint: bool,
-    direct_return: &PromptDirectReturnReceiver,
 ) -> Result<VerifySpanReply> {
     if tokens.is_empty() {
         bail!("verify span requires at least one token");
@@ -112,9 +110,9 @@ fn send_verify_span(
         .with_context(|| format!("send verify span at decode step {decode_index}"))?;
     let write_ms = elapsed_ms(write_started);
     let wait_started = Instant::now();
-    let reply = direct_return
-        .recv_expected(WireReplyKind::PredictedTokens)
+    let reply = recv_reply(&mut *stream)
         .with_context(|| format!("receive verify span {decode_index} reply"))?;
+    ensure_reply_kind(&reply, WireReplyKind::PredictedTokens)?;
     let wait_ms = elapsed_ms(wait_started);
     Ok(VerifySpanReply {
         predicted_tokens: reply.predicted_tokens,
@@ -123,6 +121,13 @@ fn send_verify_span(
         wait_ms,
         elapsed_ms: elapsed_ms(verify_started),
     })
+}
+
+fn ensure_reply_kind(reply: &StageReply, expected: WireReplyKind) -> Result<()> {
+    if reply.kind != expected {
+        bail!("expected {expected:?} reply, got {:?}", reply.kind);
+    }
+    Ok(())
 }
 
 fn send_generation_config(

@@ -959,28 +959,6 @@ export const CONFIGURATION_DEFAULTS = {
       }
     },
     {
-      id: 'llamacpp-flavor',
-      categoryId: 'runtime',
-      tomlSection: 'defaults.hardware',
-      tomlKey: 'model_runtime',
-      icon: 'binary',
-      label: 'Model Runtime',
-      description: 'Select the default runtime target for new placements.',
-      inheritedLabel: 'Override when a model needs a specialized runner',
-      control: {
-        kind: 'choice',
-        name: 'model_runtime',
-        value: 'cuda',
-        options: [
-          { value: 'cuda', label: 'cuda' },
-          { value: 'rocm', label: 'rocm' },
-          { value: 'metal', label: 'metal' },
-          { value: 'vulkan', label: 'vulkan' },
-          { value: 'cpu', label: 'cpu' }
-        ]
-      }
-    },
-    {
       id: 'hardware-device',
       categoryId: 'runtime',
       tomlSection: 'defaults.hardware',
@@ -1032,7 +1010,7 @@ export const CONFIGURATION_DEFAULTS = {
       inheritedLabel: 'Applied when a placement does not override context size',
       tomlSection: MODEL_FIT_TOML_SECTION,
       mutability: 'restart-required',
-      control: { kind: 'range', name: 'ctx_size', value: '512', min: 512, max: 131072, step: 512, unit: 'tokens' }
+      control: { kind: 'range', name: 'ctx_size', value: '2048', min: 2048, max: 262144, step: 512, unit: 'tokens' }
     },
     {
       id: 'batch',
@@ -2060,7 +2038,7 @@ export const DASHBOARD_HARNESS: DashboardHarnessData = {
     description:
       'Build personal AI from open models. Pool machines across your home, office, or friends — no cloud needed.',
     actions: [
-      { label: 'Learn more', href: 'https://docs.meshllm.cloud/', tone: 'link' },
+      { label: 'Learn more', href: 'https://meshllm.cloud/', tone: 'link' },
       { label: 'GitHub', href: 'https://github.com/Mesh-LLM/mesh-llm', tone: 'secondary' }
     ]
   },
@@ -2071,7 +2049,7 @@ export const DASHBOARD_HARNESS: DashboardHarnessData = {
   meshNodeSeeds: MESH_NODES,
   meshId: 'dashboard-mesh',
   connect: {
-    installHref: 'https://docs.meshllm.cloud/#install',
+    installHref: 'https://meshllm.cloud/#install',
     apiStatus: 'configured target',
     runCommand: 'mesh-llm --auto --join <mesh-invite-token>',
     description: 'contribute compute to the mesh'
@@ -2097,11 +2075,11 @@ export const DASHBOARD_HARNESS: DashboardHarnessData = {
 export const SHELL_HARNESS: ShellHarnessData = {
   productName: 'mesh-llm',
   brand: { primary: 'mesh', accent: 'llm' },
-  footerLinks: [{ label: 'Docs', href: 'https://docs.meshllm.cloud/' }],
+  footerLinks: [{ label: 'Docs', href: 'https://meshllm.cloud/' }],
   footerTrailingLink: { label: 'GitHub', href: 'https://github.com/Mesh-LLM/mesh-llm' },
   topNavApiAccessLinks: [
-    { href: 'https://docs.meshllm.cloud/', label: 'Docs' },
-    { href: 'https://docs.meshllm.cloud/#install', label: 'Install' }
+    { href: 'https://meshllm.cloud/', label: 'Docs' },
+    { href: 'https://meshllm.cloud/#install', label: 'Install' }
   ],
   topNavJoinCommands: [
     {
@@ -2119,9 +2097,9 @@ export const SHELL_HARNESS: ShellHarnessData = {
     { label: 'Client-only join command', value: 'mesh-llm client --join <mesh-invite-token>', prefix: '$' }
   ],
   topNavJoinLinks: [
-    { href: 'https://docs.meshllm.cloud/', label: 'Setup' },
-    { href: 'https://docs.meshllm.cloud/#install', label: 'Install' },
-    { href: 'https://docs.meshllm.cloud/#blackboard', label: 'Blackboard' }
+    { href: 'https://meshllm.cloud/', label: 'Setup' },
+    { href: 'https://meshllm.cloud/#install', label: 'Install' },
+    { href: 'https://meshllm.cloud/#blackboard', label: 'Blackboard' }
   ]
 }
 

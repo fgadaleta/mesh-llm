@@ -249,7 +249,11 @@ pub(crate) struct GpuEntry {
     pub(crate) name: String,
     pub(crate) vram_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rated_vram_gb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reserved_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) allocatable_vram_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mem_bandwidth_gbps: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -327,7 +331,14 @@ pub(crate) fn build_gpus(
         .map(|(i, name)| GpuEntry {
             name,
             vram_bytes: vrams.get(i).copied().flatten().unwrap_or(0),
+            rated_vram_gb: mesh_llm_system::vram::rated_capacity_gb(
+                vrams.get(i).copied().flatten().unwrap_or(0),
+            ),
             reserved_bytes: reserved.get(i).copied().flatten(),
+            allocatable_vram_bytes: Some(mesh_llm_system::vram::allocatable_bytes(
+                vrams.get(i).copied().flatten().unwrap_or(0),
+                reserved.get(i).copied().flatten(),
+            )),
             mem_bandwidth_gbps: bandwidths.get(i).copied().flatten(),
             compute_tflops_fp32: compute_fp32.get(i).copied().flatten(),
             compute_tflops_fp16: compute_fp16.get(i).copied().flatten(),
@@ -511,6 +522,14 @@ pub(crate) struct MeshModelPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) quantization: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tokenizer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) layer_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) head_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) embedding_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
     pub(crate) multimodal: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -565,6 +584,8 @@ pub(crate) struct ModelTargetPayload {
     pub(crate) rank: usize,
     pub(crate) model_ref: String,
     pub(crate) display_name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) profile: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) model_name: Option<String>,
     pub(crate) explicit_interest_count: usize,
@@ -636,6 +657,7 @@ pub(crate) fn build_runtime_status_payload(
         .map(|process| RuntimeModelPayload {
             name: process.name,
             instance_id: process.instance_id,
+            profile: process.profile,
             backend: process.backend,
             status: process.status,
             port: Some(process.port),
@@ -650,6 +672,7 @@ pub(crate) fn build_runtime_status_payload(
             RuntimeModelPayload {
                 name: model_name.to_string(),
                 instance_id: None,
+                profile: String::new(),
                 backend: primary_backend.unwrap_or_else(|| "unknown".into()),
                 status: "starting".into(),
                 port: llama_port,

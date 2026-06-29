@@ -7,11 +7,13 @@ import type { WakeableNode } from '@/features/app-shell/lib/status-types'
 export type { WakeableNode }
 
 export interface GpuInfo {
-  idx: number
+  idx?: number
   name: string
-  total_vram_gb: number
+  rated_vram_gb?: number
+  total_vram_gb?: number
   vram_bytes?: number
   reserved_bytes?: number
+  allocatable_vram_bytes?: number
   used_vram_gb?: number
   free_vram_gb?: number
   temperature?: number
@@ -38,16 +40,23 @@ export interface ModelCapabilities {
 
 export interface MeshModelRaw {
   name: string
+  display_name?: string
   status: 'warm' | 'cold'
   size_gb?: number
   node_count: number
   capabilities?: ModelCapabilities
-  quantization: string
+  quantization?: string
   context_length?: number
+  tokenizer?: string
+  layer_count?: number
+  head_count?: number
+  embedding_size?: number
   family?: string
   tags?: string[]
   params_b?: number
   disk_gb?: number
+  source_file?: string
+  source_ref?: string
   moe?: boolean
   vision?: boolean
   license?: string
@@ -133,6 +142,7 @@ export interface StatusPayload {
   peers: PeerInfo[]
   models: MeshModelRaw[]
   my_vram_gb: number
+  my_is_soc?: boolean
   api_port?: number
   gpus: GpuInfo[]
   serving_models: ServingModelEntry[]

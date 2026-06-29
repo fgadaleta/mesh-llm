@@ -9,6 +9,10 @@ use crate::runtime::RuntimeCommand;
 use mesh_llm_events::LogFormat;
 use serde::Serialize;
 
+mod runtime_surface_help;
+
+pub use runtime_surface_help::runtime_surface_help;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum BinaryFlavor {
     #[default]
@@ -392,7 +396,7 @@ impl MeshGuardrailCliMode {
 #[derive(Parser, Debug)]
 #[command(
     name = "mesh-llm",
-    version = env!("CARGO_PKG_VERSION"),
+    version = mesh_llm_build_info::BUILD_VERSION,
     about = "Pool GPUs over the internet for LLM inference",
     after_help = "Preferred runtime entrypoints:\n  mesh-llm serve\n  mesh-llm serve --model Qwen3-8B-Q4_K_M\n  mesh-llm client --auto\n  mesh-llm gpus\n\n`mesh-llm serve` loads startup models from ~/.mesh-llm/config.toml.\nRun with --help-advanced for all options.\n\nExternal backends (vLLM, TGI, Ollama):\n  Install the plugin:\n    mesh-llm plugins install openai-endpoint\n  Add to ~/.mesh-llm/config.toml:\n    [[plugin]]\n    name = \"openai-endpoint\"\n    url = \"http://gpu-box:8000/v1\"\n  Then: mesh-llm serve     (or: mesh-llm client  for client-only mode)\n\nFlash-MoE SSD backend:\n  Install the plugin:\n    mesh-llm plugins install flash-moe\n  Add [[plugin]] name = \"flash-moe\" with url or plugin-owned args.\n  Then: mesh-llm serve     (or: mesh-llm client  for client-only mode)"
 )]
@@ -707,6 +711,11 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<RuntimeCommand>,
     },
+    /// Inspect and validate mesh-llm configuration files.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Diagnose local mesh, runtime, and split-readiness problems.
     Doctor {
         /// Print machine-readable JSON for the default doctor report.
@@ -915,6 +924,19 @@ pub enum Command {
     /// Run a CLI command contributed by a configured plugin.
     #[command(external_subcommand)]
     ExternalPlugin(Vec<OsString>),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Validate a config TOML file without starting a node.
+    Validate {
+        /// Config TOML path to validate. Defaults to --config, MESH_LLM_CONFIG, or ~/.mesh-llm/config.toml.
+        #[arg(long = "config-path")]
+        config_path: Option<PathBuf>,
+        /// Print machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1479,66 +1501,68 @@ mod tests {
     }
 
     #[test]
-    fn gpus_command_parses_without_subcommand() {
-        let cli = Cli::parse_from(["mesh-llm", "gpus"]);
+    fn gpu_and_gpus_spellings_are_synonymous() {
+        let cases = [
+            (&["gpus"][..], false, None),
+            (&["gpu"][..], false, None),
+            (&["gpus", "--json"][..], true, None),
+            (&["gpu", "--json"][..], true, None),
+            (&["gpus", "detect"][..], false, Some(false)),
+            (&["gpu", "detect"][..], false, Some(false)),
+            (&["gpus", "detect", "--json"][..], false, Some(true)),
+            (&["gpu", "detect", "--json"][..], false, Some(true)),
+        ];
+
+        for (args, expected_command_json, expected_detect_json) in cases {
+            assert_gpu_command_parse(args, expected_command_json, expected_detect_json);
+        }
+    }
+
+    fn assert_gpu_command_parse(
+        args: &[&str],
+        expected_command_json: bool,
+        expected_detect_json: Option<bool>,
+    ) {
+        let cli = Cli::parse_from(std::iter::once("mesh-llm").chain(args.iter().copied()));
 
         match cli.command.expect("gpu command expected") {
             Command::Gpus { json, command } => {
-                assert!(!json);
-                assert!(command.is_none());
+                assert_eq!(json, expected_command_json, "command json for {args:?}");
+                match (command, expected_detect_json) {
+                    (None, None) => {}
+                    (Some(GpuCommand::Detect { json }), Some(expected_json)) => {
+                        assert_eq!(json, expected_json, "detect json for {args:?}");
+                    }
+                    (actual, expected) => {
+                        panic!(
+                            "unexpected detect command for {args:?}: {actual:?}, expected {expected:?}"
+                        );
+                    }
+                }
             }
-            other => panic!("unexpected command: {other:?}"),
+            other => panic!("unexpected command for {args:?}: {other:?}"),
         }
     }
 
     #[test]
-    fn gpu_alias_parses_without_subcommand() {
-        let cli = Cli::parse_from(["mesh-llm", "gpu"]);
+    fn config_validate_command_parses_config_path_and_json() {
+        let cli = Cli::parse_from([
+            "mesh-llm",
+            "config",
+            "validate",
+            "--config-path",
+            "mesh.toml",
+            "--json",
+        ]);
 
-        match cli.command.expect("gpu command expected") {
-            Command::Gpus { json, command } => {
-                assert!(!json);
-                assert!(command.is_none());
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gpus_command_accepts_json_flag() {
-        let cli = Cli::parse_from(["mesh-llm", "gpus", "--json"]);
-
-        match cli.command.expect("gpu command expected") {
-            Command::Gpus { json, command } => {
-                assert!(json);
-                assert!(command.is_none());
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gpu_detect_subcommand_parses() {
-        let cli = Cli::parse_from(["mesh-llm", "gpu", "detect"]);
-        assert!(matches!(
-            cli.command,
-            Some(Command::Gpus {
-                json: false,
-                command: Some(GpuCommand::Detect { json: false }),
-            })
-        ));
-    }
-
-    #[test]
-    fn gpu_detect_subcommand_accepts_json_flag() {
-        let cli = Cli::parse_from(["mesh-llm", "gpu", "detect", "--json"]);
-        assert!(matches!(
-            cli.command,
-            Some(Command::Gpus {
-                json: false,
-                command: Some(GpuCommand::Detect { json: true }),
-            })
-        ));
+        let Some(Command::Config {
+            command: ConfigCommand::Validate { config_path, json },
+        }) = cli.command
+        else {
+            panic!("expected config validate command");
+        };
+        assert_eq!(config_path, Some(PathBuf::from("mesh.toml")));
+        assert!(json);
     }
 
     #[test]

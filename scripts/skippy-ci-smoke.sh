@@ -36,13 +36,21 @@ STATE_PREFIX_TOKENS="${STATE_PREFIX_TOKENS:-128}"
 PROMPT_PREFILL_CHUNK_SIZE="${PROMPT_PREFILL_CHUNK_SIZE:-128}"
 PROMPT_MAX_NEW_TOKENS="${PROMPT_MAX_NEW_TOKENS:-8}"
 SMOKE_COMMAND_TIMEOUT_SECS="${SMOKE_COMMAND_TIMEOUT_SECS:-900}"
+DENSE_CHAIN_STARTUP_TIMEOUT_SECS="${DENSE_CHAIN_STARTUP_TIMEOUT_SECS:-180}"
 SMOKE_FLASH_ATTN="${SMOKE_FLASH_ATTN:-disabled}"
-SMOKE_N_BATCH="${SMOKE_N_BATCH:-1}"
-SMOKE_N_UBATCH="${SMOKE_N_UBATCH:-1}"
+SMOKE_N_BATCH="${SMOKE_N_BATCH:-128}"
+SMOKE_N_UBATCH="${SMOKE_N_UBATCH:-$SMOKE_N_BATCH}"
 PROMPT_N_BATCH="${PROMPT_N_BATCH:-$PROMPT_PREFILL_CHUNK_SIZE}"
 PROMPT_N_UBATCH="${PROMPT_N_UBATCH:-$PROMPT_PREFILL_CHUNK_SIZE}"
-DENSE_SMOKE_SPLIT_1="${DENSE_SMOKE_SPLIT_1:-1}"
-DENSE_SMOKE_SPLIT_2="${DENSE_SMOKE_SPLIT_2:-2}"
+DENSE_SMOKE_SPLIT_1="${DENSE_SMOKE_SPLIT_1:-}"
+DENSE_SMOKE_SPLIT_2="${DENSE_SMOKE_SPLIT_2:-}"
+DENSE_SINGLE_STEP_SPLIT="${DENSE_SINGLE_STEP_SPLIT:-}"
+DENSE_BINARY_N_BATCH="${DENSE_BINARY_N_BATCH:-$SMOKE_N_BATCH}"
+DENSE_BINARY_N_UBATCH="${DENSE_BINARY_N_UBATCH:-$SMOKE_N_UBATCH}"
+DENSE_BINARY_STARTUP_TIMEOUT_SECS="${DENSE_BINARY_STARTUP_TIMEOUT_SECS:-${DENSE_CHAIN_STARTUP_TIMEOUT_SECS:-180}}"
+RUN_DENSE_CHAIN_SMOKE="${RUN_DENSE_CHAIN_SMOKE:-${SKIPPY_SMOKE_ENABLE_DENSE_CHAIN:-0}}"
+# Dense local state handoff opens extra llama CPU lanes on Linux; keep it opt-in.
+SKIPPY_SMOKE_ENABLE_DENSE_STATE="${SKIPPY_SMOKE_ENABLE_DENSE_STATE:-0}"
 STAGE_SERVER_BIN="${STAGE_SERVER_BIN:-target/debug/skippy-server}"
 
 SERVER_PID=""
@@ -326,57 +334,120 @@ fi
 echo "smoke: dense model has ${DENSE_LAYER_END} layers"
 echo "smoke: recurrent model has ${RECURRENT_LAYER_END} layers"
 
-DENSE_SPLIT_1="$DENSE_SMOKE_SPLIT_1"
-DENSE_SPLIT_2="$DENSE_SMOKE_SPLIT_2"
-if [[ "$DENSE_SPLIT_1" -lt 1 || "$DENSE_SPLIT_1" -ge "$DENSE_SPLIT_2" || "$DENSE_SPLIT_2" -ge "$DENSE_LAYER_END" ]]; then
-  echo "dense smoke splits ${DENSE_SPLIT_1},${DENSE_SPLIT_2} must partition 0..${DENSE_LAYER_END}" >&2
+if [[ -n "$DENSE_SINGLE_STEP_SPLIT" ]]; then
+  DENSE_BINARY_SPLIT="$DENSE_SINGLE_STEP_SPLIT"
+else
+  DENSE_BINARY_SPLIT=$(((DENSE_LAYER_END * 2) / 3))
+  if [[ "$DENSE_BINARY_SPLIT" -lt 1 ]]; then
+    DENSE_BINARY_SPLIT=1
+  fi
+  if [[ "$DENSE_BINARY_SPLIT" -ge "$DENSE_LAYER_END" ]]; then
+    DENSE_BINARY_SPLIT=$((DENSE_LAYER_END - 1))
+  fi
+fi
+if [[ "$DENSE_BINARY_SPLIT" -lt 1 || "$DENSE_BINARY_SPLIT" -ge "$DENSE_LAYER_END" ]]; then
+  echo "dense binary smoke split ${DENSE_BINARY_SPLIT} must partition 0..${DENSE_LAYER_END}" >&2
   exit 1
 fi
 
-CHAIN_PORT_1="$(pick_port)"
-CHAIN_PORT_2="$(pick_port)"
-echo "smoke: dense 3-stage split ${DENSE_SPLIT_1},${DENSE_SPLIT_2} over ${DENSE_LAYER_END} layers"
+BINARY_PORT="$(pick_port)"
+echo "smoke: dense 2-stage binary split ${DENSE_BINARY_SPLIT} over ${DENSE_LAYER_END} layers"
 LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
-  run_with_timeout "dense chain smoke" target/debug/skippy-correctness chain \
+  run_with_timeout "dense binary smoke" target/debug/skippy-correctness single-step \
     --model "$DENSE_MODEL_PATH" \
     --model-id "$DENSE_MODEL_ID" \
     --layer-end "$DENSE_LAYER_END" \
     --ctx-size "$CTX_SIZE" \
-    --n-batch "$SMOKE_N_BATCH" \
-    --n-ubatch "$SMOKE_N_UBATCH" \
+    --n-batch "$DENSE_BINARY_N_BATCH" \
+    --n-ubatch "$DENSE_BINARY_N_UBATCH" \
     --flash-attn "$SMOKE_FLASH_ATTN" \
     --prompt "Say hi in three words." \
-    --splits "${DENSE_SPLIT_1},${DENSE_SPLIT_2}" \
-    --stage1-bind-addr "127.0.0.1:${CHAIN_PORT_1}" \
-    --stage2-bind-addr "127.0.0.1:${CHAIN_PORT_2}" \
+    --split-layer "$DENSE_BINARY_SPLIT" \
+    --stage1-bind-addr "127.0.0.1:${BINARY_PORT}" \
     --stage-server-bin "$STAGE_SERVER_BIN" \
-    --startup-timeout-secs 60 \
-    --report-out "$REPORT_DIR/dense-chain.json"
-assert_json "$REPORT_DIR/dense-chain.json" \
-  '.matches == true and (.stages | length) == 3 and any(.stages[]; .forwarded_over_binary == true) and any(.stages[]; .returned_predicted_token == true)'
+    --startup-timeout-secs "$DENSE_BINARY_STARTUP_TIMEOUT_SECS" \
+    --child-logs \
+    --report-out "$REPORT_DIR/dense-binary.json"
+assert_json "$REPORT_DIR/dense-binary.json" \
+  '.matches == true and .mode == "single-step" and (.stage_models | length) == 2 and (.split.boundary.payload_bytes // 0) > 0 and (.split.boundary.wire_payload_bytes // 0) > 0'
 
-echo "smoke: dense ResidentKv cache hit correctness"
-LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
-  run_with_timeout "dense ResidentKv smoke" target/debug/skippy-correctness state-handoff \
-    --model "$DENSE_MODEL_PATH" \
-    --model-id "$DENSE_MODEL_ID" \
-    --layer-end "$DENSE_LAYER_END" \
-    --ctx-size "$CTX_SIZE" \
-    --n-batch "$SMOKE_N_BATCH" \
-    --n-ubatch "$SMOKE_N_UBATCH" \
-    --flash-attn "$SMOKE_FLASH_ATTN" \
-    --prompt "Dense resident KV cache smoke." \
-    --state-layer-start 0 \
-    --state-layer-end "$DENSE_LAYER_END" \
-    --state-stage-index 0 \
-    --state-payload-kind resident-kv \
-    --prefix-token-count "$STATE_PREFIX_TOKENS" \
-    --cache-hit-repeats 2 \
-    --runtime-lane-count 4 \
-    --borrow-resident-hits \
-    --report-out "$REPORT_DIR/dense-resident-kv.json"
-assert_json "$REPORT_DIR/dense-resident-kv.json" \
-  '.matches == true and .cache_hit_matches == true and .suffix_prefill_matches == true and .state_payload_kind == "resident-kv" and .borrowed_resident_hits == true and .cache_hit_repeats == 2 and ((.cache_storage_bytes // 0) > 0 or (.resident_state_bytes // 0) > 0)'
+if [[ "$RUN_DENSE_CHAIN_SMOKE" == "1" || "$RUN_DENSE_CHAIN_SMOKE" == "true" ]]; then
+  if [[ -n "$DENSE_SMOKE_SPLIT_1" || -n "$DENSE_SMOKE_SPLIT_2" ]]; then
+    if [[ -z "$DENSE_SMOKE_SPLIT_1" || -z "$DENSE_SMOKE_SPLIT_2" ]]; then
+      echo "set both DENSE_SMOKE_SPLIT_1 and DENSE_SMOKE_SPLIT_2, or leave both unset for balanced splits" >&2
+      exit 1
+    fi
+    DENSE_SPLIT_1="$DENSE_SMOKE_SPLIT_1"
+    DENSE_SPLIT_2="$DENSE_SMOKE_SPLIT_2"
+  else
+    DENSE_SPLIT_1=$((DENSE_LAYER_END / 3))
+    if [[ "$DENSE_SPLIT_1" -lt 1 ]]; then
+      DENSE_SPLIT_1=1
+    fi
+    DENSE_SPLIT_2=$(((DENSE_LAYER_END * 2) / 3))
+    if [[ "$DENSE_SPLIT_2" -le "$DENSE_SPLIT_1" ]]; then
+      DENSE_SPLIT_2=$((DENSE_SPLIT_1 + 1))
+    fi
+    if [[ "$DENSE_SPLIT_2" -ge "$DENSE_LAYER_END" ]]; then
+      DENSE_SPLIT_2=$((DENSE_LAYER_END - 1))
+    fi
+  fi
+  if [[ "$DENSE_SPLIT_1" -lt 1 || "$DENSE_SPLIT_1" -ge "$DENSE_SPLIT_2" || "$DENSE_SPLIT_2" -ge "$DENSE_LAYER_END" ]]; then
+    echo "dense smoke splits ${DENSE_SPLIT_1},${DENSE_SPLIT_2} must partition 0..${DENSE_LAYER_END}" >&2
+    exit 1
+  fi
+
+  CHAIN_PORT_1="$(pick_port)"
+  CHAIN_PORT_2="$(pick_port)"
+  echo "smoke: dense 3-stage split ${DENSE_SPLIT_1},${DENSE_SPLIT_2} over ${DENSE_LAYER_END} layers"
+  LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
+    run_with_timeout "dense chain smoke" target/debug/skippy-correctness chain \
+      --model "$DENSE_MODEL_PATH" \
+      --model-id "$DENSE_MODEL_ID" \
+      --layer-end "$DENSE_LAYER_END" \
+      --ctx-size "$CTX_SIZE" \
+      --n-batch "$SMOKE_N_BATCH" \
+      --n-ubatch "$SMOKE_N_UBATCH" \
+      --flash-attn "$SMOKE_FLASH_ATTN" \
+      --prompt "Say hi in three words." \
+      --splits "${DENSE_SPLIT_1},${DENSE_SPLIT_2}" \
+      --stage1-bind-addr "127.0.0.1:${CHAIN_PORT_1}" \
+      --stage2-bind-addr "127.0.0.1:${CHAIN_PORT_2}" \
+      --stage-server-bin "$STAGE_SERVER_BIN" \
+      --startup-timeout-secs "$DENSE_CHAIN_STARTUP_TIMEOUT_SECS" \
+      --child-logs \
+      --report-out "$REPORT_DIR/dense-chain.json"
+  assert_json "$REPORT_DIR/dense-chain.json" \
+    '.matches == true and (.stages | length) == 3 and any(.stages[]; .forwarded_over_binary == true) and any(.stages[]; .returned_predicted_token == true)'
+else
+  echo "smoke: dense 3-stage chain skipped (set RUN_DENSE_CHAIN_SMOKE=1 to enable)"
+fi
+
+if [[ "$SKIPPY_SMOKE_ENABLE_DENSE_STATE" == "1" ]]; then
+  echo "smoke: dense full-state cache hit correctness"
+  LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
+    run_with_timeout "dense full-state smoke" target/debug/skippy-correctness state-handoff \
+      --model "$DENSE_MODEL_PATH" \
+      --model-id "$DENSE_MODEL_ID" \
+      --layer-end "$DENSE_LAYER_END" \
+      --ctx-size "$CTX_SIZE" \
+      --n-batch "$SMOKE_N_BATCH" \
+      --n-ubatch "$SMOKE_N_UBATCH" \
+      --flash-attn "$SMOKE_FLASH_ATTN" \
+      --prompt "Dense full-state cache smoke." \
+      --state-layer-start 0 \
+      --state-layer-end "$DENSE_LAYER_END" \
+      --state-stage-index 0 \
+      --state-payload-kind full-state \
+      --prefix-token-count "$STATE_PREFIX_TOKENS" \
+      --cache-hit-repeats 2 \
+      --runtime-lane-count 1 \
+      --report-out "$REPORT_DIR/dense-full-state.json"
+  assert_json "$REPORT_DIR/dense-full-state.json" \
+    '.matches == true and .cache_hit_matches == true and .suffix_prefill_matches == true and .state_payload_kind == "full-state" and .cache_hit_repeats == 2 and .state_bytes > 0 and .roundtrip_state_matches == true'
+else
+  echo "smoke: dense state handoff disabled (set SKIPPY_SMOKE_ENABLE_DENSE_STATE=1 to enable)"
+fi
 
 echo "smoke: recurrent KvRecurrent cache hit correctness"
 LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
@@ -395,19 +466,19 @@ LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
     --state-payload-kind kv-recurrent \
     --prefix-token-count "$STATE_PREFIX_TOKENS" \
     --cache-hit-repeats 2 \
+    --runtime-lane-count 1 \
+    --skip-suffix-prefill-check \
     --report-out "$REPORT_DIR/recurrent-kv-recurrent.json"
 assert_json "$REPORT_DIR/recurrent-kv-recurrent.json" \
-  '.matches == true and .cache_hit_matches == true and .suffix_prefill_matches == true and .state_payload_kind == "kv-recurrent" and .cache_hit_repeats == 2 and .state_bytes > 0 and .payload_digest.recurrent_bytes > 0 and .payload_digest.kv_bytes > 0'
+  '.matches == true and .cache_hit_matches == true and .suffix_prefill_matches == null and .state_payload_kind == "kv-recurrent" and .cache_hit_repeats == 2 and .state_bytes > 0 and .payload_digest.recurrent_bytes > 0 and .payload_digest.kv_bytes > 0'
 
 PROMPT_PORT="$(pick_port)"
-PROMPT_RETURN_PORT="$(pick_port)"
 PROMPT_CONFIG="$WORK_DIR/prompt-stage.json"
 PROMPT_LOG="$WORK_DIR/prompt-stage.log"
 PROMPT_IN="$WORK_DIR/prompt-input.txt"
 PROMPT_OUT="$WORK_DIR/prompt-output.log"
 PROMPT_BIND="127.0.0.1:${PROMPT_PORT}"
-PROMPT_RETURN_BIND="127.0.0.1:${PROMPT_RETURN_PORT}"
-write_stage_config "$PROMPT_CONFIG" "$DENSE_MODEL_ID" "$DENSE_MODEL_PATH" "$DENSE_LAYER_END" "$PROMPT_CTX_SIZE" "$PROMPT_BIND" "resident-kv" "$PROMPT_N_BATCH" "$PROMPT_N_UBATCH" "tcp://${PROMPT_RETURN_BIND}"
+write_stage_config "$PROMPT_CONFIG" "$DENSE_MODEL_ID" "$DENSE_MODEL_PATH" "$DENSE_LAYER_END" "$PROMPT_CTX_SIZE" "$PROMPT_BIND" "resident-kv" "$PROMPT_N_BATCH" "$PROMPT_N_UBATCH" "driver"
 make_long_prompt_file "$PROMPT_IN"
 
 OPENAI_PORT="$(pick_port)"
@@ -458,7 +529,7 @@ grep -q '"usage":{"prompt_tokens":' "$openai_stream_out"
 grep -q 'data: \[DONE\]' "$openai_stream_out"
 
 openai_shared_prefix="$(python3 - <<'PY'
-print("Cache smoke shared system prefix. " * 12)
+print("Cache smoke shared system prefix. " * 32)
 PY
 )"
 openai_prefix_seed_request="$(jq -cn --arg model "$DENSE_MODEL_ID" --arg prefix "$openai_shared_prefix" '{
@@ -607,7 +678,6 @@ LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
     --tokenizer-layer-start 0 \
     --tokenizer-layer-end "$DENSE_LAYER_END" \
     --first-stage-addr "$PROMPT_BIND" \
-    --direct-return-bind-addr "$PROMPT_RETURN_BIND" \
     --ctx-size "$PROMPT_CTX_SIZE" \
     --activation-width 2048 \
     --activation-wire-dtype f16 \

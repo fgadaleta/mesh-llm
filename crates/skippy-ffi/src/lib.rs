@@ -1,11 +1,110 @@
 pub const ABI_VERSION_MAJOR: u32 = 0;
 pub const ABI_VERSION_MINOR: u32 = 1;
-pub const ABI_VERSION_PATCH: u32 = 25;
+pub const ABI_VERSION_PATCH: u32 = 27;
+pub const FEATURE_BACKEND_DEVICES: u64 = 1 << 23;
+pub const FEATURE_RUNTIME_EVENTS: u64 = 1 << 24;
+pub const FEATURE_NATIVE_MTP_N1: u64 = 1 << 25;
 
 use std::ffi::{c_char, c_int, c_void};
 
 pub type LlamaLogCallback =
     Option<unsafe extern "C" fn(level: c_int, text: *const c_char, user_data: *mut c_void)>;
+pub type SkippyRuntimeEventCallback =
+    Option<unsafe extern "C" fn(event: *const SkippyRuntimeEventV1, user_data: *mut c_void)>;
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SkippyRuntimeEventCategory(pub u32);
+
+impl SkippyRuntimeEventCategory {
+    pub const MODEL_OPEN: Self = Self(1);
+    pub const BACKEND: Self = Self(2);
+    pub const SESSION: Self = Self(3);
+    pub const KV: Self = Self(4);
+    pub const WARNING: Self = Self(5);
+}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SkippyRuntimeEventKind(pub u32);
+
+impl SkippyRuntimeEventKind {
+    pub const MODEL_OPEN_STARTED: Self = Self(1);
+    pub const MODEL_OPEN_PROGRESS: Self = Self(2);
+    pub const BACKEND_DEVICE_SELECTED: Self = Self(3);
+    pub const MODEL_OPEN_FINISHED: Self = Self(4);
+    pub const MODEL_OPEN_FAILED_HANDLED: Self = Self(5);
+}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SkippyRuntimeEventEmitterKind(pub u32);
+
+impl SkippyRuntimeEventEmitterKind {
+    pub const UNKNOWN: Self = Self(0);
+    pub const OPEN_THREAD: Self = Self(1);
+    pub const WORKER_THREAD: Self = Self(2);
+}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SkippyRuntimeEventProgressUnit(pub u32);
+
+impl SkippyRuntimeEventProgressUnit {
+    pub const NONE: Self = Self(0);
+    pub const BYTES: Self = Self(1);
+    pub const ITEMS: Self = Self(2);
+    pub const TENSORS: Self = Self(3);
+    pub const STEPS: Self = Self(4);
+}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SkippyRuntimeEventFailureCode(pub u32);
+
+impl SkippyRuntimeEventFailureCode {
+    pub const NONE: Self = Self(0);
+    pub const INVALID_ARGUMENT: Self = Self(1);
+    pub const IO_ERROR: Self = Self(2);
+    pub const MODEL_ERROR: Self = Self(3);
+    pub const RUNTIME_ERROR: Self = Self(4);
+    pub const BACKEND_ERROR: Self = Self(5);
+    pub const CANCELLED: Self = Self(6);
+    pub const INTERNAL_ERROR: Self = Self(7);
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SkippyRuntimeEventV1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub category: SkippyRuntimeEventCategory,
+    pub kind: SkippyRuntimeEventKind,
+    pub emitter: SkippyRuntimeEventEmitterKind,
+    pub reserved0: u32,
+    pub sequence: u64,
+    pub timestamp_mono_ns: u64,
+    pub model_id: u64,
+    pub stage_id: u64,
+    pub session_id: u64,
+    pub progress_current: u64,
+    pub progress_total: u64,
+    pub progress_unit: SkippyRuntimeEventProgressUnit,
+    pub failure_code: SkippyRuntimeEventFailureCode,
+    pub status: Status,
+    pub reserved1: u32,
+    pub detail_ptr: *const c_char,
+    pub detail_len: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SkippyRuntimeEventReporterV1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub callback: SkippyRuntimeEventCallback,
+    pub user_data: *mut c_void,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -230,6 +329,146 @@ pub struct LogitBias {
     pub bias: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum LlamaFileType {
+    AllF32 = 0,
+    MostlyF16 = 1,
+    MostlyQ4_0 = 2,
+    MostlyQ4_1 = 3,
+    MostlyQ8_0 = 7,
+    MostlyQ5_0 = 8,
+    MostlyQ5_1 = 9,
+    MostlyQ2K = 10,
+    MostlyQ3KS = 11,
+    MostlyQ3KM = 12,
+    MostlyQ3KL = 13,
+    MostlyQ4KS = 14,
+    MostlyQ4KM = 15,
+    MostlyQ5KS = 16,
+    MostlyQ5KM = 17,
+    MostlyQ6K = 18,
+    MostlyIQ2XXS = 19,
+    MostlyIQ2XS = 20,
+    MostlyQ2KS = 21,
+    MostlyIQ3XS = 22,
+    MostlyIQ3XXS = 23,
+    MostlyIQ1S = 24,
+    MostlyIQ4NL = 25,
+    MostlyIQ3S = 26,
+    MostlyIQ3M = 27,
+    MostlyIQ2S = 28,
+    MostlyIQ2M = 29,
+    MostlyIQ4XS = 30,
+    MostlyIQ1M = 31,
+    MostlyBf16 = 32,
+    MostlyTQ1_0 = 36,
+    MostlyTQ2_0 = 37,
+    MostlyMxfp4Moe = 38,
+    MostlyNvfp4 = 39,
+    MostlyQ1_0 = 40,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum GgmlType {
+    F32 = 0,
+    F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q8_1 = 9,
+    Q2K = 10,
+    Q3K = 11,
+    Q4K = 12,
+    Q5K = 13,
+    Q6K = 14,
+    Q8K = 15,
+    IQ2XXS = 16,
+    IQ2XS = 17,
+    IQ3XXS = 18,
+    IQ1S = 19,
+    IQ4NL = 20,
+    IQ3S = 21,
+    IQ2S = 22,
+    IQ4XS = 23,
+    I8 = 24,
+    I16 = 25,
+    I32 = 26,
+    I64 = 27,
+    F64 = 28,
+    IQ1M = 29,
+    Bf16 = 30,
+    TQ1_0 = 34,
+    TQ2_0 = 35,
+    Mxfp4 = 39,
+    Nvfp4 = 40,
+    Q1_0 = 41,
+    Count = 42,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum LlamaModelKvOverrideType {
+    Int = 0,
+    Float = 1,
+    Bool = 2,
+    Str = 3,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union LlamaModelKvOverrideValue {
+    pub val_i64: i64,
+    pub val_f64: f64,
+    pub val_bool: bool,
+    pub val_str: [c_char; 128],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LlamaModelKvOverride {
+    pub tag: LlamaModelKvOverrideType,
+    pub key: [c_char; 128],
+    pub value: LlamaModelKvOverrideValue,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LlamaModelTensorOverride {
+    pub pattern: *const c_char,
+    pub tensor_type: GgmlType,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LlamaModelImatrixData {
+    pub name: *const c_char,
+    pub data: *const f32,
+    pub size: usize,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LlamaModelQuantizeParams {
+    pub nthread: i32,
+    pub ftype: LlamaFileType,
+    pub output_tensor_type: GgmlType,
+    pub token_embedding_type: GgmlType,
+    pub allow_requantize: bool,
+    pub quantize_output_tensor: bool,
+    pub only_copy: bool,
+    pub pure: bool,
+    pub keep_split: bool,
+    pub dry_run: bool,
+    pub imatrix: *const LlamaModelImatrixData,
+    pub kv_overrides: *const LlamaModelKvOverride,
+    pub tt_overrides: *const LlamaModelTensorOverride,
+    pub prune_layers: *const i32,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SamplingConfig {
@@ -264,6 +503,15 @@ pub struct KvPageDesc {
     pub v_element_bytes: u32,
     pub payload_bytes: u64,
     pub flags: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeMtpDraft {
+    pub version: u32,
+    pub available: bool,
+    pub token_id: i32,
+    pub proposal_compute_us: i64,
 }
 
 #[repr(C)]
@@ -467,7 +715,8 @@ mod dynamic {
     dynamic_symbols! {
         llama_log_set(log_callback: LlamaLogCallback, user_data: *mut c_void);
         ggml_log_set(log_callback: LlamaLogCallback, user_data: *mut c_void);
-        skippy_status_string(status: Status) -> *const c_char;
+        llama_model_quantize_default_params() -> LlamaModelQuantizeParams;
+        llama_model_quantize(fname_inp: *const c_char, fname_out: *const c_char, params: *const LlamaModelQuantizeParams) -> u32;
         skippy_error_free(error: *mut Error);
         skippy_backend_device_count(out_count: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_backend_device_at(index: usize, out_device: *mut BackendDevice, out_error: *mut *mut Error) -> Status;
@@ -479,7 +728,6 @@ mod dynamic {
         skippy_session_create_from_resident_prefix(model: *mut Model, cache_seq_id: i32, token_ids: *const i32, token_count: usize, out_session: *mut *mut Session, out_error: *mut *mut Error) -> Status;
         skippy_session_llama_context(session: *mut Session) -> *mut Opaque;
         skippy_session_position(session: *const Session) -> i32;
-        skippy_session_native_seq_id(session: *const Session) -> i32;
         skippy_session_batch_size(session: *const Session) -> i32;
         skippy_session_begin_external_decode(session: *mut Session, out_error: *mut *mut Error) -> Status;
         skippy_session_end_external_decode(session: *mut Session, out_error: *mut *mut Error) -> Status;
@@ -491,16 +739,17 @@ mod dynamic {
         skippy_restore_session_checkpoint(session: *mut Session, token_count: u64, out_error: *mut *mut Error) -> Status;
         skippy_session_free(session: *mut Session, out_error: *mut *mut Error) -> Status;
         skippy_prefill_chunk(session: *mut Session, token_ids: *const i32, token_count: usize, input_activations: *const c_void, input_activation_bytes: usize, output_activations: *mut c_void, output_activation_capacity: usize, out_output_activation_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
-        skippy_decode_step(session: *mut Session, token_id: i32, input_activation: *const c_void, input_activation_bytes: usize, output_activation: *mut c_void, output_activation_capacity: usize, out_output_activation_bytes: *mut usize, out_predicted_token: *mut i32, out_error: *mut *mut Error) -> Status;
         skippy_verify_tokens(session: *mut Session, token_ids: *const i32, token_count: usize, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_decode_step_sampled(session: *mut Session, token_id: i32, sampling: *const SamplingConfig, input_activation: *const c_void, input_activation_bytes: usize, output_activation: *mut c_void, output_activation_capacity: usize, out_output_activation_bytes: *mut usize, out_predicted_token: *mut i32, out_error: *mut *mut Error) -> Status;
+        skippy_decode_batch_sampled(sessions: *const *mut Session, token_ids: *const i32, sampling: *const *const SamplingConfig, request_count: usize, out_predicted_tokens: *mut i32, predicted_token_capacity: usize, out_error: *mut *mut Error) -> Status;
         skippy_prefill_chunk_frame(session: *mut Session, token_ids: *const i32, token_count: usize, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_prefill_chunk_frame_sampled(session: *mut Session, token_ids: *const i32, token_count: usize, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, out_error: *mut *mut Error) -> Status;
         skippy_prefill_chunk_frame_with_positions(session: *mut Session, token_ids: *const i32, token_count: usize, positions: *const i32, position_count: usize, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_prefill_chunk_frame_sampled_with_positions(session: *mut Session, token_ids: *const i32, token_count: usize, positions: *const i32, position_count: usize, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, out_error: *mut *mut Error) -> Status;
-        skippy_decode_step_frame(session: *mut Session, token_id: i32, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, out_error: *mut *mut Error) -> Status;
-        skippy_verify_tokens_frame(session: *mut Session, token_ids: *const i32, token_count: usize, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_decode_step_frame_sampled(session: *mut Session, token_id: i32, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, out_error: *mut *mut Error) -> Status;
+        skippy_decode_step_frame_sampled_mtp_n1(session: *mut Session, token_id: i32, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, out_mtp_draft: *mut NativeMtpDraft, out_error: *mut *mut Error) -> Status;
+        skippy_decode_step_frame_batch_sampled(sessions: *const *mut Session, token_ids: *const i32, sampling: *const *const SamplingConfig, input_descs: *const *const ActivationDesc, input_payloads: *const *const c_void, output_descs: *mut ActivationDesc, output_payloads: *const *mut c_void, output_payload_capacities: *const usize, out_output_payload_bytes: *mut usize, out_predicted_tokens: *mut i32, predicted_token_capacity: usize, request_count: usize, out_error: *mut *mut Error) -> Status;
+        skippy_verify_tokens_frame_sampled(session: *mut Session, token_ids: *const i32, token_count: usize, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_session_copy_output_activation_frame(session: *mut Session, token_count: usize, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_session_last_token_signal(session: *mut Session, out_signal: *mut TokenSignal, out_error: *mut *mut Error) -> Status;
         skippy_session_signal_window(session: *mut Session, window_tokens: u32, out_window: *mut GenerationSignalWindow, out_error: *mut *mut Error) -> Status;
@@ -519,9 +768,6 @@ mod dynamic {
         skippy_tokenize(model: *mut Model, text: *const c_char, add_special: bool, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_detokenize(model: *mut Model, tokens: *const i32, token_count: usize, output_text: *mut c_char, output_text_capacity: usize, out_text_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_token_is_eog(model: *mut Model, token_id: i32, out_is_eog: *mut bool, out_error: *mut *mut Error) -> Status;
-        skippy_apply_chat_template(model: *mut Model, messages: *const ChatMessage, message_count: usize, add_assistant: bool, override_enable_thinking: bool, enable_thinking: bool, output_text: *mut c_char, output_text_capacity: usize, out_text_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
-        skippy_apply_chat_template_json(model: *mut Model, messages_json: *const c_char, tools_json: *const c_char, tool_choice_json: *const c_char, add_assistant: bool, override_enable_thinking: bool, enable_thinking: bool, parallel_tool_calls: bool, output_text: *mut c_char, output_text_capacity: usize, out_text_bytes: *mut usize, output_metadata_json: *mut c_char, output_metadata_json_capacity: usize, out_metadata_json_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
-        skippy_parse_chat_response_json(generated_text: *const c_char, metadata_json: *const c_char, is_partial: bool, output_message_json: *mut c_char, output_message_json_capacity: usize, out_message_json_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_model_info_open(path: *const c_char, out_info: *mut *mut ModelInfo, out_error: *mut *mut Error) -> Status;
         skippy_model_info_free(info: *mut ModelInfo, out_error: *mut *mut Error) -> Status;
         skippy_model_info_tensor_count(info: *mut ModelInfo, out_count: *mut usize, out_error: *mut *mut Error) -> Status;
@@ -553,10 +799,243 @@ mod dynamic {
         mtmd_helper_eval_chunks(ctx: *mut MtmdContext, lctx: *mut Opaque, chunks: *const MtmdInputChunks, n_past: i32, seq_id: i32, n_batch: i32, logits_last: bool, new_n_past: *mut i32) -> c_int;
         mtmd_helper_eval_chunk_single(ctx: *mut MtmdContext, lctx: *mut Opaque, chunk: *const Opaque, n_past: i32, seq_id: i32, n_batch: i32, logits_last: bool, new_n_past: *mut i32) -> c_int;
     }
+
+    // -----------------------------------------------------------------------
+    // Optional symbols — not required for library load.
+    // Older runtimes may lack these and callers must check availability first.
+    // -----------------------------------------------------------------------
+
+    type SkippyAbiFeaturesFn = unsafe extern "C" fn() -> u64;
+    type SkippyModelOpenWithEventsFn = unsafe extern "C" fn(
+        path: *const c_char,
+        config: *const RuntimeConfig,
+        reporter: *const SkippyRuntimeEventReporterV1,
+        out_model: *mut *mut Model,
+        out_error: *mut *mut Error,
+    ) -> Status;
+    type SkippyModelOpenFromPartsWithEventsFn = unsafe extern "C" fn(
+        paths: *const *const c_char,
+        path_count: usize,
+        config: *const RuntimeConfig,
+        reporter: *const SkippyRuntimeEventReporterV1,
+        out_model: *mut *mut Model,
+        out_error: *mut *mut Error,
+    ) -> Status;
+    type SkippyApplyChatTemplateFn = unsafe extern "C" fn(
+        model: *mut Model,
+        messages: *const ChatMessage,
+        message_count: usize,
+        add_assistant: bool,
+        override_enable_thinking: bool,
+        enable_thinking: bool,
+        output_text: *mut c_char,
+        output_text_capacity: usize,
+        out_text_bytes: *mut usize,
+        out_error: *mut *mut Error,
+    ) -> Status;
+    type SkippyApplyChatTemplateJsonFn = unsafe extern "C" fn(
+        model: *mut Model,
+        messages_json: *const c_char,
+        tools_json: *const c_char,
+        tool_choice_json: *const c_char,
+        add_assistant: bool,
+        override_enable_thinking: bool,
+        enable_thinking: bool,
+        parallel_tool_calls: bool,
+        output_text: *mut c_char,
+        output_text_capacity: usize,
+        out_text_bytes: *mut usize,
+        output_metadata_json: *mut c_char,
+        output_metadata_json_capacity: usize,
+        out_metadata_json_bytes: *mut usize,
+        out_error: *mut *mut Error,
+    ) -> Status;
+    type SkippyParseChatResponseJsonFn = unsafe extern "C" fn(
+        generated_text: *const c_char,
+        metadata_json: *const c_char,
+        is_partial: bool,
+        output_message_json: *mut c_char,
+        output_message_json_capacity: usize,
+        out_message_json_bytes: *mut usize,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    impl Symbols {
+        fn lookup_optional<Sym>(&self, name: &[u8]) -> Option<Sym>
+        where
+            Sym: Copy + 'static,
+        {
+            for library in self._libraries.iter().rev() {
+                if let Ok(sym) = unsafe { library.get::<Sym>(name) } {
+                    return Some(*sym);
+                }
+            }
+            None
+        }
+    }
+
+    pub fn skippy_abi_features_optional() -> Option<SkippyAbiFeaturesFn> {
+        static CACHE: OnceLock<Option<SkippyAbiFeaturesFn>> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            symbols().lookup_optional::<SkippyAbiFeaturesFn>(b"skippy_abi_features\0")
+        })
+    }
+
+    pub fn skippy_model_open_with_events_fn() -> Option<SkippyModelOpenWithEventsFn> {
+        static CACHE: OnceLock<Option<SkippyModelOpenWithEventsFn>> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            symbols()
+                .lookup_optional::<SkippyModelOpenWithEventsFn>(b"skippy_model_open_with_events\0")
+        })
+    }
+
+    pub fn skippy_model_open_from_parts_with_events_fn()
+    -> Option<SkippyModelOpenFromPartsWithEventsFn> {
+        static CACHE: OnceLock<Option<SkippyModelOpenFromPartsWithEventsFn>> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            symbols().lookup_optional::<SkippyModelOpenFromPartsWithEventsFn>(
+                b"skippy_model_open_from_parts_with_events\0",
+            )
+        })
+    }
+
+    fn skippy_apply_chat_template_fn() -> Option<SkippyApplyChatTemplateFn> {
+        static CACHE: OnceLock<Option<SkippyApplyChatTemplateFn>> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            symbols().lookup_optional::<SkippyApplyChatTemplateFn>(b"skippy_apply_chat_template\0")
+        })
+    }
+
+    fn skippy_apply_chat_template_json_fn() -> Option<SkippyApplyChatTemplateJsonFn> {
+        static CACHE: OnceLock<Option<SkippyApplyChatTemplateJsonFn>> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            symbols().lookup_optional::<SkippyApplyChatTemplateJsonFn>(
+                b"skippy_apply_chat_template_json\0",
+            )
+        })
+    }
+
+    fn skippy_parse_chat_response_json_fn() -> Option<SkippyParseChatResponseJsonFn> {
+        static CACHE: OnceLock<Option<SkippyParseChatResponseJsonFn>> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            symbols().lookup_optional::<SkippyParseChatResponseJsonFn>(
+                b"skippy_parse_chat_response_json\0",
+            )
+        })
+    }
+
+    #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+    pub unsafe fn skippy_apply_chat_template(
+        model: *mut Model,
+        messages: *const ChatMessage,
+        message_count: usize,
+        add_assistant: bool,
+        override_enable_thinking: bool,
+        enable_thinking: bool,
+        output_text: *mut c_char,
+        output_text_capacity: usize,
+        out_text_bytes: *mut usize,
+        out_error: *mut *mut Error,
+    ) -> Status {
+        let Some(function) = skippy_apply_chat_template_fn() else {
+            return Status::Unsupported;
+        };
+        unsafe {
+            function(
+                model,
+                messages,
+                message_count,
+                add_assistant,
+                override_enable_thinking,
+                enable_thinking,
+                output_text,
+                output_text_capacity,
+                out_text_bytes,
+                out_error,
+            )
+        }
+    }
+
+    #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+    pub unsafe fn skippy_apply_chat_template_json(
+        model: *mut Model,
+        messages_json: *const c_char,
+        tools_json: *const c_char,
+        tool_choice_json: *const c_char,
+        add_assistant: bool,
+        override_enable_thinking: bool,
+        enable_thinking: bool,
+        parallel_tool_calls: bool,
+        output_text: *mut c_char,
+        output_text_capacity: usize,
+        out_text_bytes: *mut usize,
+        output_metadata_json: *mut c_char,
+        output_metadata_json_capacity: usize,
+        out_metadata_json_bytes: *mut usize,
+        out_error: *mut *mut Error,
+    ) -> Status {
+        let Some(function) = skippy_apply_chat_template_json_fn() else {
+            return Status::Unsupported;
+        };
+        unsafe {
+            function(
+                model,
+                messages_json,
+                tools_json,
+                tool_choice_json,
+                add_assistant,
+                override_enable_thinking,
+                enable_thinking,
+                parallel_tool_calls,
+                output_text,
+                output_text_capacity,
+                out_text_bytes,
+                output_metadata_json,
+                output_metadata_json_capacity,
+                out_metadata_json_bytes,
+                out_error,
+            )
+        }
+    }
+
+    #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+    pub unsafe fn skippy_parse_chat_response_json(
+        generated_text: *const c_char,
+        metadata_json: *const c_char,
+        is_partial: bool,
+        output_message_json: *mut c_char,
+        output_message_json_capacity: usize,
+        out_message_json_bytes: *mut usize,
+        out_error: *mut *mut Error,
+    ) -> Status {
+        let Some(function) = skippy_parse_chat_response_json_fn() else {
+            return Status::Unsupported;
+        };
+        unsafe {
+            function(
+                generated_text,
+                metadata_json,
+                is_partial,
+                output_message_json,
+                output_message_json_capacity,
+                out_message_json_bytes,
+                out_error,
+            )
+        }
+    }
 }
 
 #[cfg(feature = "dynamic-runtime")]
 pub use dynamic::*;
+
+#[cfg(feature = "dynamic-runtime")]
+/// Returns the skippy ABI feature bitmask.
+/// Requires the native runtime to be loaded first (checked by caller).
+pub fn skippy_abi_features() -> u64 {
+    let fns = dynamic::skippy_abi_features_optional()
+        .expect("skippy_abi_features not available in loaded runtime");
+    unsafe { fns() }
+}
 
 #[cfg(not(feature = "dynamic-runtime"))]
 unsafe extern "C" {
@@ -564,7 +1043,16 @@ unsafe extern "C" {
 
     pub fn ggml_log_set(log_callback: LlamaLogCallback, user_data: *mut c_void);
 
-    pub fn skippy_status_string(status: Status) -> *const c_char;
+    pub fn llama_model_quantize_default_params() -> LlamaModelQuantizeParams;
+
+    pub fn llama_model_quantize(
+        fname_inp: *const c_char,
+        fname_out: *const c_char,
+        params: *const LlamaModelQuantizeParams,
+    ) -> u32;
+
+    pub fn skippy_abi_features() -> u64;
+
     pub fn skippy_error_free(error: *mut Error);
 
     pub fn skippy_backend_device_count(out_count: *mut usize, out_error: *mut *mut Error)
@@ -613,8 +1101,6 @@ unsafe extern "C" {
     pub fn skippy_session_llama_context(session: *mut Session) -> *mut Opaque;
 
     pub fn skippy_session_position(session: *const Session) -> i32;
-
-    pub fn skippy_session_native_seq_id(session: *const Session) -> i32;
 
     pub fn skippy_session_batch_size(session: *const Session) -> i32;
 
@@ -677,18 +1163,6 @@ unsafe extern "C" {
         out_error: *mut *mut Error,
     ) -> Status;
 
-    pub fn skippy_decode_step(
-        session: *mut Session,
-        token_id: i32,
-        input_activation: *const c_void,
-        input_activation_bytes: usize,
-        output_activation: *mut c_void,
-        output_activation_capacity: usize,
-        out_output_activation_bytes: *mut usize,
-        out_predicted_token: *mut i32,
-        out_error: *mut *mut Error,
-    ) -> Status;
-
     pub fn skippy_verify_tokens(
         session: *mut Session,
         token_ids: *const i32,
@@ -709,6 +1183,16 @@ unsafe extern "C" {
         output_activation_capacity: usize,
         out_output_activation_bytes: *mut usize,
         out_predicted_token: *mut i32,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    pub fn skippy_decode_batch_sampled(
+        sessions: *const *mut Session,
+        token_ids: *const i32,
+        sampling: *const *const SamplingConfig,
+        request_count: usize,
+        out_predicted_tokens: *mut i32,
+        predicted_token_capacity: usize,
         out_error: *mut *mut Error,
     ) -> Status;
 
@@ -772,23 +1256,11 @@ unsafe extern "C" {
         out_error: *mut *mut Error,
     ) -> Status;
 
-    pub fn skippy_decode_step_frame(
-        session: *mut Session,
-        token_id: i32,
-        input_desc: *const ActivationDesc,
-        input_payload: *const c_void,
-        output_desc: *mut ActivationDesc,
-        output_payload: *mut c_void,
-        output_payload_capacity: usize,
-        out_output_payload_bytes: *mut usize,
-        out_predicted_token: *mut i32,
-        out_error: *mut *mut Error,
-    ) -> Status;
-
-    pub fn skippy_verify_tokens_frame(
+    pub fn skippy_verify_tokens_frame_sampled(
         session: *mut Session,
         token_ids: *const i32,
         token_count: usize,
+        sampling: *const SamplingConfig,
         input_desc: *const ActivationDesc,
         input_payload: *const c_void,
         output_desc: *mut ActivationDesc,
@@ -812,6 +1284,37 @@ unsafe extern "C" {
         output_payload_capacity: usize,
         out_output_payload_bytes: *mut usize,
         out_predicted_token: *mut i32,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    pub fn skippy_decode_step_frame_sampled_mtp_n1(
+        session: *mut Session,
+        token_id: i32,
+        sampling: *const SamplingConfig,
+        input_desc: *const ActivationDesc,
+        input_payload: *const c_void,
+        output_desc: *mut ActivationDesc,
+        output_payload: *mut c_void,
+        output_payload_capacity: usize,
+        out_output_payload_bytes: *mut usize,
+        out_predicted_token: *mut i32,
+        out_mtp_draft: *mut NativeMtpDraft,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    pub fn skippy_decode_step_frame_batch_sampled(
+        sessions: *const *mut Session,
+        token_ids: *const i32,
+        sampling: *const *const SamplingConfig,
+        input_descs: *const *const ActivationDesc,
+        input_payloads: *const *const c_void,
+        output_descs: *mut ActivationDesc,
+        output_payloads: *const *mut c_void,
+        output_payload_capacities: *const usize,
+        out_output_payload_bytes: *mut usize,
+        out_predicted_tokens: *mut i32,
+        predicted_token_capacity: usize,
+        request_count: usize,
         out_error: *mut *mut Error,
     ) -> Status;
 

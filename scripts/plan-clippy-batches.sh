@@ -12,6 +12,7 @@ set -euo pipefail
 
 WORKSPACE_MEMBERS=(
   "mesh-llm"
+  "mesh-llm-build-info"
   "mesh-llm-cli"
   "mesh-llm-commands"
   "mesh-llm-config"
@@ -57,8 +58,10 @@ WORKSPACE_MEMBERS=(
   "skippy-server"
   "metrics-server"
   "skippy-model-package"
+  "skippy-quantize"
   "model-package"
   "skippy-correctness"
+  "llama-quant-ffi"
   "llama-spec-bench"
   "skippy-bench"
   "skippy-prompt"
@@ -129,6 +132,7 @@ crates = json.loads(sys.argv[2])
 # Unknown crates intentionally default to 1 so new crates still get scheduled.
 weights = {
     "mesh-llm": 10,
+    "mesh-llm-build-info": 1,
     "mesh-llm-cli": 1,
     "mesh-llm-commands": 1,
     "mesh-llm-events": 1,
@@ -141,6 +145,7 @@ weights = {
     "model-package": 5,
     "skippy-bench": 4,
     "skippy-model-package": 4,
+    "skippy-quantize": 4,
     "openai-frontend": 4,
     "model-artifact": 4,
     "model-hf": 4,

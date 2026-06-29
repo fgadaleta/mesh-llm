@@ -12,19 +12,21 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
+pub use skippy_ffi::Status;
 use skippy_ffi::{
     ActivationDType, ActivationDesc as RawActivationDesc, ActivationLayout,
     ChatMessage as RawChatMessage, Error as RawError,
     GenerationSignalWindow as RawGenerationSignalWindow, KvPageDesc as RawKvPageDesc, LoadMode,
     LogitBias as RawLogitBias, Model as RawModel, ModelInfo as RawModelInfo,
-    RuntimeConfig as RawRuntimeConfig, SamplingConfig as RawSamplingConfig, Session as RawSession,
-    SlicePlan as RawSlicePlan, Status, TensorInfo as RawTensorInfo, TensorRole,
-    TokenSignal as RawTokenSignal,
+    NativeMtpDraft as RawNativeMtpDraft, RuntimeConfig as RawRuntimeConfig,
+    SamplingConfig as RawSamplingConfig, Session as RawSession, SlicePlan as RawSlicePlan,
+    TensorInfo as RawTensorInfo, TensorRole, TokenSignal as RawTokenSignal,
 };
 use tokio::sync::mpsc;
 
 mod devices;
 pub mod package;
+mod runtime_events;
 
 pub const MAX_LOGIT_BIAS: usize = 256;
 pub const GGML_TYPE_F16: u32 = 1;
@@ -54,6 +56,10 @@ pub enum FlashAttentionType {
 }
 
 pub use devices::{BackendDevice, BackendDeviceType, backend_devices};
+pub use runtime_events::{
+    RuntimeEvent, RuntimeEventCategory, RuntimeEventEmitterKind, RuntimeEventFailureCode,
+    RuntimeEventKind, RuntimeEventProgressUnit,
+};
 pub use skippy_ffi::LoadMode as RuntimeLoadMode;
 pub use skippy_ffi::{
     ActivationDType as RuntimeActivationDType, ActivationLayout as RuntimeActivationLayout,
@@ -1053,6 +1059,21 @@ impl From<RawActivationDesc> for ActivationDesc {
     }
 }
 
+fn empty_raw_activation_desc() -> RawActivationDesc {
+    RawActivationDesc {
+        version: 0,
+        dtype: ActivationDType::Unknown,
+        layout: ActivationLayout::Opaque,
+        producer_stage_index: -1,
+        layer_start: 0,
+        layer_end: 0,
+        token_count: 0,
+        sequence_count: 0,
+        payload_bytes: 0,
+        flags: 0,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationFrame {
     pub desc: ActivationDesc,
@@ -1190,6 +1211,41 @@ pub struct StageModel {
 pub struct StageSession {
     raw: *mut RawSession,
     token_count: u64,
+}
+
+pub struct DecodeBatchRequest<'a> {
+    pub session: &'a mut StageSession,
+    pub token_id: i32,
+    pub sampling: Option<&'a SamplingConfig>,
+}
+
+pub struct DecodeFrameBatchRequest<'a> {
+    pub session: &'a mut StageSession,
+    pub token_id: i32,
+    pub sampling: Option<&'a SamplingConfig>,
+    pub input: Option<&'a ActivationFrame>,
+}
+
+pub struct DecodeFrameBatchOutput {
+    pub predicted_token: i32,
+    pub output: ActivationFrame,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeMtpDraft {
+    pub token_id: i32,
+    pub proposal_compute_us: i64,
+}
+
+const NATIVE_MTP_DRAFT_VERSION: u32 = 1;
+
+impl NativeMtpDraft {
+    fn from_raw(raw: RawNativeMtpDraft) -> Option<Self> {
+        (raw.available && raw.version == NATIVE_MTP_DRAFT_VERSION).then_some(Self {
+            token_id: raw.token_id,
+            proposal_compute_us: raw.proposal_compute_us,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1416,25 +1472,13 @@ impl StageModel {
         }
     }
 
-    pub fn open(path: impl AsRef<Path>, config: &RuntimeConfig) -> Result<Self> {
-        let path = path.as_ref();
-        write_native_log_note(format!(
-            "skippy_model_open begin path={} {}",
-            path.display(),
-            config.native_log_summary()
-        ));
-        let path = CString::new(path.to_string_lossy().as_bytes())
-            .context("model path contains an interior NUL byte")?;
-        let raw_config = config.as_raw()?;
-        let mut raw = ptr::null_mut();
-        let mut error = ptr::null_mut();
-        let status = unsafe {
-            skippy_ffi::skippy_model_open(path.as_ptr(), &raw_config.raw, &mut raw, &mut error)
-        };
-        write_native_log_note(format!("skippy_model_open returned status={status:?}"));
-        ensure_ok(status, error)?;
+    fn from_opened_raw(
+        raw: *mut RawModel,
+        config: &RuntimeConfig,
+        null_handle_message: &'static str,
+    ) -> Result<Self> {
         if raw.is_null() {
-            return Err(anyhow!("skippy_model_open returned a null handle"));
+            return Err(anyhow!(null_handle_message));
         }
         let media = config
             .projector_path
@@ -1444,17 +1488,110 @@ impl StageModel {
         Ok(Self { raw, media })
     }
 
-    pub fn open_from_parts(paths: &[impl AsRef<Path>], config: &RuntimeConfig) -> Result<Self> {
+    fn open_path_with_optional_event_reporter(
+        path: impl AsRef<Path>,
+        config: &RuntimeConfig,
+        event_reporter: Option<&mut dyn FnMut(RuntimeEvent)>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let use_events = event_reporter.is_some() && runtime_events::model_open_events_supported();
+        let begin_label = if use_events {
+            "skippy_model_open_with_events begin"
+        } else {
+            "skippy_model_open begin"
+        };
+        let end_label = if use_events {
+            "skippy_model_open_with_events returned"
+        } else {
+            "skippy_model_open returned"
+        };
+        let null_handle_message = if use_events {
+            "skippy_model_open_with_events returned a null handle"
+        } else {
+            "skippy_model_open returned a null handle"
+        };
+        write_native_log_note(format!(
+            "{begin_label} path={} {}",
+            path.display(),
+            config.native_log_summary()
+        ));
+        let path = CString::new(path.to_string_lossy().as_bytes())
+            .context("model path contains an interior NUL byte")?;
+        let raw_config = config.as_raw()?;
+        #[cfg(not(test))]
+        let (raw, status, error) = runtime_events::run_model_open(
+            |out_model, out_error| unsafe {
+                skippy_ffi::skippy_model_open(path.as_ptr(), &raw_config.raw, out_model, out_error)
+            },
+            |reporter, out_model, out_error| unsafe {
+                let open_with_events_symbol = runtime_events::model_open_with_events_symbol()
+                    .expect("runtime-event symbol availability checked before use");
+                open_with_events_symbol(
+                    path.as_ptr(),
+                    &raw_config.raw,
+                    reporter,
+                    out_model,
+                    out_error,
+                )
+            },
+            event_reporter,
+            use_events,
+        );
+        #[cfg(test)]
+        let (raw, status, error) = {
+            debug_assert!(event_reporter.is_none());
+            runtime_events::run_model_open(
+                |out_model, out_error| unsafe {
+                    skippy_ffi::skippy_model_open(
+                        path.as_ptr(),
+                        &raw_config.raw,
+                        out_model,
+                        out_error,
+                    )
+                },
+                |_reporter, _out_model, _out_error| {
+                    unreachable!("test builds do not link _with_events model-open symbols")
+                },
+                None,
+                false,
+            )
+        };
+        write_native_log_note(format!("{end_label} status={status:?}"));
+        ensure_ok(status, error)?;
+        Self::from_opened_raw(raw, config, null_handle_message)
+    }
+
+    fn open_parts_with_optional_event_reporter(
+        paths: &[impl AsRef<Path>],
+        config: &RuntimeConfig,
+        event_reporter: Option<&mut dyn FnMut(RuntimeEvent)>,
+    ) -> Result<Self> {
         if paths.is_empty() {
             return Err(anyhow!("at least one GGUF part path is required"));
         }
+        let use_events = event_reporter.is_some() && runtime_events::model_open_events_supported();
+        let begin_label = if use_events {
+            "skippy_model_open_from_parts_with_events begin"
+        } else {
+            "skippy_model_open_from_parts begin"
+        };
+        let end_label = if use_events {
+            "skippy_model_open_from_parts_with_events returned"
+        } else {
+            "skippy_model_open_from_parts returned"
+        };
+        let null_handle_message = if use_events {
+            "skippy_model_open_from_parts_with_events returned a null handle"
+        } else {
+            "skippy_model_open_from_parts returned a null handle"
+        };
         let path_list = paths
             .iter()
             .map(|path| path.as_ref().display().to_string())
             .collect::<Vec<_>>()
             .join(",");
         write_native_log_note(format!(
-            "skippy_model_open_from_parts begin parts={} {}",
+            "{begin_label} parts={} {}",
             path_list,
             config.native_log_summary()
         ));
@@ -1467,32 +1604,96 @@ impl StageModel {
             .collect::<Result<Vec<_>>>()?;
         let path_ptrs = paths.iter().map(|path| path.as_ptr()).collect::<Vec<_>>();
         let raw_config = config.as_raw()?;
-        let mut raw = ptr::null_mut();
-        let mut error = ptr::null_mut();
-        let status = unsafe {
-            skippy_ffi::skippy_model_open_from_parts(
-                path_ptrs.as_ptr(),
-                path_ptrs.len(),
-                &raw_config.raw,
-                &mut raw,
-                &mut error,
+        #[cfg(not(test))]
+        let (raw, status, error) = runtime_events::run_model_open(
+            |out_model, out_error| unsafe {
+                skippy_ffi::skippy_model_open_from_parts(
+                    path_ptrs.as_ptr(),
+                    path_ptrs.len(),
+                    &raw_config.raw,
+                    out_model,
+                    out_error,
+                )
+            },
+            |reporter, out_model, out_error| unsafe {
+                let open_from_parts_with_events_symbol =
+                    runtime_events::model_open_from_parts_with_events_symbol()
+                        .expect("runtime-event symbol availability checked before use");
+                open_from_parts_with_events_symbol(
+                    path_ptrs.as_ptr(),
+                    path_ptrs.len(),
+                    &raw_config.raw,
+                    reporter,
+                    out_model,
+                    out_error,
+                )
+            },
+            event_reporter,
+            use_events,
+        );
+        #[cfg(test)]
+        let (raw, status, error) = {
+            debug_assert!(event_reporter.is_none());
+            runtime_events::run_model_open(
+                |out_model, out_error| unsafe {
+                    skippy_ffi::skippy_model_open_from_parts(
+                        path_ptrs.as_ptr(),
+                        path_ptrs.len(),
+                        &raw_config.raw,
+                        out_model,
+                        out_error,
+                    )
+                },
+                |_reporter, _out_model, _out_error| {
+                    unreachable!(
+                        "test builds do not link _with_events model-open-from-parts symbols"
+                    )
+                },
+                None,
+                false,
             )
         };
-        write_native_log_note(format!(
-            "skippy_model_open_from_parts returned status={status:?}"
-        ));
+        write_native_log_note(format!("{end_label} status={status:?}"));
         ensure_ok(status, error)?;
-        if raw.is_null() {
-            return Err(anyhow!(
-                "skippy_model_open_from_parts returned a null handle"
-            ));
+        Self::from_opened_raw(raw, config, null_handle_message)
+    }
+
+    pub fn open(path: impl AsRef<Path>, config: &RuntimeConfig) -> Result<Self> {
+        Self::open_path_with_optional_event_reporter(path, config, None)
+    }
+
+    pub fn open_with_events(
+        path: impl AsRef<Path>,
+        config: &RuntimeConfig,
+        event_reporter: &mut dyn FnMut(RuntimeEvent),
+    ) -> Result<Self> {
+        #[cfg(test)]
+        {
+            let _ = event_reporter;
+            Self::open_path_with_optional_event_reporter(path, config, None)
         }
-        let media = config
-            .projector_path
-            .as_deref()
-            .map(|projector_path| MediaProjector::open(projector_path, raw))
-            .transpose()?;
-        Ok(Self { raw, media })
+
+        #[cfg(not(test))]
+        Self::open_path_with_optional_event_reporter(path, config, Some(event_reporter))
+    }
+
+    pub fn open_from_parts(paths: &[impl AsRef<Path>], config: &RuntimeConfig) -> Result<Self> {
+        Self::open_parts_with_optional_event_reporter(paths, config, None)
+    }
+
+    pub fn open_from_parts_with_events(
+        paths: &[impl AsRef<Path>],
+        config: &RuntimeConfig,
+        event_reporter: &mut dyn FnMut(RuntimeEvent),
+    ) -> Result<Self> {
+        #[cfg(test)]
+        {
+            let _ = event_reporter;
+            Self::open_parts_with_optional_event_reporter(paths, config, None)
+        }
+
+        #[cfg(not(test))]
+        Self::open_parts_with_optional_event_reporter(paths, config, Some(event_reporter))
     }
 
     pub fn create_session(&self) -> Result<StageSession> {
@@ -2551,6 +2752,55 @@ impl StageSession {
         Ok(predicted_token)
     }
 
+    pub fn decode_batch_sampled(requests: &mut [DecodeBatchRequest<'_>]) -> Result<Vec<i32>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sessions = requests
+            .iter_mut()
+            .map(|request| request.session.raw)
+            .collect::<Vec<_>>();
+        let token_ids = requests
+            .iter()
+            .map(|request| request.token_id)
+            .collect::<Vec<_>>();
+        let raw_sampling = requests
+            .iter()
+            .map(|request| request.sampling.map(SamplingConfig::as_raw))
+            .collect::<Vec<_>>();
+        let sampling = raw_sampling
+            .iter()
+            .map(|sampling| {
+                sampling
+                    .as_ref()
+                    .map_or(ptr::null(), |sampling| sampling as *const RawSamplingConfig)
+            })
+            .collect::<Vec<_>>();
+        let mut predicted_tokens = vec![0_i32; requests.len()];
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            skippy_ffi::skippy_decode_batch_sampled(
+                sessions.as_ptr(),
+                token_ids.as_ptr(),
+                sampling.as_ptr(),
+                requests.len(),
+                predicted_tokens.as_mut_ptr(),
+                predicted_tokens.len(),
+                &mut error,
+            )
+        };
+        ensure_ok(status, error)?;
+        for request in requests {
+            request.session.token_count = request
+                .session
+                .token_count
+                .checked_add(1)
+                .context("session token count overflow")?;
+        }
+        Ok(predicted_tokens)
+    }
+
     pub fn last_token_signal(&mut self) -> Result<TokenSignal> {
         let mut signal = RawTokenSignal::default();
         let mut error = ptr::null_mut();
@@ -2877,6 +3127,25 @@ impl StageSession {
         ))
     }
 
+    pub fn decode_step_frame_sampled_mtp_n1(
+        &mut self,
+        token_id: i32,
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(i32, Option<NativeMtpDraft>, ActivationFrame)> {
+        let (predicted_token, mtp_draft, output_desc, output_payload) =
+            self.decode_step_frame_mtp_n1_raw(token_id, sampling, input, output_capacity)?;
+        Ok((
+            predicted_token,
+            mtp_draft,
+            ActivationFrame {
+                desc: output_desc.into(),
+                payload: output_payload,
+            },
+        ))
+    }
+
     fn decode_step_frame_raw(
         &mut self,
         token_id: i32,
@@ -2937,9 +3206,228 @@ impl StageSession {
         Ok((predicted_token, output_desc, output_payload))
     }
 
+    fn decode_step_frame_mtp_n1_raw(
+        &mut self,
+        token_id: i32,
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(i32, Option<NativeMtpDraft>, RawActivationDesc, Vec<u8>)> {
+        let input_desc = input.map(|frame| frame.desc.as_raw());
+        let input_desc_ptr = input_desc
+            .as_ref()
+            .map_or(ptr::null(), |desc| desc as *const RawActivationDesc);
+        let input_payload_ptr = input.map_or(ptr::null(), |frame| frame.payload.as_ptr().cast());
+        let mut output_desc = RawActivationDesc {
+            version: 0,
+            dtype: ActivationDType::Unknown,
+            layout: ActivationLayout::Opaque,
+            producer_stage_index: -1,
+            layer_start: 0,
+            layer_end: 0,
+            token_count: 0,
+            sequence_count: 0,
+            payload_bytes: 0,
+            flags: 0,
+        };
+        let mut output_payload = vec![0_u8; output_capacity];
+        let mut output_bytes = 0usize;
+        let mut predicted_token = 0_i32;
+        let mut mtp_draft = RawNativeMtpDraft::default();
+        let mut error = ptr::null_mut();
+        let raw_sampling = sampling.map(SamplingConfig::as_raw);
+        let sampling_ptr = raw_sampling
+            .as_ref()
+            .map_or(ptr::null(), |sampling| sampling as *const RawSamplingConfig);
+        let status = unsafe {
+            skippy_ffi::skippy_decode_step_frame_sampled_mtp_n1(
+                self.raw,
+                token_id,
+                sampling_ptr,
+                input_desc_ptr,
+                input_payload_ptr,
+                &mut output_desc,
+                output_payload.as_mut_ptr().cast(),
+                output_payload.len(),
+                &mut output_bytes,
+                &mut predicted_token,
+                &mut mtp_draft,
+                &mut error,
+            )
+        };
+        if status == Status::BufferTooSmall && output_bytes > output_payload.len() {
+            free_error(error);
+            return self.decode_step_frame_mtp_n1_raw(token_id, sampling, input, output_bytes);
+        }
+        ensure_ok(status, error)?;
+        output_payload.truncate(output_bytes);
+        self.token_count = self
+            .token_count
+            .checked_add(1)
+            .context("session token count overflow")?;
+        Ok((
+            predicted_token,
+            NativeMtpDraft::from_raw(mtp_draft),
+            output_desc,
+            output_payload,
+        ))
+    }
+
+    pub fn decode_step_frame_batch_sampled(
+        requests: &mut [DecodeFrameBatchRequest<'_>],
+    ) -> Result<Vec<DecodeFrameBatchOutput>> {
+        Self::decode_step_frame_batch_sampled_raw(requests, &vec![0; requests.len()])
+    }
+
+    fn decode_step_frame_batch_sampled_raw(
+        requests: &mut [DecodeFrameBatchRequest<'_>],
+        output_capacities: &[usize],
+    ) -> Result<Vec<DecodeFrameBatchOutput>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sessions = requests
+            .iter_mut()
+            .map(|request| request.session.raw)
+            .collect::<Vec<_>>();
+        let token_ids = requests
+            .iter()
+            .map(|request| request.token_id)
+            .collect::<Vec<_>>();
+        let raw_sampling = requests
+            .iter()
+            .map(|request| request.sampling.map(SamplingConfig::as_raw))
+            .collect::<Vec<_>>();
+        let sampling = raw_sampling
+            .iter()
+            .map(|sampling| {
+                sampling
+                    .as_ref()
+                    .map_or(ptr::null(), |sampling| sampling as *const RawSamplingConfig)
+            })
+            .collect::<Vec<_>>();
+        let input_descs = requests
+            .iter()
+            .map(|request| request.input.map(|frame| frame.desc.as_raw()))
+            .collect::<Vec<_>>();
+        let input_desc_ptrs = input_descs
+            .iter()
+            .map(|desc| {
+                desc.as_ref()
+                    .map_or(ptr::null(), |desc| desc as *const RawActivationDesc)
+            })
+            .collect::<Vec<_>>();
+        let input_payloads = requests
+            .iter()
+            .map(|request| {
+                request
+                    .input
+                    .map_or(ptr::null(), |frame| frame.payload.as_ptr().cast())
+            })
+            .collect::<Vec<_>>();
+        let mut output_descs = vec![empty_raw_activation_desc(); requests.len()];
+        let mut output_payloads = output_capacities
+            .iter()
+            .map(|capacity| vec![0_u8; *capacity])
+            .collect::<Vec<_>>();
+        let output_payload_ptrs = output_payloads
+            .iter_mut()
+            .map(|payload| payload.as_mut_ptr().cast())
+            .collect::<Vec<_>>();
+        let mut output_bytes = vec![0_usize; requests.len()];
+        let mut predicted_tokens = vec![0_i32; requests.len()];
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            skippy_ffi::skippy_decode_step_frame_batch_sampled(
+                sessions.as_ptr(),
+                token_ids.as_ptr(),
+                sampling.as_ptr(),
+                input_desc_ptrs.as_ptr(),
+                input_payloads.as_ptr(),
+                output_descs.as_mut_ptr(),
+                output_payload_ptrs.as_ptr(),
+                output_capacities.as_ptr(),
+                output_bytes.as_mut_ptr(),
+                predicted_tokens.as_mut_ptr(),
+                predicted_tokens.len(),
+                requests.len(),
+                &mut error,
+            )
+        };
+        if status == Status::BufferTooSmall {
+            free_error(error);
+            error = ptr::null_mut();
+            if output_bytes
+                .iter()
+                .zip(output_capacities.iter())
+                .any(|(required, capacity)| required > capacity)
+            {
+                return Self::decode_step_frame_batch_sampled_raw(requests, &output_bytes);
+            }
+        }
+        if status == Status::Unsupported {
+            free_error(error);
+            return Self::decode_step_frame_batch_sampled_serial(requests);
+        }
+        ensure_ok(status, error)?;
+        for request in requests.iter_mut() {
+            request.session.token_count = request
+                .session
+                .token_count
+                .checked_add(1)
+                .context("session token count overflow")?;
+        }
+        Ok(output_payloads
+            .into_iter()
+            .zip(output_descs)
+            .zip(output_bytes)
+            .zip(predicted_tokens)
+            .map(|(((mut payload, desc), bytes), predicted_token)| {
+                payload.truncate(bytes);
+                DecodeFrameBatchOutput {
+                    predicted_token,
+                    output: ActivationFrame {
+                        desc: desc.into(),
+                        payload,
+                    },
+                }
+            })
+            .collect())
+    }
+
+    fn decode_step_frame_batch_sampled_serial(
+        requests: &mut [DecodeFrameBatchRequest<'_>],
+    ) -> Result<Vec<DecodeFrameBatchOutput>> {
+        requests
+            .iter_mut()
+            .map(|request| {
+                let (predicted_token, output) = request.session.decode_step_frame_sampled(
+                    request.token_id,
+                    request.sampling,
+                    request.input,
+                    0,
+                )?;
+                Ok(DecodeFrameBatchOutput {
+                    predicted_token,
+                    output,
+                })
+            })
+            .collect()
+    }
+
     pub fn verify_tokens_frame(
         &mut self,
         token_ids: &[i32],
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(Vec<i32>, ActivationFrame)> {
+        self.verify_tokens_frame_sampled(token_ids, None, input, output_capacity)
+    }
+
+    pub fn verify_tokens_frame_sampled(
+        &mut self,
+        token_ids: &[i32],
+        sampling: Option<&SamplingConfig>,
         input: Option<&ActivationFrame>,
         output_capacity: usize,
     ) -> Result<(Vec<i32>, ActivationFrame)> {
@@ -2947,7 +3435,7 @@ impl StageSession {
             return Err(anyhow!("verify_tokens_frame requires at least one token"));
         }
         let (predicted_tokens, output_desc, output_payload) =
-            self.verify_tokens_frame_raw(token_ids, input, output_capacity)?;
+            self.verify_tokens_frame_raw(token_ids, sampling, input, output_capacity)?;
         Ok((
             predicted_tokens,
             ActivationFrame {
@@ -2960,6 +3448,7 @@ impl StageSession {
     fn verify_tokens_frame_raw(
         &mut self,
         token_ids: &[i32],
+        sampling: Option<&SamplingConfig>,
         input: Option<&ActivationFrame>,
         output_capacity: usize,
     ) -> Result<(Vec<i32>, RawActivationDesc, Vec<u8>)> {
@@ -2982,14 +3471,19 @@ impl StageSession {
         };
         let mut output_payload = vec![0_u8; output_capacity];
         let mut output_bytes = 0usize;
-        let mut predicted = vec![0_i32; token_ids.len()];
+        let mut predicted = vec![0_i32; token_ids.len().saturating_add(3)];
         let mut output_token_count = 0usize;
         let mut error = ptr::null_mut();
+        let raw_sampling = sampling.map(SamplingConfig::as_raw);
+        let sampling_ptr = raw_sampling
+            .as_ref()
+            .map_or(ptr::null(), |sampling| sampling as *const RawSamplingConfig);
         let status = unsafe {
-            skippy_ffi::skippy_verify_tokens_frame(
+            skippy_ffi::skippy_verify_tokens_frame_sampled(
                 self.raw,
                 token_ids.as_ptr(),
                 token_ids.len(),
+                sampling_ptr,
                 input_desc_ptr,
                 input_payload_ptr,
                 &mut output_desc,
@@ -3004,7 +3498,7 @@ impl StageSession {
         };
         if status == Status::BufferTooSmall && output_bytes > output_payload.len() {
             free_error(error);
-            return self.verify_tokens_frame_raw(token_ids, input, output_bytes);
+            return self.verify_tokens_frame_raw(token_ids, sampling, input, output_bytes);
         }
         ensure_ok(status, error)?;
         predicted.truncate(output_token_count);
@@ -3630,6 +4124,16 @@ fn free_error(error: *mut RawError) {
 mod tests {
     use serde_json::Value;
 
+    use super::{
+        ChatTemplateMessage, FlashAttentionType, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
+        LLAMA_SERVER_DEFAULT_N_BATCH, LLAMA_SERVER_DEFAULT_N_UBATCH, ModelInfo,
+        NativeLogAggregator, NativeLogEvent, RuntimeConfig, RuntimeLoadMode,
+        SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH, SamplingConfig, StageModel, Status, TensorRole,
+        flush_native_log_writer, format_skippy_error, parse_cache_type, parse_layer_assign_index,
+        redirect_native_logs_to_file, register_filtered_native_logs, restore_native_logs,
+        set_filtered_native_logs_enabled, unregister_filtered_native_logs, write_native_log,
+        write_native_log_note,
+    };
     use std::{
         env,
         ffi::CString,
@@ -3644,17 +4148,6 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::sync::mpsc::error::TryRecvError;
-
-    use super::{
-        ChatTemplateMessage, FlashAttentionType, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
-        LLAMA_SERVER_DEFAULT_N_BATCH, LLAMA_SERVER_DEFAULT_N_UBATCH, ModelInfo,
-        NativeLogAggregator, NativeLogEvent, RuntimeConfig, RuntimeLoadMode,
-        SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH, SamplingConfig, StageModel, Status, TensorRole,
-        flush_native_log_writer, format_skippy_error, parse_cache_type, parse_layer_assign_index,
-        redirect_native_logs_to_file, register_filtered_native_logs, restore_native_logs,
-        set_filtered_native_logs_enabled, unregister_filtered_native_logs, write_native_log,
-        write_native_log_note,
-    };
 
     static NATIVE_LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -4521,4 +5014,34 @@ mod tests {
         );
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn model_open_events_success() {
+    runtime_events::tests::assert_model_open_events_success();
+}
+
+#[cfg(test)]
+#[test]
+fn model_open_events_handled_failure() {
+    runtime_events::tests::assert_model_open_events_handled_failure();
+}
+
+#[cfg(test)]
+#[test]
+fn model_open_events_missing_terminal_callback_uses_return() {
+    runtime_events::tests::assert_model_open_events_missing_terminal_callback_uses_return();
+}
+
+#[cfg(test)]
+#[test]
+fn model_open_events_forwarded_before_open_returns() {
+    runtime_events::tests::assert_model_open_events_forwarded_before_open_returns();
+}
+
+#[cfg(test)]
+#[test]
+fn model_open_events_feature_missing_falls_back() {
+    runtime_events::tests::assert_model_open_events_feature_missing_falls_back();
 }

@@ -15,6 +15,8 @@
 //!   GET  /api/runtime/endpoints — registered plugin endpoint state (JSON)
 //!   GET  /api/runtime/processes — local inference process state (JSON)
 //!   GET  /api/runtime/stages — backend-neutral staged-serving state (JSON)
+//!   GET  /api/runtime/config-schema — merged built-in and installed-plugin config schema (JSON)
+//!   GET  /api/runtime/config-control-state — local-only runtime config availability/options overlay (JSON)
 //!   GET  /api/runtime/control-bootstrap — local-only owner-control bootstrap policy (JSON)
 //!   POST /api/runtime/control/get-config — run local owner-control get-config against an explicit endpoint
 //!   POST /api/runtime/control/refresh-inventory — run local owner-control refresh-inventory against an explicit endpoint
@@ -92,7 +94,7 @@ use crate::network::proxy;
 #[cfg(test)]
 use crate::runtime::wakeable::{WakeableInventoryEntry, WakeableState};
 
-const MESH_LLM_VERSION: &str = crate::VERSION;
+const MESH_LLM_BUILD_VERSION: &str = crate::BUILD_VERSION;
 
 async fn external_inference_models(plugin_manager: &plugin::PluginManager) -> Vec<String> {
     plugin_manager
@@ -908,7 +910,7 @@ impl MeshApi {
 
         let mut payload = runtime_data::status_payload(runtime_data_collector.build_status_view(
             runtime_data::StatusViewInput {
-                version: MESH_LLM_VERSION.to_string(),
+                version: MESH_LLM_BUILD_VERSION.to_string(),
                 latest_version,
                 node_id,
                 owner: node.owner_summary().await,
@@ -974,6 +976,7 @@ impl ServingController for MeshApi {
             control_tx
                 .send(RuntimeControlRequest::Load {
                     spec: model_ref.clone(),
+                    profile: request.profile.clone(),
                     resp: resp_tx,
                 })
                 .map_err(|_| runtime_unavailable("runtime control unavailable"))?;
@@ -989,6 +992,7 @@ impl ServingController for MeshApi {
             let capabilities = infer_served_model_capabilities(&model_ref, &loaded.model);
             Ok(ServedModel {
                 model_ref: loaded.model_ref,
+                profile: loaded.profile,
                 model_id: loaded.model,
                 instance_id: Some(loaded.instance_id),
                 state: ServingModelState::Ready,
@@ -1071,8 +1075,15 @@ impl ServingController for MeshApi {
 
 fn served_model_from_runtime_payload(model: RuntimeModelPayload) -> ServedModel {
     let capabilities = infer_served_model_capabilities(&model.name, &model.name);
+    // Build model_ref with profile suffix for non-default profiles
+    let model_ref = if model.profile.is_empty() {
+        model.name.clone()
+    } else {
+        format!("{}#{}", model.name, model.profile)
+    };
     ServedModel {
-        model_ref: model.name.clone(),
+        model_ref,
+        profile: model.profile,
         model_id: model.name,
         instance_id: model.instance_id,
         state: serving_model_state_from_runtime_status(&model.status),

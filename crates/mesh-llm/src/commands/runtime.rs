@@ -4,9 +4,13 @@ use std::path::Path;
 
 use mesh_llm_cli::MeshGuardrailCliMode;
 use mesh_llm_cli::runtime::RuntimeCommand;
+use mesh_llm_commands::runtime_native::NativeRuntimeConfigSelection;
 use mesh_llm_host_runtime::command_support::plugin::{MeshConfig, load_config};
 
-pub(crate) async fn dispatch_runtime_command(command: Option<&RuntimeCommand>) -> Result<()> {
+pub(crate) async fn dispatch_runtime_command(
+    command: Option<&RuntimeCommand>,
+    config_path: Option<&Path>,
+) -> Result<()> {
     match command {
         Some(RuntimeCommand::List {
             available,
@@ -16,11 +20,17 @@ pub(crate) async fn dispatch_runtime_command(command: Option<&RuntimeCommand>) -
             cache_dir,
             json,
         }) => {
+            let selector = if *available {
+                native_runtime_config_selector(config_path)?
+            } else {
+                None
+            };
             mesh_llm_commands::runtime_native::run_native_runtime_list(
                 *available,
                 manifest.as_deref(),
                 bundle_dirs,
                 cache_dir.as_deref(),
+                native_runtime_command_selection(selector.as_ref()),
                 *json,
             )
             .await
@@ -32,11 +42,13 @@ pub(crate) async fn dispatch_runtime_command(command: Option<&RuntimeCommand>) -
             cache_dir,
             json,
         }) => {
+            let selector = native_runtime_config_selector(config_path)?;
             mesh_llm_commands::runtime_native::run_native_runtime_install(
                 runtime.as_deref(),
                 manifest.as_deref(),
                 bundle_dirs,
                 cache_dir.as_deref(),
+                native_runtime_command_selection(selector.as_ref()),
                 *json,
             )
             .await
@@ -57,12 +69,23 @@ pub(crate) async fn dispatch_runtime_command(command: Option<&RuntimeCommand>) -
             mesh_version,
             cache_dir,
             json,
-        }) => mesh_llm_commands::runtime_native::run_native_runtime_prune(
-            *active_only,
-            mesh_version.as_deref(),
-            cache_dir.as_deref(),
-            *json,
-        ),
+        }) => {
+            let selector = if mesh_version.is_none() {
+                native_runtime_config_selector(config_path)?
+            } else {
+                None
+            };
+            mesh_llm_commands::runtime_native::run_native_runtime_prune(
+                *active_only,
+                mesh_version.as_deref().or_else(|| {
+                    selector
+                        .as_ref()
+                        .map(|selector| selector.mesh_version.as_str())
+                }),
+                cache_dir.as_deref(),
+                *json,
+            )
+        }
         Some(RuntimeCommand::Status { port }) => run_status(*port).await,
         Some(RuntimeCommand::Bootstrap { port, json }) => run_control_bootstrap(*port, *json).await,
         Some(RuntimeCommand::GetConfig {
@@ -88,6 +111,36 @@ pub(crate) async fn dispatch_runtime_command(command: Option<&RuntimeCommand>) -
             run_set_mesh_guardrails(*mode, *port, *json).await
         }
         None => run_status(3131).await,
+    }
+}
+
+struct NativeRuntimeConfigSelector {
+    mesh_version: String,
+    skippy_abi: Option<String>,
+    selection: Option<String>,
+}
+
+fn native_runtime_config_selector(
+    config_path: Option<&Path>,
+) -> Result<Option<NativeRuntimeConfigSelector>> {
+    let config = load_config(config_path)?;
+    Ok(match config.runtime.native_runtime.mesh_version {
+        Some(mesh_version) => Some(NativeRuntimeConfigSelector {
+            mesh_version,
+            skippy_abi: config.runtime.native_runtime.skippy_abi,
+            selection: config.runtime.native_runtime.selection,
+        }),
+        None => None,
+    })
+}
+
+fn native_runtime_command_selection<'a>(
+    selector: Option<&'a NativeRuntimeConfigSelector>,
+) -> NativeRuntimeConfigSelection<'a> {
+    NativeRuntimeConfigSelection {
+        mesh_version: selector.map(|selector| selector.mesh_version.as_str()),
+        skippy_abi_version: selector.and_then(|selector| selector.skippy_abi.as_deref()),
+        selection: selector.and_then(|selector| selector.selection.as_deref()),
     }
 }
 
@@ -463,6 +516,7 @@ fn display_runtime_state(value: &str) -> &'static str {
 fn display_backend_label(value: &str) -> &'static str {
     match value {
         "llama" => "Llama",
+        "skippy" => "Skippy",
         _ => "Unknown",
     }
 }
@@ -508,7 +562,7 @@ fn find_pid(processes: &[serde_json::Value], model: &serde_json::Value) -> Optio
 mod tests {
     use super::{
         build_apply_config_request, build_control_endpoint_request, build_guardrail_mode_request,
-        control_bootstrap_lines, runtime_success_lines, yes_no,
+        control_bootstrap_lines, display_backend_label, runtime_success_lines, yes_no,
     };
     use mesh_llm_cli::MeshGuardrailCliMode;
     use mesh_llm_host_runtime::command_support::plugin::{GpuAssignment, GpuConfig, MeshConfig};
@@ -569,6 +623,12 @@ mod tests {
     fn control_plane_bootstrap_yes_no_labels_are_stable() {
         assert_eq!(yes_no(true), "yes");
         assert_eq!(yes_no(false), "no");
+    }
+
+    #[test]
+    fn status_backend_labels_include_skippy() {
+        assert_eq!(display_backend_label("skippy"), "Skippy");
+        assert_eq!(display_backend_label("llama"), "Llama");
     }
 
     #[test]

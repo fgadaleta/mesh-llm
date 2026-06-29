@@ -42,6 +42,10 @@ impl BinaryProactiveEviction {
     pub(super) fn insert_attrs(&self, attrs: &mut BTreeMap<String, Value>) {
         attrs.extend(self.attrs());
     }
+
+    pub(super) fn should_emit_summary(&self) -> bool {
+        self.error_kind.is_some() || self.evicted_entries > 0 || self.evicted_tokens > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,4 +119,48 @@ pub(super) fn evict_binary_resident_prefix_for_decode(
         evicted_entries: eviction.evicted_entries,
         evicted_tokens: eviction.evicted_tokens,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_and_noop_evictions_are_debug_only() {
+        assert!(!BinaryProactiveEviction::disabled().should_emit_summary());
+        assert!(
+            !BinaryProactiveEviction {
+                status: "noop",
+                error_kind: None,
+                target_tokens: 1024,
+                evicted_entries: 0,
+                evicted_tokens: 0,
+            }
+            .should_emit_summary()
+        );
+    }
+
+    #[test]
+    fn actionable_evictions_stay_summary_visible() {
+        assert!(
+            BinaryProactiveEviction {
+                status: "evicted",
+                error_kind: None,
+                target_tokens: 1024,
+                evicted_entries: 1,
+                evicted_tokens: 512,
+            }
+            .should_emit_summary()
+        );
+        assert!(
+            BinaryProactiveEviction {
+                status: "error",
+                error_kind: Some("runtime"),
+                target_tokens: 1024,
+                evicted_entries: 0,
+                evicted_tokens: 0,
+            }
+            .should_emit_summary()
+        );
+    }
 }

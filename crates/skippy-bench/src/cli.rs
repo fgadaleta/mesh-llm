@@ -20,6 +20,8 @@ pub enum CommandKind {
     LocalSplitBinary(LocalSplitBinaryArgs),
     LocalSplitCompare(LocalSplitCompareArgs),
     LocalSplitChainBinary(LocalSplitChainBinaryArgs),
+    #[command(name = "verify-span-local")]
+    VerifySpanLocal(VerifySpanLocalArgs),
     #[command(name = "chat-corpus")]
     ChatCorpus(ChatCorpusArgs),
     #[command(name = "token-lengths")]
@@ -86,6 +88,39 @@ pub struct TokenLengthsArgs {
     pub output_tsv: PathBuf,
     #[arg(long)]
     pub summary_json: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+pub struct VerifySpanLocalArgs {
+    #[arg(long)]
+    pub model_path: PathBuf,
+    #[arg(long, default_value_t = 48)]
+    pub layer_end: u32,
+    #[arg(long)]
+    pub split_layer: Option<u32>,
+    #[arg(long, default_value_t = 4096)]
+    pub ctx_size: u32,
+    #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
+    pub n_gpu_layers: i32,
+    #[arg(long, default_value = "f16")]
+    pub cache_type_k: String,
+    #[arg(long, default_value = "f16")]
+    pub cache_type_v: String,
+    #[arg(long)]
+    pub n_batch: Option<u32>,
+    #[arg(long)]
+    pub n_ubatch: Option<u32>,
+    #[arg(long, default_value_t = 64)]
+    pub iterations: usize,
+    #[arg(long, default_value_t = 8)]
+    pub warmup: usize,
+    #[arg(
+        long,
+        default_value = "Write a Rust function that parses a list of integers and returns the median."
+    )]
+    pub prompt: String,
+    #[arg(long)]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -415,6 +450,8 @@ pub struct LocalSplitChainBinaryArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
 
     use super::{Cli, CommandKind, FocusedRuntimeScenario};
@@ -470,5 +507,54 @@ mod tests {
         };
 
         assert_eq!(args.run.max_new_tokens, None);
+    }
+
+    #[test]
+    fn parses_verify_span_local_command() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-span-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--layer-end",
+            "48",
+            "--iterations",
+            "3",
+            "--warmup",
+            "1",
+            "--n-gpu-layers",
+            "-1",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifySpanLocal(args) = cli.command else {
+            panic!("expected verify-span-local subcommand");
+        };
+
+        assert_eq!(args.model_path, PathBuf::from("/tmp/model.gguf"));
+        assert_eq!(args.layer_end, 48);
+        assert_eq!(args.split_layer, None);
+        assert_eq!(args.iterations, 3);
+        assert_eq!(args.warmup, 1);
+        assert_eq!(args.n_gpu_layers, -1);
+    }
+
+    #[test]
+    fn parses_verify_span_local_split_layer() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-span-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--split-layer",
+            "24",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifySpanLocal(args) = cli.command else {
+            panic!("expected verify-span-local subcommand");
+        };
+
+        assert_eq!(args.split_layer, Some(24));
     }
 }

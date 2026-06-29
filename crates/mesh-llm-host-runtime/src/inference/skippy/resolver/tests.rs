@@ -1,82 +1,17 @@
+use super::test_support::*;
 use super::*;
-use crate::inference::skippy::{SkippyPackageIdentity, SkippyTelemetryOptions, StageWireDType};
+use crate::inference::skippy::{SkippyTelemetryOptions, StageWireDType};
 use crate::plugin::{MeshConfig, ReasoningBudget, RequestDefaultsConfig};
 use serde_json::Value;
-use skippy_protocol::{LoadMode, StageKvCachePayload};
+use skippy_protocol::{LoadMode, StageKvCacheMode, StageKvCachePayload};
 use skippy_server::{EmbeddedReasoningEnabled, EmbeddedReasoningFormat};
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::path::Path;
 use tempfile::NamedTempFile;
 
 const FULL_SURFACE_VALID_FIXTURE: &str =
     include_str!("../../../../tests/fixtures/skippy_full_surface_valid.toml");
 const FULL_SURFACE_INVALID_FIXTURE: &str =
     include_str!("../../../../tests/fixtures/skippy_full_surface_invalid.toml");
-
-fn fake_package_identity(layer_count: u32) -> SkippyPackageIdentity {
-    SkippyPackageIdentity {
-        package_ref: "gguf:///models/qwen.gguf".to_string(),
-        manifest_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-            .to_string(),
-        source_model_path: PathBuf::from("/models/qwen.gguf"),
-        source_model_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-            .to_string(),
-        source_model_bytes: 1234,
-        source_files: Vec::new(),
-        layer_count,
-        activation_width: 4096,
-        tensor_count: 100,
-    }
-}
-
-fn fake_hf_package_identity(layer_count: u32) -> SkippyPackageIdentity {
-    let mut package = fake_package_identity(layer_count);
-    package.package_ref = "hf://meshllm/Qwen3-8B-Q4_K_M-layers".to_string();
-    package
-}
-
-fn parse_config(toml: &str) -> MeshConfig {
-    toml::from_str(toml).expect("config should parse")
-}
-
-fn push_gguf_string(bytes: &mut Vec<u8>, value: &str) {
-    bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(value.as_bytes());
-}
-
-fn push_u32_kv(bytes: &mut Vec<u8>, key: &str, value: u32) {
-    push_gguf_string(bytes, key);
-    bytes.extend_from_slice(&4u32.to_le_bytes());
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_string_kv(bytes: &mut Vec<u8>, key: &str, value: &str) {
-    push_gguf_string(bytes, key);
-    bytes.extend_from_slice(&8u32.to_le_bytes());
-    push_gguf_string(bytes, value);
-}
-
-fn temp_model_file() -> NamedTempFile {
-    let mut file = NamedTempFile::new().expect("temp model file");
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"GGUF");
-    bytes.extend_from_slice(&2u32.to_le_bytes());
-    bytes.extend_from_slice(&0i64.to_le_bytes());
-    bytes.extend_from_slice(&8i64.to_le_bytes());
-    push_string_kv(&mut bytes, "general.architecture", "llama");
-    push_string_kv(&mut bytes, "tokenizer.ggml.model", "gpt2");
-    push_u32_kv(&mut bytes, "llama.context_length", 8192);
-    push_u32_kv(&mut bytes, "llama.embedding_length", 4096);
-    push_u32_kv(&mut bytes, "llama.block_count", 24);
-    push_u32_kv(&mut bytes, "llama.attention.head_count", 32);
-    push_u32_kv(&mut bytes, "llama.attention.head_count_kv", 8);
-    push_u32_kv(&mut bytes, "llama.attention.key_length", 128);
-    file.write_all(&bytes).expect("write fake gguf");
-    file.flush().expect("flush fake gguf");
-    file
-}
 
 fn resolve_qwen_config_with_request_defaults(
     mesh_config: &MeshConfig,
@@ -90,6 +25,7 @@ fn resolve_qwen_config_with_request_defaults(
         model_bytes: 10 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults,
+        package_generation: None,
     })
     .expect("qwen config should resolve")
 }
@@ -202,6 +138,7 @@ fn resolve_explicit_full_surface_config(
         model_bytes: 4 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: Some(12 * 1024 * 1024 * 1024),
         request_defaults: Some(request_defaults),
+        package_generation: None,
     })
     .expect("explicit model should resolve")
 }
@@ -214,6 +151,7 @@ fn resolve_defaults_full_surface_config(fixture: &FullSurfaceFixture) -> Resolve
         model_bytes: 2 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: Some(12 * 1024 * 1024 * 1024),
         request_defaults: None,
+        package_generation: None,
     })
     .expect("defaults-only model should resolve")
 }
@@ -351,6 +289,7 @@ temperature = 0.4
         model_bytes: 8 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: Some(16 * 1024 * 1024 * 1024),
         request_defaults: Some(&request_defaults),
+        package_generation: None,
     })
     .unwrap();
 
@@ -399,6 +338,7 @@ tuning_profile = "throughput"
         model_bytes: 10 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: Some(12 * 1024 * 1024 * 1024),
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap();
 
@@ -412,6 +352,111 @@ tuning_profile = "throughput"
     assert_eq!(resolved.throughput.parallel, 2);
     assert_eq!(resolved.throughput.continuous_batching, "true");
     assert_eq!(resolved.hardware.fit_target_mib, Some(10_752));
+}
+
+#[test]
+fn resolver_treats_auto_cache_type_as_policy_selected_cache_type() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.model_fit]
+kv_cache_policy = "saver"
+cache_type_k = "auto"
+cache_type_v = "auto"
+"#,
+    );
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: Path::new("/models/qwen.gguf"),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved.model_fit.kv_cache_policy, "saver");
+    assert_eq!(resolved.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved.model_fit.cache_type_v, "q8_0");
+}
+
+#[test]
+fn resolver_treats_auto_cache_type_case_insensitively() {
+    // Test uppercase "AUTO"
+    let mesh_config_upper = parse_config(
+        r#"
+[defaults.model_fit]
+kv_cache_policy = "saver"
+cache_type_k = "AUTO"
+cache_type_v = "AUTO"
+"#,
+    );
+
+    let resolved_upper = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config_upper,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: Path::new("/models/qwen.gguf"),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved_upper.model_fit.kv_cache_policy, "saver");
+    assert_eq!(resolved_upper.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved_upper.model_fit.cache_type_v, "q8_0");
+
+    // Test mixed-case "Auto"
+    let mesh_config_mixed = parse_config(
+        r#"
+[defaults.model_fit]
+kv_cache_policy = "saver"
+cache_type_k = "Auto"
+cache_type_v = "Auto"
+"#,
+    );
+
+    let resolved_mixed = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config_mixed,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: Path::new("/models/qwen.gguf"),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved_mixed.model_fit.kv_cache_policy, "saver");
+    assert_eq!(resolved_mixed.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved_mixed.model_fit.cache_type_v, "q8_0");
+
+    // Test mixed-case "AuTo"
+    let mesh_config_mixed2 = parse_config(
+        r#"
+[defaults.model_fit]
+kv_cache_policy = "saver"
+cache_type_k = "AuTo"
+cache_type_v = "AuTo"
+"#,
+    );
+
+    let resolved_mixed2 = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config_mixed2,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: Path::new("/models/qwen.gguf"),
+        model_bytes: 10 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved_mixed2.model_fit.kv_cache_policy, "saver");
+    assert_eq!(resolved_mixed2.model_fit.cache_type_k, "q8_0");
+    assert_eq!(resolved_mixed2.model_fit.cache_type_v, "q8_0");
 }
 
 #[test]
@@ -439,6 +484,7 @@ cache_type_v = "q4_0"
         model_bytes: 10 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap();
 
@@ -479,6 +525,7 @@ parallel = 11
         model_bytes: 10 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap();
 
@@ -547,6 +594,7 @@ reasoning_enabled = "on"
         model_bytes: 10 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap();
 
@@ -602,6 +650,7 @@ chat_template = "unsafe-template"
         model_bytes: 10 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap_err()
     .to_string();
@@ -618,10 +667,38 @@ fn family_policy_beats_builtin_wire_dtype_when_config_is_unset() {
         model_bytes: 2 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap();
 
     assert_eq!(resolved.skippy.activation_wire_dtype, StageWireDType::F32);
+}
+
+#[test]
+fn family_policy_wires_prefix_cache_by_default_for_supported_models() {
+    let model_file = temp_model_file();
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &MeshConfig::default(),
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+        package_generation: None,
+    })
+    .expect("config should resolve");
+
+    let stage_config = resolved
+        .to_stage_config(Some(fake_package_identity(24)), LoadMode::RuntimeSlice)
+        .expect("stage config should build");
+    let kv_cache = stage_config
+        .kv_cache
+        .expect("supported family should enable prefix cache by default");
+
+    assert_eq!(kv_cache.mode, StageKvCacheMode::LookupRecord);
+    assert_eq!(kv_cache.payload, StageKvCachePayload::ResidentKv);
+    assert!(kv_cache.max_entries > 0);
+    assert!(kv_cache.max_bytes > 0);
 }
 
 #[test]
@@ -662,6 +739,7 @@ draft_max_tokens = 8
         model_bytes: 4 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .expect("config should resolve");
 
@@ -708,6 +786,7 @@ fn layer_package_translation_does_not_treat_hf_ref_as_direct_gguf() {
         model_bytes: 5 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap();
 
@@ -741,6 +820,7 @@ draft_selection_policy = "auto"
         model_bytes: 4 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .expect("auto draft selection policy should not force draft resolution");
 
@@ -766,6 +846,7 @@ prefill_chunk_size = 128
         model_bytes: 4 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .expect("config should resolve");
 
@@ -797,6 +878,7 @@ draft_max_tokens = 8
         model_bytes: 4 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .expect("warn_disable should resolve");
 
@@ -825,6 +907,7 @@ draft_max_tokens = 8
         model_bytes: 4 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap_err()
     .to_string();
@@ -850,6 +933,7 @@ stage_layer_end = 24
         model_bytes: 4 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .expect("config should resolve");
 
@@ -882,6 +966,7 @@ draft_acceptance_threshold = 0.5
         model_bytes: 4 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap_err()
     .to_string();
@@ -928,6 +1013,7 @@ model = "Qwen/Qwen3-0.6B:Q4_K_M"
         model_bytes: 2 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap_err()
     .to_string();
@@ -952,6 +1038,7 @@ placement = "auto"
         model_bytes: 2 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap_err()
     .to_string();
@@ -976,6 +1063,7 @@ fn integrated_invalid_fixture_fails_closed_for_request_defaults_and_single_stage
         model_bytes: 2 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .unwrap_err()
     .to_string();
@@ -992,6 +1080,7 @@ fn integrated_invalid_fixture_fails_closed_for_request_defaults_and_single_stage
         model_bytes: 2 * 1024 * 1024 * 1024,
         allocatable_memory_bytes: None,
         request_defaults: None,
+        package_generation: None,
     })
     .expect("staged-only config should resolve before translation gating");
     let staged_only_error = resolved

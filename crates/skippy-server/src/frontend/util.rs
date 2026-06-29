@@ -12,6 +12,33 @@ pub(super) fn trim_at_stop<'a>(text: &'a str, stop_values: &[&str]) -> &'a str {
     }
 }
 
+pub(super) fn generation_stop_values(
+    stop: Option<&openai_frontend::StopSequence>,
+    chat_metadata: Option<&str>,
+) -> Vec<String> {
+    let mut values: Vec<String> = stop
+        .map(|stop| stop.values().into_iter().map(str::to_string).collect())
+        .unwrap_or_default();
+    let additional_stops = chat_metadata
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+        .and_then(|value| {
+            value
+                .get("additional_stops")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        });
+    if let Some(stops) = additional_stops {
+        values.extend(
+            stops
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        );
+    }
+    values
+}
+
 pub(super) fn valid_utf8_prefix_len(bytes: &[u8]) -> usize {
     match std::str::from_utf8(bytes) {
         Ok(_) => bytes.len(),

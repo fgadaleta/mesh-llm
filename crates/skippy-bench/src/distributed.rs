@@ -35,8 +35,6 @@ use crate::{
     support::{ChildGuard, parse_wire_dtype, retry},
 };
 
-use crate::direct_return::BenchDirectReturnServer;
-
 struct DistributedRunOutcome {
     run_id: String,
     topology_id: String,
@@ -187,7 +185,6 @@ struct DeploymentPlan {
     work_dir: PathBuf,
     metrics_http: String,
     metrics_otlp_grpc: String,
-    driver_return_bind_addr: String,
     driver_return_endpoint: String,
     stages: Vec<StageAssignment>,
     execute_remote: bool,
@@ -1075,7 +1072,6 @@ fn build_deployment_plan(
         work_dir: args.work_dir.clone(),
         metrics_http,
         metrics_otlp_grpc: metrics_otlp,
-        driver_return_bind_addr: driver_return_bind_addr(args),
         driver_return_endpoint: driver_return_endpoint(args, &stages)?,
         stages,
         execute_remote: args.execute_remote,
@@ -1213,10 +1209,6 @@ fn parse_load_mode(load_mode: &str) -> Result<LoadMode> {
         "runtime-slice" => Ok(LoadMode::RuntimeSlice),
         _ => bail!("unsupported stage load mode for topology: {load_mode}"),
     }
-}
-
-fn driver_return_bind_addr(args: &RunArgs) -> String {
-    format!("0.0.0.0:{}", driver_return_port(args))
 }
 
 fn driver_return_endpoint(args: &RunArgs, stages: &[StageAssignment]) -> Result<String> {
@@ -1584,8 +1576,6 @@ fn run_remote_prompt_driver(args: &RunArgs, plan: &DeploymentPlan) -> Result<Pro
     } else {
         Some(DriverTokenizer::open(args, plan)?)
     };
-    let direct_returns = BenchDirectReturnServer::start(&plan.driver_return_bind_addr)?;
-
     let mut results = Vec::with_capacity(prompt_cases.len());
     for (index, prompt_case) in prompt_cases.iter().enumerate() {
         let started = Instant::now();
@@ -1597,15 +1587,8 @@ fn run_remote_prompt_driver(args: &RunArgs, plan: &DeploymentPlan) -> Result<Pro
                 .expect("tokenizer is present without explicit prompt tokens")
                 .tokenize(&prompt_case.prompt)?
         };
-        let mut result = run_remote_prompt_case(
-            args,
-            first,
-            wire_dtype,
-            prompt_case,
-            token_ids,
-            index,
-            &direct_returns,
-        )?;
+        let mut result =
+            run_remote_prompt_case(args, first, wire_dtype, prompt_case, token_ids, index)?;
         result.elapsed_ms = started.elapsed().as_millis();
         results.push(result);
     }
@@ -1697,6 +1680,16 @@ fn mean_ms(results: &[PromptDriverResult], value: impl Fn(&PromptDriverResult) -
     results.iter().map(value).sum::<u128>() as f64 / results.len() as f64
 }
 
+fn ensure_reply_kind(
+    reply: &skippy_protocol::binary::StageReply,
+    expected: WireReplyKind,
+) -> Result<()> {
+    if reply.kind != expected {
+        bail!("expected {expected:?} reply, got {:?}", reply.kind);
+    }
+    Ok(())
+}
+
 fn run_remote_prompt_case(
     args: &RunArgs,
     first: &StageAssignment,
@@ -1704,7 +1697,6 @@ fn run_remote_prompt_case(
     prompt_case: &PromptCase,
     token_ids: Vec<i32>,
     prompt_index: usize,
-    direct_returns: &BenchDirectReturnServer,
 ) -> Result<PromptDriverResult> {
     if token_ids.is_empty() {
         bail!("prompt produced no tokens");
@@ -1721,7 +1713,6 @@ fn run_remote_prompt_case(
     let wire_started = Instant::now();
     let request_id = 10_000_u64 + prompt_index as u64;
     let session_id = 20_000_u64 + prompt_index as u64;
-    let direct_return = direct_returns.register(request_id, session_id)?;
     send_generation_config(
         &mut stream,
         wire_dtype,
@@ -1791,11 +1782,10 @@ fn run_remote_prompt_case(
         write_stage_message(&mut stream, &message, wire_dtype).with_context(|| {
             format!("send remote decode step {decode_step} for prompt {prompt_index}")
         })?;
-        let reply = direct_return
-            .recv_expected(WireReplyKind::PredictedToken)
-            .with_context(|| {
-                format!("receive direct decode step {decode_step} reply for prompt {prompt_index}")
-            })?;
+        let reply = recv_reply(&mut stream).with_context(|| {
+            format!("receive decode step {decode_step} reply for prompt {prompt_index}")
+        })?;
+        ensure_reply_kind(&reply, WireReplyKind::PredictedToken)?;
         if decode_step == 0 {
             ttft_ms = wire_started.elapsed().as_millis();
         }
@@ -3349,7 +3339,6 @@ mod tests {
             work_dir: PathBuf::from("/tmp/work"),
             metrics_http: "http://127.0.0.1:18080".to_string(),
             metrics_otlp_grpc: "http://coordinator.local:14317".to_string(),
-            driver_return_bind_addr: "0.0.0.0:20031".to_string(),
             driver_return_endpoint: "host.local:20031".to_string(),
             stages: Vec::new(),
             execute_remote: true,

@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use model_artifact::ModelIdentity;
+use model_artifact::{ModelIdentity, gguf::scan_gguf_compact_meta};
 use model_hf::HfModelRepository;
 use model_ref::ModelRef;
 use serde::Deserialize;
@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use skippy_protocol::binary::{
-    StageStateHeader, StageWireMessage, WireMessageKind, WireReplyKind,
+    StageReply, StageStateHeader, StageWireMessage, WireMessageKind, WireReplyKind,
     activation_state_flags_from_frame_flags, read_stage_message, recv_reply, state_flags,
     write_stage_message,
 };
@@ -28,15 +28,14 @@ use skippy_runtime::{
 
 use crate::{
     cli::{
-        ChainArgs, DtypeMatrixArgs, FlashAttentionArg, RuntimeArgs, ServerArgs, SingleStepArgs,
-        SplitScanArgs, StageLoadMode, StateHandoffArgs, StatePayloadKind,
+        ChainArgs, DtypeMatrixArgs, FlashAttentionArg, NativeMtpArgs, RuntimeArgs, ServerArgs,
+        SingleStepArgs, SplitScanArgs, StageLoadMode, StateHandoffArgs, StatePayloadKind,
     },
-    direct_return::CorrectnessDirectReturnServer,
     report::{
         BaselineReport, BoundaryReport, ChainReport, ChainStageReport, DtypeMatrixReport,
-        PackagePartReport, PackageStageReport, SingleStepReport, SplitReport, SplitScanReport,
-        StageModelReport, StateHandoffReport, StatePayloadBlockDigestReport,
-        StatePayloadDigestReport,
+        NativeMtpN1VerificationReport, NativeMtpSidebandReport, PackagePartReport,
+        PackageStageReport, SingleStepReport, SplitReport, SplitScanReport, StageModelReport,
+        StateHandoffReport, StatePayloadBlockDigestReport, StatePayloadDigestReport,
     },
     support::{
         ChildGuard, activation_width, connect_ready, generate_run_id, parse_wire_dtype,
@@ -47,6 +46,7 @@ use crate::{
 struct FullModelResult {
     token_id: i32,
     predicted_token: i32,
+    second_predicted_token: Option<i32>,
 }
 
 struct BinarySplitConfig {
@@ -66,12 +66,22 @@ struct BinarySplitConfig {
     activation_wire_dtype: String,
     child_logs: bool,
     startup_timeout_secs: u64,
+    max_inflight: usize,
     model_identity: ModelIdentity,
+    native_mtp_verification: bool,
+}
+
+#[derive(Clone, Copy)]
+struct NativeMtpRequirement {
+    require_draft: bool,
 }
 
 struct BinarySplitResult {
     token_id: i32,
     predicted_token: i32,
+    second_predicted_token: Option<i32>,
+    native_mtp: NativeMtpSidebandReport,
+    native_mtp_verification_compute_us: Option<i64>,
     activation_width: i32,
     wire_dtype: String,
     boundary_producer_stage_index: i32,
@@ -81,6 +91,37 @@ struct BinarySplitResult {
     boundary_payload_bytes: u64,
     boundary_wire_payload_bytes: usize,
     stage_models: Vec<StageModelReport>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NativeMtpArtifactSummary {
+    nextn_predict_layers: u32,
+    has_eh_proj: bool,
+    has_enorm: bool,
+    has_hnorm: bool,
+}
+
+impl NativeMtpArtifactSummary {
+    fn supports_native_mtp(&self) -> bool {
+        self.nextn_predict_layers > 0 && self.has_eh_proj && self.has_enorm && self.has_hnorm
+    }
+
+    fn missing_reasons(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.nextn_predict_layers == 0 {
+            missing.push("*.nextn_predict_layers > 0");
+        }
+        if !self.has_eh_proj {
+            missing.push("*.nextn.eh_proj tensor");
+        }
+        if !self.has_enorm {
+            missing.push("*.nextn.enorm tensor");
+        }
+        if !self.has_hnorm {
+            missing.push("*.nextn.hnorm tensor");
+        }
+        missing
+    }
 }
 
 struct BinaryChainConfig {
@@ -102,12 +143,17 @@ struct BinaryChainConfig {
     activation_wire_dtype: String,
     child_logs: bool,
     startup_timeout_secs: u64,
+    max_inflight: usize,
     model_identity: ModelIdentity,
+    native_mtp_verification: bool,
 }
 
 struct BinaryChainResult {
     token_id: i32,
     predicted_token: i32,
+    second_predicted_token: Option<i32>,
+    native_mtp: NativeMtpSidebandReport,
+    native_mtp_verification_compute_us: Option<i64>,
     activation_width: i32,
     wire_dtype: String,
     stage0_wire_payload_bytes: usize,
@@ -143,10 +189,12 @@ struct BinaryStateHandoffConfig {
     runtime_lane_count: Option<u32>,
     borrow_resident_hits: bool,
     cache_decoded_result_hits: bool,
+    skip_suffix_prefill_check: bool,
     synthetic_input_activation: bool,
     binary_control: bool,
     child_logs: bool,
     startup_timeout_secs: u64,
+    max_inflight: usize,
     model_identity: ModelIdentity,
 }
 
@@ -287,6 +335,8 @@ impl LocalStatePayload {
 }
 
 pub fn single_step(args: SingleStepArgs) -> Result<()> {
+    let native_mtp = native_mtp_requirement(args.native_mtp);
+    ensure_native_mtp_artifact_if_required(&args.runtime, native_mtp)?;
     let model_identity = runtime_model_identity(&args.runtime)?;
     let baseline = run_full_model_decode(&args.runtime)?;
     let report = run_single_step_with_baseline(
@@ -298,6 +348,7 @@ pub fn single_step(args: SingleStepArgs) -> Result<()> {
             split_layer: args.split_layer,
             stage1_bind_addr: args.stage1_bind_addr,
             activation_wire_dtype: args.activation_wire_dtype,
+            native_mtp,
         },
     )?;
     emit_report(&report, args.output.report_out.as_deref())?;
@@ -306,6 +357,8 @@ pub fn single_step(args: SingleStepArgs) -> Result<()> {
 }
 
 pub fn chain(args: ChainArgs) -> Result<()> {
+    let native_mtp_requirement = native_mtp_requirement(args.native_mtp);
+    ensure_native_mtp_artifact_if_required(&args.runtime, native_mtp_requirement)?;
     let splits = parse_chain_splits(&args.splits)?;
     let model_identity = runtime_model_identity(&args.runtime)?;
     let baseline = run_full_model_decode(&args.runtime)?;
@@ -328,17 +381,33 @@ pub fn chain(args: ChainArgs) -> Result<()> {
         activation_wire_dtype: args.activation_wire_dtype,
         child_logs: args.server.child_logs,
         startup_timeout_secs: args.server.startup_timeout_secs,
+        max_inflight: args.server.max_inflight,
         model_identity: model_identity.clone(),
+        native_mtp_verification: native_mtp_requirement.require_draft,
     })?;
-    let matches = baseline.predicted_token == chain.predicted_token;
+    let native_mtp = chain.native_mtp.clone();
+    let native_mtp_n1 = native_mtp_n1_verification_report(
+        native_mtp_requirement.require_draft,
+        &native_mtp,
+        chain.second_predicted_token,
+        baseline.second_predicted_token,
+        chain.native_mtp_verification_compute_us,
+    );
+    let matches = baseline.predicted_token == chain.predicted_token
+        && native_mtp_satisfies_requirement(&native_mtp, native_mtp_requirement)
+        && native_mtp_n1_satisfies_requirement(&native_mtp_n1, native_mtp_requirement);
     let report = ChainReport {
         mode: "chain",
         status: status(matches),
         model_identity,
         matches,
+        native_mtp_draft_required: native_mtp_requirement.require_draft,
         baseline: baseline_report(baseline),
         token_id: chain.token_id,
         predicted_token: chain.predicted_token,
+        second_predicted_token: chain.second_predicted_token,
+        native_mtp,
+        native_mtp_n1,
         activation_width: chain.activation_width,
         wire_dtype: chain.wire_dtype,
         stages: vec![
@@ -378,6 +447,8 @@ pub fn chain(args: ChainArgs) -> Result<()> {
 }
 
 pub fn split_scan(args: SplitScanArgs) -> Result<()> {
+    let native_mtp = native_mtp_requirement(args.native_mtp);
+    ensure_native_mtp_artifact_if_required(&args.runtime, native_mtp)?;
     let splits = parse_split_list(&args.splits)?;
     let model_identity = runtime_model_identity(&args.runtime)?;
     let baseline = run_full_model_decode(&args.runtime)?;
@@ -396,11 +467,13 @@ pub fn split_scan(args: SplitScanArgs) -> Result<()> {
             FullModelResult {
                 token_id: baseline.token_id,
                 predicted_token: baseline.predicted_token,
+                second_predicted_token: baseline.second_predicted_token,
             },
             SingleStepCase {
                 split_layer,
                 stage1_bind_addr: args.stage1_bind_addr,
                 activation_wire_dtype: args.activation_wire_dtype.clone(),
+                native_mtp,
             },
         )?);
     }
@@ -420,6 +493,8 @@ pub fn split_scan(args: SplitScanArgs) -> Result<()> {
 }
 
 pub fn dtype_matrix(args: DtypeMatrixArgs) -> Result<()> {
+    let native_mtp = native_mtp_requirement(args.native_mtp);
+    ensure_native_mtp_artifact_if_required(&args.runtime, native_mtp)?;
     let dtypes = parse_csv(&args.dtypes)?;
     let model_identity = runtime_model_identity(&args.runtime)?;
     let baseline = run_full_model_decode(&args.runtime)?;
@@ -432,11 +507,13 @@ pub fn dtype_matrix(args: DtypeMatrixArgs) -> Result<()> {
             FullModelResult {
                 token_id: baseline.token_id,
                 predicted_token: baseline.predicted_token,
+                second_predicted_token: baseline.second_predicted_token,
             },
             SingleStepCase {
                 split_layer: args.split_layer,
                 stage1_bind_addr: args.stage1_bind_addr,
                 activation_wire_dtype: dtype,
+                native_mtp,
             },
         )?);
     }
@@ -493,10 +570,12 @@ pub fn state_handoff(args: StateHandoffArgs) -> Result<()> {
         runtime_lane_count: args.runtime_lane_count,
         borrow_resident_hits: args.borrow_resident_hits,
         cache_decoded_result_hits: args.cache_decoded_result_hits,
+        skip_suffix_prefill_check: args.skip_suffix_prefill_check,
         synthetic_input_activation: args.synthetic_input_activation,
         binary_control: args.binary_control,
         child_logs: args.server.child_logs,
         startup_timeout_secs: args.server.startup_timeout_secs,
+        max_inflight: args.server.max_inflight,
         model_identity: model_identity.clone(),
     })?;
     let report = StateHandoffReport {
@@ -565,6 +644,7 @@ struct SingleStepCase {
     split_layer: u32,
     stage1_bind_addr: SocketAddr,
     activation_wire_dtype: String,
+    native_mtp: NativeMtpRequirement,
 }
 
 fn run_single_step_with_baseline(
@@ -591,17 +671,29 @@ fn run_single_step_with_baseline(
         activation_wire_dtype: case.activation_wire_dtype,
         child_logs: server.child_logs,
         startup_timeout_secs: server.startup_timeout_secs,
+        max_inflight: server.max_inflight,
         model_identity: model_identity.clone(),
+        native_mtp_verification: case.native_mtp.require_draft,
     })?;
-    let matches = baseline.predicted_token == split.predicted_token;
+    let native_mtp_n1 = native_mtp_n1_verification_report(
+        case.native_mtp.require_draft,
+        &split.native_mtp,
+        split.second_predicted_token,
+        baseline.second_predicted_token,
+        split.native_mtp_verification_compute_us,
+    );
+    let matches = baseline.predicted_token == split.predicted_token
+        && native_mtp_satisfies_requirement(&split.native_mtp, case.native_mtp)
+        && native_mtp_n1_satisfies_requirement(&native_mtp_n1, case.native_mtp);
     let stage_models = split.stage_models.clone();
     Ok(SingleStepReport {
         mode: "single-step",
         status: status(matches),
         model_identity: model_identity.clone(),
         matches,
+        native_mtp_draft_required: case.native_mtp.require_draft,
         baseline: baseline_report(baseline),
-        split: split_report(split),
+        split: split_report(split, native_mtp_n1),
         stage_models,
     })
 }
@@ -640,10 +732,64 @@ fn run_full_model_decode(args: &RuntimeArgs) -> Result<FullModelResult> {
         .decode_step_frame(token_id, None, 0)
         .context("full model failed to decode")?
         .0;
+    let second_predicted_token = session
+        .decode_step_frame(predicted_token, None, 0)
+        .context("full model failed to decode second token")?
+        .0;
     Ok(FullModelResult {
         token_id,
         predicted_token,
+        second_predicted_token: Some(second_predicted_token),
     })
+}
+
+struct BinaryDecodeMessageArgs<'a> {
+    wire_dtype: skippy_protocol::binary::WireActivationDType,
+    token_id: i32,
+    decode_step: i32,
+    source_stage_index: i32,
+    boundary: &'a ActivationFrame,
+    activation_width: i32,
+    request_id: u64,
+    session_id: u64,
+}
+
+fn binary_decode_message(args: BinaryDecodeMessageArgs<'_>) -> Result<StageWireMessage> {
+    let mut state = StageStateHeader::new(WireMessageKind::DecodeEmbd, args.wire_dtype);
+    state.prompt_token_count = 0;
+    state.decode_step = args.decode_step;
+    state.current_token = args.token_id;
+    state.source_stage_index = args.source_stage_index;
+    state.flags |= activation_state_flags(args.boundary);
+    let activation = skippy_protocol::binary::encode_f32_activation_payload_with_state_flags(
+        args.wire_dtype,
+        1,
+        args.activation_width,
+        &args.boundary.payload,
+        activation_state_flags(args.boundary),
+    )
+    .context("failed to encode boundary activation for wire")?;
+    Ok(StageWireMessage {
+        kind: WireMessageKind::DecodeEmbd,
+        pos_start: args.decode_step,
+        token_count: 1,
+        state,
+        request_id: args.request_id,
+        session_id: args.session_id,
+        sampling: None,
+        chat_sampling_metadata: None,
+        tokens: vec![args.token_id],
+        positions: vec![args.decode_step],
+        activation,
+        raw_bytes: Vec::new(),
+    })
+}
+
+fn ensure_reply_kind(reply: &StageReply, expected: WireReplyKind) -> Result<()> {
+    if reply.kind != expected {
+        bail!("expected {expected:?} reply, got {:?}", reply.kind);
+    }
+    Ok(())
 }
 
 fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
@@ -721,7 +867,6 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
     }
     let activation_width = activation_width(&boundary)?;
 
-    let direct_returns = CorrectnessDirectReturnServer::start("127.0.0.1:0")?;
     let run_id = generate_run_id();
     let model_id = args.model_identity.model_id.clone();
     let config_path = temp_config_path_for(&run_id, "stage-1");
@@ -751,7 +896,7 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         "upstream": {
             "stage_id": "stage-0",
             "stage_index": 0,
-            "endpoint": format!("tcp://{}", direct_returns.endpoint())
+            "endpoint": "driver"
         },
         "downstream": null
     });
@@ -762,7 +907,7 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
             CorrectnessTopologyStage {
                 stage_id: "stage-0",
                 stage_index: 0,
-                endpoint: format!("tcp://{}", direct_returns.endpoint()),
+                endpoint: "driver".to_string(),
                 layer_start: 0,
                 layer_end: args.split_layer,
                 load_mode: protocol_load_mode(args.stage_load_mode),
@@ -797,6 +942,8 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         &activation_width.to_string(),
         "--activation-wire-dtype",
         &args.activation_wire_dtype,
+        "--max-inflight",
+        &args.max_inflight.to_string(),
     ]);
     configure_child_logs(&mut stage_command, args.child_logs);
     let _stage1 = ChildGuard::spawn(stage_command)?;
@@ -805,47 +952,59 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         .context("stage 1 binary server did not become ready")?;
     let request_id = 1;
     let session_id = 1;
-    let direct_return = direct_returns.register(request_id, session_id)?;
     send_generation_config(&mut stream, wire_dtype, request_id, session_id, 1)
         .context("send binary generation config")?;
-    let mut state = StageStateHeader::new(WireMessageKind::DecodeEmbd, wire_dtype);
-    state.prompt_token_count = 0;
-    state.decode_step = 0;
-    state.current_token = token_id;
-    state.source_stage_index = 0;
-    state.flags |= activation_state_flags(&boundary);
-    let activation = skippy_protocol::binary::encode_f32_activation_payload_with_state_flags(
+    let message = binary_decode_message(BinaryDecodeMessageArgs {
         wire_dtype,
-        1,
+        token_id,
+        decode_step: 0,
+        source_stage_index: 0,
+        boundary: &boundary,
         activation_width,
-        &boundary.payload,
-        activation_state_flags(&boundary),
-    )
-    .context("failed to encode boundary activation for wire")?;
-    let message = StageWireMessage {
-        kind: WireMessageKind::DecodeEmbd,
-        pos_start: 0,
-        token_count: 1,
-        state,
         request_id,
         session_id,
-        sampling: None,
-        chat_sampling_metadata: None,
-        tokens: vec![token_id],
-        positions: vec![0],
-        activation,
-        raw_bytes: Vec::new(),
-    };
+    })?;
     write_stage_message(&mut stream, &message, wire_dtype).context("send binary decode")?;
-    let reply = direct_return
-        .recv_expected(WireReplyKind::PredictedToken)
-        .context("receive direct binary reply")?;
+    let reply = recv_reply(&mut stream).context("receive binary prediction reply")?;
+    ensure_reply_kind(&reply, WireReplyKind::PredictedToken)?;
+    let native_mtp = native_mtp_sideband_report(&reply);
+    let (second_predicted_token, native_mtp_verification_compute_us) =
+        if args.native_mtp_verification {
+            let verification_timer = Instant::now();
+            let (_boundary_prediction, second_boundary) = session0
+                .decode_step_frame(reply.predicted, None, 0)
+                .context("stage 0 failed to produce second activation frame")?;
+            let second_message = binary_decode_message(BinaryDecodeMessageArgs {
+                wire_dtype,
+                token_id: reply.predicted,
+                decode_step: 1,
+                source_stage_index: 0,
+                boundary: &second_boundary,
+                activation_width,
+                request_id,
+                session_id,
+            })?;
+            write_stage_message(&mut stream, &second_message, wire_dtype)
+                .context("send second binary decode")?;
+            let second_reply =
+                recv_reply(&mut stream).context("receive second binary prediction reply")?;
+            ensure_reply_kind(&second_reply, WireReplyKind::PredictedToken)?;
+            (
+                Some(second_reply.predicted),
+                Some(elapsed_us(verification_timer)),
+            )
+        } else {
+            (None, None)
+        };
     write_stage_message(&mut stream, &StageWireMessage::stop(wire_dtype), wire_dtype)
         .context("send binary stop")?;
 
     Ok(BinarySplitResult {
         token_id,
         predicted_token: reply.predicted,
+        second_predicted_token,
+        native_mtp,
+        native_mtp_verification_compute_us,
         activation_width,
         wire_dtype: args.activation_wire_dtype,
         boundary_producer_stage_index: boundary.desc.producer_stage_index,
@@ -952,7 +1111,6 @@ fn run_binary_chain(args: BinaryChainConfig) -> Result<BinaryChainResult> {
     }
     let activation_width = activation_width(&boundary)?;
 
-    let direct_returns = CorrectnessDirectReturnServer::start("127.0.0.1:0")?;
     let run_id = generate_run_id();
     let model_id = args.model_identity.model_id.clone();
     let stage1_config_path = temp_config_path_for(&run_id, "stage-1");
@@ -1012,7 +1170,7 @@ fn run_binary_chain(args: BinaryChainConfig) -> Result<BinaryChainResult> {
         "upstream": {
             "stage_id": "stage-0",
             "stage_index": 0,
-            "endpoint": format!("tcp://{}", direct_returns.endpoint())
+            "endpoint": "driver"
         },
         "downstream": {
             "stage_id": "stage-2",
@@ -1027,7 +1185,7 @@ fn run_binary_chain(args: BinaryChainConfig) -> Result<BinaryChainResult> {
             CorrectnessTopologyStage {
                 stage_id: "stage-0",
                 stage_index: 0,
-                endpoint: format!("tcp://{}", direct_returns.endpoint()),
+                endpoint: "driver".to_string(),
                 layer_start: 0,
                 layer_end: args.split_layer_1,
                 load_mode: protocol_load_mode(args.stage_load_mode),
@@ -1078,6 +1236,8 @@ fn run_binary_chain(args: BinaryChainConfig) -> Result<BinaryChainResult> {
         &activation_width.to_string(),
         "--activation-wire-dtype",
         &args.activation_wire_dtype,
+        "--max-inflight",
+        &args.max_inflight.to_string(),
     ]);
     configure_child_logs(&mut stage2_command, args.child_logs);
     let _stage2 = ChildGuard::spawn(stage2_command)?;
@@ -1101,6 +1261,8 @@ fn run_binary_chain(args: BinaryChainConfig) -> Result<BinaryChainResult> {
         &activation_width.to_string(),
         "--activation-wire-dtype",
         &args.activation_wire_dtype,
+        "--max-inflight",
+        &args.max_inflight.to_string(),
     ]);
     configure_child_logs(&mut stage1_command, args.child_logs);
     let _stage1 = ChildGuard::spawn(stage1_command)?;
@@ -1109,47 +1271,59 @@ fn run_binary_chain(args: BinaryChainConfig) -> Result<BinaryChainResult> {
         .context("stage 1 binary server did not become ready")?;
     let request_id = 2;
     let session_id = 2;
-    let direct_return = direct_returns.register(request_id, session_id)?;
     send_generation_config(&mut stream, wire_dtype, request_id, session_id, 1)
         .context("send binary chain generation config")?;
-    let mut state = StageStateHeader::new(WireMessageKind::DecodeEmbd, wire_dtype);
-    state.prompt_token_count = 0;
-    state.decode_step = 0;
-    state.current_token = token_id;
-    state.source_stage_index = 0;
-    state.flags |= activation_state_flags(&boundary);
-    let activation = skippy_protocol::binary::encode_f32_activation_payload_with_state_flags(
+    let message = binary_decode_message(BinaryDecodeMessageArgs {
         wire_dtype,
-        1,
+        token_id,
+        decode_step: 0,
+        source_stage_index: 0,
+        boundary: &boundary,
         activation_width,
-        &boundary.payload,
-        activation_state_flags(&boundary),
-    )
-    .context("failed to encode boundary activation for wire")?;
-    let message = StageWireMessage {
-        kind: WireMessageKind::DecodeEmbd,
-        pos_start: 0,
-        token_count: 1,
-        state,
         request_id,
         session_id,
-        sampling: None,
-        chat_sampling_metadata: None,
-        tokens: vec![token_id],
-        positions: vec![0],
-        activation,
-        raw_bytes: Vec::new(),
-    };
+    })?;
     write_stage_message(&mut stream, &message, wire_dtype).context("send binary chain decode")?;
-    let reply = direct_return
-        .recv_expected(WireReplyKind::PredictedToken)
-        .context("receive direct binary chain reply")?;
+    let reply = recv_reply(&mut stream).context("receive binary chain prediction reply")?;
+    ensure_reply_kind(&reply, WireReplyKind::PredictedToken)?;
+    let native_mtp = native_mtp_sideband_report(&reply);
+    let (second_predicted_token, native_mtp_verification_compute_us) =
+        if args.native_mtp_verification {
+            let verification_timer = Instant::now();
+            let (_boundary_prediction, second_boundary) = session0
+                .decode_step_frame(reply.predicted, None, 0)
+                .context("stage 0 failed to produce second chain activation frame")?;
+            let second_message = binary_decode_message(BinaryDecodeMessageArgs {
+                wire_dtype,
+                token_id: reply.predicted,
+                decode_step: 1,
+                source_stage_index: 0,
+                boundary: &second_boundary,
+                activation_width,
+                request_id,
+                session_id,
+            })?;
+            write_stage_message(&mut stream, &second_message, wire_dtype)
+                .context("send second binary chain decode")?;
+            let second_reply =
+                recv_reply(&mut stream).context("receive second binary chain prediction reply")?;
+            ensure_reply_kind(&second_reply, WireReplyKind::PredictedToken)?;
+            (
+                Some(second_reply.predicted),
+                Some(elapsed_us(verification_timer)),
+            )
+        } else {
+            (None, None)
+        };
     write_stage_message(&mut stream, &StageWireMessage::stop(wire_dtype), wire_dtype)
         .context("send binary chain stop")?;
 
     Ok(BinaryChainResult {
         token_id,
         predicted_token: reply.predicted,
+        second_predicted_token,
+        native_mtp,
+        native_mtp_verification_compute_us,
         activation_width,
         wire_dtype: args.activation_wire_dtype,
         stage0_wire_payload_bytes: message.activation.len(),
@@ -1396,6 +1570,8 @@ fn run_binary_state_handoff(args: BinaryStateHandoffConfig) -> Result<BinaryStat
         &stage_activation_width.to_string(),
         "--activation-wire-dtype",
         &args.activation_wire_dtype,
+        "--max-inflight",
+        &args.max_inflight.to_string(),
     ]);
     configure_child_logs(&mut source_command, args.child_logs);
     let _source = ChildGuard::spawn(source_command)?;
@@ -1448,6 +1624,8 @@ fn run_binary_state_handoff(args: BinaryStateHandoffConfig) -> Result<BinaryStat
         &stage_activation_width.to_string(),
         "--activation-wire-dtype",
         &args.activation_wire_dtype,
+        "--max-inflight",
+        &args.max_inflight.to_string(),
     ]);
     configure_child_logs(&mut restore_command, args.child_logs);
     let _restore = ChildGuard::spawn(restore_command)?;
@@ -1567,6 +1745,10 @@ fn stage_id_for_index(stage_index: u32) -> &'static str {
 
 fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn elapsed_us(started: Instant) -> i64 {
+    (started.elapsed().as_secs_f64() * 1_000_000.0).round() as i64
 }
 
 fn mean_pair_sum(left: &[f64], right: &[f64]) -> f64 {
@@ -1708,6 +1890,7 @@ fn run_local_state_handoff(
 
     let resident_state_bytes = measure_resident_state_bytes(&mut source, args, prefix.len() as u64)
         .context("local state handoff resident KV size measurement failed")?;
+    let source_guard = (args.state_payload_kind == StatePayloadKind::ResidentKv).then_some(source);
 
     let (
         roundtrip_state_payload,
@@ -1777,20 +1960,32 @@ fn run_local_state_handoff(
         cache_hit_matches &=
             predicted == source_predicted_token && output.payload == source_output.payload;
     }
-    let mut suffix_restored =
-        create_local_cache_hit_session(&model, args, &state_payload, prefix.len() as u64, &prefix)
-            .context("local state handoff suffix-prefill restore import failed")?;
-    drop(source);
-    let suffix_prefill_matches = run_local_suffix_prefill_remap_check(
-        &model,
-        &mut suffix_restored,
-        &prefix,
-        continuation,
-        prefill_input.as_ref(),
-        decode_input.as_ref(),
-        include_output,
-    )
-    .context("local state handoff suffix-prefill remap check failed")?;
+    let suffix_prefill_matches = if args.skip_suffix_prefill_check {
+        drop(source_guard);
+        None
+    } else {
+        let mut suffix_restored = create_local_cache_hit_session(
+            &model,
+            args,
+            &state_payload,
+            prefix.len() as u64,
+            &prefix,
+        )
+        .context("local state handoff suffix-prefill restore import failed")?;
+        drop(source_guard);
+        Some(
+            run_local_suffix_prefill_remap_check(
+                &model,
+                &mut suffix_restored,
+                &prefix,
+                continuation,
+                prefill_input.as_ref(),
+                decode_input.as_ref(),
+                include_output,
+            )
+            .context("local state handoff suffix-prefill remap check failed")?,
+        )
+    };
 
     let mut stage_models = Vec::new();
     if let Some(input_resolution) = input_resolution {
@@ -1836,12 +2031,12 @@ fn run_local_state_handoff(
         cache_hit_decode_ms,
         matches: predicted_token_matches
             && restored_output_matches
-            && suffix_prefill_matches
+            && suffix_prefill_matches.unwrap_or(true)
             && cache_hit_matches,
         predicted_token_matches,
         roundtrip_state_matches,
         restored_output_matches: Some(restored_output_matches),
-        suffix_prefill_matches: Some(suffix_prefill_matches),
+        suffix_prefill_matches,
         cache_hit_matches,
         stage_models,
     })
@@ -2624,13 +2819,20 @@ fn baseline_report(result: FullModelResult) -> BaselineReport {
     BaselineReport {
         token_id: result.token_id,
         predicted_token: result.predicted_token,
+        second_predicted_token: result.second_predicted_token,
     }
 }
 
-fn split_report(result: BinarySplitResult) -> SplitReport {
+fn split_report(
+    result: BinarySplitResult,
+    native_mtp_n1: Option<NativeMtpN1VerificationReport>,
+) -> SplitReport {
     SplitReport {
         token_id: result.token_id,
         predicted_token: result.predicted_token,
+        second_predicted_token: result.second_predicted_token,
+        native_mtp: result.native_mtp,
+        native_mtp_n1,
         activation_width: result.activation_width,
         wire_dtype: result.wire_dtype,
         boundary: BoundaryReport {
@@ -2644,20 +2846,359 @@ fn split_report(result: BinarySplitResult) -> SplitReport {
     }
 }
 
+fn native_mtp_n1_verification_report(
+    requested: bool,
+    first: &NativeMtpSidebandReport,
+    second_target_token: Option<i32>,
+    second_baseline_token: Option<i32>,
+    verification_compute_us: Option<i64>,
+) -> Option<NativeMtpN1VerificationReport> {
+    if !requested && first.draft_token.is_none() {
+        return None;
+    }
+
+    let drafted_tokens = u64::from(first.draft_token.is_some());
+    let verification_count =
+        u64::from(first.draft_token.is_some() && second_target_token.is_some());
+    let accepted_tokens = u64::from(
+        matches!((first.draft_token, second_target_token), (Some(draft), Some(target)) if draft == target),
+    );
+    let rejected_tokens = verification_count.saturating_sub(accepted_tokens);
+    let pending_tokens = drafted_tokens.saturating_sub(verification_count);
+    let byte_identical = matches!((second_target_token, second_baseline_token), (Some(target), Some(baseline)) if target == baseline);
+    let accept_rate = if verification_count == 0 {
+        0.0
+    } else {
+        accepted_tokens as f64 / verification_count as f64
+    };
+
+    Some(NativeMtpN1VerificationReport {
+        drafted_tokens,
+        accepted_tokens,
+        rejected_tokens,
+        pending_tokens,
+        verification_count,
+        accept_rate,
+        byte_identical,
+        draft_token: first.draft_token,
+        second_target_token,
+        second_baseline_token,
+        proposal_compute_us: first.proposal_compute_us,
+        verification_compute_us,
+    })
+}
+
+fn native_mtp_n1_satisfies_requirement(
+    report: &Option<NativeMtpN1VerificationReport>,
+    requirement: NativeMtpRequirement,
+) -> bool {
+    if !requirement.require_draft {
+        return true;
+    }
+    report.as_ref().is_some_and(|report| {
+        report.drafted_tokens == 1
+            && report.verification_count == 1
+            && report.pending_tokens == 0
+            && report.byte_identical
+    })
+}
+
+fn native_mtp_sideband_report(reply: &StageReply) -> NativeMtpSidebandReport {
+    let authoritative_token = reply.predicted_tokens.first().copied();
+    let draft_token = reply.predicted_tokens.get(1).copied();
+    let proposal_compute_us = reply
+        .predicted_tokens
+        .get(2)
+        .copied()
+        .map(|value| i64::from(value.max(0)));
+    NativeMtpSidebandReport {
+        sideband_present: draft_token.is_some(),
+        predicted_token_count: reply.predicted_tokens.len(),
+        authoritative_matches_reply: authoritative_token
+            .is_none_or(|token| token == reply.predicted),
+        authoritative_token,
+        draft_token,
+        proposal_compute_us,
+    }
+}
+
+fn native_mtp_requirement(args: NativeMtpArgs) -> NativeMtpRequirement {
+    NativeMtpRequirement {
+        require_draft: args.require_native_mtp_draft,
+    }
+}
+
+fn ensure_native_mtp_artifact_if_required(
+    runtime: &RuntimeArgs,
+    requirement: NativeMtpRequirement,
+) -> Result<()> {
+    if !requirement.require_draft {
+        return Ok(());
+    }
+
+    let model_path = native_mtp_preflight_model_path(runtime);
+    if !model_path.is_file() {
+        return Ok(());
+    }
+
+    let summary = native_mtp_artifact_summary(model_path)?;
+    if summary.supports_native_mtp() {
+        return Ok(());
+    }
+
+    bail!(
+        "native MTP draft was required, but {} does not advertise a usable native MTP head: missing {}",
+        model_path.display(),
+        summary.missing_reasons().join(", ")
+    );
+}
+
+fn native_mtp_preflight_model_path(runtime: &RuntimeArgs) -> &Path {
+    runtime
+        .stage_model
+        .as_deref()
+        .filter(|path| path.is_file())
+        .unwrap_or(runtime.model.as_path())
+}
+
+fn native_mtp_artifact_summary(model_path: &Path) -> Result<NativeMtpArtifactSummary> {
+    let meta = scan_gguf_compact_meta(model_path)
+        .with_context(|| format!("inspect GGUF metadata for {}", model_path.display()))?;
+    let info = skippy_runtime::ModelInfo::open(model_path)
+        .with_context(|| format!("inspect GGUF tensors for {}", model_path.display()))?;
+    let tensors = info.tensors()?;
+    Ok(native_mtp_artifact_summary_from_names(
+        meta.nextn_predict_layers,
+        tensors.iter().map(|tensor| tensor.name.as_str()),
+    ))
+}
+
+fn native_mtp_artifact_summary_from_names<'a>(
+    nextn_predict_layers: u32,
+    names: impl IntoIterator<Item = &'a str>,
+) -> NativeMtpArtifactSummary {
+    let mut summary = NativeMtpArtifactSummary {
+        nextn_predict_layers,
+        ..NativeMtpArtifactSummary::default()
+    };
+    for name in names {
+        let name = name.to_ascii_lowercase();
+        summary.has_eh_proj |= native_mtp_name_matches(&name, "eh_proj");
+        summary.has_enorm |= native_mtp_name_matches(&name, "enorm");
+        summary.has_hnorm |= native_mtp_name_matches(&name, "hnorm");
+    }
+    summary
+}
+
+fn native_mtp_name_matches(name: &str, suffix: &str) -> bool {
+    name.contains(&format!(".nextn.{suffix}"))
+        || name.contains(&format!(".{suffix}."))
+        || name.ends_with(&format!(".{suffix}"))
+}
+
+fn native_mtp_satisfies_requirement(
+    report: &NativeMtpSidebandReport,
+    requirement: NativeMtpRequirement,
+) -> bool {
+    report.authoritative_matches_reply && (!requirement.require_draft || report.sideband_present)
+}
+
 fn emit_report<T: Serialize>(report: &T, report_out: Option<&Path>) -> Result<()> {
     let json = serde_json::to_string_pretty(report)?;
     println!("{json}");
     if let Some(path) = report_out {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create report directory {}", parent.display()))?;
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create report directory {}", parent.display()))?;
+            }
+            _ => {}
         }
         fs::write(path, format!("{json}\n"))
             .with_context(|| format!("write correctness report {}", path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use skippy_protocol::binary::{StageReplyStats, WireReplyKind};
+
+    use super::*;
+
+    fn predicted_reply(predicted: i32, predicted_tokens: Vec<i32>) -> StageReply {
+        StageReply {
+            kind: WireReplyKind::PredictedToken,
+            predicted,
+            predicted_tokens,
+            stats: StageReplyStats::default(),
+        }
+    }
+
+    #[test]
+    fn native_mtp_report_treats_plain_authoritative_token_as_no_draft() {
+        let report = native_mtp_sideband_report(&predicted_reply(11, vec![11]));
+
+        assert!(!report.sideband_present);
+        assert_eq!(report.predicted_token_count, 1);
+        assert!(report.authoritative_matches_reply);
+        assert_eq!(report.authoritative_token, Some(11));
+        assert_eq!(report.draft_token, None);
+        assert_eq!(report.proposal_compute_us, None);
+    }
+
+    #[test]
+    fn native_mtp_report_extracts_draft_sideband() {
+        let report = native_mtp_sideband_report(&predicted_reply(11, vec![11, 12, 34]));
+
+        assert!(report.sideband_present);
+        assert_eq!(report.predicted_token_count, 3);
+        assert!(report.authoritative_matches_reply);
+        assert_eq!(report.authoritative_token, Some(11));
+        assert_eq!(report.draft_token, Some(12));
+        assert_eq!(report.proposal_compute_us, Some(34));
+    }
+
+    #[test]
+    fn native_mtp_report_flags_authoritative_sideband_mismatch() {
+        let report = native_mtp_sideband_report(&predicted_reply(11, vec![10, 12, 34]));
+
+        assert!(report.sideband_present);
+        assert!(!report.authoritative_matches_reply);
+        assert_eq!(report.authoritative_token, Some(10));
+        assert_eq!(report.draft_token, Some(12));
+    }
+
+    #[test]
+    fn native_mtp_report_clamps_negative_proposal_time() {
+        let report = native_mtp_sideband_report(&predicted_reply(11, vec![11, 12, -34]));
+
+        assert_eq!(report.proposal_compute_us, Some(0));
+    }
+
+    #[test]
+    fn native_mtp_requirement_can_require_draft_presence() {
+        let no_draft = native_mtp_sideband_report(&predicted_reply(11, vec![11]));
+        let draft = native_mtp_sideband_report(&predicted_reply(11, vec![11, 12, 34]));
+        let optional = NativeMtpRequirement {
+            require_draft: false,
+        };
+        let required = NativeMtpRequirement {
+            require_draft: true,
+        };
+
+        assert!(native_mtp_satisfies_requirement(&no_draft, optional));
+        assert!(!native_mtp_satisfies_requirement(&no_draft, required));
+        assert!(native_mtp_satisfies_requirement(&draft, required));
+    }
+
+    #[test]
+    fn native_mtp_n1_report_accepts_matching_second_target() {
+        let first = native_mtp_sideband_report(&predicted_reply(11, vec![11, 12, 34]));
+        let report = native_mtp_n1_verification_report(true, &first, Some(12), Some(12), Some(9))
+            .expect("verification report");
+
+        assert_eq!(report.drafted_tokens, 1);
+        assert_eq!(report.accepted_tokens, 1);
+        assert_eq!(report.rejected_tokens, 0);
+        assert_eq!(report.pending_tokens, 0);
+        assert_eq!(report.verification_count, 1);
+        assert_eq!(report.accept_rate, 1.0);
+        assert!(report.byte_identical);
+        assert_eq!(report.proposal_compute_us, Some(34));
+        assert_eq!(report.verification_compute_us, Some(9));
+        assert!(native_mtp_n1_satisfies_requirement(
+            &Some(report),
+            NativeMtpRequirement {
+                require_draft: true
+            }
+        ));
+    }
+
+    #[test]
+    fn native_mtp_n1_report_rejects_mismatched_draft_without_failing_byte_identity() {
+        let first = native_mtp_sideband_report(&predicted_reply(11, vec![11, 12, 34]));
+        let report = native_mtp_n1_verification_report(true, &first, Some(13), Some(13), Some(9))
+            .expect("verification report");
+
+        assert_eq!(report.drafted_tokens, 1);
+        assert_eq!(report.accepted_tokens, 0);
+        assert_eq!(report.rejected_tokens, 1);
+        assert_eq!(report.pending_tokens, 0);
+        assert_eq!(report.verification_count, 1);
+        assert_eq!(report.accept_rate, 0.0);
+        assert!(report.byte_identical);
+        assert!(native_mtp_n1_satisfies_requirement(
+            &Some(report),
+            NativeMtpRequirement {
+                require_draft: true
+            }
+        ));
+    }
+
+    #[test]
+    fn native_mtp_n1_requirement_fails_when_required_draft_is_missing() {
+        let first = native_mtp_sideband_report(&predicted_reply(11, vec![11]));
+        let report = native_mtp_n1_verification_report(true, &first, Some(13), Some(13), Some(9))
+            .expect("required verification report");
+
+        assert_eq!(report.drafted_tokens, 0);
+        assert_eq!(report.verification_count, 0);
+        assert!(report.byte_identical);
+        assert!(!native_mtp_n1_satisfies_requirement(
+            &Some(report),
+            NativeMtpRequirement {
+                require_draft: true
+            }
+        ));
+    }
+
+    #[test]
+    fn native_mtp_artifact_summary_requires_metadata_and_tensors() {
+        let summary = native_mtp_artifact_summary_from_names(
+            1,
+            [
+                "blk.47.nextn.eh_proj",
+                "blk.47.nextn.enorm",
+                "blk.47.nextn.hnorm",
+            ],
+        );
+
+        assert!(summary.supports_native_mtp());
+        assert!(summary.missing_reasons().is_empty());
+    }
+
+    #[test]
+    fn native_mtp_artifact_summary_accepts_source_style_tensor_names() {
+        let summary = native_mtp_artifact_summary_from_names(
+            1,
+            [
+                "model.layers.47.eh_proj.weight",
+                "model.layers.47.enorm.weight",
+                "model.layers.47.hnorm.weight",
+            ],
+        );
+
+        assert!(summary.supports_native_mtp());
+    }
+
+    #[test]
+    fn native_mtp_artifact_summary_rejects_missing_nextn_metadata() {
+        let summary = native_mtp_artifact_summary_from_names(
+            0,
+            [
+                "blk.47.nextn.eh_proj",
+                "blk.47.nextn.enorm",
+                "blk.47.nextn.hnorm",
+            ],
+        );
+
+        assert!(!summary.supports_native_mtp());
+        assert_eq!(
+            summary.missing_reasons(),
+            vec!["*.nextn_predict_layers > 0"]
+        );
+    }
 }
 
 #[derive(Clone, Copy)]

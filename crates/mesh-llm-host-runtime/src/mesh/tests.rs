@@ -14,6 +14,8 @@ use skippy_protocol::proto::stage as skippy_stage_proto;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, watch};
 
+mod direct_path;
+
 #[test]
 fn quic_bind_addr_uses_explicit_port_on_all_platforms() {
     assert_eq!(
@@ -223,7 +225,7 @@ fn endpoint_addr_filter_for_bind_ip_keeps_selected_ip_relay_and_public_candidate
         "https://relay.example.com".parse().unwrap(),
     ));
 
-    let filtered = filter_endpoint_addr_for_bind_ip(addr, Some("10.1.2.3".parse().unwrap()));
+    let filtered = filter_endpoint_addr_for_bind_ip(addr, Some("10.1.2.3".parse().unwrap()), true);
     let ip_addrs: HashSet<_> = filtered
         .addrs
         .iter()
@@ -238,6 +240,40 @@ fn endpoint_addr_filter_for_bind_ip_keeps_selected_ip_relay_and_public_candidate
     assert!(!ip_addrs.contains("172.23.0.1:47916"));
     assert!(!ip_addrs.contains("100.107.22.123:47916"));
     assert!(!ip_addrs.contains("192.168.1.20:47916"));
+    assert!(
+        filtered
+            .addrs
+            .iter()
+            .any(|addr| matches!(addr, iroh::TransportAddr::Relay(_)))
+    );
+}
+
+#[test]
+fn endpoint_addr_filter_for_lan_only_bind_ip_strips_public_candidates() {
+    let mut addr = EndpointAddr {
+        id: make_test_endpoint_id(0x42),
+        addrs: Default::default(),
+    };
+    addr.addrs
+        .insert(iroh::TransportAddr::Ip("10.1.2.3:47916".parse().unwrap()));
+    addr.addrs.insert(iroh::TransportAddr::Ip(
+        "35.199.1.10:47916".parse().unwrap(),
+    ));
+    addr.addrs.insert(iroh::TransportAddr::Relay(
+        "https://relay.example.com".parse().unwrap(),
+    ));
+
+    let filtered = filter_endpoint_addr_for_bind_ip(addr, Some("10.1.2.3".parse().unwrap()), false);
+    let ip_addrs: HashSet<_> = filtered
+        .addrs
+        .iter()
+        .filter_map(|addr| match addr {
+            iroh::TransportAddr::Ip(socket) => Some(socket.to_string()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(ip_addrs, HashSet::from(["10.1.2.3:47916".to_string()]));
     assert!(
         filtered
             .addrs
@@ -273,6 +309,7 @@ fn stage_load_request() -> crate::inference::skippy::StageLoadRequest {
         cache_type_k: "f16".to_string(),
         cache_type_v: "q8_0".to_string(),
         flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
+        native_mtp_enabled: true,
         shutdown_generation: 3,
         coordinator_term: 11,
         coordinator_id: None,
@@ -326,6 +363,7 @@ async fn make_test_node_with_requirements(
         endpoint_secret_key,
         public_addr: None,
         quic_bind: QuicBindSelection::default(),
+        relay_policy: RelayPolicy::DefaultPublic,
         owner_keypair: None,
         local_mesh_requirements,
         state: Arc::new(Mutex::new(MeshState {
@@ -334,6 +372,7 @@ async fn make_test_node_with_requirements(
             remote_tunnel_maps: HashMap::new(),
             dead_peers: HashMap::new(),
             peer_down_rejections: HashMap::new(),
+            direct_path_request_last_at: HashMap::new(),
             seen_plugin_messages: HashMap::new(),
             seen_plugin_message_order: VecDeque::new(),
             policy_rejected_peers: HashMap::new(),
@@ -357,6 +396,7 @@ async fn make_test_node_with_requirements(
         genesis_policy: Arc::new(Mutex::new(None)),
         signed_genesis_policy: Arc::new(Mutex::new(None)),
         bootstrap_token: Arc::new(Mutex::new(None)),
+        join_targets: Arc::new(Mutex::new(Vec::new())),
         first_joined_mesh_ts: Arc::new(Mutex::new(None)),
         accepting: Arc::new((
             tokio::sync::Notify::new(),
@@ -2190,11 +2230,6 @@ async fn control_plane_refresh_inventory() -> Result<()> {
     let (server, _secret_key, _config_path) =
         start_owner_control_test_server(&owner_keypair, &tmp).await?;
     let expected_model_ref = crate::models::model_ref_for_path(&gguf_path);
-    let expected_inventory_name = gguf_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .expect("gguf test file should have a valid stem")
-        .to_string();
     assert!(server.available_models().await.is_empty());
 
     let (_refresh_endpoint, mut refresh_send, mut refresh_recv, requester_id) =
@@ -2233,11 +2268,7 @@ async fn control_plane_refresh_inventory() -> Result<()> {
             .contains(&expected_model_ref)
     );
     let inventory_snapshot = server.runtime_data_collector().local_inventory_snapshot();
-    assert!(
-        inventory_snapshot
-            .model_names
-            .contains(&expected_inventory_name)
-    );
+    assert!(inventory_snapshot.model_names.contains(&expected_model_ref));
 
     write_len_prefixed(&mut refresh_send, &refresh_request(31).encode_to_vec()).await?;
     let second = read_owner_control_envelope(&mut refresh_recv).await?;
@@ -3112,6 +3143,142 @@ fn relay_reconnect_controller_applies_cooldown_after_attempt_and_prunes_gone_pee
         controller.peer_health(peer).is_none(),
         "controller should prune peers that are no longer active"
     );
+}
+
+mod lan_join_target_tracking_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remember_join_target_updates_address_on_peer_rebind() {
+        let node = make_test_node(super::super::NodeRole::Worker)
+            .await
+            .unwrap();
+        let peer_id = make_test_endpoint_id(34);
+
+        let mut first = EndpointAddr {
+            id: peer_id,
+            addrs: Default::default(),
+        };
+        first
+            .addrs
+            .insert(TransportAddr::Ip("192.168.1.50:47916".parse().unwrap()));
+        node.remember_join_target(first).await;
+
+        assert_eq!(
+            node.join_target_lan_ipv4().await,
+            vec!["192.168.1.50:47916".parse().unwrap()],
+            "the first advertised LAN address should be recorded"
+        );
+
+        let mut rebound = EndpointAddr {
+            id: peer_id,
+            addrs: Default::default(),
+        };
+        rebound
+            .addrs
+            .insert(TransportAddr::Ip("192.168.1.50:51000".parse().unwrap()));
+        node.remember_join_target(rebound).await;
+
+        assert_eq!(
+            node.join_target_lan_ipv4().await,
+            vec!["192.168.1.50:51000".parse().unwrap()],
+            "a rebind under the same peer id must replace the stale dial-back address"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_target_lan_ipv4_keeps_only_lan_addresses() {
+        let node = make_test_node(super::super::NodeRole::Worker)
+            .await
+            .unwrap();
+        let peer_id = make_test_endpoint_id(35);
+        let mut target = EndpointAddr {
+            id: peer_id,
+            addrs: Default::default(),
+        };
+        for addr in [
+            "192.168.1.50:47916",
+            "8.8.8.8:47916",
+            "100.64.0.1:47916",
+            "127.0.0.1:47916",
+            "172.17.0.1:47916",
+        ] {
+            target
+                .addrs
+                .insert(TransportAddr::Ip(addr.parse().unwrap()));
+        }
+        node.remember_join_target(target).await;
+
+        let lan_addrs: HashSet<_> = node
+            .join_target_lan_ipv4()
+            .await
+            .into_iter()
+            .map(|addr| addr.to_string())
+            .collect();
+        assert_eq!(
+            lan_addrs,
+            ["192.168.1.50:47916", "172.17.0.1:47916"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn known_peer_lan_ipv4_keeps_only_lan_addresses() {
+        let node = make_test_node(super::super::NodeRole::Worker)
+            .await
+            .unwrap();
+        let peer_id = make_test_endpoint_id(36);
+        let mut peer = make_test_peer_info(peer_id);
+        for addr in [
+            "10.0.0.5:47916",
+            "203.0.113.5:47916",
+            "100.64.0.1:47916",
+            "172.17.0.1:47916",
+        ] {
+            peer.addr
+                .addrs
+                .insert(TransportAddr::Ip(addr.parse().unwrap()));
+        }
+        node.state.lock().await.peers.insert(peer_id, peer);
+
+        let lan_addrs: HashSet<_> = node
+            .known_peer_lan_ipv4()
+            .await
+            .into_iter()
+            .map(|addr| addr.to_string())
+            .collect();
+        assert_eq!(
+            lan_addrs,
+            ["10.0.0.5:47916", "172.17.0.1:47916"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_peer_addr_clears_dead_peer_gate_before_connect() {
+        let node = make_test_node(super::super::NodeRole::Worker)
+            .await
+            .unwrap();
+        let peer_id = make_test_endpoint_id(37);
+        node.state
+            .lock()
+            .await
+            .dead_peers
+            .insert(peer_id, std::time::Instant::now());
+
+        let _ = node
+            .dial_peer_addr(EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            })
+            .await;
+
+        assert!(!node.state.lock().await.dead_peers.contains_key(&peer_id));
+    }
 }
 
 #[test]
@@ -7394,6 +7561,7 @@ fn test_stage_load_request() -> crate::inference::skippy::StageLoadRequest {
         cache_type_k: "f16".to_string(),
         cache_type_v: "f16".to_string(),
         flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
+        native_mtp_enabled: true,
         shutdown_generation: 7,
         coordinator_term: 11,
         coordinator_id: Some(make_test_endpoint_id(0x70)),

@@ -1,5 +1,5 @@
 mod cli;
-mod direct_return;
+mod native_mtp_openai;
 mod report;
 mod runner;
 mod support;
@@ -9,6 +9,7 @@ use clap::Parser;
 
 use crate::{
     cli::{Cli, CommandKind},
+    native_mtp_openai::native_mtp_openai_ab,
     runner::{chain, dtype_matrix, single_step, split_scan, state_handoff},
 };
 
@@ -19,5 +20,6 @@ fn main() -> Result<()> {
         CommandKind::SplitScan(args) => split_scan(args),
         CommandKind::DtypeMatrix(args) => dtype_matrix(args),
         CommandKind::StateHandoff(args) => state_handoff(args),
+        CommandKind::NativeMtpOpenAiAb(args) => native_mtp_openai_ab(*args),
     }
 }

@@ -4,6 +4,7 @@
 use crate::mesh::NodeRole;
 use crate::mesh::PeerAnnouncement;
 
+pub(crate) mod config_diagnostic;
 pub(crate) mod convert;
 use anyhow::Result;
 pub(crate) use convert::*;
@@ -38,11 +39,13 @@ pub(crate) const STREAM_CONFIG_SUBSCRIBE: u8 = 0x0b;
 /// keep 0x0c reserved so old wire values are not accidentally reused.
 pub(crate) const STREAM_CONFIG_PUSH: u8 = 0x0c;
 pub(crate) const STREAM_SUBPROTOCOL: u8 = 0x0d;
+pub(crate) const STREAM_DIRECT_PATH_REQUEST: u8 = 0x0e;
 const _: () = {
     let _ = ALPN_CONTROL_V1;
     let _ = STREAM_CONFIG_SUBSCRIBE;
     let _ = STREAM_CONFIG_PUSH;
     let _ = STREAM_SUBPROTOCOL;
+    let _ = STREAM_DIRECT_PATH_REQUEST;
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +68,7 @@ pub(crate) enum ControlFrameError {
     InvalidSenderId {
         got: usize,
     },
+    MissingDirectPathAddress,
     MissingHttpPort,
     MissingControlOwnerId,
     InvalidConfigHashLength {
@@ -116,6 +120,9 @@ impl std::fmt::Display for ControlFrameError {
             }
             ControlFrameError::InvalidSenderId { got } => {
                 write!(f, "invalid sender_id length: expected 32, got {}", got)
+            }
+            ControlFrameError::MissingDirectPathAddress => {
+                write!(f, "direct path request missing endpoint address")
             }
             ControlFrameError::MissingHttpPort => {
                 write!(f, "HOST-role peer annotation missing http_port")
@@ -270,6 +277,23 @@ impl ValidateControlFrame for crate::proto::node::PeerLeaving {
             return Err(ControlFrameError::InvalidEndpointId {
                 got: self.peer_id.len(),
             });
+        }
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::DirectPathRequest {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if self.r#gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.r#gen });
+        }
+        if self.requester_id.len() != 32 {
+            return Err(ControlFrameError::InvalidEndpointId {
+                got: self.requester_id.len(),
+            });
+        }
+        if self.serialized_addr.is_empty() {
+            return Err(ControlFrameError::MissingDirectPathAddress);
         }
         Ok(())
     }
@@ -716,7 +740,7 @@ pub(crate) mod tests {
         NodeConfigSnapshot {
             version: 1,
             gpu: Some(NodeGpuConfig {
-                assignment: crate::proto::node::GpuAssignment::Auto as i32,
+                assignment: crate::proto::node::GpuAssignment::Pinned as i32,
             }),
             models: vec![NodeModelEntry {
                 model: "Qwen3-8B".to_string(),
@@ -1760,7 +1784,7 @@ alias = "model-alias"
 
     fn assert_mesh_config_from_proto(config: &crate::plugin::MeshConfig) {
         assert_eq!(config.version, Some(1));
-        assert_eq!(config.gpu.assignment, crate::plugin::GpuAssignment::Auto);
+        assert_eq!(config.gpu.assignment, crate::plugin::GpuAssignment::Pinned);
         assert_eq!(config.models.len(), 1);
         assert_eq!(config.models[0].model, "Qwen3-8B");
         assert_eq!(config.models[0].mmproj.as_deref(), Some("mmproj-cut"));
@@ -1777,7 +1801,7 @@ alias = "model-alias"
         assert_eq!(roundtripped.version, snapshot.version);
         assert_eq!(
             roundtripped.gpu.as_ref().map(|g| g.assignment),
-            Some(crate::proto::node::GpuAssignment::Auto as i32)
+            Some(crate::proto::node::GpuAssignment::Pinned as i32)
         );
         assert_eq!(roundtripped.models.len(), snapshot.models.len());
         assert_eq!(roundtripped.models[0].model, snapshot.models[0].model);
@@ -1994,7 +2018,7 @@ alias = "model-alias"
         let config = crate::plugin::MeshConfig {
             version: Some(1),
             gpu: GpuConfig {
-                assignment: GpuAssignment::Auto,
+                assignment: GpuAssignment::Pinned,
                 parallel: None,
             },
             mesh_requirements: Default::default(),
@@ -2025,6 +2049,7 @@ alias = "model-alias"
                 command: Some("mesh-llm".to_string()),
                 args: vec!["--plugin".to_string()],
                 url: None,
+                settings: Default::default(),
                 startup: Default::default(),
             }],
             extra: Default::default(),

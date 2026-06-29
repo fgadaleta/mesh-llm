@@ -18,6 +18,32 @@ append_rustflag() {
     esac
 }
 
+stamp_build_version() {
+    local release_version=""
+    local pkgid=""
+
+    if [[ -n "${MESH_LLM_BUILD_VERSION:-}" ]]; then
+        echo "Using preset MESH_LLM_BUILD_VERSION: $MESH_LLM_BUILD_VERSION"
+        return 0
+    fi
+
+    if ! pkgid="$(cd "$REPO_ROOT" && cargo pkgid -p mesh-llm 2>/dev/null)"; then
+        echo "Warning: unable to derive build version; cargo pkgid unavailable." >&2
+        unset MESH_LLM_BUILD_VERSION || true
+        return 0
+    fi
+    release_version="${pkgid##*#}"
+    if [[ -z "$release_version" || "$release_version" == "$pkgid" ]]; then
+        echo "Warning: unable to derive build version; cargo pkgid output was unexpected." >&2
+        unset MESH_LLM_BUILD_VERSION || true
+        return 0
+    fi
+
+    export MESH_LLM_BUILD_VERSION="$release_version"
+    echo "Using release MESH_LLM_BUILD_VERSION: $MESH_LLM_BUILD_VERSION"
+    return 0
+}
+
 configure_lld_linker() {
     case "$(uname -s)" in
         Linux)
@@ -85,6 +111,15 @@ EOF
     esac
 }
 
+configure_rust_cache() {
+    if [[ -n "${RUSTC_WRAPPER:-}" ]]; then
+        echo "Using Rust compiler wrapper: $RUSTC_WRAPPER"
+    elif command -v sccache >/dev/null 2>&1; then
+        export RUSTC_WRAPPER="$(command -v sccache)"
+        echo "Using Rust compiler wrapper: $RUSTC_WRAPPER"
+    fi
+}
+
 os_name="$(uname -s)"
 case "$os_name" in
     Darwin)
@@ -111,6 +146,7 @@ if [[ -z "${LLAMA_STAGE_BUILD_DIR:-}" ]]; then
 fi
 
 configure_lld_linker
+configure_rust_cache
 
 if [[ "$DYNAMIC_NATIVE_RUNTIME" == "1" ]]; then
     echo "Skipping embedded llama.cpp ABI build; release binary will load native runtimes dynamically."
@@ -131,6 +167,11 @@ MESH_LLM_BUILD_PROFILE=release "$SCRIPT_DIR/build-ui.sh" "$UI_DIR"
 echo "Building mesh-llm..."
 cargo_features=()
 if [[ "$DYNAMIC_NATIVE_RUNTIME" == "1" ]]; then
-    cargo_features=(--features dynamic-native-runtime)
+    cargo_features+=(--features dynamic-native-runtime)
 fi
+case "$BACKEND" in
+    cuda) cargo_features+=(--features gpu-bench-cuda) ;;
+    rocm) cargo_features+=(--features gpu-bench-hip) ;;
+esac
+stamp_build_version
 (cd "$REPO_ROOT" && cargo build --release --locked -p mesh-llm "${cargo_features[@]}")

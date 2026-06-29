@@ -3,6 +3,7 @@ mod formatters_console;
 mod formatters_json;
 
 use anyhow::{Result, anyhow, bail};
+use formatters::DownloadStats;
 use mesh_llm_cli::models::ModelSearchSort;
 use mesh_llm_cli::models::ModelsCommand;
 use mesh_llm_host_runtime::command_support::models::skippy::{
@@ -10,8 +11,9 @@ use mesh_llm_host_runtime::command_support::models::skippy::{
     identity_from_layer_package, is_layer_package_ref, resolve_hf_package_to_local,
 };
 use mesh_llm_host_runtime::command_support::models::{
-    ModelCleanupPlan, ModelCleanupResult, SearchArtifactFilter, SearchProgress, SearchSort,
-    ShowVariantsProgress, delete, download_model_ref_with_progress_details,
+    DownloadTransferStats, ModelCleanupPlan, ModelCleanupResult, SearchArtifactFilter,
+    SearchProgress, SearchSort, ShowVariantsProgress, delete,
+    download_model_ref_with_progress_details, download_model_ref_with_progress_details_direct,
     find_remote_catalog_model_exact, installed_model_capabilities,
     load_model_usage_record_for_path, model_usage_cache_dir, plan_model_cleanup, remote_catalog,
     remote_catalog_model_ref, scan_installed_models, search_catalog_models, search_huggingface,
@@ -24,8 +26,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use formatters::{
-    InstalledRow, catalog_model_is_mlx, format_installed_size, format_relative_timestamp,
-    model_kind_code, models_formatter, search_formatter,
+    DownloadRenderInput, InstalledRow, catalog_model_is_mlx, format_installed_size,
+    format_relative_timestamp, model_kind_code, models_formatter, search_formatter,
 };
 
 pub async fn run_model_search(
@@ -386,32 +388,59 @@ pub async fn run_model_show(model_ref: &str, json_output: bool) -> Result<()> {
 pub async fn run_model_download(
     model_ref: &str,
     include_draft: bool,
+    direct: bool,
     json_output: bool,
 ) -> Result<()> {
     let formatter = models_formatter(json_output);
-    if let Some((package_ref, package_dir)) =
-        download_layer_package_for_model_ref(model_ref).await?
+    if !direct
+        && let Some((package_ref, package_dir)) =
+            download_layer_package_for_model_ref(model_ref).await?
     {
+        if !json_output {
+            eprintln!("ℹ Using repackaged model from catalog: {package_ref}");
+        }
         if include_draft && !json_output {
             eprintln!("⚠ Draft download is not available for layer packages");
         }
         return formatter.render_layer_package_download(model_ref, &package_ref, &package_dir);
     }
 
-    let (path, details) = download_model_ref_with_progress_details(model_ref, !json_output).await?;
+    let download = if direct {
+        download_model_ref_with_progress_details_direct(model_ref, !json_output, true).await?
+    } else {
+        download_model_ref_with_progress_details(model_ref, !json_output).await?
+    };
+    let download_stats = download_stats_from_transfer(download.transfer_stats);
+    let download_paths = download
+        .paths
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect::<Vec<_>>();
     if !include_draft {
-        return formatter.render_download(model_ref, &path, details.as_ref(), false, None);
+        return formatter.render_download(DownloadRenderInput {
+            model_ref,
+            path: &download.path,
+            paths: &download_paths,
+            details: download.details.as_ref(),
+            stats: download_stats.as_ref(),
+            include_draft: false,
+            draft: None,
+        });
     }
 
     let mut draft_out: Option<(String, std::path::PathBuf)> = None;
-    if let Some(details_ref) = details.as_ref() {
+    if let Some(details_ref) = download.details.as_ref() {
         if let Some(draft_name) = details_ref.draft.as_deref() {
             let draft_ref = find_remote_catalog_model_exact(draft_name)
                 .map(|model| remote_catalog_model_ref(&model))
                 .unwrap_or_else(|| draft_name.to_string());
-            let (draft_path, _) =
-                download_model_ref_with_progress_details(&draft_ref, !json_output).await?;
-            draft_out = Some((draft_name.to_string(), draft_path));
+            let draft_download = if direct {
+                download_model_ref_with_progress_details_direct(&draft_ref, !json_output, true)
+                    .await?
+            } else {
+                download_model_ref_with_progress_details(&draft_ref, !json_output).await?
+            };
+            draft_out = Some((draft_name.to_string(), draft_download.path));
         } else if !json_output {
             eprintln!(
                 "⚠ No draft model available for {}",
@@ -419,13 +448,27 @@ pub async fn run_model_download(
             );
         }
     }
-    formatter.render_download(
+    formatter.render_download(DownloadRenderInput {
         model_ref,
-        &path,
-        details.as_ref(),
-        true,
-        draft_out.as_ref().map(|(n, p)| (n.as_str(), p.as_path())),
-    )
+        path: &download.path,
+        paths: &download_paths,
+        details: download.details.as_ref(),
+        stats: download_stats.as_ref(),
+        include_draft: true,
+        draft: draft_out.as_ref().map(|(n, p)| (n.as_str(), p.as_path())),
+    })
+}
+
+fn download_stats_from_transfer(stats: Option<DownloadTransferStats>) -> Option<DownloadStats> {
+    stats.map(|stats| DownloadStats {
+        bytes: Some(stats.bytes),
+        elapsed: stats.elapsed,
+        bytes_per_second: stats.bytes_per_sec.and_then(rounded_positive_rate),
+    })
+}
+
+fn rounded_positive_rate(value: f64) -> Option<u64> {
+    (value.is_finite() && value > 0.0).then(|| value.round() as u64)
 }
 
 async fn download_layer_package_for_model_ref(
@@ -537,9 +580,12 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
             json,
         } => run_model_search(query, *gguf, *mlx, *catalog, *limit, *sort, *json).await?,
         ModelsCommand::Show { model, json } => run_model_show(model, *json).await?,
-        ModelsCommand::Download { model, draft, json } => {
-            run_model_download(model, *draft, *json).await?
-        }
+        ModelsCommand::Download {
+            model,
+            draft,
+            direct,
+            json,
+        } => run_model_download(model, *draft, *direct, *json).await?,
         ModelsCommand::Updates {
             repo,
             all,

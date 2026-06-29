@@ -36,9 +36,10 @@ pub mod models {
 
     pub use crate::models::remote_catalog;
     pub use crate::models::{
-        DeleteResult, ModelCapabilities, ModelCleanupPlan, ModelCleanupResult, ModelDetails,
-        ResolvedModel, SearchArtifactFilter, SearchHit, SearchProgress, SearchSort,
-        ShowVariantsProgress, delete, download_model_ref_with_progress_details,
+        DeleteResult, DownloadTransferStats, ModelCapabilities, ModelCleanupPlan,
+        ModelCleanupResult, ModelDetails, ResolvedModel, SearchArtifactFilter, SearchHit,
+        SearchProgress, SearchSort, ShowVariantsProgress, delete,
+        download_model_ref_with_progress_details, download_model_ref_with_progress_details_direct,
         execute_model_cleanup, find_model_path, find_remote_catalog_model_exact,
         huggingface_hub_cache_dir, huggingface_identity_for_path, installed_model_capabilities,
         installed_model_display_name, installed_model_huggingface_ref,
@@ -58,6 +59,14 @@ pub mod plugin {
         ResolvedPlugins, ToolCallResult, bundled_cli_plugin_spec, load_config,
     };
     pub use crate::runtime::load_resolved_plugins;
+}
+
+pub mod config {
+    pub use crate::plugin::{config_path, validate_config_file};
+    pub use mesh_llm_config::{
+        ConfigDiagnostic, ConfigDiagnosticCode, ConfigDiagnosticSchemaSource,
+        ConfigDiagnosticSeverity, ConfigDiagnosticSource, ConfigPath,
+    };
 }
 
 pub mod runtime_instances {

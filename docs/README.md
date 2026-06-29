@@ -26,6 +26,7 @@ Use this hub to find project guides that are not owned by a single Rust crate.
 | [skippy/FAMILY_CERTIFY.md](skippy/FAMILY_CERTIFY.md) | Certification workflow for new families |
 | [skippy/TOPOLOGY_PLANNER.md](skippy/TOPOLOGY_PLANNER.md) | Stage topology planning behavior |
 | [skippy/CONFIGURATION.md](skippy/CONFIGURATION.md) | Authoritative operator matrix for Skippy config keys and rejection boundaries |
+| [skippy/PROMPT_CACHE.md](skippy/PROMPT_CACHE.md) | OpenAI prompt-prefix cache behavior, defaults, telemetry, and benchmark flow |
 | [skippy/DATA_FLOW.md](skippy/DATA_FLOW.md) | Stage data flow and transport details |
 | [skippy/LLAMA_PARITY.md](skippy/LLAMA_PARITY.md) | Remaining llama.cpp parity queue |
 | [specs/layer-package-repos.md](specs/layer-package-repos.md) | Manifest schema and package artifact rules |
@@ -42,6 +43,7 @@ Use [SKIPPY_SPLITS.md](SKIPPY_SPLITS.md) for Skippy split-serving workflows.
 | [design/](design/) | Architecture notes, protocol design, testing playbooks, carried llama.cpp patch documentation |
 | [design/NATIVE_RUNTIMES.md](design/NATIVE_RUNTIMES.md) | Native runtime artifact packaging, exact version matching, resolver behavior, and SDK/autoupdater ownership |
 | [design/NODE_OWNER_IDENTITY.md](design/NODE_OWNER_IDENTITY.md) | Owner identity, trust policy, and how owner trust stays separate from release attestation |
+| [design/EMITTER_HOOKS.md](design/EMITTER_HOOKS.md) | Inventory of hook, callback, and emitter surfaces plus readiness ownership. |
 | [plugins/](plugins/) | Plugin architecture and implementation planning |
 | [plans/](plans/) | Narrow implementation plans that are not yet general design docs |
 | [specs/](specs/) | Focused behavior specs for individual features |

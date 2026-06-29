@@ -18,6 +18,9 @@ use skippy_ffi::TensorRole;
 use skippy_runtime::{ModelInfo, TensorInfo, write_gguf_from_parts};
 
 mod preflight;
+mod progress;
+
+use progress::{PackageProgress, format_bytes};
 
 #[derive(Debug, Parser)]
 #[command(name = "skippy-model-package")]
@@ -180,6 +183,8 @@ struct PackageManifest {
     layer_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     activation_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<PackageGeneration>,
     shared: PackageShared,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     projectors: Vec<PackageProjector>,
@@ -211,6 +216,38 @@ struct PackageShared {
     metadata: PackageArtifact,
     embeddings: PackageArtifact,
     output: PackageArtifact,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PackageGeneration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speculative_decoding: Option<PackageSpeculativeDecoding>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PackageSpeculativeDecoding {
+    default: String,
+    strategies: BTreeMap<String, PackageSpeculativeStrategy>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PackageSpeculativeStrategy {
+    #[serde(rename = "type")]
+    strategy_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prediction_depth: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    layer_indices: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window_policy: Option<PackageWindowPolicy>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PackageWindowPolicy {
+    default: String,
+    initial_window: u32,
+    min_window: u32,
+    max_window: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -499,7 +536,9 @@ fn write_package(
     let layer_count = layer_count(tensors)?;
     let activation_width = activation_width(&input.model_path)?;
     let source_sha256 = file_sha256(&input.model_path)?;
+    let mut progress = PackageProgress::new(3 + layer_count as usize + projectors.len() + 1);
 
+    progress.start_step("shared/metadata.gguf")?;
     let metadata = write_package_artifact(
         &source,
         tensors,
@@ -514,6 +553,8 @@ fn write_package(
         &out_dir,
         &artifact_hook,
     )?;
+    progress.finish_step(&artifact_progress_detail(&metadata))?;
+    progress.start_step("shared/embeddings.gguf")?;
     let embeddings = write_package_artifact(
         &source,
         tensors,
@@ -528,6 +569,8 @@ fn write_package(
         &out_dir,
         &artifact_hook,
     )?;
+    progress.finish_step(&artifact_progress_detail(&embeddings))?;
+    progress.start_step("shared/output.gguf")?;
     let output = write_package_artifact(
         &source,
         tensors,
@@ -542,10 +585,12 @@ fn write_package(
         &out_dir,
         &artifact_hook,
     )?;
+    progress.finish_step(&artifact_progress_detail(&output))?;
 
     let mut layers = Vec::new();
     for layer_index in 0..layer_count {
         let relative = PathBuf::from(format!("layers/layer-{layer_index:03}.gguf"));
+        progress.start_step(&relative.display().to_string())?;
         let artifact = write_package_artifact(
             &source,
             tensors,
@@ -560,6 +605,7 @@ fn write_package(
             &out_dir,
             &artifact_hook,
         )?;
+        progress.finish_step(&artifact_progress_detail(&artifact))?;
         layers.push(PackageLayer {
             layer_index,
             path: artifact.path,
@@ -570,13 +616,14 @@ fn write_package(
         });
     }
 
-    let projectors = projectors
-        .iter()
-        .enumerate()
-        .map(|(index, projector)| {
-            copy_projector_artifact(projector, index, &out_dir, &artifact_hook)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut package_projectors = Vec::new();
+    for (index, projector) in projectors.iter().enumerate() {
+        progress.start_step(&projector.display().to_string())?;
+        let package_projector =
+            copy_projector_artifact(projector, index, &out_dir, &artifact_hook)?;
+        progress.finish_step(&projector_progress_detail(&package_projector))?;
+        package_projectors.push(package_projector);
+    }
 
     let manifest = PackageManifest {
         schema_version: 1,
@@ -594,12 +641,13 @@ fn write_package(
         format: "layer-package".to_string(),
         layer_count,
         activation_width: Some(activation_width),
+        generation: package_generation(tensors),
         shared: PackageShared {
             metadata,
             embeddings,
             output,
         },
-        projectors,
+        projectors: package_projectors,
         layers,
         skippy_abi_version: format!(
             "{}.{}.{}",
@@ -614,9 +662,34 @@ fn write_package(
     };
 
     let manifest_path = out_dir.join("model-package.json");
+    progress.start_step("model-package.json")?;
     write_json_file(&manifest_path, &manifest)?;
+    let manifest_bytes = fs::metadata(&manifest_path)
+        .with_context(|| format!("read manifest metadata {}", manifest_path.display()))?
+        .len();
+    progress.finish_step(&format!(
+        "model-package.json {}",
+        format_bytes(manifest_bytes)
+    ))?;
+    progress.finish()?;
     println!("{}", serde_json::to_string_pretty(&manifest)?);
     Ok(())
+}
+
+fn artifact_progress_detail(artifact: &PackageArtifact) -> String {
+    format!(
+        "{} {}",
+        artifact.path,
+        format_bytes(artifact.artifact_bytes)
+    )
+}
+
+fn projector_progress_detail(projector: &PackageProjector) -> String {
+    format!(
+        "{} {}",
+        projector.path,
+        format_bytes(projector.artifact_bytes)
+    )
 }
 
 fn resolve_package_input(model: String, explicit: ExplicitSourceIdentity) -> Result<PackageInput> {
@@ -1116,16 +1189,22 @@ fn write_package_artifact(
     );
     let path = out_dir.join(&spec.relative_path);
     write_stage_artifact(source, &stage, &path)?;
+    let relative_path = spec.relative_path.display().to_string();
+    run_artifact_hook(artifact_hook, &path, &relative_path)?;
+    let artifact_info = ModelInfo::open(&path)
+        .with_context(|| format!("open package artifact {}", path.display()))?;
+    let artifact_tensors = artifact_info
+        .tensors()
+        .with_context(|| format!("read package artifact tensors {}", path.display()))?;
     let metadata = fs::metadata(&path)
         .with_context(|| format!("read artifact metadata {}", path.display()))?;
     let artifact = PackageArtifact {
-        path: spec.relative_path.display().to_string(),
-        tensor_count: stage.tensor_count,
-        tensor_bytes: stage.tensor_bytes,
+        path: relative_path,
+        tensor_count: artifact_tensors.len(),
+        tensor_bytes: artifact_tensors.iter().map(|tensor| tensor.byte_size).sum(),
         artifact_bytes: metadata.len(),
         sha256: file_sha256(&path)?,
     };
-    run_artifact_hook(artifact_hook, &path, &artifact.path)?;
     Ok(artifact)
 }
 
@@ -1651,6 +1730,51 @@ fn layer_count(tensors: &[TensorInfo]) -> Result<u32> {
         .context("model has no layer tensors")
 }
 
+fn package_generation(tensors: &[TensorInfo]) -> Option<PackageGeneration> {
+    let mtp_layers = native_mtp_layer_indices(tensors);
+    if mtp_layers.is_empty() {
+        return None;
+    }
+
+    let strategy_id = "native-mtp-n1".to_string();
+    let mut strategies = BTreeMap::new();
+    strategies.insert(
+        strategy_id.clone(),
+        PackageSpeculativeStrategy {
+            strategy_type: "native-mtp".to_string(),
+            prediction_depth: Some(1),
+            layer_indices: mtp_layers,
+            window_policy: Some(PackageWindowPolicy {
+                default: "fixed".to_string(),
+                initial_window: 1,
+                min_window: 1,
+                max_window: 1,
+            }),
+        },
+    );
+
+    Some(PackageGeneration {
+        speculative_decoding: Some(PackageSpeculativeDecoding {
+            default: strategy_id,
+            strategies,
+        }),
+    })
+}
+
+fn native_mtp_layer_indices(tensors: &[TensorInfo]) -> Vec<u32> {
+    tensors
+        .iter()
+        .filter(|tensor| is_native_mtp_tensor_name(&tensor.name))
+        .filter_map(|tensor| tensor.layer_index)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn is_native_mtp_tensor_name(name: &str) -> bool {
+    name.contains(".nextn.")
+}
+
 fn stage_plan_from_tensors(
     stage_index: usize,
     layer_start: u32,
@@ -1825,8 +1949,11 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         ExplicitSourceIdentity, activation_width, local_artifact_files, model_distribution_id,
-        resolve_gguf_shard_paths, resolve_local_package_input,
+        native_mtp_layer_indices, package_generation, resolve_gguf_shard_paths,
+        resolve_local_package_input,
     };
+    use skippy_ffi::TensorRole;
+    use skippy_runtime::TensorInfo;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -1875,6 +2002,46 @@ mod tests {
             input.source_identity.distribution_id.as_deref(),
             Some("Qwen3-8B-Q4_K_M")
         );
+    }
+
+    #[test]
+    fn package_generation_is_absent_without_native_mtp_tensors() {
+        let tensors = vec![tensor("blk.0.attn_norm.weight", Some(0))];
+
+        assert!(package_generation(&tensors).is_none());
+    }
+
+    #[test]
+    fn package_generation_advertises_native_mtp_n1_strategy() {
+        let tensors = vec![
+            tensor("blk.0.attn_norm.weight", Some(0)),
+            tensor("blk.47.nextn.eh_proj.weight", Some(47)),
+            tensor("blk.47.nextn.enorm.weight", Some(47)),
+            tensor("blk.47.nextn.hnorm.weight", Some(47)),
+        ];
+
+        assert_eq!(native_mtp_layer_indices(&tensors), vec![47]);
+        let generation =
+            package_generation(&tensors).expect("MTP tensors should enable generation");
+        let speculative = generation
+            .speculative_decoding
+            .expect("MTP generation should configure speculative decoding");
+        assert_eq!(speculative.default, "native-mtp-n1");
+        let strategy = speculative
+            .strategies
+            .get("native-mtp-n1")
+            .expect("default strategy should be present");
+        assert_eq!(strategy.strategy_type, "native-mtp");
+        assert_eq!(strategy.prediction_depth, Some(1));
+        assert_eq!(strategy.layer_indices, vec![47]);
+        let window = strategy
+            .window_policy
+            .as_ref()
+            .expect("native MTP should declare its fixed window");
+        assert_eq!(window.default, "fixed");
+        assert_eq!(window.initial_window, 1);
+        assert_eq!(window.min_window, 1);
+        assert_eq!(window.max_window, 1);
     }
 
     #[test]
@@ -2021,6 +2188,17 @@ mod tests {
         let error = activation_width(&model).unwrap_err().to_string();
         assert!(error.contains("array nesting exceeds"), "{error}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn tensor(name: &str, layer_index: Option<u32>) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            layer_index,
+            role: TensorRole::Layer,
+            ggml_type: 0,
+            byte_size: 1,
+            element_count: 1,
+        }
     }
 
     fn gguf_header(kv_count: u64) -> Vec<u8> {

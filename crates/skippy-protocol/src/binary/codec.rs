@@ -44,10 +44,28 @@ pub fn send_reply_predicted_with_stats(
     predicted: i32,
     stats: StageReplyStats,
 ) -> io::Result<()> {
+    send_reply_predicted_with_tokens_and_stats(&mut writer, predicted, &[predicted], stats)
+}
+
+pub fn send_reply_predicted_with_tokens_and_stats(
+    mut writer: impl Write,
+    predicted: i32,
+    predicted_tokens: &[i32],
+    stats: StageReplyStats,
+) -> io::Result<()> {
+    if predicted_tokens.len() > MAX_STAGE_PREDICTED_TOKENS {
+        return Err(invalid_input("too many predicted tokens"));
+    }
     write_i32(&mut writer, WireReplyKind::PredictedToken as i32)?;
     write_i32(&mut writer, predicted)?;
-    write_i32(&mut writer, 1)?;
-    write_i32(&mut writer, predicted)?;
+    write_i32(
+        &mut writer,
+        i32::try_from(predicted_tokens.len())
+            .map_err(|_| invalid_input("too many predicted tokens"))?,
+    )?;
+    for token in predicted_tokens {
+        write_i32(&mut writer, *token)?;
+    }
     write_reply_stats(&mut writer, stats)
 }
 
@@ -417,90 +435,120 @@ fn read_sampling_config(mut reader: impl Read) -> io::Result<StageSamplingConfig
     Ok(sampling)
 }
 
+const REPLY_STATS_FIELD_COUNT: usize = 39;
+const REPLY_STATS_WIRE_BYTES: usize = REPLY_STATS_FIELD_COUNT * std::mem::size_of::<i64>();
+
 fn write_reply_stats(mut writer: impl Write, stats: StageReplyStats) -> io::Result<()> {
-    write_i64(&mut writer, stats.kv_lookup_hits)?;
-    write_i64(&mut writer, stats.kv_lookup_misses)?;
-    write_i64(&mut writer, stats.kv_lookup_errors)?;
-    write_i64(&mut writer, stats.kv_imported_pages)?;
-    write_i64(&mut writer, stats.kv_imported_tokens)?;
-    write_i64(&mut writer, stats.kv_recorded_pages)?;
-    write_i64(&mut writer, stats.kv_recorded_bytes)?;
-    write_i64(&mut writer, stats.kv_hit_stage_mask)?;
-    write_i64(&mut writer, stats.kv_record_stage_mask)?;
-    write_i64(&mut writer, stats.checkpoint_flush_us)?;
-    write_i64(&mut writer, stats.checkpoint_prefill_drain_us)?;
-    write_i64(&mut writer, stats.checkpoint_local_us)?;
-    write_i64(&mut writer, stats.checkpoint_downstream_write_us)?;
-    write_i64(&mut writer, stats.checkpoint_downstream_wait_us)?;
-    write_i64(&mut writer, stats.checkpoint_total_us)?;
-    write_i64(&mut writer, stats.checkpoint_prefill_drained_replies)?;
-    write_i64(&mut writer, stats.restore_flush_us)?;
-    write_i64(&mut writer, stats.restore_prefill_drain_us)?;
-    write_i64(&mut writer, stats.restore_local_us)?;
-    write_i64(&mut writer, stats.restore_downstream_write_us)?;
-    write_i64(&mut writer, stats.restore_downstream_wait_us)?;
-    write_i64(&mut writer, stats.restore_total_us)?;
-    write_i64(&mut writer, stats.restore_prefill_drained_replies)?;
-    write_i64(&mut writer, stats.verify_span_compute_us)?;
-    write_i64(&mut writer, stats.verify_span_forward_write_us)?;
-    write_i64(&mut writer, stats.verify_span_downstream_wait_us)?;
-    write_i64(&mut writer, stats.verify_span_total_us)?;
-    write_i64(&mut writer, stats.verify_span_stage_count)?;
-    write_i64(&mut writer, stats.verify_span_request_count)?;
-    write_i64(&mut writer, stats.verify_span_token_count)?;
-    write_i64(&mut writer, stats.verify_span_max_tokens)?;
-    write_i64(&mut writer, stats.verify_span_checkpointed_requests)?;
-    write_i64(&mut writer, stats.verify_span_skip_checkpoint_requests)?;
-    write_i64(&mut writer, stats.prefill_edge_write_us_max)?;
-    write_i64(&mut writer, stats.prefill_edge_wait_us_max)?;
-    write_i64(&mut writer, stats.prefill_edge_total_us_max)?;
-    write_i64(&mut writer, stats.prefill_edge_stage_index)?;
-    write_i64(&mut writer, stats.prefill_edge_activation_bytes_max)?;
-    write_i64(&mut writer, stats.prefill_edge_observation_count)
+    let fields = reply_stats_fields(stats);
+    let mut bytes = [0_u8; REPLY_STATS_WIRE_BYTES];
+    for (chunk, value) in bytes
+        .chunks_exact_mut(std::mem::size_of::<i64>())
+        .zip(fields)
+    {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    writer.write_all(&bytes)
 }
 
 fn read_reply_stats(mut reader: impl Read) -> io::Result<StageReplyStats> {
-    Ok(StageReplyStats {
-        kv_lookup_hits: read_i64(&mut reader)?,
-        kv_lookup_misses: read_i64(&mut reader)?,
-        kv_lookup_errors: read_i64(&mut reader)?,
-        kv_imported_pages: read_i64(&mut reader)?,
-        kv_imported_tokens: read_i64(&mut reader)?,
-        kv_recorded_pages: read_i64(&mut reader)?,
-        kv_recorded_bytes: read_i64(&mut reader)?,
-        kv_hit_stage_mask: read_i64(&mut reader)?,
-        kv_record_stage_mask: read_i64(&mut reader)?,
-        checkpoint_flush_us: read_i64(&mut reader)?,
-        checkpoint_prefill_drain_us: read_i64(&mut reader)?,
-        checkpoint_local_us: read_i64(&mut reader)?,
-        checkpoint_downstream_write_us: read_i64(&mut reader)?,
-        checkpoint_downstream_wait_us: read_i64(&mut reader)?,
-        checkpoint_total_us: read_i64(&mut reader)?,
-        checkpoint_prefill_drained_replies: read_i64(&mut reader)?,
-        restore_flush_us: read_i64(&mut reader)?,
-        restore_prefill_drain_us: read_i64(&mut reader)?,
-        restore_local_us: read_i64(&mut reader)?,
-        restore_downstream_write_us: read_i64(&mut reader)?,
-        restore_downstream_wait_us: read_i64(&mut reader)?,
-        restore_total_us: read_i64(&mut reader)?,
-        restore_prefill_drained_replies: read_i64(&mut reader)?,
-        verify_span_compute_us: read_i64(&mut reader)?,
-        verify_span_forward_write_us: read_i64(&mut reader)?,
-        verify_span_downstream_wait_us: read_i64(&mut reader)?,
-        verify_span_total_us: read_i64(&mut reader)?,
-        verify_span_stage_count: read_i64(&mut reader)?,
-        verify_span_request_count: read_i64(&mut reader)?,
-        verify_span_token_count: read_i64(&mut reader)?,
-        verify_span_max_tokens: read_i64(&mut reader)?,
-        verify_span_checkpointed_requests: read_i64(&mut reader)?,
-        verify_span_skip_checkpoint_requests: read_i64(&mut reader)?,
-        prefill_edge_write_us_max: read_i64(&mut reader)?,
-        prefill_edge_wait_us_max: read_i64(&mut reader)?,
-        prefill_edge_total_us_max: read_i64(&mut reader)?,
-        prefill_edge_stage_index: read_i64(&mut reader)?,
-        prefill_edge_activation_bytes_max: read_i64(&mut reader)?,
-        prefill_edge_observation_count: read_i64(&mut reader)?,
-    })
+    let mut bytes = [0_u8; REPLY_STATS_WIRE_BYTES];
+    reader.read_exact(&mut bytes)?;
+    let mut fields = [0_i64; REPLY_STATS_FIELD_COUNT];
+    for (field, chunk) in fields
+        .iter_mut()
+        .zip(bytes.chunks_exact(std::mem::size_of::<i64>()))
+    {
+        *field = i64::from_le_bytes(chunk.try_into().expect("i64 chunk size"));
+    }
+    Ok(reply_stats_from_fields(fields))
+}
+
+fn reply_stats_fields(stats: StageReplyStats) -> [i64; REPLY_STATS_FIELD_COUNT] {
+    [
+        stats.kv_lookup_hits,
+        stats.kv_lookup_misses,
+        stats.kv_lookup_errors,
+        stats.kv_imported_pages,
+        stats.kv_imported_tokens,
+        stats.kv_recorded_pages,
+        stats.kv_recorded_bytes,
+        stats.kv_hit_stage_mask,
+        stats.kv_record_stage_mask,
+        stats.checkpoint_flush_us,
+        stats.checkpoint_prefill_drain_us,
+        stats.checkpoint_local_us,
+        stats.checkpoint_downstream_write_us,
+        stats.checkpoint_downstream_wait_us,
+        stats.checkpoint_total_us,
+        stats.checkpoint_prefill_drained_replies,
+        stats.restore_flush_us,
+        stats.restore_prefill_drain_us,
+        stats.restore_local_us,
+        stats.restore_downstream_write_us,
+        stats.restore_downstream_wait_us,
+        stats.restore_total_us,
+        stats.restore_prefill_drained_replies,
+        stats.verify_span_compute_us,
+        stats.verify_span_forward_write_us,
+        stats.verify_span_downstream_wait_us,
+        stats.verify_span_total_us,
+        stats.verify_span_stage_count,
+        stats.verify_span_request_count,
+        stats.verify_span_token_count,
+        stats.verify_span_max_tokens,
+        stats.verify_span_checkpointed_requests,
+        stats.verify_span_skip_checkpoint_requests,
+        stats.prefill_edge_write_us_max,
+        stats.prefill_edge_wait_us_max,
+        stats.prefill_edge_total_us_max,
+        stats.prefill_edge_stage_index,
+        stats.prefill_edge_activation_bytes_max,
+        stats.prefill_edge_observation_count,
+    ]
+}
+
+fn reply_stats_from_fields(fields: [i64; REPLY_STATS_FIELD_COUNT]) -> StageReplyStats {
+    StageReplyStats {
+        kv_lookup_hits: fields[0],
+        kv_lookup_misses: fields[1],
+        kv_lookup_errors: fields[2],
+        kv_imported_pages: fields[3],
+        kv_imported_tokens: fields[4],
+        kv_recorded_pages: fields[5],
+        kv_recorded_bytes: fields[6],
+        kv_hit_stage_mask: fields[7],
+        kv_record_stage_mask: fields[8],
+        checkpoint_flush_us: fields[9],
+        checkpoint_prefill_drain_us: fields[10],
+        checkpoint_local_us: fields[11],
+        checkpoint_downstream_write_us: fields[12],
+        checkpoint_downstream_wait_us: fields[13],
+        checkpoint_total_us: fields[14],
+        checkpoint_prefill_drained_replies: fields[15],
+        restore_flush_us: fields[16],
+        restore_prefill_drain_us: fields[17],
+        restore_local_us: fields[18],
+        restore_downstream_write_us: fields[19],
+        restore_downstream_wait_us: fields[20],
+        restore_total_us: fields[21],
+        restore_prefill_drained_replies: fields[22],
+        verify_span_compute_us: fields[23],
+        verify_span_forward_write_us: fields[24],
+        verify_span_downstream_wait_us: fields[25],
+        verify_span_total_us: fields[26],
+        verify_span_stage_count: fields[27],
+        verify_span_request_count: fields[28],
+        verify_span_token_count: fields[29],
+        verify_span_max_tokens: fields[30],
+        verify_span_checkpointed_requests: fields[31],
+        verify_span_skip_checkpoint_requests: fields[32],
+        prefill_edge_write_us_max: fields[33],
+        prefill_edge_wait_us_max: fields[34],
+        prefill_edge_total_us_max: fields[35],
+        prefill_edge_stage_index: fields[36],
+        prefill_edge_activation_bytes_max: fields[37],
+        prefill_edge_observation_count: fields[38],
+    }
 }
 
 fn read_i32(mut reader: impl Read) -> io::Result<i32> {
@@ -530,16 +578,6 @@ fn read_f32(mut reader: impl Read) -> io::Result<f32> {
 }
 
 fn write_f32(mut writer: impl Write, value: f32) -> io::Result<()> {
-    writer.write_all(&value.to_le_bytes())
-}
-
-fn read_i64(mut reader: impl Read) -> io::Result<i64> {
-    let mut bytes = [0_u8; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(i64::from_le_bytes(bytes))
-}
-
-fn write_i64(mut writer: impl Write, value: i64) -> io::Result<()> {
     writer.write_all(&value.to_le_bytes())
 }
 

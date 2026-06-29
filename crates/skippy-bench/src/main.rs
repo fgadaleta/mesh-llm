@@ -1,12 +1,12 @@
 mod chat_corpus;
 mod cli;
-mod direct_return;
 mod distributed;
 mod local_single;
 mod local_split;
 mod model_identity;
 mod support;
 mod token_lengths;
+mod verify_span_local;
 
 use anyhow::Result;
 use clap::Parser;
@@ -20,6 +20,7 @@ use crate::{
         local_split_binary, local_split_chain_binary, local_split_compare, local_split_inprocess,
     },
     token_lengths::token_lengths,
+    verify_span_local::verify_span_local,
 };
 
 fn main() -> Result<()> {
@@ -29,6 +30,7 @@ fn main() -> Result<()> {
         CommandKind::LocalSplitBinary(args) => local_split_binary(args),
         CommandKind::LocalSplitCompare(args) => local_split_compare(args),
         CommandKind::LocalSplitChainBinary(args) => local_split_chain_binary(args),
+        CommandKind::VerifySpanLocal(args) => verify_span_local(args),
         CommandKind::ChatCorpus(args) => chat_corpus(args),
         CommandKind::TokenLengths(args) => token_lengths(args),
         CommandKind::FocusedRuntime(args) => focused_runtime(args),

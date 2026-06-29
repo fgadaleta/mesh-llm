@@ -1,5 +1,8 @@
 use super::*;
 
+const DIRECT_RETURN_FALLBACK_POLL: Duration = Duration::from_millis(10);
+const DIRECT_RETURN_FALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+
 impl StageOpenAiBackend {
     pub(super) fn execute_embedded_stage_message(
         &self,
@@ -41,13 +44,16 @@ impl StageOpenAiBackend {
                 message,
                 token_ids,
                 None,
-                false,
-                stage_output_activation_capacity(
-                    request.config,
-                    message.token_count,
-                    request.activation_width,
-                )
-                .map_err(openai_backend_error)?,
+                BinaryStageExecutionOptions::new(
+                    false,
+                    stage_output_activation_capacity(
+                        request.config,
+                        message.token_count,
+                        request.activation_width,
+                    )
+                    .map_err(openai_backend_error)?,
+                    request.native_mtp_enabled,
+                ),
             )
             .map_err(openai_backend_error)?
             .2;
@@ -77,12 +83,11 @@ impl StageOpenAiBackend {
         .map_err(openai_io_error)?;
         let forward_write_ms = write_timer.elapsed_ms();
         let wait_timer = PhaseTimer::start();
-        let reply = request
-            .prediction_return
-            .as_ref()
-            .ok_or_else(|| OpenAiError::backend("missing direct prediction return receiver"))?
-            .recv_expected(expected_reply)
-            .map_err(openai_backend_error)?;
+        let reply = receive_embedded_stage_reply(
+            downstream,
+            request.prediction_return.as_ref(),
+            expected_reply,
+        )?;
         let downstream_wait_ms = wait_timer.elapsed_ms();
         stats.merge(reply.stats);
         if message.kind == WireMessageKind::VerifySpan {
@@ -164,4 +169,159 @@ impl StageOpenAiBackend {
             downstream_wait_ms,
         })
     }
+
+    pub(super) fn trim_embedded_stage_session(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        downstream: &mut TcpStream,
+        session_key: &str,
+        request_id: u64,
+        session_id: u64,
+        token_count: usize,
+    ) -> OpenAiResult<EmbeddedSessionControl> {
+        let timer = PhaseTimer::start();
+        let local_timer = PhaseTimer::start();
+        {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
+            runtime
+                .trim_session(session_key, token_count as u64)
+                .map_err(openai_backend_error)?;
+        }
+        let local_ms = local_timer.elapsed_ms();
+        let message =
+            embedded_trim_session_message(request.wire_dtype, request_id, session_id, token_count)?;
+        let write_timer = PhaseTimer::start();
+        write_stage_message_conditioned(
+            &mut *downstream,
+            &message,
+            request.wire_dtype,
+            request.downstream_wire_condition,
+        )
+        .map_err(openai_io_error)?;
+        let downstream_write_ms = write_timer.elapsed_ms();
+        let wait_timer = PhaseTimer::start();
+        let reply = recv_reply(&mut *downstream).map_err(openai_io_error)?;
+        let downstream_wait_ms = wait_timer.elapsed_ms();
+        if reply.kind != WireReplyKind::Ack {
+            return Err(OpenAiError::backend(format!(
+                "trim expected ACK from downstream, got {:?}",
+                reply.kind
+            )));
+        }
+        Ok(EmbeddedSessionControl {
+            elapsed_ms: timer.elapsed_ms(),
+            local_ms,
+            downstream_write_ms,
+            downstream_wait_ms,
+        })
+    }
+
+    pub(super) fn trim_embedded_stage_session_local(
+        &self,
+        session_key: &str,
+        token_count: usize,
+    ) -> OpenAiResult<EmbeddedSessionControl> {
+        let timer = PhaseTimer::start();
+        let local_timer = PhaseTimer::start();
+        {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
+            runtime
+                .trim_session(session_key, token_count as u64)
+                .map_err(openai_backend_error)?;
+        }
+        Ok(EmbeddedSessionControl {
+            elapsed_ms: timer.elapsed_ms(),
+            local_ms: local_timer.elapsed_ms(),
+            downstream_write_ms: 0.0,
+            downstream_wait_ms: 0.0,
+        })
+    }
+}
+
+pub(crate) fn receive_embedded_stage_reply(
+    downstream: &mut TcpStream,
+    prediction_return: Option<&PredictionReturnReceiver>,
+    expected_reply: WireReplyKind,
+) -> OpenAiResult<StageReply> {
+    let Some(prediction_return) = prediction_return else {
+        return receive_downstream_stage_reply(downstream, expected_reply);
+    };
+    poll_direct_or_downstream_reply(downstream, prediction_return, expected_reply)
+}
+
+fn poll_direct_or_downstream_reply(
+    downstream: &mut TcpStream,
+    prediction_return: &PredictionReturnReceiver,
+    expected_reply: WireReplyKind,
+) -> OpenAiResult<StageReply> {
+    let previous_timeout = downstream.read_timeout().map_err(openai_io_error)?;
+    downstream
+        .set_read_timeout(Some(DIRECT_RETURN_FALLBACK_POLL))
+        .map_err(openai_io_error)?;
+    let started = Instant::now();
+    loop {
+        if let Some(reply) = prediction_return
+            .try_recv_expected(expected_reply)
+            .map_err(openai_backend_error)?
+        {
+            restore_downstream_read_timeout(downstream, previous_timeout)?;
+            return Ok(reply);
+        }
+        if downstream_reply_available(downstream)? {
+            restore_downstream_read_timeout(downstream, previous_timeout)?;
+            return receive_downstream_stage_reply(downstream, expected_reply);
+        }
+        if started.elapsed() >= DIRECT_RETURN_FALLBACK_TIMEOUT {
+            restore_downstream_read_timeout(downstream, previous_timeout)?;
+            return Err(OpenAiError::backend(format!(
+                "timed out waiting for {expected_reply:?} reply from direct return or downstream"
+            )));
+        }
+    }
+}
+
+fn downstream_reply_available(downstream: &TcpStream) -> OpenAiResult<bool> {
+    let mut byte = [0u8; 1];
+    match downstream.peek(&mut byte) {
+        Ok(0) => Err(OpenAiError::backend("downstream closed before stage reply")),
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(openai_io_error(error)),
+    }
+}
+
+fn restore_downstream_read_timeout(
+    downstream: &TcpStream,
+    timeout: Option<Duration>,
+) -> OpenAiResult<()> {
+    downstream
+        .set_read_timeout(timeout)
+        .map_err(openai_io_error)
+}
+
+fn receive_downstream_stage_reply(
+    downstream: &mut TcpStream,
+    expected_reply: WireReplyKind,
+) -> OpenAiResult<StageReply> {
+    let reply = recv_reply(&mut *downstream).map_err(openai_io_error)?;
+    if reply.kind != expected_reply {
+        return Err(OpenAiError::backend(format!(
+            "expected {expected_reply:?} reply from downstream, got {:?}",
+            reply.kind
+        )));
+    }
+    Ok(reply)
 }

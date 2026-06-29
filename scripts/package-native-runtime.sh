@@ -161,8 +161,21 @@ sha256_file() {
     fi
 }
 
+python_bin() {
+    local candidate
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 &&
+            "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    echo "Python 3.9 or newer is required to package native runtimes" >&2
+    exit 1
+}
+
 workspace_version() {
-    python3 - "$REPO_ROOT/Cargo.toml" <<'PY'
+    "$(python_bin)" - "$REPO_ROOT/Cargo.toml" <<'PY'
 import re
 import sys
 
@@ -184,7 +197,7 @@ PY
 }
 
 skippy_abi_version() {
-    python3 - "$REPO_ROOT/crates/skippy-ffi/src/lib.rs" <<'PY'
+    "$(python_bin)" - "$REPO_ROOT/crates/skippy-ffi/src/lib.rs" <<'PY'
 import re
 import sys
 
@@ -205,36 +218,106 @@ library_pattern() {
     esac
 }
 
-primary_library_name() {
+primary_library_names() {
     case "$TARGET_TRIPLE" in
         *apple-darwin) printf 'libllama.dylib\n' ;;
-        *windows*) printf 'llama.dll\n' ;;
+        *windows*) printf 'llama.dll\nlibllama.dll\n' ;;
         *) printf 'libllama.so\n' ;;
     esac
 }
 
 collect_runtime_libraries() {
-    local pattern primary
+    local pattern primary_names
     pattern="$(library_pattern)"
-    primary="$(primary_library_name)"
+    primary_names="$(primary_library_names | tr '\n' ' ')"
     find "$LLAMA_STAGE_BUILD_DIR" \( -type f -o -type l \) -name "$pattern" \
         ! -path '*/CMakeFiles/*' \
         | sort \
-        | awk -v primary="$primary" '
-            BEGIN { primary_path = "" }
+        | awk -v primary_names="$primary_names" '
+            BEGIN {
+                primary_count = split(primary_names, names, " ")
+                for (idx = 1; idx <= primary_count; idx++) {
+                    if (names[idx] != "") primary[names[idx]] = idx
+                }
+            }
             {
                 name = $0
                 sub(/^.*\//, "", name)
-                if (name == primary) {
-                    primary_path = $0
-                } else {
-                    print $0
-                }
+                paths[++path_count] = $0
+                if (name in primary) primary_paths[name] = $0
             }
             END {
-                if (primary_path != "") print primary_path
+                chosen_primary = ""
+                for (idx = 1; idx <= primary_count; idx++) {
+                    if (names[idx] in primary_paths) {
+                        chosen_primary = primary_paths[names[idx]]
+                        break
+                    }
+                }
+                for (idx = 1; idx <= path_count; idx++) {
+                    if (paths[idx] != chosen_primary) print paths[idx]
+                }
+                if (chosen_primary != "") print chosen_primary
             }
         '
+}
+
+rewrite_macos_runtime_paths() {
+    case "$TARGET_TRIPLE" in
+        *apple-darwin) ;;
+        *) return 0 ;;
+    esac
+    if ! command -v install_name_tool >/dev/null 2>&1; then
+        echo "install_name_tool is required to package macOS native runtimes" >&2
+        exit 1
+    fi
+    if ! command -v otool >/dev/null 2>&1; then
+        echo "otool is required to package macOS native runtimes" >&2
+        exit 1
+    fi
+
+    local rel_path library name dep dep_name candidate candidate_name
+    for rel_path in "${library_paths[@]}"; do
+        library="$stage_dir/$rel_path"
+        name="$(basename "$library")"
+        install_name_tool -id "@rpath/$name" "$library"
+        if ! otool -l "$library" | awk '
+            $1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
+            in_rpath && $1 == "path" { print $2; in_rpath = 0 }
+        ' | grep -qx '@loader_path'; then
+            install_name_tool -add_rpath "@loader_path" "$library"
+        fi
+    done
+
+    for rel_path in "${library_paths[@]}"; do
+        library="$stage_dir/$rel_path"
+        while IFS= read -r dep; do
+            dep_name="$(basename "$dep")"
+            for candidate in "${library_paths[@]}"; do
+                candidate_name="$(basename "$candidate")"
+                if [[ "$dep_name" == "$candidate_name" && "$dep" != "@rpath/$candidate_name" ]]; then
+                    install_name_tool -change "$dep" "@rpath/$candidate_name" "$library"
+                fi
+            done
+        done < <(otool -L "$library" | awk 'NR > 1 { print $1 }')
+    done
+}
+
+rewrite_linux_runtime_paths() {
+    case "$TARGET_TRIPLE" in
+        *linux*) ;;
+        *) return 0 ;;
+    esac
+    if ! command -v patchelf >/dev/null 2>&1; then
+        echo "patchelf is required to package Linux native runtimes" >&2
+        exit 1
+    fi
+
+    local rel_path library
+    for rel_path in "${library_paths[@]}"; do
+        library="$stage_dir/$rel_path"
+        patchelf --set-rpath '$ORIGIN' "$library"
+    done
 }
 
 if [[ -z "$TARGET_TRIPLE" ]]; then
@@ -275,10 +358,11 @@ if [[ "${#runtime_libraries[@]}" -eq 0 ]]; then
     exit 1
 fi
 
-primary_name="$(primary_library_name)"
 last_index=$((${#runtime_libraries[@]} - 1))
-if [[ "$(basename "${runtime_libraries[$last_index]}")" != "$primary_name" ]]; then
-    echo "primary native runtime library not found: $primary_name" >&2
+primary_name="$(basename "${runtime_libraries[$last_index]}")"
+if ! primary_library_names | grep -Fxq "$primary_name"; then
+    echo "primary native runtime library not found; expected one of:" >&2
+    primary_library_names | sed 's/^/  /' >&2
     exit 1
 fi
 
@@ -291,6 +375,9 @@ for library in "${runtime_libraries[@]}"; do
     cp "$library" "$stage_dir/lib/$name"
     library_paths+=("lib/$name")
 done
+
+rewrite_macos_runtime_paths
+rewrite_linux_runtime_paths
 
 primary_library="lib/$primary_name"
 primary_sha="$(sha256_file "$stage_dir/$primary_library")"
@@ -310,7 +397,7 @@ if [[ -f "$LLAMA_WORKDIR/.mesh-llm-patch-digest" ]]; then
     patch_digest="$(tr -d '[:space:]' < "$LLAMA_WORKDIR/.mesh-llm-patch-digest")"
 fi
 
-python3 - "$stage_dir/manifest.json" "$primary_library" "${library_paths[@]}" <<PY
+"$(python_bin)" - "$stage_dir/manifest.json" "$primary_library" "${library_paths[@]}" <<PY
 import json
 import os
 import sys
@@ -320,24 +407,23 @@ primary_library = sys.argv[2]
 library_paths = sys.argv[3:]
 backend = "$BACKEND"
 kind = {"hip": "rocm", "cuda-blackwell": "cuda"}.get(backend, backend)
-cuda_arches = [
-    value.strip()
-    for value in (
-        os.environ.get("LLAMA_STAGE_CUDA_ARCHITECTURES")
-        or os.environ.get("SKIPPY_CUDA_ARCHITECTURES")
-        or ("sm_120" if backend == "cuda-blackwell" else "")
-    ).split(",")
-    if value.strip()
-]
-rocm_arches = [
-    value.strip()
-    for value in (
-        os.environ.get("LLAMA_STAGE_AMDGPU_TARGETS")
-        or os.environ.get("SKIPPY_AMDGPU_TARGETS")
-        or ""
-    ).split(",")
-    if value.strip()
-]
+
+def split_arches(raw):
+    values = []
+    for comma_part in raw.split(","):
+        values.extend(part.strip() for part in comma_part.split(";"))
+    return [value for value in values if value]
+
+cuda_arches = split_arches(
+    os.environ.get("LLAMA_STAGE_CUDA_ARCHITECTURES")
+    or os.environ.get("SKIPPY_CUDA_ARCHITECTURES")
+    or ("sm_120" if backend == "cuda-blackwell" else "")
+)
+rocm_arches = split_arches(
+    os.environ.get("LLAMA_STAGE_AMDGPU_TARGETS")
+    or os.environ.get("SKIPPY_AMDGPU_TARGETS")
+    or ""
+)
 backend_manifest = {"kind": kind}
 if kind == "cuda":
     backend_manifest["cuda"] = {

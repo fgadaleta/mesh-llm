@@ -6,6 +6,8 @@ pub use model_artifact::ModelIdentity;
 pub struct BaselineReport {
     pub token_id: i32,
     pub predicted_token: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_predicted_token: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -22,9 +24,48 @@ pub struct BoundaryReport {
 pub struct SplitReport {
     pub token_id: i32,
     pub predicted_token: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_predicted_token: Option<i32>,
+    pub native_mtp: NativeMtpSidebandReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_mtp_n1: Option<NativeMtpN1VerificationReport>,
     pub activation_width: i32,
     pub wire_dtype: String,
     pub boundary: BoundaryReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeMtpSidebandReport {
+    pub sideband_present: bool,
+    pub predicted_token_count: usize,
+    pub authoritative_matches_reply: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authoritative_token: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_token: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_compute_us: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeMtpN1VerificationReport {
+    pub drafted_tokens: u64,
+    pub accepted_tokens: u64,
+    pub rejected_tokens: u64,
+    pub pending_tokens: u64,
+    pub verification_count: u64,
+    pub accept_rate: f64,
+    pub byte_identical: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_token: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_target_token: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_baseline_token: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_compute_us: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_compute_us: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,6 +74,7 @@ pub struct SingleStepReport {
     pub status: &'static str,
     pub model_identity: ModelIdentity,
     pub matches: bool,
+    pub native_mtp_draft_required: bool,
     pub baseline: BaselineReport,
     pub split: SplitReport,
     pub stage_models: Vec<StageModelReport>,
@@ -55,9 +97,15 @@ pub struct ChainReport {
     pub status: &'static str,
     pub model_identity: ModelIdentity,
     pub matches: bool,
+    pub native_mtp_draft_required: bool,
     pub baseline: BaselineReport,
     pub token_id: i32,
     pub predicted_token: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_predicted_token: Option<i32>,
+    pub native_mtp: NativeMtpSidebandReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_mtp_n1: Option<NativeMtpN1VerificationReport>,
     pub activation_width: i32,
     pub wire_dtype: String,
     pub stages: Vec<ChainStageReport>,
@@ -198,4 +246,79 @@ pub struct StatePayloadBlockDigestReport {
     pub offset: usize,
     pub bytes: usize,
     pub sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NativeMtpOpenAiAbReport {
+    pub mode: &'static str,
+    pub status: &'static str,
+    pub model_id: String,
+    pub model_path: String,
+    pub prompt: String,
+    pub max_tokens: u32,
+    pub split_layer: u32,
+    pub layer_end: u32,
+    pub activation_width: i32,
+    pub activation_wire_dtype: String,
+    pub exact_content_match: bool,
+    pub batched_events_required: bool,
+    pub batched_events_present: bool,
+    pub matches: bool,
+    pub baseline: NativeMtpOpenAiCaseReport,
+    pub n1: NativeMtpOpenAiCaseReport,
+    pub batched: NativeMtpOpenAiCaseReport,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NativeMtpOpenAiCaseReport {
+    pub case: &'static str,
+    pub native_mtp_enabled: bool,
+    pub batched_verify_enabled: bool,
+    pub http_status: u16,
+    pub content: String,
+    pub completion_tokens: Option<u64>,
+    pub openai_bind_addr: String,
+    pub stage0_bind_addr: String,
+    pub stage0_endpoint_addr: String,
+    pub stage1_bind_addr: String,
+    pub stage1_endpoint_addr: String,
+    pub stage0_config: String,
+    pub stage1_config: String,
+    pub topology_config: String,
+    pub stage0_log: String,
+    pub stage1_log: String,
+    pub stage1_launch_mode: String,
+    pub stage1_remote_config: Option<String>,
+    pub stage1_remote_topology: Option<String>,
+    pub stage1_remote_log: Option<String>,
+    pub metrics: NativeMtpOpenAiMetricsReport,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct NativeMtpOpenAiMetricsReport {
+    pub native_mtp_enabled: bool,
+    pub drafted_tokens: u64,
+    pub accepted_tokens: u64,
+    pub rejected_tokens: u64,
+    pub pending_tokens: u64,
+    pub verification_count: u64,
+    pub accept_rate: f64,
+    pub proposal_compute_us: i64,
+    pub verification_compute_us: i64,
+    pub decode_token_events: u64,
+    pub batched_verify_events: u64,
+    pub batched_accepted_events: u64,
+    pub batched_rejected_events: u64,
+    pub batched_accepted_verify_elapsed_ms: f64,
+    pub batched_accepted_verify_avg_ms: f64,
+    pub batched_rejected_verify_elapsed_ms: f64,
+    pub batched_rejected_verify_avg_ms: f64,
+    pub batched_consumed_positions: u64,
+    pub batched_committed_positions: u64,
+    pub batched_trim_count: u64,
+    pub batched_trim_elapsed_ms: f64,
+    pub batched_trim_local_ms: f64,
+    pub batched_trim_downstream_write_ms: f64,
+    pub batched_trim_downstream_wait_ms: f64,
+    pub fatal_error_events: u64,
 }

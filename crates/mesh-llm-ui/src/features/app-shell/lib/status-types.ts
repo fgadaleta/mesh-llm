@@ -1,4 +1,4 @@
-import type { LatencySource } from '@/lib/api/types'
+import type { GpuInfo, LatencySource } from '@/lib/api/types'
 
 export type LiveNodeState = 'client' | 'standby' | 'loading' | 'serving'
 
@@ -96,7 +96,7 @@ export type Peer = {
   hostname?: string
   version?: string
   is_soc?: boolean
-  gpus?: { name: string; vram_bytes: number; bandwidth_gbps?: number }[]
+  gpus?: GpuInfo[]
   first_joined_mesh_ts?: number
 }
 
@@ -249,7 +249,7 @@ export type StatusPayload = {
   publication_state?: 'private' | 'public' | 'publish_failed'
   my_hostname?: string
   my_is_soc?: boolean
-  gpus?: { name: string; vram_bytes: number; bandwidth_gbps?: number }[]
+  gpus?: GpuInfo[]
   first_joined_mesh_ts?: number
   mesh_requirements?: MeshRequirementsSummary
   recent_mesh_rejections?: MeshRequirementRejection[]

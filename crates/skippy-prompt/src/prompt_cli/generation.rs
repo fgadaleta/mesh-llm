@@ -11,7 +11,6 @@ struct PromptRun<'a> {
     prompt_index: usize,
     prompt: &'a str,
     live_session: Option<&'a mut PromptLiveSession>,
-    direct_returns: &'a PromptDirectReturnServer,
 }
 
 fn run_prompt(run: PromptRun<'_>) -> Result<()> {
@@ -28,7 +27,6 @@ fn run_prompt(run: PromptRun<'_>) -> Result<()> {
         prompt_index,
         prompt,
         mut live_session,
-        direct_returns,
     } = run;
 
     if args.prefill_chunk_size == 0 {
@@ -69,9 +67,6 @@ fn run_prompt(run: PromptRun<'_>) -> Result<()> {
     );
     let prompt_index_bytes = prompt_index.to_le_bytes();
     let request_id = stable_wire_id(&[session_id.as_bytes(), &prompt_index_bytes]);
-    let direct_return_timeout = Duration::from_secs(args.decode_timeout_secs.max(1));
-    let direct_return =
-        direct_returns.register(request_id, wire_session_id, direct_return_timeout)?;
 
     let mut session_reuse = PromptSessionReuseStats::default();
     let mut one_shot_stream = None;
@@ -337,7 +332,6 @@ fn run_prompt(run: PromptRun<'_>) -> Result<()> {
                 prefill_token_count,
                 decode_index,
                 current,
-                &direct_return,
             )
             .with_context(|| stage_chain_error_context(args))?;
             decode_ms += reply.elapsed_ms;
@@ -385,7 +379,6 @@ fn run_prompt(run: PromptRun<'_>) -> Result<()> {
             decode_index,
             &verify_inputs,
             true,
-            &direct_return,
         )
         .with_context(|| stage_chain_error_context(args))?;
         decode_ms += reply.elapsed_ms;
@@ -439,7 +432,6 @@ fn run_prompt(run: PromptRun<'_>) -> Result<()> {
                     prefill_token_count,
                     decode_index,
                     current,
-                    &direct_return,
                 )
                 .with_context(|| stage_chain_error_context(args))?;
                 commit_tokens = vec![repair.predicted];
@@ -461,7 +453,6 @@ fn run_prompt(run: PromptRun<'_>) -> Result<()> {
                     decode_index,
                     repair_inputs,
                     false,
-                    &direct_return,
                 )
                 .with_context(|| stage_chain_error_context(args))?;
                 commit_tokens = repaired_commit_tokens(

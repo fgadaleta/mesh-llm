@@ -2,7 +2,7 @@
 
 mod cache;
 mod flavor;
-mod host;
+pub mod host;
 mod load_plan;
 mod manifest;
 mod resolver;
@@ -26,5 +26,5 @@ pub use manifest::{
 pub use resolver::{
     CandidateEvaluation, CandidateRejection, NativeRuntimeResolution, NativeRuntimeResolver,
     NativeRuntimeSource, RuntimeSelection, select_native_runtime,
-    select_native_runtime_for_skippy_abi,
+    select_native_runtime_for_skippy_abi, select_native_runtime_from_artifacts,
 };

@@ -28,6 +28,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod native_runtime_events;
+
+use native_runtime_events::skippy_native_model_open_event_reporter;
+
 const SPLIT_PARTICIPANT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SPLIT_PARTICIPANT_STABLE_FOR: Duration = Duration::from_secs(2);
 pub(super) const SPLIT_DEFAULT_MIN_PARTICIPANTS: usize = 2;
@@ -60,6 +64,7 @@ pub(super) enum RuntimeEvent {
     },
     ModelTargetReconciliationLoadFinished {
         model_ref: String,
+        profile: String,
         result: std::result::Result<api::RuntimeLoadResponse, String>,
     },
 }
@@ -324,7 +329,7 @@ fn resolve_runtime_skippy_config(
 ) -> Result<skippy::ResolvedSkippyConfig> {
     let allocatable_memory_bytes = spec
         .capacity_budget_bytes
-        .or_else(|| spec.pinned_gpu.map(|gpu| gpu.vram_bytes));
+        .or_else(|| spec.pinned_gpu.map(|gpu| gpu.allocatable_vram_bytes()));
     let mut resolved = skippy::resolve_skippy_config(skippy::SkippyConfigResolveRequest {
         mesh_config: spec.mesh_config,
         model_id: spec.config_model_id.unwrap_or(model_name),
@@ -332,6 +337,7 @@ fn resolve_runtime_skippy_config(
         model_bytes,
         allocatable_memory_bytes,
         request_defaults: None,
+        package_generation: None,
     })?;
     resolved.model_id = model_name.to_string();
     apply_runtime_skippy_launch_overrides(
@@ -422,12 +428,18 @@ pub(super) async fn advertise_model_ready(
     node: &mesh::Node,
     primary_model_name: &str,
     model_name: &str,
+    profile: &str,
 ) {
     let mut hosted_models = node.hosted_models().await;
-    if hosted_models.iter().any(|m| m == model_name) {
+    let public_id = if profile.is_empty() {
+        model_name.to_string()
+    } else {
+        format!("{}#{}", model_name, profile)
+    };
+    if hosted_models.iter().any(|m| m == &public_id) {
         return;
     }
-    hosted_models.push(model_name.to_string());
+    hosted_models.push(public_id);
     hosted_models.sort();
     if let Some(pos) = hosted_models.iter().position(|m| m == primary_model_name) {
         let primary = hosted_models.remove(pos);
@@ -447,10 +459,15 @@ pub(super) async fn set_advertised_model_context(
     node.regossip().await;
 }
 
-pub(super) async fn withdraw_advertised_model(node: &mesh::Node, model_name: &str) {
+pub(super) async fn withdraw_advertised_model(node: &mesh::Node, model_name: &str, profile: &str) {
     let mut hosted_models = node.hosted_models().await;
+    let public_id = if profile.is_empty() {
+        model_name.to_string()
+    } else {
+        format!("{}#{}", model_name, profile)
+    };
     let old_len = hosted_models.len();
-    hosted_models.retain(|m| m != model_name);
+    hosted_models.retain(|m| m != &public_id);
     if hosted_models.len() == old_len {
         return;
     }
@@ -568,7 +585,7 @@ pub(super) async fn start_runtime_local_model(
         .unwrap_or_else(|| election::total_model_bytes(spec.model_path));
     let my_vram = spec
         .capacity_budget_bytes
-        .or_else(|| spec.pinned_gpu.map(|gpu| gpu.vram_bytes))
+        .or_else(|| spec.pinned_gpu.map(|gpu| gpu.allocatable_vram_bytes()))
         .unwrap_or_else(|| spec.node.vram_bytes());
 
     // For split/layer-package models, compute the local share of model weights
@@ -838,7 +855,7 @@ async fn prepare_split_runtime_start(
         model_ref,
         model_ref,
         &package,
-        spec.pinned_gpu.map(|gpu| gpu.vram_bytes),
+        spec.pinned_gpu.map(|gpu| gpu.allocatable_vram_bytes()),
         timeout,
     )
     .await?;
@@ -1308,6 +1325,7 @@ async fn load_split_runtime_generation_inner(
     let vision_projector_loaded = runtime_options.config.projector_path.is_some();
     let node_for_hook = spec.node.clone();
     let model_ref = spec.model_ref.to_string();
+    let reporter_model_ref = model_ref.clone();
     let skippy_telemetry = spec.skippy_telemetry.clone();
     let guardrail_telemetry = spec.survey_telemetry.clone();
     let openai_guardrails =
@@ -1317,11 +1335,12 @@ async fn load_split_runtime_generation_inner(
         source: None,
     });
     let handle = tokio::task::spawn_blocking(move || {
-        skippy::SkippyModelHandle::load_stage0_runtime_options_with_openai_args(
+        skippy::SkippyModelHandle::load_stage0_runtime_options_with_openai_args_and_open_events(
             runtime_options,
             settings.embedded_openai.clone(),
             Some(skippy::MeshAutoHookPolicy::new(node_for_hook)),
             skippy_telemetry,
+            Some(skippy_native_model_open_event_reporter(reporter_model_ref)),
             skippy::SkippyOpenAiGuardrailOptions::new(Some(openai_guardrails), guardrail_telemetry),
         )
     })
@@ -1492,6 +1511,7 @@ fn split_runtime_stage_load_request(
         cache_type_k: resolved_config.cache_type_k.clone(),
         cache_type_v: resolved_config.cache_type_v.clone(),
         flash_attn_type: resolved_config.flash_attn_type,
+        native_mtp_enabled: resolved_config.native_mtp_enabled,
         shutdown_generation: spec.generation.generation,
         coordinator_term: spec.generation.coordinator_term,
         coordinator_id: Some(spec.node.id()),
@@ -1531,8 +1551,9 @@ fn split_generation_load_settings<'a>(
         model_id: spec.model_ref,
         model_path: spec.model_path,
         model_bytes: spec.package.source_model_bytes,
-        allocatable_memory_bytes: spec.pinned_gpu.map(|gpu| gpu.vram_bytes),
+        allocatable_memory_bytes: spec.pinned_gpu.map(|gpu| gpu.allocatable_vram_bytes()),
         request_defaults: None,
+        package_generation: spec.package.generation.as_ref(),
     })?;
     resolved.model_fit.ctx_size = spec.ctx_size;
     resolved.throughput.parallel = spec.slots;
@@ -1944,7 +1965,9 @@ impl SplitTopologyCoordinator {
             &self.model_name,
             &self.model_ref,
             &self.package,
-            self.pinned_gpu.as_ref().map(|gpu| gpu.vram_bytes),
+            self.pinned_gpu
+                .as_ref()
+                .map(|gpu| gpu.allocatable_vram_bytes()),
         )
         .await;
         self.node
@@ -2320,7 +2343,7 @@ impl SplitTopologyCoordinator {
         let local_capacity = self
             .pinned_gpu
             .as_ref()
-            .map(|gpu| gpu.vram_bytes)
+            .map(|gpu| gpu.allocatable_vram_bytes())
             .unwrap_or_else(|| self.node.vram_bytes());
         // Use the package's source model bytes when available — layer-package
         // refs use `hf://` pseudo-paths that `total_model_bytes` cannot stat.
@@ -3585,11 +3608,13 @@ async fn start_runtime_skippy_model(
         source: None,
     });
     let node_for_hook = spec.node.clone();
+    let reporter_model_name = model_name.clone();
     let guardrail_telemetry = spec.survey_telemetry.clone();
     let skippy_model = tokio::task::spawn_blocking(move || {
-        skippy::SkippyModelHandle::load_with_hooks(
+        skippy::SkippyModelHandle::load_with_hooks_and_open_events(
             options,
             Some(skippy::MeshAutoHookPolicy::new(node_for_hook)),
+            Some(skippy_native_model_open_event_reporter(reporter_model_name)),
             guardrail_telemetry,
         )
     })
@@ -3690,6 +3715,7 @@ async fn start_runtime_layer_package_model(
     runtime_options.config.downstream = None;
     let node_for_hook = spec.node.clone();
     let model_ref = model_name.clone();
+    let reporter_model_ref = model_ref.clone();
     let skippy_telemetry = spec.skippy_telemetry.clone();
     let guardrail_telemetry = spec.survey_telemetry.clone();
     let openai_guardrails =
@@ -3699,11 +3725,12 @@ async fn start_runtime_layer_package_model(
         source: None,
     });
     let handle = tokio::task::spawn_blocking(move || {
-        skippy::SkippyModelHandle::load_stage0_runtime_options_with_openai_args(
+        skippy::SkippyModelHandle::load_stage0_runtime_options_with_openai_args_and_open_events(
             runtime_options,
             embedded_openai,
             Some(skippy::MeshAutoHookPolicy::new(node_for_hook)),
             skippy_telemetry,
+            Some(skippy_native_model_open_event_reporter(reporter_model_ref)),
             skippy::SkippyOpenAiGuardrailOptions::new(Some(openai_guardrails), guardrail_telemetry),
         )
     })
@@ -3734,9 +3761,11 @@ async fn start_runtime_layer_package_model(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn local_process_payload(
     model_name: &str,
     instance_id: Option<&str>,
+    profile: &str,
     backend: &str,
     port: u16,
     pid: u32,
@@ -3746,6 +3775,7 @@ pub(super) fn local_process_payload(
     local_process_snapshot(
         model_name,
         instance_id,
+        profile,
         backend,
         port,
         pid,
@@ -3755,9 +3785,11 @@ pub(super) fn local_process_payload(
     .to_payload()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn local_process_snapshot(
     model_name: &str,
     instance_id: Option<&str>,
+    profile: &str,
     backend: &str,
     port: u16,
     pid: u32,
@@ -3767,6 +3799,7 @@ pub(super) fn local_process_snapshot(
     crate::runtime_data::RuntimeProcessSnapshot {
         model: model_name.to_string(),
         instance_id: instance_id.map(str::to_string),
+        profile: profile.to_string(),
         backend: backend.into(),
         pid,
         slots,
@@ -3812,6 +3845,7 @@ mod tests {
             layer_count,
             activation_width: 2048,
             tensor_count: 100,
+            generation: None,
         }
     }
 
@@ -3847,6 +3881,7 @@ mod tests {
             cache_type_k: "f16".to_string(),
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
+            native_mtp_enabled: true,
             shutdown_generation: 1,
             coordinator_term: 1,
             coordinator_id: None,
@@ -4127,6 +4162,7 @@ prefill_chunking = "fixed"
 prefill_chunk_size = 96
 
 [models.speculative]
+strategy = "disabled"
 mode = "draft"
 draft_model_path = "/models/draft.gguf"
 draft_max_tokens = 7
@@ -4208,6 +4244,8 @@ stop = ["END"]
             settings.runtime_options.config.projector_path.as_deref(),
             Some(projector_path.to_string_lossy().as_ref())
         );
+        assert!(!settings.runtime_options.config.native_mtp_enabled);
+        assert!(!settings.embedded_openai.native_mtp_enabled);
         assert_eq!(settings.embedded_openai.generation_concurrency, 4);
         assert_eq!(settings.embedded_openai.default_max_tokens, 321);
         assert_eq!(

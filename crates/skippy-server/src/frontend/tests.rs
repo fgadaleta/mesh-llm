@@ -1,4 +1,5 @@
 use super::*;
+use crate::kv_integration::PrefillKvIdentity;
 use async_trait::async_trait;
 use std::io::Cursor;
 use std::{
@@ -99,6 +100,7 @@ fn prefix_cache_test_config() -> StageConfig {
             shared_prefix_stride_tokens: 128,
             shared_prefix_record_limit: 2,
         }),
+        native_mtp_enabled: true,
         load_mode: LoadMode::RuntimeSlice,
         bind_addr: "127.0.0.1:0".to_string(),
         upstream: None,
@@ -124,6 +126,158 @@ fn prefix_cache_test_base() -> MessageBase {
         chat_template_id: Some("template".to_string()),
         seq: Some(1),
     }
+}
+
+fn prefix_cache_base_with_request(request_id: &str, session_id: &str) -> MessageBase {
+    MessageBase {
+        request_id: request_id.to_string(),
+        session_id: session_id.to_string(),
+        ..prefix_cache_test_base()
+    }
+}
+
+fn seed_resident_prefix(kv: &KvStageIntegration, identity: &PrefillKvIdentity) {
+    let token_count = identity.identity.token_count;
+    let mut cache = kv.resident.lock().expect("resident cache lock poisoned");
+    let allocation = cache
+        .allocate_for_record(&identity.page_id, token_count, token_count, |_| Ok(()))
+        .expect("synthetic resident prefix should allocate");
+    assert!(allocation.should_retain);
+    cache.commit_record(
+        identity.page_id.clone(),
+        allocation.seq_id,
+        token_count,
+        token_count,
+    );
+}
+
+#[test]
+fn openai_cache_stats_default_to_disabled() {
+    let stats = GenerationCacheStats::default();
+
+    assert_eq!(stats.status, "disabled");
+    assert_eq!(stats.cached_prompt_tokens, 0);
+    assert_eq!(stats.matched_prefix_tokens, 0);
+    assert_eq!(stats.suffix_prefill_tokens, 0);
+    assert_eq!(stats.hit_kind, None);
+}
+
+#[test]
+fn cache_identity_reuses_repeated_prompts_without_client_cache_key() {
+    let config = prefix_cache_test_config();
+    let kv = KvStageIntegration::from_config(&config)
+        .unwrap()
+        .expect("resident prefix cache enabled");
+    let first_request = prefix_cache_base_with_request("request-a", "session-a");
+    let second_request = prefix_cache_base_with_request("request-b", "session-b");
+    let tokens = (0..1024).collect::<Vec<_>>();
+
+    let recorded = kv.prefill_identity(&config, &first_request, 0, &tokens);
+    let looked_up = kv.prefill_identity(&config, &second_request, 0, &tokens);
+
+    assert_eq!(recorded.page_id, looked_up.page_id);
+    assert_eq!(
+        recorded.identity.prefix_hash,
+        looked_up.identity.prefix_hash
+    );
+    assert_ne!(recorded.identity.session_id, looked_up.identity.session_id);
+
+    seed_resident_prefix(&kv, &recorded);
+    let hit = kv
+        .probe_resident_prefix(&looked_up)
+        .expect("repeated prompt should hit without a client cache key");
+    assert_eq!(hit.page_id, recorded.page_id);
+    assert_eq!(hit.token_count, tokens.len());
+}
+
+#[test]
+fn cache_identity_namespaces_explicit_prompt_cache_keys() {
+    let config = prefix_cache_test_config();
+    let kv = KvStageIntegration::from_config(&config)
+        .unwrap()
+        .expect("resident prefix cache enabled");
+    let tokens = (0..1024).collect::<Vec<_>>();
+    let mut default_namespace = prefix_cache_test_base();
+    default_namespace.chat_template_id = None;
+    let mut explicit_namespace = prefix_cache_test_base();
+    explicit_namespace.chat_template_id = Some("openai:prompt_cache_key:tenant-a".to_string());
+
+    let default_identity = kv.prefill_identity(&config, &default_namespace, 0, &tokens);
+    let explicit_identity = kv.prefill_identity(&config, &explicit_namespace, 0, &tokens);
+
+    assert_ne!(default_identity.page_id, explicit_identity.page_id);
+    assert_ne!(
+        default_identity.identity.prefix_hash,
+        explicit_identity.identity.prefix_hash
+    );
+}
+
+#[test]
+fn disabled_cache_config_has_no_stage_integration() {
+    let config = StageConfig {
+        kv_cache: Some(StageKvCacheConfig {
+            mode: StageKvCacheMode::Disabled,
+            ..prefix_cache_test_config()
+                .kv_cache
+                .expect("test cache config")
+        }),
+        ..prefix_cache_test_config()
+    };
+
+    let kv = KvStageIntegration::from_config(&config).unwrap();
+
+    assert!(kv.is_none());
+}
+
+#[test]
+fn cold_resident_prefix_lookup_misses_before_recording() {
+    let config = prefix_cache_test_config();
+    let kv = KvStageIntegration::from_config(&config)
+        .unwrap()
+        .expect("resident prefix cache enabled");
+    let identity = kv.prefill_identity(
+        &config,
+        &prefix_cache_test_base(),
+        0,
+        &(0..1024).collect::<Vec<_>>(),
+    );
+
+    assert!(kv.probe_resident_prefix(&identity).is_none());
+}
+
+#[test]
+fn resident_prefix_cache_hits_shared_prefix_grid() {
+    let config = prefix_cache_test_config();
+    let kv = KvStageIntegration::from_config(&config)
+        .unwrap()
+        .expect("resident prefix cache enabled");
+    let base = prefix_cache_test_base();
+    let recorded_tokens = (0..2214).collect::<Vec<_>>();
+    let mut lookup_tokens = recorded_tokens.clone();
+    lookup_tokens.extend(100_000..100_017);
+    let record_plan = super::prefix_cache::stage0_full_prefill_record_identities(
+        &kv,
+        &config,
+        &base,
+        &recorded_tokens,
+    );
+    let lookup_plan = kv.lookup_identities(&config, &base, 0, &lookup_tokens);
+    let recorded_shared = record_plan
+        .iter()
+        .find(|identity| identity.identity.token_count == 2176)
+        .expect("record plan should include shared grid prefix");
+    let lookup_shared = lookup_plan
+        .iter()
+        .find(|identity| identity.identity.token_count == 2176)
+        .expect("lookup plan should probe shared grid prefix");
+
+    seed_resident_prefix(&kv, recorded_shared);
+    let hit = kv
+        .probe_resident_prefix(lookup_shared)
+        .expect("different-tail prompt should hit shared prefix grid");
+
+    assert_eq!(hit.page_id, recorded_shared.page_id);
+    assert_eq!(hit.token_count, 2176);
 }
 
 #[test]
@@ -813,6 +967,28 @@ fn tool_request() -> ChatCompletionRequest {
 }
 
 #[test]
+fn plain_chat_does_not_require_chat_output_parser() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+
+    assert!(!chat_output_parser_required(
+        &request,
+        &ChatTemplateOptions::default(),
+    ));
+}
+
+#[test]
+fn tools_require_chat_output_parser() {
+    assert!(chat_output_parser_required(
+        &tool_request(),
+        &ChatTemplateOptions::default(),
+    ));
+}
+
+#[test]
 fn parses_llama_message_tool_calls() {
     let request = tool_request();
     let parsed = parsed_tool_calls_from_message_json(
@@ -854,6 +1030,7 @@ fn chat_response_from_parsed_message_separates_reasoning_content() {
     let output = GeneratedText {
         prompt_tokens: 4,
         completion_tokens: 7,
+        cache_status: "disabled",
         cached_prompt_tokens: 0,
         matched_prefix_tokens: 0,
         suffix_prefill_tokens: 0,
@@ -1075,6 +1252,7 @@ fn multimodal_stage_config(
         filter_tensors_on_load: layer_start != 0 || layer_end != fixture.layer_end,
         selected_device: None,
         kv_cache: None,
+        native_mtp_enabled: true,
         load_mode: skippy_protocol::LoadMode::RuntimeSlice,
         bind_addr: bind_addr.to_string(),
         upstream: None,
@@ -1085,6 +1263,8 @@ fn multimodal_stage_config(
 fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
     let runtime = load_runtime(&config)?.context("load smoke runtime")?;
     let ctx_size = usize::try_from(config.ctx_size).unwrap_or(usize::MAX);
+    let decode_batcher = DecodeBatcher::new(runtime.clone(), 1);
+    let decode_frame_batcher = DecodeFrameBatcher::new(runtime.clone(), 1);
     Ok(StageOpenAiBackend {
         runtime,
         telemetry: Telemetry::new(
@@ -1108,6 +1288,8 @@ fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
         generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: None,
         kv: None,
+        decode_batcher,
+        decode_frame_batcher,
     })
 }
 
@@ -1243,6 +1425,7 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
             async_prefill_forward: false,
             downstream_wire_condition: WireCondition::new(0.0, None)?,
             downstream_connect_timeout_secs: 5,
+            native_mtp_enabled: true,
             openai: None,
         });
     let ready = connect_endpoint_ready(&stage1_addr.to_string(), 120);
@@ -1265,6 +1448,8 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
         .context("create split smoke lane pool")?;
     let runtime = load_runtime(&stage0_config)?.context("load stage-0 smoke runtime")?;
     let ctx_size = usize::try_from(stage0_config.ctx_size).unwrap_or(usize::MAX);
+    let decode_batcher = DecodeBatcher::new(runtime.clone(), 1);
+    let decode_frame_batcher = DecodeFrameBatcher::new(runtime.clone(), 1);
     let backend = StageOpenAiBackend {
         runtime,
         telemetry,
@@ -1282,6 +1467,7 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
             prefill_reply_credit_limit: 0,
             lane_pool: Some(lane_pool),
             prediction_returns: None,
+            native_mtp_enabled: true,
         },
         draft: None,
         speculative_window: 0,
@@ -1292,6 +1478,8 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
         generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: None,
         kv: None,
+        decode_batcher,
+        decode_frame_batcher,
     };
     let response = backend
         .chat_completion(multimodal_chat_request(&fixture)?)
@@ -1307,6 +1495,19 @@ fn trims_at_first_stop_sequence() {
     assert_eq!(trim_at_stop("hello END world", &["END"]), "hello ");
     assert_eq!(trim_at_stop("abc xyz def", &["def", "xyz"]), "abc ");
     assert_eq!(trim_at_stop("abc", &[""]), "abc");
+}
+
+#[test]
+fn generation_stop_values_include_chat_template_stops() {
+    let request_stop = openai_frontend::StopSequence::One("</stop>".to_string());
+    let metadata = json!({
+        "additional_stops": ["<|user|>", "<|observation|>", ""],
+    })
+    .to_string();
+
+    let stops = generation_stop_values(Some(&request_stop), Some(&metadata));
+
+    assert_eq!(stops, vec!["</stop>", "<|user|>", "<|observation|>"]);
 }
 
 #[test]
@@ -1692,15 +1893,9 @@ fn request_defaults_fill_omitted_chat_fields_only() {
     assert_eq!(sampling.logit_bias.len(), 2);
     assert_eq!(
         chat_template_options(&request).unwrap().enable_thinking,
-        Some(true)
+        None
     );
-    assert_eq!(
-        request
-            .reasoning
-            .as_ref()
-            .and_then(|value| value.max_tokens),
-        Some(256)
-    );
+    assert_eq!(request.reasoning, None);
     assert_eq!(
         GenerationTokenLimit::from_request(request.effective_max_tokens(), 64),
         GenerationTokenLimit::Default(64)
@@ -1788,7 +1983,7 @@ fn explicit_chat_request_values_override_request_defaults() {
     assert_eq!(sampling.logit_bias.len(), 1);
     assert_eq!(
         chat_template_options(&request).unwrap().enable_thinking,
-        Some(false)
+        None
     );
     assert_eq!(
         GenerationTokenLimit::from_request(request.effective_max_tokens(), 64),
@@ -1857,31 +2052,7 @@ fn request_defaults_do_not_make_structured_output_or_logprobs_executable() {
 }
 
 #[test]
-fn deepseek_legacy_request_default_enables_chat_template_thinking() {
-    let mut request: ChatCompletionRequest = serde_json::from_value(json!({
-        "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
-        "messages": [{"role": "user", "content": "hello"}]
-    }))
-    .unwrap();
-
-    let defaults = EmbeddedOpenAiRequestDefaults {
-        reasoning_format: Some(EmbeddedReasoningFormat::DeepseekLegacy),
-        ..EmbeddedOpenAiRequestDefaults::default()
-    };
-    apply_chat_request_defaults(&mut request, &defaults);
-
-    assert_eq!(
-        request.reasoning.as_ref().and_then(|value| value.enabled),
-        Some(true)
-    );
-    assert_eq!(
-        chat_template_options(&request).unwrap().enable_thinking,
-        Some(true)
-    );
-}
-
-#[test]
-fn canonical_reasoning_disabled_turns_off_chat_template_thinking() {
+fn canonical_reasoning_does_not_override_chat_template_thinking() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
         "messages": [{"role": "user", "content": "hello"}],
@@ -1890,11 +2061,11 @@ fn canonical_reasoning_disabled_turns_off_chat_template_thinking() {
     .unwrap();
 
     let options = chat_template_options(&request).unwrap();
-    assert_eq!(options.enable_thinking, Some(false));
+    assert_eq!(options.enable_thinking, None);
 }
 
 #[test]
-fn reasoning_effort_none_turns_off_chat_template_thinking() {
+fn reasoning_effort_does_not_override_chat_template_thinking() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
         "messages": [{"role": "user", "content": "hello"}],
@@ -1903,11 +2074,11 @@ fn reasoning_effort_none_turns_off_chat_template_thinking() {
     .unwrap();
 
     let options = chat_template_options(&request).unwrap();
-    assert_eq!(options.enable_thinking, Some(false));
+    assert_eq!(options.enable_thinking, None);
 }
 
 #[test]
-fn top_level_reasoning_effort_none_turns_off_chat_template_thinking() {
+fn top_level_reasoning_effort_does_not_override_chat_template_thinking() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
         "messages": [{"role": "user", "content": "hello"}],
@@ -1916,11 +2087,11 @@ fn top_level_reasoning_effort_none_turns_off_chat_template_thinking() {
     .unwrap();
 
     let options = chat_template_options(&request).unwrap();
-    assert_eq!(options.enable_thinking, Some(false));
+    assert_eq!(options.enable_thinking, None);
 }
 
 #[test]
-fn provider_enable_thinking_overrides_canonical_reasoning() {
+fn provider_enable_thinking_does_not_override_chat_template_thinking() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
         "messages": [{"role": "user", "content": "hello"}],
@@ -1930,11 +2101,11 @@ fn provider_enable_thinking_overrides_canonical_reasoning() {
     .unwrap();
 
     let options = chat_template_options(&request).unwrap();
-    assert_eq!(options.enable_thinking, Some(true));
+    assert_eq!(options.enable_thinking, None);
 }
 
 #[test]
-fn chat_template_kwargs_enable_thinking_is_supported() {
+fn chat_template_kwargs_enable_thinking_does_not_override_template() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
         "messages": [{"role": "user", "content": "hello"}],
@@ -1943,11 +2114,11 @@ fn chat_template_kwargs_enable_thinking_is_supported() {
     .unwrap();
 
     let options = chat_template_options(&request).unwrap();
-    assert_eq!(options.enable_thinking, Some(false));
+    assert_eq!(options.enable_thinking, None);
 }
 
 #[test]
-fn thinking_boolean_aliases_are_supported() {
+fn thinking_boolean_aliases_do_not_override_chat_template_thinking() {
     for field in openai_frontend::THINKING_BOOLEAN_ALIASES {
         let request: ChatCompletionRequest = serde_json::from_value(json!({
             "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
@@ -1957,7 +2128,7 @@ fn thinking_boolean_aliases_are_supported() {
         .unwrap();
         assert_eq!(
             chat_template_options(&request).unwrap().enable_thinking,
-            Some(false),
+            None,
             "top-level alias {field}"
         );
 
@@ -1969,14 +2140,14 @@ fn thinking_boolean_aliases_are_supported() {
         .unwrap();
         assert_eq!(
             chat_template_options(&request).unwrap().enable_thinking,
-            Some(false),
+            None,
             "chat_template_kwargs alias {field}"
         );
     }
 }
 
 #[test]
-fn reasoning_max_tokens_enables_and_zero_budget_disables_thinking() {
+fn reasoning_budget_does_not_override_chat_template_thinking() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
         "messages": [{"role": "user", "content": "hello"}],
@@ -1985,7 +2156,7 @@ fn reasoning_max_tokens_enables_and_zero_budget_disables_thinking() {
     .unwrap();
     assert_eq!(
         chat_template_options(&request).unwrap().enable_thinking,
-        Some(true)
+        None
     );
 
     let request: ChatCompletionRequest = serde_json::from_value(json!({
@@ -1997,7 +2168,7 @@ fn reasoning_max_tokens_enables_and_zero_budget_disables_thinking() {
     .unwrap();
     assert_eq!(
         chat_template_options(&request).unwrap().enable_thinking,
-        Some(false)
+        None
     );
 }
 

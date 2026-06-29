@@ -1,7 +1,7 @@
 use super::{
     binary_full_prefill_record_identities, decode_record_tokens_sideband,
-    prepare_binary_stage_connection, restore_prefill_decode_as_decode_message,
-    token_sideband_or_fill,
+    is_decode_frame_batch_candidate, native_mtp_enabled_from, prepare_binary_stage_connection,
+    restore_prefill_decode_as_decode_message, token_sideband_or_fill,
 };
 use std::{
     io,
@@ -14,7 +14,8 @@ use std::{
 use crate::kv_integration::KvStageIntegration;
 use crate::runtime_state::RuntimeState;
 use skippy_protocol::binary::{
-    StageSamplingConfig, StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
+    StageReplyStats, StageSamplingConfig, StageStateHeader, StageWireMessage, WireActivationDType,
+    WireMessageKind,
 };
 use skippy_protocol::{
     LoadMode, PeerConfig, StageConfig, StageKvCacheConfig, StageKvCacheMode, StageKvCachePayload,
@@ -50,6 +51,66 @@ fn accepted_binary_stage_connection_is_blocking() {
     assert_ne!(flags, -1);
     assert_eq!(flags & libc::O_NONBLOCK, 0);
     drop(client.join().unwrap());
+}
+
+#[test]
+fn native_mtp_enabled_flag_defaults_on_and_accepts_false_values() {
+    assert!(native_mtp_enabled_from(None));
+    assert!(native_mtp_enabled_from(Some("1")));
+    assert!(native_mtp_enabled_from(Some("true")));
+    assert!(!native_mtp_enabled_from(Some("0")));
+    assert!(!native_mtp_enabled_from(Some("false")));
+    assert!(!native_mtp_enabled_from(Some(" disabled ")));
+}
+
+#[test]
+fn request_summary_tracks_verify_span_compute_ms() {
+    let config = prefix_cache_test_config();
+    let mut summary = super::BinaryRequestSummary::default();
+    let verify = test_message(WireMessageKind::VerifySpan, 2);
+    let decode = test_message(WireMessageKind::DecodeEmbd, 1);
+
+    summary.observe(summary_observation(&config, &verify, 12.5));
+    summary.observe(summary_observation(&config, &decode, 7.0));
+
+    assert_eq!(summary.verify_span_count, 1);
+    assert_eq!(summary.verify_span_token_count, 2);
+    assert_eq!(summary.verify_span_max_tokens, 2);
+    assert_eq!(summary.verify_span_compute_ms, 12.5);
+    assert_eq!(summary.verify_span_input_activation_decode_ms, 1.25);
+    assert_eq!(summary.verify_span_runtime_lock_hold_ms, 2.5);
+    assert_eq!(summary.verify_span_upstream_reply_ms, 0.75);
+    assert_eq!(summary.compute_ms, 19.5);
+    assert_eq!(summary.input_activation_decode_ms, 2.5);
+    assert_eq!(summary.runtime_lock_hold_ms, 5.0);
+    assert_eq!(summary.upstream_reply_ms, 1.5);
+}
+
+#[test]
+fn request_summary_tracks_auto_align_totals() {
+    let config = prefix_cache_test_config();
+    let mut summary = super::BinaryRequestSummary::default();
+    let verify = test_message(WireMessageKind::VerifySpan, 2);
+    let decode = test_message(WireMessageKind::DecodeEmbd, 1);
+
+    let mut verify_observation = summary_observation(&config, &verify, 12.5);
+    verify_observation.session_auto_align_count = 1;
+    verify_observation.session_auto_align_ms = 0.75;
+    verify_observation.session_auto_align_trimmed_tokens = 1;
+    summary.observe(verify_observation);
+
+    let mut decode_observation = summary_observation(&config, &decode, 7.0);
+    decode_observation.session_auto_align_count = 1;
+    decode_observation.session_auto_align_ms = 1.25;
+    decode_observation.session_auto_align_trimmed_tokens = 2;
+    summary.observe(decode_observation);
+
+    assert_eq!(summary.session_auto_align_count, 2);
+    assert_eq!(summary.session_auto_align_ms, 2.0);
+    assert_eq!(summary.session_auto_align_trimmed_tokens, 3);
+    assert_eq!(summary.verify_span_session_auto_align_count, 1);
+    assert_eq!(summary.verify_span_session_auto_align_ms, 0.75);
+    assert_eq!(summary.verify_span_session_auto_align_trimmed_tokens, 1);
 }
 
 #[test]
@@ -168,6 +229,7 @@ fn prefix_cache_test_config() -> StageConfig {
             shared_prefix_stride_tokens: 128,
             shared_prefix_record_limit: 2,
         }),
+        native_mtp_enabled: true,
         load_mode: LoadMode::RuntimeSlice,
         bind_addr: "127.0.0.1:0".to_string(),
         upstream: None,
@@ -176,6 +238,58 @@ fn prefix_cache_test_config() -> StageConfig {
             stage_index: 1,
             endpoint: "127.0.0.1:0".to_string(),
         }),
+    }
+}
+
+fn test_message(kind: WireMessageKind, token_count: i32) -> StageWireMessage {
+    StageWireMessage {
+        kind,
+        pos_start: 0,
+        token_count,
+        state: StageStateHeader::new(kind, WireActivationDType::F16),
+        request_id: 11,
+        session_id: 13,
+        sampling: None,
+        chat_sampling_metadata: None,
+        tokens: Vec::new(),
+        positions: Vec::new(),
+        activation: Vec::new(),
+        raw_bytes: Vec::new(),
+    }
+}
+
+fn summary_observation<'a>(
+    config: &'a StageConfig,
+    message: &'a StageWireMessage,
+    compute_ms: f64,
+) -> super::BinaryMessageObservation<'a> {
+    super::BinaryMessageObservation {
+        config,
+        message,
+        reply_stats: StageReplyStats::default(),
+        compute_ms,
+        forward_write_ms: 0.0,
+        downstream_wait_ms: 0.0,
+        upstream_reply_ms: 0.75,
+        message_elapsed_ms: compute_ms,
+        input_activation_decode_ms: 1.25,
+        forward_activation_encode_ms: 0.0,
+        runtime_lock_hold_ms: 2.5,
+        input_activation_bytes: 0,
+        output_activation_bytes: 0,
+        prefill_credit_limit: 0,
+        pending_prefill_replies_before: 0,
+        pending_prefill_replies_after: 0,
+        credit_wait_count: 0,
+        deferred_prefill_replies_drained: 0,
+        session_auto_align_count: 0,
+        session_auto_align_ms: 0.0,
+        session_auto_align_trimmed_tokens: 0,
+        verify_span_pre_compute_ms: 0.25,
+        verify_span_post_compute_ms: 0.5,
+        verify_span_pre_reply_ms: 0.0,
+        verify_span_after_reply_ms: 0.0,
+        upstream_message_wait_ms: 0.0,
     }
 }
 
@@ -249,6 +363,23 @@ fn decode_record_tokens_sideband_rejects_wrong_checkpoint_len() {
 
     assert!(decode_record_tokens_sideband(&message).is_none());
     assert_eq!(token_sideband_or_fill(&message).unwrap(), vec![104]);
+}
+
+#[test]
+fn decode_frame_batch_candidate_keeps_intermediate_decode_batching() {
+    let config = prefix_cache_test_config();
+    let message = first_decode_message_with_full_prompt_sideband();
+
+    assert!(is_decode_frame_batch_candidate(&config, &message, &[104]));
+}
+
+#[test]
+fn decode_frame_batch_candidate_skips_final_output_stage() {
+    let mut config = prefix_cache_test_config();
+    config.downstream = None;
+    let message = first_decode_message_with_full_prompt_sideband();
+
+    assert!(!is_decode_frame_batch_candidate(&config, &message, &[104]));
 }
 
 #[test]

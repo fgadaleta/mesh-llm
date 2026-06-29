@@ -3,16 +3,29 @@ use super::super::{
     http::{respond_error, respond_json, respond_runtime_error},
     status::decode_runtime_model_path,
 };
+use super::control_apply_diagnostics::{
+    LocalControlApplyDiagnosticPayload, local_control_apply_diagnostic_payload,
+    local_control_apply_diagnostic_payload_from_local,
+};
+use super::runtime_control_state::collect_runtime_config_control_state_payload;
+use crate::config_schema::{EngineConfigSchemaDescriptor, export_runtime_config_schema_reference};
 use crate::crypto::{
     OwnerKeychainLoadError, keystore_metadata, load_keystore, load_owner_keypair_from_keychain,
 };
+use crate::plugin::validate_config_diagnostics_with_installed_plugin_schemas;
 use mesh_client::{
     ClientBuilder, ControlPlaneBootstrapOptions, ControlPlaneClientError, ControlPlaneConnection,
     InviteToken, OwnerControlRemoteError,
 };
+use mesh_llm_config::{
+    ConfigConditionValue, ConfigControlAvailabilitySource, ConfigDisabledWritePolicy,
+    ConfigOptionsSource,
+};
+use mesh_llm_config::{ConfigDiagnosticSeverity, legacy_validation_error_text};
 use mesh_llm_node::serving::{UnloadOptions, UnloadTarget};
 use openai_frontend::GuardrailMode;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use tokio::io::AsyncWriteExt;
@@ -48,6 +61,10 @@ async fn handle_get(
         "/api/runtime/endpoints" => handle_runtime_endpoints(stream, state).await,
         "/api/runtime/processes" => handle_runtime_processes(stream, state).await,
         "/api/runtime/stages" => handle_runtime_stages(stream, state).await,
+        "/api/runtime/config-schema" => handle_runtime_config_schema(stream).await,
+        "/api/runtime/config-control-state" => {
+            handle_runtime_config_control_state(stream, state).await
+        }
         "/api/runtime/control-bootstrap" => handle_control_bootstrap(stream, state).await,
         "/api/events" => handle_events(stream, state).await,
         _ => Ok(()),
@@ -68,6 +85,7 @@ async fn handle_post(
         "/api/runtime/control/apply-config" => {
             handle_control_apply_config(stream, state, body).await
         }
+        "/api/runtime/config/validate" => handle_runtime_config_validate(stream, body).await,
         "/api/runtime/mesh-guardrails" => handle_set_mesh_guardrails(stream, state, body).await,
         "/api/runtime/models" => handle_load_model(stream, state, body).await,
         _ => Ok(()),
@@ -95,6 +113,34 @@ async fn handle_control_bootstrap(stream: &mut TcpStream, state: &MeshApi) -> an
     respond_json(stream, 200, &state.control_bootstrap().await).await
 }
 
+async fn handle_runtime_config_schema(stream: &mut TcpStream) -> anyhow::Result<()> {
+    if !ensure_loopback_control_caller(stream).await? {
+        return Ok(());
+    }
+
+    match export_runtime_config_schema_reference(std::iter::empty::<EngineConfigSchemaDescriptor>())
+    {
+        Ok(schema) => respond_json(stream, 200, &schema).await,
+        Err(error) => respond_error(stream, 500, &error.to_string()).await,
+    }
+}
+
+async fn handle_runtime_config_control_state(
+    stream: &mut TcpStream,
+    state: &MeshApi,
+) -> anyhow::Result<()> {
+    if !ensure_loopback_control_caller(stream).await? {
+        return Ok(());
+    }
+
+    respond_json(
+        stream,
+        200,
+        &collect_runtime_config_control_state_payload(state).await,
+    )
+    .await
+}
+
 #[derive(Debug, Deserialize)]
 struct ControlEndpointRequest {
     endpoint: Option<String>,
@@ -105,6 +151,19 @@ struct ApplyConfigRequest {
     endpoint: Option<String>,
     expected_revision: u64,
     config: crate::plugin::MeshConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawApplyConfigRequest {
+    endpoint: Option<String>,
+    expected_revision: u64,
+    config: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ValidateConfigRequest {
+    toml: String,
+    path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +189,18 @@ struct LocalControlApplyPayload {
     apply_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    diagnostics: Vec<LocalControlApplyDiagnosticPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalConfigValidatePayload {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    diagnostics: Vec<LocalControlApplyDiagnosticPayload>,
 }
 
 #[derive(Debug, Serialize)]
@@ -139,6 +210,38 @@ struct LocalControlErrorPayload {
     legacy_retry_allowed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     current_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct ConfigControlStatePayload {
+    #[serde(default)]
+    pub(crate) settings: BTreeMap<String, ConfigControlStateEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ConfigControlStateEntry {
+    pub(crate) enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
+    pub(crate) source: ConfigControlAvailabilitySource,
+    pub(crate) write_policy: ConfigDisabledWritePolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) options: Option<Vec<ConfigControlOption>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ConfigControlOption {
+    pub(crate) value: ConfigConditionValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
+    pub(crate) disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+    pub(crate) source: ConfigOptionsSource,
 }
 
 async fn handle_control_get_config(
@@ -217,14 +320,50 @@ async fn handle_control_apply_config(
     if !ensure_loopback_control_caller(stream).await? {
         return Ok(());
     }
-    let request: ApplyConfigRequest = match serde_json::from_str(body) {
+    let raw_request: RawApplyConfigRequest = match serde_json::from_str(body) {
         Ok(request) => request,
         Err(_) => return respond_error(stream, 400, "Invalid JSON body").await,
+    };
+    let raw_config_toml = toml::to_string(&raw_request.config).ok();
+    let request = ApplyConfigRequest {
+        endpoint: raw_request.endpoint,
+        expected_revision: raw_request.expected_revision,
+        config: match serde_json::from_value(raw_request.config) {
+            Ok(config) => config,
+            Err(_) => return respond_error(stream, 400, "Invalid JSON body").await,
+        },
     };
     let endpoint = match required_control_endpoint(request.endpoint) {
         Ok(endpoint) => endpoint,
         Err(error) => return respond_control_error(stream, error).await,
     };
+    let diagnostics = validate_config_diagnostics_with_installed_plugin_schemas(
+        &request.config,
+        raw_config_toml.as_deref(),
+    );
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == ConfigDiagnosticSeverity::Error)
+    {
+        return respond_json(
+            stream,
+            200,
+            &LocalControlApplyPayload {
+                success: false,
+                current_revision: request.expected_revision,
+                config_hash: hex::encode(crate::protocol::convert::canonical_config_hash(
+                    &crate::protocol::convert::mesh_config_to_proto(&request.config),
+                )),
+                apply_mode: "unspecified".to_string(),
+                error: Some(legacy_validation_error_text(&diagnostics)),
+                diagnostics: diagnostics
+                    .iter()
+                    .map(local_control_apply_diagnostic_payload_from_local)
+                    .collect(),
+            },
+        )
+        .await;
+    }
     match connect_owner_control_client(state, &endpoint).await {
         Ok(client) => {
             let result = client
@@ -245,6 +384,11 @@ async fn handle_control_apply_config(
                             config_hash: hex::encode(response.config_hash),
                             apply_mode: control_apply_mode_label(response.apply_mode),
                             error: response.error,
+                            diagnostics: response
+                                .diagnostics
+                                .iter()
+                                .map(local_control_apply_diagnostic_payload)
+                                .collect(),
                         },
                     )
                     .await
@@ -254,6 +398,54 @@ async fn handle_control_apply_config(
         }
         Err(error) => respond_control_error(stream, error).await,
     }
+}
+
+async fn handle_runtime_config_validate(stream: &mut TcpStream, body: &str) -> anyhow::Result<()> {
+    if !ensure_loopback_control_caller(stream).await? {
+        return Ok(());
+    }
+
+    let request: ValidateConfigRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(_) => return respond_error(stream, 400, "Invalid JSON body").await,
+    };
+
+    let config: crate::plugin::MeshConfig = match toml::from_str(&request.toml) {
+        Ok(config) => config,
+        Err(error) => {
+            return respond_json(
+                stream,
+                200,
+                &LocalConfigValidatePayload {
+                    ok: false,
+                    path: request.path,
+                    error: Some(format!("Invalid config TOML: {error}")),
+                    diagnostics: Vec::new(),
+                },
+            )
+            .await;
+        }
+    };
+
+    let diagnostics =
+        validate_config_diagnostics_with_installed_plugin_schemas(&config, Some(&request.toml));
+    let ok = diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.severity != ConfigDiagnosticSeverity::Error);
+    respond_json(
+        stream,
+        200,
+        &LocalConfigValidatePayload {
+            ok,
+            path: request.path,
+            error: None,
+            diagnostics: diagnostics
+                .iter()
+                .map(local_control_apply_diagnostic_payload_from_local)
+                .collect(),
+        },
+    )
+    .await
 }
 
 async fn connect_owner_control_client(
@@ -665,44 +857,79 @@ async fn handle_load_model(
         return respond_error(stream, 503, "Runtime control unavailable").await;
     };
 
-    let parsed: Result<serde_json::Value, _> = serde_json::from_str(body);
-    match parsed {
-        Ok(val) => {
-            let spec = val["model"].as_str().unwrap_or("").to_string();
-            if spec.is_empty() {
-                respond_error(stream, 400, "Missing 'model' field").await?;
-            } else {
-                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                let _ = control_tx.send(RuntimeControlRequest::Load {
-                    spec,
-                    resp: resp_tx,
-                });
-                match resp_rx.await {
-                    Ok(Ok(loaded)) => {
-                        respond_json(
-                            stream,
-                            201,
-                            &serde_json::json!({
-                                "loaded": loaded.model,
-                                "instance_id": loaded.instance_id,
-                            }),
-                        )
-                        .await?;
-                    }
-                    Ok(Err(e)) => {
-                        respond_runtime_error(stream, &e.to_string()).await?;
-                    }
-                    Err(_) => {
-                        respond_error(stream, 503, "Runtime control unavailable").await?;
-                    }
-                }
-            }
+    let (spec, profile) = match parse_runtime_load_request(body) {
+        Ok((spec, profile)) => (spec, profile),
+        Err(RuntimeLoadRequestParseError::InvalidJson) => {
+            respond_error(stream, 400, "Invalid JSON body").await?;
+            return Ok(());
+        }
+        Err(RuntimeLoadRequestParseError::MissingModel) => {
+            respond_error(stream, 400, "Missing 'model' field").await?;
+            return Ok(());
+        }
+    };
+
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    let _ = control_tx.send(RuntimeControlRequest::Load {
+        spec,
+        profile,
+        resp: resp_tx,
+    });
+    match resp_rx.await {
+        Ok(Ok(loaded)) => {
+            respond_json(
+                stream,
+                201,
+                &serde_json::json!({
+                    "loaded": loaded.model,
+                    "instance_id": loaded.instance_id,
+                }),
+            )
+            .await?;
+        }
+        Ok(Err(e)) => {
+            respond_runtime_error(stream, &e.to_string()).await?;
         }
         Err(_) => {
-            respond_error(stream, 400, "Invalid JSON body").await?;
+            respond_error(stream, 503, "Runtime control unavailable").await?;
         }
     }
+
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RuntimeLoadRequestParseError {
+    InvalidJson,
+    MissingModel,
+}
+
+fn parse_runtime_load_request(
+    body: &str,
+) -> Result<(String, String), RuntimeLoadRequestParseError> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| RuntimeLoadRequestParseError::InvalidJson)?;
+    let model = value
+        .get("model")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or(RuntimeLoadRequestParseError::MissingModel)?;
+    let (model_ref, profile) = parse_model_with_profile(model);
+    Ok((model_ref.to_string(), profile.to_string()))
+}
+
+fn parse_model_with_profile(model: &str) -> (&str, &str) {
+    if let Some(hash_pos) = model.rfind('#') {
+        let model_ref = &model[..hash_pos];
+        let profile = &model[hash_pos + 1..];
+        if profile.is_empty() {
+            (model_ref, "")
+        } else {
+            (model_ref, profile)
+        }
+    } else {
+        (model, "")
+    }
 }
 
 async fn handle_unload_model(
@@ -851,7 +1078,10 @@ async fn handle_events(stream: &mut TcpStream, state: &MeshApi) -> anyhow::Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{GuardrailMode, is_loopback_control_caller, parse_guardrail_mode};
+    use super::{
+        GuardrailMode, RuntimeLoadRequestParseError, is_loopback_control_caller,
+        parse_guardrail_mode, parse_model_with_profile, parse_runtime_load_request,
+    };
 
     #[test]
     fn loopback_control_caller_accepts_localhost_only() {
@@ -888,5 +1118,40 @@ mod tests {
     fn parse_guardrail_mode_rejects_unknown_labels() {
         assert_eq!(parse_guardrail_mode(""), None);
         assert_eq!(parse_guardrail_mode("strict"), None);
+    }
+
+    #[test]
+    fn parse_runtime_load_request_with_profile() {
+        assert_eq!(
+            parse_runtime_load_request(r#"{"model": "Qwen3-8B#low-ctx"}"#).unwrap(),
+            ("Qwen3-8B".to_string(), "low-ctx".to_string()),
+        );
+        assert_eq!(
+            parse_runtime_load_request(r#"{"model": "Qwen3-8B"}"#).unwrap(),
+            ("Qwen3-8B".to_string(), String::new()),
+        );
+    }
+
+    #[test]
+    fn parse_runtime_load_request_missing_model() {
+        assert!(matches!(
+            parse_runtime_load_request(r#"{"foo": "bar"}"#),
+            Err(RuntimeLoadRequestParseError::MissingModel)
+        ));
+    }
+
+    #[test]
+    fn parse_runtime_load_request_rejects_invalid_json() {
+        assert!(matches!(
+            parse_runtime_load_request("invalid"),
+            Err(RuntimeLoadRequestParseError::InvalidJson)
+        ));
+    }
+
+    #[test]
+    fn parse_model_with_profile_from_runtime_route() {
+        let (model_ref, profile) = parse_model_with_profile("Qwen3-8B#low-ctx");
+        assert_eq!(model_ref, "Qwen3-8B");
+        assert_eq!(profile, "low-ctx");
     }
 }

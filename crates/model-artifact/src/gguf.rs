@@ -239,6 +239,7 @@ pub struct GgufCompactMeta {
     pub rope_freq_base: f32,
     pub expert_count: u32,
     pub expert_used_count: u32,
+    pub nextn_predict_layers: u32,
 }
 
 impl GgufCompactMeta {
@@ -489,21 +490,28 @@ pub fn scan_gguf_compact_meta(path: &Path) -> Option<GgufCompactMeta> {
             if let Ok(Some(v)) = read_gguf_value_as_u32(&mut f, vtype) {
                 meta.expert_used_count = v;
             }
+        } else if key.ends_with(".nextn_predict_layers") {
+            if let Ok(Some(v)) = read_gguf_value_as_u32(&mut f, vtype) {
+                meta.nextn_predict_layers = v;
+            }
         } else {
             skip_gguf_value(&mut f, vtype).ok()?;
         }
     }
 
-    if meta.key_length == 0
-        && meta.head_count > 0
-        && let Some(key_length) = meta.embedding_size.checked_div(meta.head_count)
-    {
+    let derived_key_length = (meta.key_length == 0 && meta.head_count > 0)
+        .then(|| meta.embedding_size.checked_div(meta.head_count))
+        .flatten();
+    if let Some(key_length) = derived_key_length {
         meta.key_length = key_length;
     }
-    if meta.value_length == 0
-        && let Some(effective_kv) = meta.effective_kv_head_count()
-        && let Some(value_length) = meta.embedding_size.checked_div(effective_kv)
-    {
+    let derived_value_length = (meta.value_length == 0)
+        .then(|| {
+            meta.effective_kv_head_count()
+                .and_then(|effective_kv| meta.embedding_size.checked_div(effective_kv))
+        })
+        .flatten();
+    if let Some(value_length) = derived_value_length {
         meta.value_length = value_length;
     }
 
@@ -799,6 +807,25 @@ mod tests {
         assert_eq!(meta.effective_kv_head_count(), Some(8));
         assert_eq!(meta.k_cache_bytes_per_token_f16(), Some(49_152));
         assert_eq!(meta.v_cache_bytes_per_token_f16(), Some(49_152));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scan_gguf_compact_meta_preserves_nextn_predict_layers() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&2i64.to_le_bytes());
+        push_gguf_string(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&(GgufType::String as u32).to_le_bytes());
+        push_gguf_string(&mut bytes, "deepseek2");
+        push_u32_kv(&mut bytes, "deepseek2.nextn_predict_layers", 1);
+
+        let path = write_bytes("model-artifact-gguf-nextn", &bytes);
+        let meta = scan_gguf_compact_meta(&path).expect("should parse GGUF");
+        assert_eq!(meta.architecture, "deepseek2");
+        assert_eq!(meta.nextn_predict_layers, 1);
         let _ = std::fs::remove_file(path);
     }
 
