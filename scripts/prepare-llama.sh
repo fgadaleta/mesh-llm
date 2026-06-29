@@ -125,15 +125,56 @@ while IFS= read -r patch; do
   PATCHES+=("$patch")
 done < <(find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' | sort)
 
+python_bin() {
+  local candidate
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    local python
+    python="$(python_bin)" || {
+      echo "shasum, sha256sum, or python is required" >&2
+      return 1
+    }
+    "$python" -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$1"
+  fi
+}
+
+sha256_stream() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    local python
+    python="$(python_bin)" || {
+      echo "shasum, sha256sum, or python is required" >&2
+      return 1
+    }
+    "$python" -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+  fi
+}
+
 compute_patch_digest() {
   (
     for patch in "${PATCHES[@]}"; do
       rel="${patch#$PATCH_DIR/}"
-      checksum="$(shasum -a 256 "$patch" | awk '{print $1}')"
+      checksum="$(sha256_file "$patch")"
       printf '%s\n' "$rel"
       printf '%s\n' "$checksum"
     done
-  ) | shasum -a 256 | awk '{print $1}'
+  ) | sha256_stream
 }
 
 PATCH_DIGEST="$(compute_patch_digest)"
