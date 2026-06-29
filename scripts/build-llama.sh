@@ -180,6 +180,12 @@ case "$LLAMA_BACKEND" in
 esac
 
 USE_SCCACHE="${LLAMA_STAGE_USE_SCCACHE:-${SKIPPY_USE_SCCACHE:-1}}"
+if [[ "$USE_SCCACHE" != "0" && -n "$SCCACHE_BIN" ]] &&
+   ! "$SCCACHE_BIN" --start-server >/dev/null 2>&1; then
+  echo "sccache failed to start; llama.cpp build will run without compiler caching" >&2
+  USE_SCCACHE=0
+fi
+
 if [[ "$USE_SCCACHE" != "0" && -n "$SCCACHE_BIN" ]]; then
   CMAKE_ARGS+=(
     -DCMAKE_C_COMPILER_LAUNCHER="$SCCACHE_BIN"
