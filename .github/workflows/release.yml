@@ -1167,6 +1167,11 @@ jobs:
             throw "CUDA_PATH was not configured by Jimver/cuda-toolkit."
           }
           & nvcc --version
+      - name: Initialize MSVC for CUDA
+        if: ${{ matrix.backend == 'cuda' }}
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       - name: Install backend SDK
         if: ${{ matrix.backend != 'cuda' }}
         shell: pwsh
