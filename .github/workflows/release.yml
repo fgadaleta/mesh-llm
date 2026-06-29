@@ -1232,7 +1232,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          persist-credentials: false
+          persist-credentials: true
           fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
