@@ -203,7 +203,6 @@ pub fn plugin_server_info_full(
             .enable_resources_list_changed()
             .enable_resources_subscribe()
             .enable_completions()
-            .enable_logging()
             .enable_tasks()
             .build(),
     )
