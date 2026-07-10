@@ -13,6 +13,12 @@ mod runtime_surface_help;
 
 pub use runtime_surface_help::runtime_surface_help;
 
+#[cfg(test)]
+mod setup_tests;
+
+#[cfg(test)]
+mod uninstall_tests;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum BinaryFlavor {
     #[default]
@@ -729,6 +735,57 @@ pub enum Command {
         json: bool,
         #[command(subcommand)]
         command: Option<DoctorCommand>,
+    },
+    /// Bootstrap a new installation.
+    Setup {
+        /// Automatically answer yes to prompts.
+        #[arg(long)]
+        yes: bool,
+        /// Run without prompting for interactive input.
+        #[arg(long = "no-interactive")]
+        no_interactive: bool,
+        /// Install and enable the mesh-llm service.
+        #[arg(long, conflicts_with = "no_service")]
+        service: bool,
+        /// Skip installing and enabling the mesh-llm service.
+        #[arg(long = "no-service", conflicts_with = "service")]
+        no_service: bool,
+        /// Skip downloading or configuring the native runtime.
+        #[arg(long = "skip-runtime")]
+        skip_runtime: bool,
+        /// Print detailed setup paths, commands, and follow-up guidance.
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Remove mesh-llm binaries, service files, and optional caches.
+    Uninstall {
+        /// Print what would be removed without changing the machine.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not prompt before removing files and services.
+        #[arg(long)]
+        yes: bool,
+        /// Preserve native runtime caches.
+        #[arg(long)]
+        keep_cache: bool,
+        /// Preserve setup-owned service helper files.
+        #[arg(long)]
+        keep_service_files: bool,
+        /// Also remove ~/.mesh-llm configuration and identity data.
+        #[arg(long, conflicts_with = "keep_config")]
+        purge_config: bool,
+        /// Explicitly preserve ~/.mesh-llm configuration and identity data.
+        #[arg(long, conflicts_with = "purge_config")]
+        keep_config: bool,
+        /// Override the installed binary path to remove.
+        #[arg(long)]
+        binary_path: Option<std::path::PathBuf>,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+        /// Print detailed cleanup steps and removed paths.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Load a local model into a running mesh-llm instance.
     Load {
