@@ -10,6 +10,9 @@ Catalog id definition: a catalog id is the model id shown in `mesh-llm models re
 ```bash
 mesh-llm --help
 mesh-llm <command> --help
+mesh-llm setup --help
+mesh-llm uninstall --help
+mesh-llm doctor --help
 mesh-llm serve --help
 mesh-llm client --help
 mesh-llm --help-advanced
@@ -27,42 +30,61 @@ the complete runtime option surface.
 mesh-llm --version
 ```
 
-Release builds report the released package version, such as `mesh-llm 0.68.0`.
-Local source builds may include build metadata, such as `mesh-llm 0.68.0+gABCDEF.dirty`, so you can tell exactly which commit produced the binary. Compatibility checks, native-runtime cache paths, and release identity still use the plain release version.
+Release builds report the released package version, such as `mesh-llm 0.72.1`.
+Local source builds may include build metadata, such as `mesh-llm 0.72.1+gABCDEF.dirty`, so you can tell exactly which commit produced the binary. Compatibility checks, native-runtime cache paths, and release identity still use the plain release version.
 
 ## Start here (common tasks)
 
 If you want to:
 
-1. Start serving right away:
+1. Finish a fresh install:
+
+```bash
+mesh-llm setup
+```
+
+2. Start serving on this machine:
+
+```bash
+mesh-llm serve --model Qwen3-0.6B-Q4_K_M
+```
+
+3. Join the public mesh:
 
 ```bash
 mesh-llm serve --auto
 ```
 
-2. Find a model you can run:
+4. Find a model you can run:
 
 ```bash
 mesh-llm models search gemma --gguf
 mesh-llm models search smoll --mlx
 ```
 
-3. Inspect a model before downloading:
+5. Inspect a model before downloading:
 
 ```bash
 mesh-llm models show unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL
 ```
 
-4. Download a model:
+6. Download a model:
 
 ```bash
 mesh-llm models download unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL
 ```
 
-5. Check what is already installed:
+7. Check what is already installed:
 
 ```bash
 mesh-llm models installed
+```
+
+8. Remove the executable and setup-owned files:
+
+```bash
+mesh-llm uninstall --dry-run
+mesh-llm uninstall --yes
 ```
 
 ## Runtime entrypoints (`serve` / `client`)
@@ -72,20 +94,100 @@ If you want to start serving, join a mesh, or run as an API-only client, start h
 Examples:
 
 ```bash
+mesh-llm setup
 mesh-llm serve
 mesh-llm serve --model Qwen3-0.6B-Q4_K_M
 mesh-llm client --auto
 ```
 
-Use `mesh-llm serve --help` for the common serving flags, including `--model`,
-`--gguf`, `--auto`, `--join`, ports, and logging. Use
-`mesh-llm client --help` for client-only mesh operation when this machine should
-join or discover a mesh without serving a local model.
+### `setup`
 
-Runtime switches:
+Use this to finish a fresh install after the executable is on your `PATH`.
+
+`mesh-llm setup` downloads and configures the native runtime, can install and
+enable the background service on supported macOS and Linux machines, and only
+shows the GitHub star prompt when it is interactive and eligible. The star
+prompt defaults to Yes, and `--yes` or `--no-interactive` skip it without
+starring anything. Default output is concise; use `--verbose` when you want
+service paths, commands, log locations, and detailed setup status.
+
+Usage:
+
+```bash
+mesh-llm setup
+mesh-llm setup --service
+mesh-llm setup --no-service --skip-runtime
+mesh-llm setup --yes
+mesh-llm setup --verbose
+```
+
+Switches:
+
+- `--yes`: automatically answer yes to setup prompts. This accepts the service prompt and skips the GitHub star prompt.
+- `--no-interactive`: run without prompting. When service is not requested, setup prints guidance to rerun with `--service`.
+- `--service`: install and enable the background service.
+- `--no-service`: skip installing and enabling the background service.
+- `--skip-runtime`: skip downloading or configuring the native runtime.
+- `--verbose`: print detailed service paths, commands, log locations, and setup status.
+
+On Windows, `--service` is unsupported.
+
+### `uninstall`
+
+Use this to remove a Mesh executable install and setup-owned service/runtime files from a machine.
+
+By default, uninstall stops tracked `mesh-llm` processes, disables and removes
+the per-user service when present, removes setup-owned service helper files,
+removes the native-runtime cache, and removes the executable last. It preserves
+`~/.mesh-llm` configuration and identity data unless you explicitly pass
+`--purge-config`.
+
+Usage:
+
+```bash
+mesh-llm uninstall --dry-run
+mesh-llm uninstall --yes
+mesh-llm uninstall --yes --keep-cache
+mesh-llm uninstall --yes --purge-config
+mesh-llm uninstall --verbose --dry-run
+```
+
+Switches:
+
+- `--dry-run`: print the cleanup plan without changing the machine.
+- `--yes`: run without a confirmation prompt.
+- `--json`: print dry-run plans and outcomes as JSON.
+- `--verbose`: print detailed cleanup steps and removed paths.
+- `--keep-cache`: preserve downloaded native runtimes.
+- `--keep-service-files`: preserve setup-owned service helper files.
+- `--purge-config`: remove `~/.mesh-llm` configuration and identity data.
+- `--keep-config`: explicitly preserve configuration and identity data.
+- `--binary-path <PATH>`: remove a specific executable path.
+
+If the setup service configuration directory contains unrelated files,
+uninstall leaves that directory in place and reports a warning instead of
+recursively deleting it. Default text output is concise; use `--verbose` when
+you want the full cleanup plan or exact removed paths.
+
+### `doctor`
+
+Use this only when troubleshooting a failed install or runtime problem. It gathers local status, runtime diagnostics, and logs.
+
+Usage:
+
+```bash
+mesh-llm doctor
+```
+
+Switches:
+
+- `--json`: machine-readable output.
+
+### Common runtime options
 
 - `--join <TOKEN>`: join a specific mesh using an invite token (repeatable).
 - `--discover [NAME]`: discover a mesh via Nostr and join it. With a name, joins the mesh matching that name. Without a name, behaves like `--auto`.
+- `--mesh-discovery-mode <nostr|mdns>`: choose public Nostr or LAN mDNS discovery. mDNS is LAN-scoped and still requires an invite token for joining.
 - `--auto`: auto-join the best discovered mesh.
 - `--model <MODEL>`: model to serve (catalog id from `models recommended`, HF ref/URL, or path).
 - `--gguf <GGUF>`: serve a specific local GGUF file directly (repeatable).
@@ -116,11 +218,15 @@ Subcommands:
 
 - `recommended`
 - `installed`
+- `cleanup`
+- `prune`
 - `search`
 - `show`
 - `download`
+- `package`
 - `certify`
 - `updates`
+- `delete`
 
 ### `models recommended`
 
@@ -137,6 +243,29 @@ Run this when you want to see what’s already on your machine.
 Switches:
 
 - `--json`: machine-readable output.
+
+### `models cleanup`
+
+Preview or remove stale managed model-cache entries:
+
+```bash
+mesh-llm models cleanup
+mesh-llm models cleanup --unused-since 30d --yes
+```
+
+Use `--json` for machine-readable output. The default is a preview; `--yes`
+applies the removal.
+
+### `models prune`
+
+Preview or remove stale derived Skippy stage artifacts:
+
+```bash
+mesh-llm models prune
+mesh-llm models prune --yes
+```
+
+The default is a preview and active or pinned stage artifacts are preserved.
 
 ### `models search`
 
@@ -190,6 +319,21 @@ Switches:
 - `--direct`: download the exact HuggingFace GGUF file directly, bypassing catalog layer-package resolution.
 - `--json`: machine-readable output.
 
+### `models package`
+
+Plan or submit a Hugging Face Job that splits a source GGUF into a Skippy
+layer-package repository. The default is a dry run; `--confirm` is required to
+submit a spend-bearing job.
+
+```bash
+mesh-llm models package unsloth/Qwen3-8B-GGUF:Q4_K_M --dry-run
+mesh-llm models package unsloth/Qwen3-8B-GGUF:Q4_K_M --confirm --follow
+mesh-llm models package --status <JOB_ID>
+```
+
+Use `--help` for the full planning, status, logs, cancel, and publishing
+options.
+
 ### `models certify`
 
 Use this when you want a repeatable Skippy layer-package confidence report
@@ -235,6 +379,11 @@ Switches:
 - `--check`: check only; do not refresh cache.
 - `--json`: machine-readable output.
 
+### `models delete`
+
+Remove a managed model entry. Run `mesh-llm models delete --help` first to
+review the current confirmation and selection options.
+
 ### `download`
 
 Use this to quickly download by built-in catalog ID or shorthand.
@@ -260,6 +409,21 @@ Switches:
 - `--flavor <FLAVOR>`: install or switch to a specific release bundle flavor (`cpu`, `cuda`, `rocm`, `vulkan`, or `metal`).
 - `--detect-flavor`: re-detect the best host backend flavor before selecting the release bundle. Cannot be combined with `--flavor`.
 - `--auto-update`: available on most commands; when set, mesh-llm checks for a newer bundled release before proceeding.
+
+### `runtime`
+
+Inspect and manage installed native runtimes:
+
+```bash
+mesh-llm runtime list
+mesh-llm runtime install
+mesh-llm runtime install cuda13
+mesh-llm runtime remove <RUNTIME_ID>
+mesh-llm runtime prune --active-only
+```
+
+Use `--json` for machine-readable output. Runtime selection is constrained by
+the running Mesh version, platform, backend, and Skippy ABI.
 
 
 ### `gpus`
@@ -352,6 +516,81 @@ Switches:
 - `--auto`: print best invite token (useful for piping).
 - `--relay <RELAY>`: custom relay URL(s).
 
+### `benchmark`
+
+Use this to benchmark model-serving throughput and import prompt corpora. The
+`benchmark` command has two subcommands: `tune` and `import-prompts`.
+
+#### `benchmark tune`
+
+Tune model-serving settings by running isolated throughput trials against one or
+more local model targets. Trials sweep candidate values and recommend the best
+configuration.
+
+Usage:
+
+```bash
+mesh-llm benchmark tune
+mesh-llm benchmark tune --model Qwen3-0.6B-Q4_K_M
+mesh-llm benchmark tune --models Qwen3-0.6B-Q4_K_M,gemma-4-31B-it-Q4_K_M
+mesh-llm benchmark tune --model Qwen3-0.6B-Q4_K_M --ctx-sizes 4096,8192 --batch-sizes 512,1024 --ubatch-sizes 256,512
+mesh-llm benchmark tune --model Qwen3-0.6B-Q4_K_M --apply
+mesh-llm benchmark tune --model Qwen3-0.6B-Q4_K_M --apply --replace-existing
+mesh-llm benchmark tune --model Qwen3-0.6B-Q4_K_M --launch-args
+```
+
+Core tuning switches:
+
+- `--model <MODEL>`: tune one specific local/configured model target.
+- `--models <MODELS>`: tune multiple local/configured model targets (comma-separated). Conflicts with `--model`.
+- `--json`: print machine-readable JSON output.
+- `--apply`: persist the recommended settings to the local config file (`~/.mesh-llm/config.toml`).
+- `--replace-existing`: when persisting, overwrite existing writable recommendation fields instead of preserving current values.
+- `--launch-args`: print the exact `mesh-llm serve` arguments generated by the tune path instead of performing config application.
+- `--ctx-sizes <SIZES>`: context sizes to benchmark (comma-separated token counts).
+- `--batch-sizes <SIZES>`: batch sizes to benchmark (comma-separated).
+- `--ubatch-sizes <SIZES>`: micro-batch sizes to benchmark (comma-separated).
+- `--mmap-values <VALUES>`: mmap settings to benchmark independently (`auto`, `enabled`, `disabled`; comma-separated).
+- `--mlock-values <VALUES>`: mlock settings to benchmark independently (`enabled`, `disabled`; comma-separated).
+
+Speculative decoding tuning switches:
+
+- `--speculative-types <TYPES>`: speculative decoding types to sweep (`auto`, `disabled`, `mtp`, `draft`, `ngram`; comma-separated). Conflicts with `--no-speculative-tune`.
+- `--no-speculative-tune`: disable speculative decoding sweeps and only benchmark the disabled baseline.
+- `--spec-draft-models <PATHS>`: candidate draft GGUF paths for speculative draft mode (comma-separated).
+- `--spec-draft-max-tokens <N>`: candidate maximum draft-token windows for MTP and draft speculation (comma-separated).
+- `--spec-draft-min-tokens <N>`: candidate minimum draft-token windows for MTP and draft speculation (comma-separated).
+- `--spec-ngram-min <N>`: candidate minimum ngram draft-token counts (comma-separated).
+- `--spec-ngram-max <N>`: candidate maximum ngram draft-token counts (comma-separated).
+
+Additional switches:
+
+- `--throughput-tolerance-pct <PCT>`: treat candidates within this percent of the raw best tok/s as throughput-equivalent (default `10.0`).
+- `--max-tokens <N>`: maximum generated tokens per benchmark request (default `128`).
+- `--startup-timeout-secs <SECS>`: startup wait limit for each benchmark trial (default `600`).
+- `--request-timeout-secs <SECS>`: HTTP request timeout for each benchmark request (default `600`).
+- `--debug-telemetry`: capture Skippy debug telemetry in each trial log.
+- `--prompt <PROMPT>`: prompt sent during benchmark trials (default `"Write a concise paragraph about distributed GPU inference."`).
+
+#### `benchmark import-prompts`
+
+Import a prompt corpus from a supported online source into local JSONL.
+
+Usage:
+
+```bash
+mesh-llm benchmark import-prompts --source mt-bench --output ./corpus.jsonl
+mesh-llm benchmark import-prompts --source gsm8k --limit 50 --max-tokens 512 --output ./eval.jsonl
+```
+
+Switches:
+
+- `--source <SOURCE>`: online source to import (`mt-bench`, `gsm8k`, `humaneval`).
+- `--limit <LIMIT>`: maximum number of prompts to import (default `20`).
+- `--max-tokens <N>`: optional per-prompt decode budget hint written into the corpus.
+- `--output <PATH>`: output JSONL path (required).
+
+
 ### `goose`
 
 Use this to launch Goose already wired to mesh-llm’s OpenAI-compatible endpoint.
@@ -398,13 +637,13 @@ Use this to stop local `mesh-llm` instances tracked in the runtime root.
 
 ### `blackboard` (plugin)
 
-Shared mesh notes — post, search, and read notes across the mesh. Blackboard was moved from a built-in command to an [installable plugin](plugins.md#using-plugins):
+Shared mesh notes — post, search, and read notes across the mesh. Blackboard was moved from a built-in command to an [installable plugin](/docs/pages/plugins/#use-plugin-features):
 
 ```bash
 mesh-llm plugins install blackboard
 ```
 
-Once installed, it runs as a managed plugin process when mesh-llm starts. See the [plugins documentation](plugins.md#using-plugins) for configuration and usage.
+Once installed, it runs as a managed plugin process when mesh-llm starts. See the [plugins documentation](/docs/pages/plugins/#use-plugin-features) for configuration and usage.
 
 ### `plugins` / `plugin`
 
@@ -423,7 +662,7 @@ Subcommands:
 - `plugins search [query]`: search the plugin catalog.
 - `plugins list`: list installed/configured plugins.
 
-See [plugins documentation](plugins.md#using-plugins) for more detail.
+See [plugins documentation](/docs/pages/plugins/#use-plugin-features) for more detail.
 
 
 ### `auth`

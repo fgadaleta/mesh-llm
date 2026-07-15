@@ -164,9 +164,74 @@ pub fn validate_config_diagnostics(config: &MeshConfig) -> Vec<ConfigDiagnostic>
         }
     }
 
+    collect_legacy_draft_model_path_warnings(config, &mut diagnostics);
+
     validate_duplicate_model_entries(&config.models, &mut diagnostics);
 
     diagnostics
+}
+
+fn collect_legacy_draft_model_path_warnings(
+    config: &MeshConfig,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    if let Some(speculative) = config
+        .defaults
+        .as_ref()
+        .and_then(|d| d.speculative.as_ref())
+        .filter(|s| s.legacy_draft_model_path_used)
+    {
+        // Only warn when the value looks like a model identifier (a ':' that
+        // sits after the last '/', as in `Org/Name:Q4_K_M`). Bare local paths
+        // including Windows-style absolutes like `C:/models/draft.gguf` put
+        // their ':' before the slash and are not identifiers, so they cannot
+        // be migrated to draft_model without failing identifier validation.
+        if speculative
+            .draft_model
+            .as_deref()
+            .is_some_and(looks_like_model_identifier)
+        {
+            diagnostics.push(alias_diagnostic(
+                ConfigPath::from_fields(["defaults", "speculative", "draft_model_path"]),
+                ConfigPath::from_fields(["defaults", "speculative", "draft_model"]),
+                "draft_model_path is deprecated; rename to draft_model",
+            ));
+        }
+    }
+    for (index, model) in config.models.iter().enumerate() {
+        if let Some(speculative) = model
+            .speculative
+            .as_ref()
+            .filter(|s| s.legacy_draft_model_path_used)
+        {
+            // Only warn when the value looks like a model identifier (a ':'
+            // that sits after the last '/', as in `Org/Name:Q4_K_M`). Bare
+            // local paths including Windows-style absolutes like
+            // `C:/models/draft.gguf` cannot be migrated to draft_model
+            // without failing identifier validation.
+            if speculative
+                .draft_model
+                .as_deref()
+                .is_some_and(looks_like_model_identifier)
+            {
+                let mut used_path =
+                    ConfigPath::from_fields(["models", "speculative", "draft_model_path"]);
+                used_path
+                    .segments
+                    .insert(1, ConfigPathSegment::Index { index });
+                let mut canonical_path =
+                    ConfigPath::from_fields(["models", "speculative", "draft_model"]);
+                canonical_path
+                    .segments
+                    .insert(1, ConfigPathSegment::Index { index });
+                diagnostics.push(alias_diagnostic(
+                    used_path,
+                    canonical_path,
+                    "draft_model_path is deprecated; rename to draft_model",
+                ));
+            }
+        }
+    }
 }
 
 fn validate_runtime_config(config: &RuntimeConfig) -> DiagnosticResult {
@@ -245,10 +310,13 @@ pub fn built_in_support_diagnostic(
 
 pub fn validate_config(config: &MeshConfig) -> Result<()> {
     let diagnostics = validate_config_diagnostics(config);
-    if diagnostics.is_empty() {
-        Ok(())
-    } else {
+    let has_errors = diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == ConfigDiagnosticSeverity::Error);
+    if has_errors {
         Err(anyhow::anyhow!(legacy_validation_error_text(&diagnostics)))
+    } else {
+        Ok(())
     }
 }
 
@@ -812,7 +880,7 @@ fn validate_skippy(config: &SkippyConfig, base_path: &str) -> DiagnosticResult {
 fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> DiagnosticResult {
     validate_optional_enum(
         config.strategy.as_deref(),
-        &["auto", "disabled", "native-mtp-n1"],
+        &["auto", "disabled", "mtp"],
         &format!("{base_path}.strategy"),
     )?;
     validate_optional_enum(
@@ -820,9 +888,10 @@ fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Diagnost
         &["auto", "disabled", "draft", "ngram"],
         &format!("{base_path}.mode"),
     )?;
-    validate_optional_path(
-        config.draft_model_path.as_deref(),
-        &format!("{base_path}.draft_model_path"),
+    validate_model_identifier(
+        config.draft_model.as_deref(),
+        &format!("{base_path}.draft_model"),
+        config.legacy_draft_model_path_used,
     )?;
     validate_hf_pair(
         config.draft_hf_repo.as_deref(),
@@ -849,7 +918,7 @@ fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Diagnost
     validate_optional_u32_range(
         config.draft_min_tokens,
         &format!("{base_path}.draft_min_tokens"),
-        1,
+        0,
         10_000_000,
     )?;
     validate_optional_u32_range(
@@ -918,7 +987,7 @@ fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Diagnost
         &format!("{base_path}.spec_default"),
     )?;
     if config.mode.as_deref() == Some("draft")
-        && config.draft_model_path.is_none()
+        && config.draft_model.is_none()
         && config.draft_hf_repo.is_none()
         && config.draft_selection_policy.is_none()
     {
@@ -1400,6 +1469,54 @@ fn validate_optional_path(value: Option<&str>, path: &str) -> DiagnosticResult {
     Ok(())
 }
 
+/// Heuristic for distinguishing a model identifier (`Org/Name:Q4_K_M`) from a
+/// bare filesystem path (`/models/draft.gguf`, `C:/models/draft.gguf`). The
+/// strict identifier validator requires a `':'` separator, but a Windows-style
+/// absolute path also contains a `':'` immediately after the drive letter.
+/// Identifiers place the quantization marker *after* the last `/`, so this
+/// returns true only when the value contains a `:` that follows a `/`.
+fn looks_like_model_identifier(value: &str) -> bool {
+    let Some(colon) = value.rfind(':') else {
+        return false;
+    };
+    match value.rfind('/') {
+        Some(slash) => colon > slash,
+        None => false,
+    }
+}
+
+/// Validate that a `draft_model` value is a model identifier (e.g. `Qwen/Qwen3-0.6B:Q4_K_M`),
+/// not a bare file path. Identifiers must contain a `:` quantization marker that follows
+/// the last `/`, so that Windows-style absolute paths like `C:/models/draft.gguf` are not
+/// mistaken for identifiers. When `legacy_path_used` is true, the value is treated as a
+/// filesystem path and the identifier-shape check is skipped; `validate_path_chars` is still
+/// applied so NUL bytes and control characters are rejected on legacy paths too.
+fn validate_model_identifier(
+    value: Option<&str>,
+    path: &str,
+    legacy_path_used: bool,
+) -> DiagnosticResult {
+    if let Some(value) = value {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            // Reject NUL bytes and control characters regardless of which key
+            // supplied the value; legacy paths should not bypass path-char
+            // validation.
+            validate_path_chars(trimmed, path)?;
+            if !legacy_path_used && !looks_like_model_identifier(trimmed) {
+                return Err(validation_diagnostic(
+                    path,
+                    format!(
+                        "{path} must be a model identifier (e.g. \"Qwen/Qwen3-0.6B:Q4_K_M\"), \
+                         not a bare file path; use the legacy `draft_model_path` key for local paths"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_path_chars(value: &str, path: &str) -> DiagnosticResult {
     if value.contains('\0') {
         return Err(validation_diagnostic(
@@ -1568,6 +1685,8 @@ fn validate_telemetry_config(config: &TelemetryConfig) -> DiagnosticResult {
 #[cfg(test)]
 mod schema_tests {
     use super::*;
+
+    include!("validate_gpu_tune_tests.rs");
 
     #[test]
     fn schema_diagnostic_constructors_preserve_paths_and_legacy_message() {
@@ -1789,6 +1908,52 @@ strategy = "mystery-oracle"
     }
 
     #[test]
+    fn speculative_strategy_native_mtp_n1_alias_parses_as_mtp() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[defaults.speculative]
+strategy = "native-mtp-n1"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let strategy = config
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.speculative.as_ref())
+            .and_then(|speculative| speculative.strategy.as_deref());
+        assert_eq!(strategy, Some("mtp"));
+        validate_config(&config).expect("normalized speculative strategy should not fail");
+        assert!(validate_config_diagnostics(&config).is_empty());
+    }
+
+    #[test]
+    fn speculative_strategy_native_mtp_n1_raw_value_is_invalid() {
+        let config = MeshConfig {
+            defaults: Some(ModelConfigDefaults {
+                speculative: Some(SpeculativeConfig {
+                    strategy: Some("native-mtp-n1".to_string()),
+                    ..SpeculativeConfig::default()
+                }),
+                ..ModelConfigDefaults::default()
+            }),
+            ..MeshConfig::default()
+        };
+
+        let diagnostics = validate_config_diagnostics(&config);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].path.as_ref().map(ConfigPath::render),
+            Some("defaults.speculative.strategy".to_string())
+        );
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("defaults.speculative.strategy must be one of")
+        );
+    }
+
+    #[test]
     fn legacy_validation_errors_derive_compatible_string_messages() {
         let config: MeshConfig = toml::from_str(
             r#"
@@ -1876,6 +2041,203 @@ model = "my-model"
         assert!(
             text.contains("and default profile"),
             "expected 'and default profile' in error, got: {text}"
+        );
+    }
+
+    #[test]
+    fn draft_model_rejects_bare_path_without_colon() {
+        let config = MeshConfig {
+            defaults: Some(ModelConfigDefaults {
+                speculative: Some(SpeculativeConfig {
+                    strategy: Some("mtp".to_string()),
+                    draft_model: Some("/models/draft.gguf".to_string()),
+                    ..SpeculativeConfig::default()
+                }),
+                ..ModelConfigDefaults::default()
+            }),
+            ..MeshConfig::default()
+        };
+
+        let diagnostics = validate_config_diagnostics(&config);
+        let text = legacy_validation_error_text(&diagnostics);
+        assert!(
+            text.contains("must be a model identifier"),
+            "expected identifier validation error, got: {text}"
+        );
+    }
+
+    #[test]
+    fn legacy_draft_model_path_skips_identifier_validation() {
+        let config = MeshConfig {
+            defaults: Some(ModelConfigDefaults {
+                speculative: Some(SpeculativeConfig {
+                    strategy: Some("mtp".to_string()),
+                    draft_model: Some("/models/draft.gguf".to_string()),
+                    legacy_draft_model_path_used: true,
+                    ..SpeculativeConfig::default()
+                }),
+                ..ModelConfigDefaults::default()
+            }),
+            ..MeshConfig::default()
+        };
+
+        let diagnostics = validate_config_diagnostics(&config);
+        let text = legacy_validation_error_text(&diagnostics);
+        assert!(
+            !text.contains("must be a model identifier"),
+            "expected no identifier error when legacy path used, got: {text}"
+        );
+    }
+
+    #[test]
+    fn draft_model_accepts_identifier_with_colon() {
+        let config = MeshConfig {
+            defaults: Some(ModelConfigDefaults {
+                speculative: Some(SpeculativeConfig {
+                    strategy: Some("mtp".to_string()),
+                    draft_model: Some("Qwen/Qwen3-0.6B:Q4_K_M".to_string()),
+                    ..SpeculativeConfig::default()
+                }),
+                ..ModelConfigDefaults::default()
+            }),
+            ..MeshConfig::default()
+        };
+
+        let diagnostics = validate_config_diagnostics(&config);
+        let text = legacy_validation_error_text(&diagnostics);
+        assert!(
+            !text.contains("must be a model identifier"),
+            "expected no identifier error for valid identifier, got: {text}"
+        );
+    }
+
+    #[test]
+    fn legacy_draft_model_path_emits_migration_warning() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[defaults.speculative]
+strategy = "mtp"
+draft_model_path = "Qwen/Qwen3-8B-GGUF:Q4_K_M"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let diagnostics = validate_config_diagnostics(&config);
+        let alias_diag = diagnostics.iter().find(|d| {
+            d.code == crate::diagnostic::ConfigDiagnosticCode::AliasApplied
+                && d.message.contains("draft_model_path")
+        });
+        assert!(
+            alias_diag.is_some(),
+            "expected legacy alias warning for draft_model_path, got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn legacy_draft_model_path_bare_path_suppresses_migration_warning() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[defaults.speculative]
+strategy = "mtp"
+draft_model_path = "/models/draft.gguf"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let diagnostics = validate_config_diagnostics(&config);
+        let alias_diag = diagnostics.iter().find(|d| {
+            d.code == crate::diagnostic::ConfigDiagnosticCode::AliasApplied
+                && d.message.contains("draft_model_path")
+        });
+        assert!(
+            alias_diag.is_none(),
+            "bare path draft_model_path should not emit migration warning, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn legacy_draft_model_path_windows_style_absolute_suppresses_migration_warning() {
+        // The previous `contains(':')` heuristic falsely fired for
+        // Windows-style absolute paths like `C:/models/draft.gguf` because
+        // they contain a `:` after the drive letter. The fix requires the
+        // colon quantization marker to follow the last `/`, so the path-like
+        // value is no longer mistaken for an identifier.
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[defaults.speculative]
+strategy = "mtp"
+draft_model_path = "C:/models/draft.gguf"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let diagnostics = validate_config_diagnostics(&config);
+        let alias_diag = diagnostics.iter().find(|d| {
+            d.code == crate::diagnostic::ConfigDiagnosticCode::AliasApplied
+                && d.message.contains("draft_model_path")
+        });
+        assert!(
+            alias_diag.is_none(),
+            "Windows-style absolute path draft_model_path should not emit migration warning, got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn legacy_draft_model_path_rejects_nul_bytes() {
+        // Legacy-path values should not bypass `validate_path_chars`. A NUL
+        // byte inside a `draft_model_path` value must be rejected even when
+        // `legacy_draft_model_path_used` is true.
+        let config = MeshConfig {
+            defaults: Some(ModelConfigDefaults {
+                speculative: Some(SpeculativeConfig {
+                    strategy: Some("mtp".to_string()),
+                    draft_model: Some("bad\0path".to_string()),
+                    legacy_draft_model_path_used: true,
+                    ..SpeculativeConfig::default()
+                }),
+                ..ModelConfigDefaults::default()
+            }),
+            ..MeshConfig::default()
+        };
+
+        let diagnostics = validate_config_diagnostics(&config);
+        let text = legacy_validation_error_text(&diagnostics);
+        assert!(
+            text.contains("must not contain NUL bytes"),
+            "expected NUL-byte rejection on legacy path, got: {text}"
+        );
+    }
+
+    #[test]
+    fn legacy_draft_model_path_rejects_control_characters() {
+        // Control characters must also be rejected on legacy-path values.
+        let config = MeshConfig {
+            defaults: Some(ModelConfigDefaults {
+                speculative: Some(SpeculativeConfig {
+                    strategy: Some("mtp".to_string()),
+                    draft_model: Some("bad\u{0001}path".to_string()),
+                    legacy_draft_model_path_used: true,
+                    ..SpeculativeConfig::default()
+                }),
+                ..ModelConfigDefaults::default()
+            }),
+            ..MeshConfig::default()
+        };
+
+        let diagnostics = validate_config_diagnostics(&config);
+        let text = legacy_validation_error_text(&diagnostics);
+        assert!(
+            text.contains("must not contain control characters"),
+            "expected control-character rejection on legacy path, got: {text}"
         );
     }
 

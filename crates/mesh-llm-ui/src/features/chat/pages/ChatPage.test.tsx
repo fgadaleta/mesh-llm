@@ -1,9 +1,10 @@
-import { configure, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, configure, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { MultimodalContent } from '@tanstack/ai-client'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CHAT_HARNESS } from '@/features/app-tabs/data'
 import { APP_STORAGE_KEYS } from '@/features/app-tabs/data'
+import { DEFAULT_SYSTEM_PROMPT } from '@/constants/system-prompt'
 import { ChatSessionProvider } from '@/features/chat/api/chat-session'
 import { loadChatState, saveChatState, trimThreadMessages } from '@/features/chat/api/chat-storage'
 import { ChatLayout } from '@/features/chat/layouts/ChatLayout'
@@ -299,13 +300,17 @@ vi.mock('@/features/chat/api/use-chat', async () => {
                     chatMock.createUiMessage(`assistant-${chatMock.sendCalls.length}`, 'assistant', '')
                   )
                 }
+                chatMock.messagesByConversation.set(conversationId, optimisticMessages)
                 setMessages(optimisticMessages)
               }
               if (chatMock.sendOptimisticStatusBeforeError) {
+                chatMock.statusByConversation.set(conversationId, chatMock.sendStatus)
                 setStatus(chatMock.sendStatus)
                 await Promise.resolve()
               }
               const sendError = new Error(chatMock.sendErrorMessage)
+              chatMock.errorByConversation.set(conversationId, sendError)
+              chatMock.statusByConversation.set(conversationId, 'error')
               setError(sendError)
               setStatus('error')
               if (chatMock.sendErrorResolves) {
@@ -320,6 +325,9 @@ vi.mock('@/features/chat/api/use-chat', async () => {
               chatMock.createUiMessage(userMessageId, 'user', body),
               chatMock.createUiMessage(assistantMessageId, 'assistant', chatMock.sendAssistantText)
             ]
+            chatMock.messagesByConversation.set(conversationId, nextMessages)
+            chatMock.statusByConversation.set(conversationId, chatMock.sendStatus)
+            chatMock.errorByConversation.set(conversationId, undefined)
             setMessages(nextMessages)
             if (chatMock.sendResponseMetadata) {
               onResponseMetadata?.({ messageId: assistantMessageId, ...chatMock.sendResponseMetadata })
@@ -348,6 +356,12 @@ vi.mock('@/features/chat/api/use-chat', async () => {
               )
             ]
 
+            chatMock.messagesByConversation.set(conversationId, nextMessages)
+            chatMock.statusByConversation.set(conversationId, chatMock.reloadStatus)
+            chatMock.errorByConversation.set(
+              conversationId,
+              chatMock.reloadErrorMessage ? new Error(chatMock.reloadErrorMessage) : undefined
+            )
             setMessages(nextMessages)
             setStatus(chatMock.reloadStatus)
             setError(chatMock.reloadErrorMessage ? new Error(chatMock.reloadErrorMessage) : undefined)
@@ -435,7 +449,15 @@ function setLocalTime(date: Date, hours: number, minutes: number) {
   return timestamp
 }
 
+async function expectPartialAssistantReply() {
+  await waitFor(() => expect(screen.getByText('Partial assistant reply')).toBeInTheDocument())
+}
+
 describe('ChatPage', () => {
+  afterEach(() => {
+    cleanup()
+  })
+
   beforeEach(() => {
     scrollIntoViewMock.mockClear()
     createObjectUrlMock.mockClear()
@@ -588,6 +610,25 @@ describe('ChatPage', () => {
     expect(screen.queryByRole('button', { name: 'System prompt' })).not.toBeInTheDocument()
   })
 
+  it('sends the default system prompt while the editor feature flag is disabled', async () => {
+    const user = userEvent.setup()
+
+    renderChatPage()
+
+    expect(screen.queryByRole('button', { name: 'System prompt' })).not.toBeInTheDocument()
+
+    await user.type(screen.getByLabelText('Prompt'), 'Tell me about mesh-llm')
+    await user.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => {
+      expect(chatMock.sendCalls[0]).toMatchObject({
+        content: 'Tell me about mesh-llm',
+        model: 'mesh',
+        systemPrompt: DEFAULT_SYSTEM_PROMPT
+      })
+    })
+  })
+
   it('opens, saves, prefills, and sends the chat-wide system prompt for new chats', async () => {
     const user = userEvent.setup()
 
@@ -628,7 +669,7 @@ describe('ChatPage', () => {
     })
   })
 
-  it('does not send a persisted system prompt while the feature flag is disabled', async () => {
+  it('sends a persisted system prompt while the editor feature flag is disabled', async () => {
     const user = userEvent.setup()
     window.localStorage.setItem(APP_STORAGE_KEYS.chatSystemPrompt, 'Hidden saved instruction')
 
@@ -643,7 +684,7 @@ describe('ChatPage', () => {
       expect(chatMock.sendCalls[0]).toMatchObject({
         content: 'Route without hidden instructions',
         model: 'mesh',
-        systemPrompt: ''
+        systemPrompt: 'Hidden saved instruction'
       })
     })
   })
@@ -928,7 +969,7 @@ describe('ChatPage', () => {
     await user.type(screen.getByLabelText('Prompt'), 'Continue this while I leave')
     await user.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(await screen.findByText('Partial assistant reply')).toBeInTheDocument()
+    await expectPartialAssistantReply()
     expect(screen.getByLabelText('Generating response')).toBeInTheDocument()
 
     await waitFor(() => {
@@ -968,7 +1009,7 @@ describe('ChatPage', () => {
       </FeatureFlagProvider>
     )
 
-    expect(await screen.findByText('Partial assistant reply')).toBeInTheDocument()
+    await expectPartialAssistantReply()
     expect(screen.getByLabelText('Generating response')).toBeInTheDocument()
     expect(chatMock.hookConversationIds).toContain(streamingConversationId)
   })
@@ -981,7 +1022,7 @@ describe('ChatPage', () => {
     await user.type(screen.getByLabelText('Prompt'), 'Write a long story')
     await user.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(await screen.findByText('Partial assistant reply')).toBeInTheDocument()
+    await expectPartialAssistantReply()
     expect(screen.getByLabelText('Generating response')).toBeInTheDocument()
 
     await waitFor(() => {
@@ -1007,7 +1048,7 @@ describe('ChatPage', () => {
 
     await user.click(screen.getAllByRole('button', { name: /Write a long story/i })[0])
 
-    expect(await screen.findByText('Partial assistant reply')).toBeInTheDocument()
+    await expectPartialAssistantReply()
     expect(screen.getByLabelText('Generating response')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Stop streaming' })).toHaveTextContent('Streaming response...')
     expect(chatMock.stopCalls).toHaveLength(0)
@@ -1023,7 +1064,7 @@ describe('ChatPage', () => {
     await user.type(screen.getByLabelText('Prompt'), 'First streaming prompt')
     await user.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(await screen.findByText('Partial assistant reply')).toBeInTheDocument()
+    await expectPartialAssistantReply()
 
     await waitFor(() => {
       const latestState = vi.mocked(saveChatState).mock.calls.at(-1)?.[1]
@@ -1076,7 +1117,7 @@ describe('ChatPage', () => {
     await user.type(screen.getByLabelText('Prompt'), 'First stream stays alive')
     await user.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(await screen.findByText('Partial assistant reply')).toBeInTheDocument()
+    await expectPartialAssistantReply()
 
     let firstStreamingConversationId = ''
     await waitFor(() => {
@@ -1090,6 +1131,8 @@ describe('ChatPage', () => {
     await user.click(screen.getByRole('button', { name: 'New' }))
     await user.type(screen.getByLabelText('Prompt'), 'Second stream also stays alive')
     await user.click(screen.getByRole('button', { name: 'Send' }))
+
+    await expectPartialAssistantReply()
 
     let secondStreamingConversationId = ''
     await waitFor(() => {
@@ -1126,7 +1169,7 @@ describe('ChatPage', () => {
     await user.type(screen.getByLabelText('Prompt'), 'First stream stays alive')
     await user.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(await screen.findByText('Partial assistant reply')).toBeInTheDocument()
+    await expectPartialAssistantReply()
 
     let firstStreamingConversationId = ''
     await waitFor(() => {
@@ -1139,6 +1182,8 @@ describe('ChatPage', () => {
     await user.click(screen.getByRole('button', { name: 'New' }))
     await user.type(screen.getByLabelText('Prompt'), 'Second stream also stays alive')
     await user.click(screen.getByRole('button', { name: 'Send' }))
+
+    await expectPartialAssistantReply()
 
     let secondStreamingConversationId = ''
     await waitFor(() => {
@@ -1207,7 +1252,7 @@ describe('ChatPage', () => {
     await user.type(screen.getByLabelText('Prompt'), 'Write a long story')
     await user.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(await screen.findByText('Partial assistant reply')).toBeInTheDocument()
+    await expectPartialAssistantReply()
 
     await waitFor(() => {
       const latestState = vi.mocked(saveChatState).mock.calls.at(-1)?.[1]
@@ -1228,7 +1273,7 @@ describe('ChatPage', () => {
 
     expect(chatMock.stopCalls).toHaveLength(0)
     expect(chatMock.hookUnmounts.slice(hookUnmountsBeforeDelete)).not.toContain(streamingConversationId)
-    expect(await screen.findByText('Partial assistant reply')).toBeInTheDocument()
+    await expectPartialAssistantReply()
     expect(screen.getByLabelText('Generating response')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Stop streaming' })).toHaveTextContent('Streaming response...')
 
@@ -1283,7 +1328,7 @@ describe('ChatPage', () => {
 
     await user.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(await screen.findByText('Partial assistant reply')).toBeInTheDocument()
+    await expectPartialAssistantReply()
     await waitFor(() => expect(scrollIntoViewMock).toHaveBeenCalledWith({ block: 'end' }))
 
     const scrollTarget = scrollIntoViewMock.mock.contexts.at(-1) as HTMLElement | undefined
@@ -1308,7 +1353,7 @@ describe('ChatPage', () => {
 
     const userHeader = screen.getByText('You').parentElement
 
-    expect(userHeader).toHaveTextContent(chatMock.sendCalls[0]?.model ?? '')
+    await waitFor(() => expect(userHeader).toHaveTextContent(chatMock.sendCalls[0]?.model ?? ''))
     expect(userHeader).not.toHaveTextContent('2026-05-06')
     expect(await screen.findByText('Response with measured metadata')).toBeInTheDocument()
     expect(screen.getByText('unsloth/MiniMax-M2.5-GGUF:Q4_K_M')).toBeInTheDocument()
@@ -1560,7 +1605,7 @@ describe('ChatPage', () => {
     await user.type(screen.getByLabelText('Prompt'), 'Hello!')
     await user.click(screen.getByRole('button', { name: 'Send' }))
 
-    expect(await screen.findByText('Partial assistant reply')).toBeInTheDocument()
+    await expectPartialAssistantReply()
     await waitFor(() => {
       const latestState = vi.mocked(saveChatState).mock.calls.at(-1)?.[1]
       const activeConversationId = latestState?.activeConversationId

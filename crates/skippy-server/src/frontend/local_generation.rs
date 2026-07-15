@@ -11,7 +11,25 @@ impl StageOpenAiBackend {
         let result = (|| {
             let mut prompt_prefill_sample = None;
             let mut chat_sampling_configured = false;
-            if request.max_tokens > 0 && request.prompt_token_ids.len() > 1 && self.kv.is_none() {
+            let can_sample_whole_prompt_in_prefill = if request.max_tokens > 0
+                && request.prompt_token_ids.len() > 1
+                && self.kv.is_none()
+            {
+                let mut runtime = self
+                    .runtime
+                    .lock()
+                    .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
+                runtime
+                    .ensure_session_active(&session_id)
+                    .map_err(openai_backend_error)?;
+                let batch_size = runtime
+                    .session_batch_size(&session_id)
+                    .map_err(openai_backend_error)?;
+                prompt_fits_single_prefill_sample(request.prompt_token_ids.len(), batch_size)
+            } else {
+                false
+            };
+            if can_sample_whole_prompt_in_prefill {
                 if let Some(metadata) = request.chat_sampling_metadata {
                     let mut runtime = self
                         .runtime
@@ -492,6 +510,9 @@ impl StageOpenAiBackend {
             let generation_hooks_active =
                 self.generation_hooks_active(&hook_request, hook_runtime.as_ref());
             let emit_token_debug = self.telemetry.is_debug_enabled();
+            let native_mtp_options = NativeMtpDecodeOptions::from_env()
+                .with_window(request.native_mtp_max_tokens, request.native_mtp_min_tokens);
+            let mut native_mtp = NativeMtpVerifier::default();
             let mut post_prefill_hook_checked = false;
             let mut last_mid_generation_hook_at = None;
             while !stopped && decoded_tokens < request.max_tokens as usize {
@@ -507,16 +528,65 @@ impl StageOpenAiBackend {
                 let token_signal;
                 let signal_window;
                 let decode_call_timer = PhaseTimer::start();
-                let outcome = self.decode_batcher.decode(
-                    &session_id,
-                    current,
-                    request.sampling.enabled.then_some(request.sampling),
-                )?;
-                current = outcome.predicted;
-                let token_batch_size = outcome.batch_size;
-                let token_batch_wait_ms = outcome.batch_wait_ms;
-                let token_runtime_lock_wait_ms = outcome.runtime_lock_wait_ms;
-                let token_runtime_lock_hold_ms = outcome.runtime_lock_hold_ms;
+                let mut native_mtp_draft;
+                let token_batch_size;
+                let token_batch_wait_ms;
+                let token_runtime_lock_wait_ms;
+                let token_runtime_lock_hold_ms;
+                if request.native_mtp_enabled {
+                    let lock_timer = PhaseTimer::start();
+                    let mut runtime = self
+                        .runtime
+                        .lock()
+                        .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
+                    token_runtime_lock_wait_ms = lock_timer.elapsed_ms();
+                    let hold_timer = PhaseTimer::start();
+                    let (predicted, draft) = runtime
+                        .decode_sampled_mtp(
+                            &session_id,
+                            current,
+                            request.sampling.enabled.then_some(request.sampling),
+                            native_mtp_options.max_draft_tokens,
+                        )
+                        .map_err(openai_backend_error)?;
+                    current = predicted;
+                    native_mtp_draft = draft.map(|draft| NativeMtpDraft {
+                        tokens: draft.token_ids,
+                        proposal_compute_us: draft.proposal_compute_us,
+                    });
+                    token_batch_size = 1;
+                    token_batch_wait_ms = 0.0;
+                    token_runtime_lock_hold_ms = hold_timer.elapsed_ms();
+                } else {
+                    let outcome = self.decode_batcher.decode(
+                        &session_id,
+                        current,
+                        request.sampling.enabled.then_some(request.sampling),
+                    )?;
+                    current = outcome.predicted;
+                    native_mtp_draft = None;
+                    token_batch_size = outcome.batch_size;
+                    token_batch_wait_ms = outcome.batch_wait_ms;
+                    token_runtime_lock_wait_ms = outcome.runtime_lock_wait_ms;
+                    token_runtime_lock_hold_ms = outcome.runtime_lock_hold_ms;
+                }
+                if native_mtp_draft
+                    .as_ref()
+                    .is_some_and(|draft: &NativeMtpDraft| {
+                        draft.tokens.len() < native_mtp_options.min_draft_tokens
+                    })
+                {
+                    native_mtp_draft = None;
+                }
+                let is_first_draft = decoded_tokens == 0;
+                let draft_origin = if is_first_draft {
+                    NativeMtpDraftOrigin::InitialSerial
+                } else {
+                    NativeMtpDraftOrigin::SerialAfterGap
+                };
+                let native_mtp_decision = request.native_mtp_enabled.then(|| {
+                    native_mtp.observe_target_token(current, 0, native_mtp_draft, draft_origin)
+                });
                 runtime_lock_wait_ms += token_runtime_lock_wait_ms;
                 runtime_lock_wait_max_ms = runtime_lock_wait_max_ms.max(token_runtime_lock_wait_ms);
                 runtime_lock_hold_ms += token_runtime_lock_hold_ms;
@@ -597,6 +667,12 @@ impl StageOpenAiBackend {
                         json!(token_runtime_lock_hold_ms),
                     );
                     token_attrs.insert("llama_stage.predicted_token".to_string(), json!(current));
+                    if let Some(native_mtp_decision) = native_mtp_decision {
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.verification".to_string(),
+                            json!(native_mtp_decision.label()),
+                        );
+                    }
                     token_attrs
                         .insert("llama_stage.message_kind".to_string(), json!("DecodeToken"));
                     self.emit_openai_phase("stage.openai_decode_token", token_timer, token_attrs);
@@ -644,6 +720,9 @@ impl StageOpenAiBackend {
                     stats,
                 );
             }
+            let native_mtp_stats = native_mtp.stats();
+            cache_stats.native_mtp_stats = native_mtp_stats;
+            native_mtp_stats.insert_attrs(&mut attrs);
             self.emit_openai_summary("stage.openai_decode", decode_timer, attrs);
             Ok(())
         })();
@@ -682,5 +761,29 @@ impl StageOpenAiBackend {
         }
         result?;
         Ok(cache_stats)
+    }
+}
+
+fn prompt_fits_single_prefill_sample(prompt_token_count: usize, session_batch_size: usize) -> bool {
+    prompt_token_count > 1 && prompt_token_count <= session_batch_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_fits_single_prefill_sample;
+
+    #[test]
+    fn single_prefill_sample_requires_prompt_to_fit_session_batch() {
+        assert!(!prompt_fits_single_prefill_sample(0, 2048));
+        assert!(!prompt_fits_single_prefill_sample(1, 2048));
+        assert!(prompt_fits_single_prefill_sample(2048, 2048));
+        assert!(!prompt_fits_single_prefill_sample(2049, 2048));
+    }
+
+    #[test]
+    fn local_native_mtp_decode_uses_non_frame_runtime_api() {
+        let source = include_str!("local_generation.rs");
+        assert!(source.contains(concat!(".decode", "_sampled_mtp(")));
+        assert!(!source.contains(concat!(".decode_frame", "_sampled_mtp(")));
     }
 }

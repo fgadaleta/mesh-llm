@@ -10,6 +10,9 @@ Catalog id definition: a catalog id is the model id shown in `mesh-llm models re
 ```bash
 mesh-llm --help
 mesh-llm <command> --help
+mesh-llm setup --help
+mesh-llm uninstall --help
+mesh-llm doctor --help
 mesh-llm models --help
 mesh-llm models <subcommand> --help
 ```
@@ -18,35 +21,54 @@ mesh-llm models <subcommand> --help
 
 If you want to:
 
-1. Start serving right away:
+1. Finish a fresh install:
+
+```bash
+mesh-llm setup
+```
+
+2. Start serving on this machine:
+
+```bash
+mesh-llm serve --model Qwen3-0.6B-Q4_K_M
+```
+
+3. Join the public mesh:
 
 ```bash
 mesh-llm serve --auto
 ```
 
-2. Find a model you can run:
+4. Find a model you can run:
 
 ```bash
 mesh-llm models search gemma --gguf
 mesh-llm models search smoll --mlx
 ```
 
-3. Inspect a model before downloading:
+5. Inspect a model before downloading:
 
 ```bash
 mesh-llm models show unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL
 ```
 
-4. Download a model:
+6. Download a model:
 
 ```bash
 mesh-llm models download unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL
 ```
 
-5. Check what is already installed:
+7. Check what is already installed:
 
 ```bash
 mesh-llm models installed
+```
+
+8. Remove the executable and setup-owned files:
+
+```bash
+mesh-llm uninstall --dry-run
+mesh-llm uninstall --yes
 ```
 
 ## Runtime entrypoints (`serve` / `client`)
@@ -56,12 +78,96 @@ If you want to start serving, join a mesh, or run as an API-only client, start h
 Examples:
 
 ```bash
+mesh-llm setup
 mesh-llm serve
 mesh-llm serve --model Qwen3-0.6B-Q4_K_M
 mesh-llm client --auto
 ```
 
-Runtime switches:
+### `setup`
+
+Use this to finish a fresh install after the executable is on your `PATH`.
+
+`mesh-llm setup` downloads and configures the native runtime, can install and
+enable the background service on supported macOS and Linux machines, and only
+shows the GitHub star prompt when it is interactive and eligible. The star
+prompt defaults to Yes, and `--yes` or `--no-interactive` skip it without
+starring anything. Default output is concise; use `--verbose` when you want
+service paths, commands, log locations, and detailed setup status.
+
+Usage:
+
+```bash
+mesh-llm setup
+mesh-llm setup --service
+mesh-llm setup --no-service --skip-runtime
+mesh-llm setup --yes
+mesh-llm setup --verbose
+```
+
+Switches:
+
+- `--yes`: automatically answer yes to setup prompts. This accepts the service prompt and skips the GitHub star prompt.
+- `--no-interactive`: run without prompting. When service is not requested, setup prints guidance to rerun with `--service`.
+- `--service`: install and enable the background service.
+- `--no-service`: skip installing and enabling the background service.
+- `--skip-runtime`: skip downloading or configuring the native runtime.
+- `--verbose`: print detailed service paths, commands, log locations, and setup status.
+
+On Windows, `--service` is unsupported.
+
+### `uninstall`
+
+Use this to remove a Mesh executable install and setup-owned service/runtime files from a machine.
+
+By default, uninstall stops tracked `mesh-llm` processes, disables and removes
+the per-user service when present, removes setup-owned service helper files,
+removes the native-runtime cache, and removes the executable last. It preserves
+`~/.mesh-llm` configuration and identity data unless you explicitly pass
+`--purge-config`.
+
+Usage:
+
+```bash
+mesh-llm uninstall --dry-run
+mesh-llm uninstall --yes
+mesh-llm uninstall --yes --keep-cache
+mesh-llm uninstall --yes --purge-config
+mesh-llm uninstall --verbose --dry-run
+```
+
+Switches:
+
+- `--dry-run`: print the cleanup plan without changing the machine.
+- `--yes`: run without a confirmation prompt.
+- `--json`: print dry-run plans and outcomes as JSON.
+- `--verbose`: print detailed cleanup steps and removed paths.
+- `--keep-cache`: preserve downloaded native runtimes.
+- `--keep-service-files`: preserve setup-owned service helper files.
+- `--purge-config`: remove `~/.mesh-llm` configuration and identity data.
+- `--keep-config`: explicitly preserve configuration and identity data.
+- `--binary-path <PATH>`: remove a specific executable path.
+
+If the setup service configuration directory contains unrelated files,
+uninstall leaves that directory in place and reports a warning instead of
+recursively deleting it. Default text output is concise; use `--verbose` when
+you want the full cleanup plan or exact removed paths.
+
+### `doctor`
+
+Use this only when troubleshooting a failed install or runtime problem. It gathers local status, runtime diagnostics, and logs.
+
+Usage:
+
+```bash
+mesh-llm doctor
+```
+
+Switches:
+
+- `--json`: machine-readable output.
+
+### Common runtime options
 
 - `--join <TOKEN>`: join a specific mesh using an invite token (repeatable).
 - `--discover [NAME]`: discover a mesh and join it. With a name, joins the mesh matching that name. Without a name, behaves like `--auto`.
@@ -225,6 +331,7 @@ mesh-llm models download mlx-community/SmolLM-135M-8bit
 Switches:
 
 - `--draft`: also download the recommended draft model (if available).
+- `--direct`: download the exact Hugging Face GGUF file directly, bypassing catalog layer-package resolution.
 - `--json`: machine-readable output.
 
 ### `models package`
@@ -337,6 +444,9 @@ Switches:
 Use this to update mesh-llm and exit.
 
 Switches:
+- `--version <VERSION>`: install a specific release tag or version, for example `v0.60.0`.
+- `--flavor <FLAVOR>`: install or switch to a specific release bundle flavor (`cpu`, `cuda`, `rocm`, `vulkan`, or `metal`).
+- `--detect-flavor`: re-detect the best host backend flavor before selecting the release bundle. Cannot be combined with `--flavor`.
 - `--auto-update`: available on most commands; when set, mesh-llm checks for a newer bundled release before proceeding.
 
 
@@ -368,8 +478,56 @@ is present, the command requires `--public-key-file` and otherwise reports
 
 ### `gpus`
 
-Use this to inspect local GPU identity and capacity, including per-device VRAM, unified-memory state, and cached benchmark-derived bandwidth when present.
+Use this to inspect local GPU identity and capacity, including per-device VRAM, unified-memory state, and cached benchmark-derived bandwidth when present. `mesh-llm gpus detect` refreshes the raw hardware fingerprint, bandwidth, and compute hints used by local planning.
 
+### `benchmark tune`
+
+Use this to benchmark model-serving throughput for already-downloaded local models. It resolves local targets, plans safe startup settings, then starts isolated trial `mesh-llm serve` children from temporary configs and reports per-candidate decode tok/s.
+
+The recommendation is tolerance-aware: benchmark tune reports the raw highest-throughput trial, computes the Pareto frontier for decode tok/s versus `ctx_size`, then recommends the largest context window whose decode throughput is within the configured tolerance of the raw best.
+
+Examples:
+
+```bash
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf
+mesh-llm benchmark tune --models /models/qwen3-8b.gguf,/models/mixtral.gguf --json
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --ctx-sizes 4096,8192,16384 --batch-sizes 1024,2048 --ubatch-sizes 256,512
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --mmap-values auto,true,false --mlock-values true,false
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --flash-attention on,off
+mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types auto
+mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types mtp --debug-telemetry --json
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --speculative-types draft,ngram,disabled --spec-draft-models /models/qwen3-draft.gguf --spec-draft-max-tokens 4,8,16 --spec-ngram-min 12,24 --spec-ngram-max 48,64
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --throughput-tolerance-pct 2.5
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --apply
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --apply --replace-existing
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --launch-args
+```
+
+Switches:
+
+- `--model <MODEL>`: benchmark one exact local model that is already downloaded.
+- `--models <MODELS>`: benchmark multiple exact local models, separated by commas.
+- `--json`: machine-readable benchmark tune report.
+- `--apply`: persist the recommended settings to the local config file (`~/.mesh-llm/config.toml`).
+- `--replace-existing`: when persisting, overwrite existing writable recommendation fields instead of preserving current values.
+- `--launch-args`: print the exact `mesh-llm serve` arguments generated for the recommendation path instead of running benchmark output/apply mode.
+- `--ctx-sizes <TOKENS>`: comma-separated context sizes to benchmark. If omitted, tune derives a small context ladder up to the planned context.
+- `--batch-sizes <VALUES>` / `--ubatch-sizes <VALUES>`: comma-separated batch and micro-batch values to benchmark. Candidates where `ubatch > batch` are skipped.
+- `--mmap-values <VALUES>`: comma-separated mmap values to benchmark independently: `auto`, `enabled`/`true`, or `disabled`/`false`. If omitted, benchmark tune tries all three.
+- `--mlock-values <VALUES>`: comma-separated mlock values to benchmark independently: `enabled`/`true` or `disabled`/`false`. If omitted, benchmark tune tries `false` and also tries `true` only when the mlock probe says the evaluated budget can be locked.
+- `--flash-attention <VALUES>`: comma-separated flash attention values to benchmark independently: `on`/`enabled`/`true` or `off`/`disabled`/`false`. When omitted, flash attention is not varied during the sweep. When supplied (e.g. `--flash-attention on,off`), trial count doubles and the recommendation applies the best flash attention setting.
+- `--speculative-types <VALUES>`: comma-separated speculative decoding types to benchmark: `auto`, `mtp`, `draft`, `ngram`, or `disabled`. If omitted, `auto` tries native MTP first for MTP-looking targets, then discovered draft candidates, then ngram candidates, then a disabled baseline.
+- `--no-speculative-tune`: skip speculative sweeps and benchmark only the disabled speculative baseline.
+- `--spec-draft-models <PATHS>`: comma-separated local draft GGUF paths for `draft` speculation trials. Tune also considers configured `draft_model` values and obvious local sibling draft/EAGLE GGUF files.
+- `--spec-draft-max-tokens <TOKENS>` / `--spec-draft-min-tokens <TOKENS>`: comma-separated draft-token window candidates for MTP and draft speculation.
+- `--spec-ngram-min <TOKENS>` / `--spec-ngram-max <TOKENS>`: comma-separated ngram token-window candidates for ngram speculation.
+- `--throughput-tolerance-pct <PCT>`: treat candidates within this percent of the raw best decode tok/s as throughput-equivalent, then prefer the largest `ctx_size` among them, default `10.0`.
+- `--max-tokens <TOKENS>`: generated tokens per measured request, default `128`.
+- `--startup-timeout-secs <SECONDS>` / `--request-timeout-secs <SECONDS>`: per-trial startup and HTTP request limits, both default `600`.
+- `--debug-telemetry`: run each isolated trial with Skippy debug telemetry mirrored into the trial log. Use this to prove speculative decoding activity; MTP summaries appear as `stage.openai_decode` telemetry lines with `llama_stage.native_mtp.*` attributes.
+- `--prompt <TEXT>`: prompt sent during measured chat-completion requests.
+
+Benchmark trials keep lifecycle timing stats in JSON under `benchmarks[].trials[].timings`: `setup_ms`, `readiness_ms`, `request_ms`, `shutdown_ms`, `total_ms`, and `readiness_attempts`. The legacy `elapsed_ms` field remains the measured chat-completion request duration used for decode tok/s.
 
 ### `load`
 

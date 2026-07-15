@@ -71,6 +71,8 @@ enum Command {
         #[arg(long)]
         after_artifact_command: Option<PathBuf>,
         #[arg(long)]
+        transform_artifact_command: Option<PathBuf>,
+        #[arg(long)]
         model_id: Option<String>,
         #[arg(long)]
         source_repo: Option<String>,
@@ -78,6 +80,8 @@ enum Command {
         source_revision: Option<String>,
         #[arg(long)]
         source_file: Option<String>,
+        #[arg(long)]
+        resume_existing_artifacts: bool,
     },
     Validate {
         full: PathBuf,
@@ -405,10 +409,12 @@ fn main() -> Result<()> {
             out_dir,
             projectors,
             after_artifact_command,
+            transform_artifact_command,
             model_id,
             source_repo,
             source_revision,
             source_file,
+            resume_existing_artifacts,
         } => write_package(
             model,
             out_dir,
@@ -416,12 +422,16 @@ fn main() -> Result<()> {
             ArtifactHook {
                 command: after_artifact_command,
             },
+            ArtifactHook {
+                command: transform_artifact_command,
+            },
             ExplicitSourceIdentity {
                 model_id,
                 source_repo,
                 source_revision,
                 source_file,
             },
+            resume_existing_artifacts,
         ),
         Command::Validate { full, slices } => validate(full, slices),
         Command::ValidatePackage { full, package } => validate_package(full, package),
@@ -517,7 +527,9 @@ fn write_package(
     out_dir: PathBuf,
     projectors: Vec<PathBuf>,
     artifact_hook: ArtifactHook,
+    artifact_transform: ArtifactHook,
     explicit: ExplicitSourceIdentity,
+    resume_existing_artifacts: bool,
 ) -> Result<()> {
     let input = resolve_package_input(model, explicit)?;
     fs::create_dir_all(&out_dir)
@@ -552,6 +564,8 @@ fn write_package(
         },
         &out_dir,
         &artifact_hook,
+        &artifact_transform,
+        resume_existing_artifacts,
     )?;
     progress.finish_step(&artifact_progress_detail(&metadata))?;
     progress.start_step("shared/embeddings.gguf")?;
@@ -568,6 +582,8 @@ fn write_package(
         },
         &out_dir,
         &artifact_hook,
+        &artifact_transform,
+        resume_existing_artifacts,
     )?;
     progress.finish_step(&artifact_progress_detail(&embeddings))?;
     progress.start_step("shared/output.gguf")?;
@@ -584,6 +600,8 @@ fn write_package(
         },
         &out_dir,
         &artifact_hook,
+        &artifact_transform,
+        resume_existing_artifacts,
     )?;
     progress.finish_step(&artifact_progress_detail(&output))?;
 
@@ -604,6 +622,8 @@ fn write_package(
             },
             &out_dir,
             &artifact_hook,
+            &artifact_transform,
+            resume_existing_artifacts,
         )?;
         progress.finish_step(&artifact_progress_detail(&artifact))?;
         layers.push(PackageLayer {
@@ -1178,6 +1198,8 @@ fn write_package_artifact(
     spec: PackageArtifactSpec,
     out_dir: &Path,
     artifact_hook: &ArtifactHook,
+    artifact_transform: &ArtifactHook,
+    resume_existing_artifacts: bool,
 ) -> Result<PackageArtifact> {
     let stage = stage_plan_from_tensors(
         spec.stage_index as usize,
@@ -1188,24 +1210,35 @@ fn write_package_artifact(
         tensors,
     );
     let path = out_dir.join(&spec.relative_path);
-    write_stage_artifact(source, &stage, &path)?;
+    if !should_resume_package_artifact(&path, resume_existing_artifacts) {
+        write_stage_artifact(source, &stage, &path)?;
+    }
     let relative_path = spec.relative_path.display().to_string();
-    run_artifact_hook(artifact_hook, &path, &relative_path)?;
-    let artifact_info = ModelInfo::open(&path)
+    run_artifact_hook(artifact_transform, &path, &relative_path)?;
+    let artifact = read_package_artifact(&path, &spec.relative_path)?;
+    run_artifact_hook(artifact_hook, &path, &artifact.path)?;
+    Ok(artifact)
+}
+
+fn should_resume_package_artifact(path: &Path, resume_existing_artifacts: bool) -> bool {
+    resume_existing_artifacts && path.is_file()
+}
+
+fn read_package_artifact(path: &Path, relative_path: &Path) -> Result<PackageArtifact> {
+    let artifact_info = ModelInfo::open(path)
         .with_context(|| format!("open package artifact {}", path.display()))?;
     let artifact_tensors = artifact_info
         .tensors()
         .with_context(|| format!("read package artifact tensors {}", path.display()))?;
-    let metadata = fs::metadata(&path)
-        .with_context(|| format!("read artifact metadata {}", path.display()))?;
-    let artifact = PackageArtifact {
-        path: relative_path,
+    let metadata =
+        fs::metadata(path).with_context(|| format!("read artifact metadata {}", path.display()))?;
+    Ok(PackageArtifact {
+        path: relative_path.display().to_string(),
         tensor_count: artifact_tensors.len(),
         tensor_bytes: artifact_tensors.iter().map(|tensor| tensor.byte_size).sum(),
         artifact_bytes: metadata.len(),
-        sha256: file_sha256(&path)?,
-    };
-    Ok(artifact)
+        sha256: file_sha256(path)?,
+    })
 }
 
 fn copy_projector_artifact(
@@ -1736,7 +1769,7 @@ fn package_generation(tensors: &[TensorInfo]) -> Option<PackageGeneration> {
         return None;
     }
 
-    let strategy_id = "native-mtp-n1".to_string();
+    let strategy_id = "mtp".to_string();
     let mut strategies = BTreeMap::new();
     strategies.insert(
         strategy_id.clone(),
@@ -1948,13 +1981,65 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExplicitSourceIdentity, activation_width, local_artifact_files, model_distribution_id,
-        native_mtp_layer_indices, package_generation, resolve_gguf_shard_paths,
-        resolve_local_package_input,
+        ArtifactHook, ExplicitSourceIdentity, activation_width, local_artifact_files,
+        model_distribution_id, native_mtp_layer_indices, package_generation,
+        resolve_gguf_shard_paths, resolve_local_package_input, run_artifact_hook,
+        should_resume_package_artifact,
     };
     use skippy_ffi::TensorRole;
     use skippy_runtime::TensorInfo;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn artifact_hook_tolerates_a_hook_that_deletes_the_uploaded_file() {
+        // The production upload hook (split-model-job.sh) uploads each artifact
+        // and then unlinks it locally to stay under the HF Jobs ephemeral
+        // storage limit. write_package_artifact must therefore read all artifact
+        // metadata before invoking the hook; this test locks in that the hook is
+        // allowed to remove the file and still report success.
+        let dir = std::env::temp_dir().join(format!("skippy-hook-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let artifact = dir.join("shared").join("metadata.gguf");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"artifact-bytes").unwrap();
+
+        let record = dir.join("hook-record.txt");
+        let hook = dir.join("delete-hook.sh");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/bash\nset -euo pipefail\n\
+                 printf '%s\\n%s\\n' \"$SKIPPY_PACKAGE_ARTIFACT_PATH\" \
+                 \"$SKIPPY_PACKAGE_ARTIFACT_RELATIVE_PATH\" > {record}\n\
+                 rm -f \"$SKIPPY_PACKAGE_ARTIFACT_PATH\"\n",
+                record = record.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let result = run_artifact_hook(
+            &ArtifactHook {
+                command: Some(hook),
+            },
+            &artifact,
+            "shared/metadata.gguf",
+        );
+        assert!(result.is_ok(), "hook run failed: {result:?}");
+        assert!(!artifact.exists(), "hook should have deleted the artifact");
+
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let mut lines = recorded.lines();
+        assert_eq!(lines.next().unwrap(), artifact.display().to_string());
+        assert_eq!(lines.next().unwrap(), "shared/metadata.gguf");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn model_distribution_id_uses_shared_gguf_stem_normalization() {
@@ -2012,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn package_generation_advertises_native_mtp_n1_strategy() {
+    fn package_generation_advertises_mtp_strategy() {
         let tensors = vec![
             tensor("blk.0.attn_norm.weight", Some(0)),
             tensor("blk.47.nextn.eh_proj.weight", Some(47)),
@@ -2026,10 +2111,10 @@ mod tests {
         let speculative = generation
             .speculative_decoding
             .expect("MTP generation should configure speculative decoding");
-        assert_eq!(speculative.default, "native-mtp-n1");
+        assert_eq!(speculative.default, "mtp");
         let strategy = speculative
             .strategies
-            .get("native-mtp-n1")
+            .get("mtp")
             .expect("default strategy should be present");
         assert_eq!(strategy.strategy_type, "native-mtp");
         assert_eq!(strategy.prediction_depth, Some(1));
@@ -2187,6 +2272,22 @@ mod tests {
 
         let error = activation_width(&model).unwrap_err().to_string();
         assert!(error.contains("array nesting exceeds"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resumes_only_existing_artifacts_when_requested() {
+        let dir = unique_test_dir("resume-artifact");
+        std::fs::create_dir_all(&dir).unwrap();
+        let artifact = dir.join("layer-000.gguf");
+        std::fs::write(&artifact, b"existing").unwrap();
+
+        assert!(should_resume_package_artifact(&artifact, true));
+        assert!(!should_resume_package_artifact(&artifact, false));
+        assert!(!should_resume_package_artifact(
+            &dir.join("missing.gguf"),
+            true
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

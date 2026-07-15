@@ -5,6 +5,7 @@ mod download;
 mod models;
 mod plugin_cli;
 mod runtime;
+mod setup;
 
 use anyhow::Result;
 use mesh_llm_cli::{Cli, Command};
@@ -16,6 +17,7 @@ use self::download::dispatch_download_command;
 use self::models::dispatch_models_command;
 use self::plugin_cli::run_external_plugin_command;
 use self::runtime::{dispatch_runtime_command, run_drop, run_load, run_status};
+use self::setup::dispatch_setup_command;
 
 pub async fn dispatch(cli: &Cli) -> Result<bool> {
     let Some(cmd) = cli.command.as_ref() else {
@@ -50,6 +52,31 @@ async fn dispatch_general_command(cli: &Cli, cmd: &Command) -> Result<()> {
         Command::Runtime { command } => {
             dispatch_runtime_command(command.as_ref(), cli.config.as_deref()).await
         }
+        Command::Setup { .. } => dispatch_setup_command(cmd, cli.config.as_deref()).await,
+        Command::Uninstall {
+            dry_run,
+            yes,
+            keep_cache,
+            keep_service_files,
+            purge_config,
+            keep_config,
+            binary_path,
+            json,
+            verbose,
+        } => mesh_llm_commands::uninstall::run_uninstall_command(
+            mesh_llm_commands::uninstall::UninstallOptions {
+                dry_run: *dry_run,
+                yes: *yes,
+                keep_cache: *keep_cache,
+                keep_service_files: *keep_service_files,
+                purge_config: *purge_config,
+                keep_config: *keep_config,
+                binary_path: binary_path.clone(),
+                json: *json,
+                verbose: *verbose,
+            },
+            run_stop,
+        ),
         Command::Config { command } => dispatch_config_command(cli, command),
         Command::Doctor { command, json } => {
             dispatch_doctor_command(command.as_ref(), cli.config.as_deref(), *json).await
@@ -96,7 +123,8 @@ async fn dispatch_general_command(cli: &Cli, cmd: &Command) -> Result<()> {
         Command::Skills { command } => mesh_llm_commands::skills::run_skills_command(command),
         Command::Plugin { command } => run_plugin_command(command, cli).await,
         Command::Benchmark { command } => {
-            mesh_llm_commands::benchmark::dispatch_benchmark_command(command).await
+            mesh_llm_commands::benchmark::dispatch_benchmark_command(cli.config.as_deref(), command)
+                .await
         }
         Command::ModelPrepare { .. } => dispatch_model_prepare(cmd).await,
         Command::Auth { command } => mesh_llm_commands::auth::run_auth_command(command),

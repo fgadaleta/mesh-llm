@@ -23,8 +23,8 @@ use crate::{
     },
     model_identity::model_identity_for_path,
     support::{
-        ChildGuard, activation_width, connect_ready, generate_run_id, parse_wire_dtype,
-        temp_config_path_for,
+        ChildGuard, activation_width, connect_ready, ensure_release_skippy_server_bin,
+        generate_run_id, parse_wire_dtype, temp_config_path_for,
     },
 };
 
@@ -224,6 +224,8 @@ fn run_full_model_decode(
         n_threads: None,
         n_threads_batch: None,
         n_gpu_layers,
+        mmap: None,
+        mlock: false,
         selected_backend_device: None,
         cache_type_k: skippy_runtime::GGML_TYPE_F16,
         cache_type_v: skippy_runtime::GGML_TYPE_F16,
@@ -271,6 +273,7 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
     if args.split_layer == 0 || args.split_layer >= args.layer_end {
         bail!("split_layer must be greater than zero and less than layer_end");
     }
+    ensure_release_skippy_server_bin(&args.stage_server_bin)?;
     validate_local_topology_plan(
         &args.model_path,
         args.layer_end,
@@ -291,6 +294,8 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         n_threads: None,
         n_threads_batch: None,
         n_gpu_layers: args.n_gpu_layers,
+        mmap: None,
+        mlock: false,
         selected_backend_device: None,
         cache_type_k: skippy_runtime::GGML_TYPE_F16,
         cache_type_v: skippy_runtime::GGML_TYPE_F16,
@@ -449,6 +454,7 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
 }
 
 fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult> {
+    ensure_release_skippy_server_bin(&args.stage_server_bin)?;
     if args.split_layer_1 == 0
         || args.split_layer_1 >= args.split_layer_2
         || args.split_layer_2 >= args.layer_end
@@ -475,6 +481,8 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         n_threads: None,
         n_threads_batch: None,
         n_gpu_layers: args.n_gpu_layers,
+        mmap: None,
+        mlock: false,
         selected_backend_device: None,
         cache_type_k: skippy_runtime::GGML_TYPE_F16,
         cache_type_v: skippy_runtime::GGML_TYPE_F16,
@@ -830,6 +838,8 @@ pub fn local_split_inprocess(args: LocalSplitInprocessArgs) -> Result<()> {
         n_threads: None,
         n_threads_batch: None,
         n_gpu_layers: args.n_gpu_layers,
+        mmap: None,
+        mlock: false,
         selected_backend_device: None,
         cache_type_k: skippy_runtime::GGML_TYPE_F16,
         cache_type_v: skippy_runtime::GGML_TYPE_F16,
@@ -851,6 +861,8 @@ pub fn local_split_inprocess(args: LocalSplitInprocessArgs) -> Result<()> {
         n_threads: None,
         n_threads_batch: None,
         n_gpu_layers: args.n_gpu_layers,
+        mmap: None,
+        mlock: false,
         selected_backend_device: None,
         cache_type_k: skippy_runtime::GGML_TYPE_F16,
         cache_type_v: skippy_runtime::GGML_TYPE_F16,

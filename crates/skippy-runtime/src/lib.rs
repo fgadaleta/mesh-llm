@@ -25,8 +25,10 @@ use skippy_ffi::{
 use tokio::sync::mpsc;
 
 mod devices;
+mod native_mtp;
 pub mod package;
 mod runtime_events;
+pub use native_mtp::NativeMtpDraft;
 
 pub const MAX_LOGIT_BIAS: usize = 256;
 pub const GGML_TYPE_F16: u32 = 1;
@@ -710,6 +712,24 @@ pub fn write_native_log_note(note: impl AsRef<str>) {
         let _ = writeln!(writer, "mesh-llm: {note}");
         let _ = writer.flush();
     }
+    forward_native_log_note(note);
+}
+
+fn forward_native_log_note(note: String) {
+    if !NATIVE_LOG_FORWARDING_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let event = NativeLogEvent {
+        message: format!("mesh-llm: {note}"),
+        category: "model",
+        params: Vec::new(),
+    };
+    if let Some(sender) = NATIVE_LOG_FILTERED_TX.get()
+        && let Ok(guard) = sender.lock()
+        && let Some(tx) = guard.as_ref()
+    {
+        let _ = tx.send(event);
+    }
 }
 
 fn clear_native_log_file() {
@@ -827,6 +847,8 @@ pub struct RuntimeConfig {
     pub n_threads: Option<u32>,
     pub n_threads_batch: Option<u32>,
     pub n_gpu_layers: i32,
+    pub mmap: Option<bool>,
+    pub mlock: bool,
     pub selected_backend_device: Option<String>,
     pub cache_type_k: u32,
     pub cache_type_v: u32,
@@ -909,6 +931,9 @@ impl RuntimeConfig {
                     .context("n_threads_batch exceeds i32")?
                     .unwrap_or(0),
                 n_gpu_layers: self.n_gpu_layers,
+                has_mmap_override: self.mmap.is_some(),
+                use_mmap: self.mmap.unwrap_or(false),
+                use_mlock: self.mlock,
                 cache_type_k: i32::try_from(self.cache_type_k)
                     .context("cache_type_k exceeds i32")?,
                 cache_type_v: i32::try_from(self.cache_type_v)
@@ -931,7 +956,7 @@ impl RuntimeConfig {
             .unwrap_or_else(|| default_n_batch_for_lane_count(self.lane_count));
         let n_ubatch = self.n_ubatch.unwrap_or(LLAMA_SERVER_DEFAULT_N_UBATCH);
         format!(
-            "stage_index={} layers={}..{} ctx={} lanes={} n_batch={} n_ubatch={} n_gpu_layers={} backend={} cache_k={} cache_v={} flash_attn={:?} load_mode={:?} include_embeddings={} include_output={} filter_tensors_on_load={}",
+            "stage_index={} layers={}..{} ctx={} lanes={} n_batch={} n_ubatch={} n_gpu_layers={} mmap={} mlock={} backend={} cache_k={} cache_v={} flash_attn={:?} load_mode={:?} include_embeddings={} include_output={} filter_tensors_on_load={}",
             self.stage_index,
             self.layer_start,
             self.layer_end,
@@ -940,6 +965,10 @@ impl RuntimeConfig {
             n_batch,
             n_ubatch,
             self.n_gpu_layers,
+            self.mmap
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "auto".to_string()),
+            self.mlock,
             self.selected_backend_device.as_deref().unwrap_or("auto"),
             self.cache_type_k,
             self.cache_type_v,
@@ -978,6 +1007,8 @@ impl Default for RuntimeConfig {
             n_threads: None,
             n_threads_batch: None,
             n_gpu_layers: 0,
+            mmap: None,
+            mlock: false,
             selected_backend_device: None,
             cache_type_k: GGML_TYPE_F16,
             cache_type_v: GGML_TYPE_F16,
@@ -1231,23 +1262,6 @@ pub struct DecodeFrameBatchOutput {
     pub output: ActivationFrame,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NativeMtpDraft {
-    pub token_id: i32,
-    pub proposal_compute_us: i64,
-}
-
-const NATIVE_MTP_DRAFT_VERSION: u32 = 1;
-
-impl NativeMtpDraft {
-    fn from_raw(raw: RawNativeMtpDraft) -> Option<Self> {
-        (raw.available && raw.version == NATIVE_MTP_DRAFT_VERSION).then_some(Self {
-            token_id: raw.token_id,
-            proposal_compute_us: raw.proposal_compute_us,
-        })
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaInput {
     pub bytes: Vec<u8>,
@@ -1378,9 +1392,38 @@ impl ChatTemplateMessage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatReasoningFormat {
+    Auto,
+    None,
+    Deepseek,
+    DeepseekLegacy,
+    Hidden,
+}
+
+impl ChatReasoningFormat {
+    pub const fn parser_name(self) -> &'static str {
+        match self {
+            Self::Auto | Self::Hidden => "auto",
+            Self::None => "none",
+            Self::Deepseek => "deepseek",
+            Self::DeepseekLegacy => "deepseek-legacy",
+        }
+    }
+
+    pub const fn parses_reasoning(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub const fn exposes_reasoning(self) -> bool {
+        !matches!(self, Self::None | Self::Hidden)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatTemplateOptions {
     pub add_assistant: bool,
     pub enable_thinking: Option<bool>,
+    pub reasoning_format: Option<ChatReasoningFormat>,
 }
 
 impl Default for ChatTemplateOptions {
@@ -1388,6 +1431,7 @@ impl Default for ChatTemplateOptions {
         Self {
             add_assistant: true,
             enable_thinking: None,
+            reasoning_format: None,
         }
     }
 }
@@ -1396,6 +1440,7 @@ impl Default for ChatTemplateOptions {
 pub struct ChatTemplateJsonOptions {
     pub add_assistant: bool,
     pub enable_thinking: Option<bool>,
+    pub reasoning_format: Option<ChatReasoningFormat>,
     pub tools_json: Option<String>,
     pub tool_choice_json: Option<String>,
     pub parallel_tool_calls: bool,
@@ -1406,6 +1451,7 @@ impl Default for ChatTemplateJsonOptions {
         Self {
             add_assistant: true,
             enable_thinking: None,
+            reasoning_format: None,
             tools_json: None,
             tool_choice_json: None,
             parallel_tool_calls: true,
@@ -1694,6 +1740,33 @@ impl StageModel {
 
         #[cfg(not(test))]
         Self::open_parts_with_optional_event_reporter(paths, config, Some(event_reporter))
+    }
+
+    pub fn attach_mtp_draft_model(
+        &mut self,
+        path: impl AsRef<Path>,
+        config: &RuntimeConfig,
+    ) -> Result<()> {
+        if self.raw.is_null() {
+            return Err(anyhow!("cannot attach MTP draft model to a null model"));
+        }
+        let attach_symbol = skippy_ffi::skippy_model_attach_mtp_draft_model_fn()
+            .ok_or_else(|| anyhow!("native runtime does not support external MTP draft models"))?;
+        let path = path.as_ref();
+        write_native_log_note(format!(
+            "skippy_model_attach_mtp_draft_model begin path={} {}",
+            path.display(),
+            config.native_log_summary()
+        ));
+        let path = CString::new(path.to_string_lossy().as_bytes())
+            .context("MTP draft model path contains an interior NUL byte")?;
+        let raw_config = config.as_raw()?;
+        let mut error = ptr::null_mut();
+        let status = unsafe { attach_symbol(self.raw, path.as_ptr(), &raw_config.raw, &mut error) };
+        write_native_log_note(format!(
+            "skippy_model_attach_mtp_draft_model returned status={status:?}"
+        ));
+        ensure_ok(status, error)
     }
 
     pub fn create_session(&self) -> Result<StageSession> {
@@ -2333,6 +2406,7 @@ impl StageModel {
             ChatTemplateOptions {
                 add_assistant,
                 enable_thinking: None,
+                reasoning_format: None,
             },
         )
     }
@@ -2435,6 +2509,16 @@ impl StageModel {
             .as_ref()
             .map(|value| value.as_ptr())
             .unwrap_or(ptr::null());
+        let reasoning_format = options
+            .reasoning_format
+            .map(ChatReasoningFormat::parser_name)
+            .map(CString::new)
+            .transpose()
+            .context("reasoning format contains an interior NUL byte")?;
+        let reasoning_format_ptr = reasoning_format
+            .as_ref()
+            .map(|value| value.as_ptr())
+            .unwrap_or(ptr::null());
 
         let mut prompt_bytes = 0usize;
         let mut metadata_bytes = 0usize;
@@ -2449,6 +2533,7 @@ impl StageModel {
                 options.enable_thinking.is_some(),
                 options.enable_thinking.unwrap_or(true),
                 options.parallel_tool_calls,
+                reasoning_format_ptr,
                 ptr::null_mut(),
                 0,
                 &mut prompt_bytes,
@@ -2477,6 +2562,7 @@ impl StageModel {
                 options.enable_thinking.is_some(),
                 options.enable_thinking.unwrap_or(true),
                 options.parallel_tool_calls,
+                reasoning_format_ptr,
                 prompt.as_mut_ptr().cast(),
                 prompt.len(),
                 &mut prompt_bytes,
@@ -2750,6 +2836,44 @@ impl StageSession {
             .checked_add(1)
             .context("session token count overflow")?;
         Ok(predicted_token)
+    }
+
+    pub fn decode_step_sampled_mtp(
+        &mut self,
+        token_id: i32,
+        sampling: Option<&SamplingConfig>,
+        max_draft_tokens: usize,
+    ) -> Result<(i32, Option<NativeMtpDraft>)> {
+        if skippy_ffi::skippy_decode_step_sampled_mtp_fn().is_none() {
+            let (predicted, draft, _) =
+                self.decode_step_frame_sampled_mtp(token_id, sampling, None, 0, max_draft_tokens)?;
+            return Ok((predicted, draft));
+        }
+
+        let mut predicted_token = 0_i32;
+        let mut mtp_draft = RawNativeMtpDraft::default();
+        let mut error = ptr::null_mut();
+        let raw_sampling = sampling.map(SamplingConfig::as_raw);
+        let sampling_ptr = raw_sampling
+            .as_ref()
+            .map_or(ptr::null(), |sampling| sampling as *const RawSamplingConfig);
+        let status = unsafe {
+            skippy_ffi::skippy_decode_step_sampled_mtp(
+                self.raw,
+                token_id,
+                sampling_ptr,
+                &mut predicted_token,
+                max_draft_tokens.min(skippy_ffi::NATIVE_MTP_MAX_DRAFT_TOKENS),
+                &mut mtp_draft,
+                &mut error,
+            )
+        };
+        ensure_ok(status, error)?;
+        self.token_count = self
+            .token_count
+            .checked_add(1)
+            .context("session token count overflow")?;
+        Ok((predicted_token, NativeMtpDraft::from_raw(mtp_draft)))
     }
 
     pub fn decode_batch_sampled(requests: &mut [DecodeBatchRequest<'_>]) -> Result<Vec<i32>> {
@@ -3127,15 +3251,22 @@ impl StageSession {
         ))
     }
 
-    pub fn decode_step_frame_sampled_mtp_n1(
+    pub fn decode_step_frame_sampled_mtp(
         &mut self,
         token_id: i32,
         sampling: Option<&SamplingConfig>,
         input: Option<&ActivationFrame>,
         output_capacity: usize,
+        max_draft_tokens: usize,
     ) -> Result<(i32, Option<NativeMtpDraft>, ActivationFrame)> {
-        let (predicted_token, mtp_draft, output_desc, output_payload) =
-            self.decode_step_frame_mtp_n1_raw(token_id, sampling, input, output_capacity)?;
+        let (predicted_token, mtp_draft, output_desc, output_payload) = self
+            .decode_step_frame_mtp_raw(
+                token_id,
+                sampling,
+                input,
+                output_capacity,
+                max_draft_tokens,
+            )?;
         Ok((
             predicted_token,
             mtp_draft,
@@ -3206,12 +3337,13 @@ impl StageSession {
         Ok((predicted_token, output_desc, output_payload))
     }
 
-    fn decode_step_frame_mtp_n1_raw(
+    fn decode_step_frame_mtp_raw(
         &mut self,
         token_id: i32,
         sampling: Option<&SamplingConfig>,
         input: Option<&ActivationFrame>,
         output_capacity: usize,
+        max_draft_tokens: usize,
     ) -> Result<(i32, Option<NativeMtpDraft>, RawActivationDesc, Vec<u8>)> {
         let input_desc = input.map(|frame| frame.desc.as_raw());
         let input_desc_ptr = input_desc
@@ -3240,7 +3372,7 @@ impl StageSession {
             .as_ref()
             .map_or(ptr::null(), |sampling| sampling as *const RawSamplingConfig);
         let status = unsafe {
-            skippy_ffi::skippy_decode_step_frame_sampled_mtp_n1(
+            skippy_ffi::skippy_decode_step_frame_sampled_mtp(
                 self.raw,
                 token_id,
                 sampling_ptr,
@@ -3251,13 +3383,20 @@ impl StageSession {
                 output_payload.len(),
                 &mut output_bytes,
                 &mut predicted_token,
+                max_draft_tokens.min(skippy_ffi::NATIVE_MTP_MAX_DRAFT_TOKENS),
                 &mut mtp_draft,
                 &mut error,
             )
         };
         if status == Status::BufferTooSmall && output_bytes > output_payload.len() {
             free_error(error);
-            return self.decode_step_frame_mtp_n1_raw(token_id, sampling, input, output_bytes);
+            return self.decode_step_frame_mtp_raw(
+                token_id,
+                sampling,
+                input,
+                output_bytes,
+                max_draft_tokens,
+            );
         }
         ensure_ok(status, error)?;
         output_payload.truncate(output_bytes);
@@ -4122,14 +4261,16 @@ fn free_error(error: *mut RawError) {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Result;
     use serde_json::Value;
 
     use super::{
-        ChatTemplateMessage, FlashAttentionType, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
-        LLAMA_SERVER_DEFAULT_N_BATCH, LLAMA_SERVER_DEFAULT_N_UBATCH, ModelInfo,
-        NativeLogAggregator, NativeLogEvent, RuntimeConfig, RuntimeLoadMode,
-        SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH, SamplingConfig, StageModel, Status, TensorRole,
-        flush_native_log_writer, format_skippy_error, parse_cache_type, parse_layer_assign_index,
+        ChatReasoningFormat, ChatTemplateJsonOptions, ChatTemplateMessage, FlashAttentionType,
+        GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, LLAMA_SERVER_DEFAULT_N_BATCH,
+        LLAMA_SERVER_DEFAULT_N_UBATCH, ModelInfo, NativeLogAggregator, NativeLogEvent,
+        NativeMtpDraft, RuntimeConfig, RuntimeLoadMode, SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH,
+        SamplingConfig, StageModel, StageSession, Status, TensorRole, flush_native_log_writer,
+        format_skippy_error, parse_cache_type, parse_layer_assign_index,
         redirect_native_logs_to_file, register_filtered_native_logs, restore_native_logs,
         set_filtered_native_logs_enabled, unregister_filtered_native_logs, write_native_log,
         write_native_log_note,
@@ -4206,6 +4347,33 @@ mod tests {
             batch_thread_config.validate(),
             Err("n_threads_batch must be greater than zero when provided")
         );
+    }
+
+    #[test]
+    fn runtime_config_raw_mmap_override_and_mlock_are_distinct() -> anyhow::Result<()> {
+        let forced_config = RuntimeConfig {
+            mmap: Some(false),
+            mlock: true,
+            ..RuntimeConfig::default()
+        };
+        let forced_raw = forced_config.as_raw()?;
+
+        assert!(forced_raw.raw.has_mmap_override);
+        assert!(!forced_raw.raw.use_mmap);
+        assert!(forced_raw.raw.use_mlock);
+
+        let auto_config = RuntimeConfig {
+            mmap: None,
+            mlock: false,
+            ..RuntimeConfig::default()
+        };
+        let auto_raw = auto_config.as_raw()?;
+
+        assert!(!auto_raw.raw.has_mmap_override);
+        assert!(!auto_raw.raw.use_mmap);
+        assert!(!auto_raw.raw.use_mlock);
+
+        Ok(())
     }
 
     #[test]
@@ -4450,6 +4618,8 @@ mod tests {
             n_threads: None,
             n_threads_batch: None,
             n_gpu_layers: 0,
+            mmap: None,
+            mlock: false,
             selected_backend_device: None,
             cache_type_k: GGML_TYPE_F16,
             cache_type_v: GGML_TYPE_F16,
@@ -4479,6 +4649,62 @@ mod tests {
         )?;
         assert!(prompt.contains("Template smoke prompt."));
         assert!(prompt.len() >= "Template smoke prompt.".len());
+        Ok(())
+    }
+
+    // Requires SKIPPY_CORRECTNESS_MODEL to point at a reasoning-capable model
+    // family whose chat parser extracts <think> blocks (e.g. Qwen3).
+    #[test]
+    fn chat_reasoning_markers_are_stripped_and_extracted_when_model_is_configured()
+    -> anyhow::Result<()> {
+        let Some(model_path) = correctness_model() else {
+            eprintln!("skipping chat reasoning smoke: SKIPPY_CORRECTNESS_MODEL is not set");
+            return Ok(());
+        };
+        let model = open_correctness_model(&model_path)?;
+        let rendered = model.apply_chat_template_json(
+            r#"[{"role":"user","content":"Say hi."}]"#,
+            ChatTemplateJsonOptions {
+                reasoning_format: Some(ChatReasoningFormat::Hidden),
+                ..ChatTemplateJsonOptions::default()
+            },
+        )?;
+        let metadata: Value = serde_json::from_str(&rendered.metadata_json)?;
+        assert_eq!(
+            metadata.get("reasoning_format").and_then(Value::as_str),
+            Some("auto"),
+        );
+
+        // The generation prompt may already open the thought block, in which
+        // case the model output continues inside it without the opening tag.
+        let generation_prompt = metadata
+            .get("generation_prompt")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let generated = if generation_prompt.contains("<think>") {
+            "Consider the greeting.</think>Hi there!"
+        } else {
+            "<think>Consider the greeting.</think>Hi there!"
+        };
+        let parsed = model.parse_chat_response_json(generated, &rendered.metadata_json, false)?;
+        let message: Value = serde_json::from_str(&parsed)?;
+        let content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !content.contains("<think>") && !content.contains("</think>"),
+            "reasoning markers must be stripped from content: {content:?}"
+        );
+        assert!(
+            content.contains("Hi there!"),
+            "visible content must survive reasoning extraction: {content:?}"
+        );
+        assert_eq!(
+            message.get("reasoning_content").and_then(Value::as_str),
+            Some("Consider the greeting."),
+            "reasoning content must be extracted from the thought block"
+        );
         Ok(())
     }
 
@@ -4839,6 +5065,36 @@ mod tests {
     }
 
     #[test]
+    fn native_log_note_forwards_when_forwarding_enabled() {
+        let _native_log_guard = native_log_test_guard();
+
+        struct ResetNativeLogForwarding;
+
+        impl Drop for ResetNativeLogForwarding {
+            fn drop(&mut self) {
+                unregister_filtered_native_logs();
+                set_filtered_native_logs_enabled(false);
+            }
+        }
+
+        let _reset = ResetNativeLogForwarding;
+        unregister_filtered_native_logs();
+        let mut rx = register_filtered_native_logs();
+        set_filtered_native_logs_enabled(true);
+
+        write_native_log_note("skippy_model_open begin\nwith context");
+
+        assert_eq!(
+            rx.blocking_recv(),
+            Some(NativeLogEvent {
+                message: "mesh-llm: skippy_model_open begin with context".to_string(),
+                category: "model",
+                params: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
     fn register_filtered_native_logs_replaces_receiver_cleanly() {
         let _native_log_guard = native_log_test_guard();
 
@@ -5013,6 +5269,18 @@ mod tests {
             "configure_chat_sampling should return Ok even with bad metadata: {result:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn stage_session_exposes_non_frame_native_mtp_decode_api() {
+        type DecodeStepSampledMtp = fn(
+            &mut StageSession,
+            i32,
+            Option<&SamplingConfig>,
+            usize,
+        ) -> Result<(i32, Option<NativeMtpDraft>)>;
+
+        let _decode: DecodeStepSampledMtp = StageSession::decode_step_sampled_mtp;
     }
 }
 

@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use crate::benchmark::BenchmarkCommand;
+use crate::benchmark::{BenchmarkCommand, GpuBenchmarkBackend};
 use crate::models;
 use crate::runtime::RuntimeCommand;
 use mesh_llm_events::LogFormat;
@@ -12,6 +12,12 @@ use serde::Serialize;
 mod runtime_surface_help;
 
 pub use runtime_surface_help::runtime_surface_help;
+
+#[cfg(test)]
+mod setup_tests;
+
+#[cfg(test)]
+mod uninstall_tests;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum BinaryFlavor {
@@ -373,6 +379,12 @@ pub enum GpuCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Run one backend benchmark probe and print raw JSON output.
+    #[command(name = "run-benchmark", hide = true)]
+    RunBenchmark {
+        #[arg(long, value_enum)]
+        backend: GpuBenchmarkBackend,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -724,6 +736,57 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<DoctorCommand>,
     },
+    /// Bootstrap a new installation.
+    Setup {
+        /// Automatically answer yes to prompts.
+        #[arg(long)]
+        yes: bool,
+        /// Run without prompting for interactive input.
+        #[arg(long = "no-interactive")]
+        no_interactive: bool,
+        /// Install and enable the mesh-llm service.
+        #[arg(long, conflicts_with = "no_service")]
+        service: bool,
+        /// Skip installing and enabling the mesh-llm service.
+        #[arg(long = "no-service", conflicts_with = "service")]
+        no_service: bool,
+        /// Skip downloading or configuring the native runtime.
+        #[arg(long = "skip-runtime")]
+        skip_runtime: bool,
+        /// Print detailed setup paths, commands, and follow-up guidance.
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Remove mesh-llm binaries, service files, and optional caches.
+    Uninstall {
+        /// Print what would be removed without changing the machine.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not prompt before removing files and services.
+        #[arg(long)]
+        yes: bool,
+        /// Preserve native runtime caches.
+        #[arg(long)]
+        keep_cache: bool,
+        /// Preserve setup-owned service helper files.
+        #[arg(long)]
+        keep_service_files: bool,
+        /// Also remove ~/.mesh-llm configuration and identity data.
+        #[arg(long, conflicts_with = "keep_config")]
+        purge_config: bool,
+        /// Explicitly preserve ~/.mesh-llm configuration and identity data.
+        #[arg(long, conflicts_with = "purge_config")]
+        keep_config: bool,
+        /// Override the installed binary path to remove.
+        #[arg(long)]
+        binary_path: Option<std::path::PathBuf>,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+        /// Print detailed cleanup steps and removed paths.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Load a local model into a running mesh-llm instance.
     Load {
         /// Model name/path/url to load
@@ -840,7 +903,6 @@ pub enum Command {
         command: SkillCommand,
     },
     /// Benchmark and compare model/runtime strategies.
-    #[command(hide = true)]
     Benchmark {
         #[command(subcommand)]
         command: BenchmarkCommand,
@@ -1516,6 +1578,226 @@ mod tests {
         for (args, expected_command_json, expected_detect_json) in cases {
             assert_gpu_command_parse(args, expected_command_json, expected_detect_json);
         }
+    }
+
+    #[test]
+    fn gpu_tune_is_not_a_gpu_subcommand() {
+        for spelling in ["gpu", "gpus"] {
+            let err = Cli::try_parse_from(["mesh-llm", spelling, "tune"])
+                .expect_err("tune should live under benchmark, not gpu/gpus");
+
+            let rendered = err.to_string();
+            assert!(rendered.contains("tune"), "unexpected error: {rendered}");
+        }
+    }
+
+    #[test]
+    fn benchmark_tune_parses_model_trial_options() {
+        let cli = Cli::parse_from([
+            "mesh-llm",
+            "benchmark",
+            "tune",
+            "--model",
+            "qwen.gguf",
+            "--ctx-sizes",
+            "4096,8192",
+            "--batch-sizes",
+            "1024,2048",
+            "--ubatch-sizes",
+            "256,512",
+            "--mmap-values",
+            "auto,true,false",
+            "--mlock-values",
+            "true,false",
+            "--speculative-types",
+            "mtp,draft,ngram,disabled",
+            "--spec-draft-models",
+            "/models/qwen-draft.gguf",
+            "--spec-draft-max-tokens",
+            "4,8",
+            "--spec-draft-min-tokens",
+            "1,2",
+            "--spec-ngram-min",
+            "12,24",
+            "--spec-ngram-max",
+            "48,64",
+            "--throughput-tolerance-pct",
+            "2.5",
+            "--max-tokens",
+            "64",
+            "--startup-timeout-secs",
+            "30",
+            "--request-timeout-secs",
+            "45",
+            "--debug-telemetry",
+            "--apply",
+            "--replace-existing",
+            "--launch-args",
+            "--prompt",
+            "hello",
+            "--json",
+        ]);
+
+        let Some(Command::Benchmark {
+            command: BenchmarkCommand::Tune(tune),
+        }) = cli.command
+        else {
+            panic!("expected benchmark tune command");
+        };
+        assert_benchmark_tune_core_options(&tune);
+        assert_benchmark_tune_speculative_options(&tune);
+    }
+
+    fn assert_benchmark_tune_core_options(tune: &crate::benchmark::BenchmarkTuneCommand) {
+        assert_eq!(tune.model.as_deref(), Some("qwen.gguf"));
+        assert!(tune.models.is_empty());
+        assert!(tune.json);
+        assert_eq!(tune.ctx_sizes, vec![4096, 8192]);
+        assert_eq!(tune.batch_sizes, vec![1024, 2048]);
+        assert_eq!(tune.ubatch_sizes, vec![256, 512]);
+        assert!(tune.apply);
+        assert!(tune.replace_existing);
+        assert!(tune.launch_args);
+        assert_eq!(
+            tune.mmap_values,
+            vec![
+                crate::benchmark::BenchmarkBoolOrAuto::Auto,
+                crate::benchmark::BenchmarkBoolOrAuto::Enabled,
+                crate::benchmark::BenchmarkBoolOrAuto::Disabled,
+            ]
+        );
+        assert_eq!(
+            tune.mlock_values,
+            vec![
+                crate::benchmark::BenchmarkBool::Enabled,
+                crate::benchmark::BenchmarkBool::Disabled,
+            ]
+        );
+        assert_eq!(tune.throughput_tolerance_pct, 2.5);
+        assert_eq!(tune.max_tokens, 64);
+        assert_eq!(tune.startup_timeout_secs, 30);
+        assert_eq!(tune.request_timeout_secs, 45);
+        assert!(tune.debug_telemetry);
+        assert_eq!(tune.prompt, "hello");
+    }
+
+    fn assert_benchmark_tune_speculative_options(tune: &crate::benchmark::BenchmarkTuneCommand) {
+        assert_eq!(
+            tune.speculative_types,
+            vec![
+                crate::benchmark::BenchmarkSpeculativeType::Mtp,
+                crate::benchmark::BenchmarkSpeculativeType::Draft,
+                crate::benchmark::BenchmarkSpeculativeType::Ngram,
+                crate::benchmark::BenchmarkSpeculativeType::Disabled,
+            ]
+        );
+        assert!(!tune.no_speculative_tune);
+        assert_eq!(
+            tune.spec_draft_models,
+            vec![std::path::PathBuf::from("/models/qwen-draft.gguf")]
+        );
+        assert_eq!(tune.spec_draft_max_tokens, vec![4, 8]);
+        assert_eq!(tune.spec_draft_min_tokens, vec![1, 2]);
+        assert_eq!(tune.spec_ngram_min, vec![12, 24]);
+        assert_eq!(tune.spec_ngram_max, vec![48, 64]);
+    }
+
+    #[test]
+    fn benchmark_tune_rejects_conflicting_model_selectors() {
+        let err = Cli::try_parse_from([
+            "mesh-llm",
+            "benchmark",
+            "tune",
+            "--model",
+            "one.gguf",
+            "--models",
+            "two.gguf,three.gguf",
+        ])
+        .expect_err("conflicting benchmark tune model selectors should be rejected");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("--model"));
+        assert!(rendered.contains("--models"));
+    }
+
+    #[test]
+    fn benchmark_tune_no_speculative_tune_conflicts_with_explicit_speculative_types() {
+        for (flag, value) in [
+            ("--speculative-types", "draft"),
+            ("--spec-draft-models", "/models/draft.gguf"),
+            ("--spec-draft-max-tokens", "8"),
+            ("--spec-draft-min-tokens", "2"),
+            ("--spec-ngram-min", "12"),
+            ("--spec-ngram-max", "48"),
+        ] {
+            let err = Cli::try_parse_from([
+                "mesh-llm",
+                "benchmark",
+                "tune",
+                "--model",
+                "qwen.gguf",
+                "--no-speculative-tune",
+                flag,
+                value,
+            ])
+            .expect_err("conflicting speculative tune controls should be rejected");
+
+            let rendered = err.to_string();
+            assert!(rendered.contains("--no-speculative-tune"));
+            assert!(rendered.contains(flag));
+        }
+    }
+
+    #[test]
+    fn benchmark_tune_defaults_to_broad_throughput_tolerance() {
+        let cli = Cli::parse_from(["mesh-llm", "benchmark", "tune", "--model", "qwen.gguf"]);
+
+        let Some(Command::Benchmark {
+            command: BenchmarkCommand::Tune(tune),
+        }) = cli.command
+        else {
+            panic!("expected benchmark tune command");
+        };
+        let throughput_tolerance_pct = tune.throughput_tolerance_pct;
+        assert!(!tune.apply, "apply should be off by default");
+        assert!(
+            !tune.replace_existing,
+            "replace-existing should be off by default"
+        );
+        assert!(!tune.launch_args, "launch-args should be off by default");
+
+        assert_eq!(throughput_tolerance_pct, 10.0);
+    }
+
+    #[test]
+    fn benchmark_tune_replace_existing_requires_apply() {
+        let err = Cli::try_parse_from([
+            "mesh-llm",
+            "benchmark",
+            "tune",
+            "--model",
+            "qwen.gguf",
+            "--replace-existing",
+        ])
+        .expect_err("replace-existing should require apply");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("--apply"), "unexpected error: {rendered}");
+    }
+
+    #[test]
+    fn hidden_gpu_run_benchmark_parses_backend() {
+        let cli = Cli::parse_from(["mesh-llm", "gpus", "run-benchmark", "--backend", "cuda"]);
+
+        let Some(Command::Gpus {
+            command: Some(GpuCommand::RunBenchmark { backend }),
+            ..
+        }) = cli.command
+        else {
+            panic!("expected hidden gpu run-benchmark command");
+        };
+
+        assert_eq!(backend, GpuBenchmarkBackend::Cuda);
     }
 
     fn assert_gpu_command_parse(

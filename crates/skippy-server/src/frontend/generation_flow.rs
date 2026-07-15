@@ -90,8 +90,10 @@ impl StageOpenAiBackend {
         };
         let chat_sampling_metadata = prompt.chat_parse_metadata.as_deref();
 
+        let emulation_active = emulation_generation_active(hook_request.as_ref(), &prompt);
         let mut collector =
-            TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk);
+            TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk)
+                .with_emulation_stop(emulation_active);
         let cache_stats = match self.mode.clone() {
             OpenAiBackendMode::LocalRuntime => self.generate_local_tokens(
                 LocalGeneration {
@@ -99,6 +101,9 @@ impl StageOpenAiBackend {
                     max_tokens,
                     sampling: &sampling,
                     chat_sampling_metadata,
+                    native_mtp_enabled: self.native_mtp_enabled,
+                    native_mtp_max_tokens: self.native_mtp_max_tokens,
+                    native_mtp_min_tokens: self.native_mtp_min_tokens,
                     hook_request: hook_request.clone(),
                     hook_runtime: hook_runtime.clone(),
                     cancellation,
@@ -116,6 +121,8 @@ impl StageOpenAiBackend {
                 lane_pool,
                 prediction_returns,
                 native_mtp_enabled,
+                native_mtp_max_tokens,
+                native_mtp_min_tokens,
             } => self.generate_embedded_stage_zero_tokens(
                 EmbeddedStageZeroGeneration {
                     config: &config,
@@ -133,7 +140,11 @@ impl StageOpenAiBackend {
                     draft: self.draft.clone(),
                     speculative_window: self.speculative_window,
                     adaptive_speculative_window: self.adaptive_speculative_window,
+                    ngram_min: self.ngram_min,
+                    ngram_max: self.ngram_max,
                     native_mtp_enabled,
+                    native_mtp_max_tokens,
+                    native_mtp_min_tokens,
                     prompt_token_ids: &prompt_token_ids,
                     max_tokens,
                     sampling: &sampling,
@@ -225,6 +236,7 @@ impl StageOpenAiBackend {
                     .map(|hub| hub.register(ids.request_id, ids.session_id))
                     .transpose()
                     .map_err(openai_backend_error)?;
+                let emulation_active = emulation_generation_active(hook_request.as_ref(), &prompt);
                 return self.generate_split_multimodal_text(
                     SplitMultimodalGeneration {
                         prompt,
@@ -239,6 +251,7 @@ impl StageOpenAiBackend {
                         downstream_wire_condition,
                         lane_pool,
                         prediction_return,
+                        emulation_active,
                     },
                     on_text_chunk,
                 );
@@ -262,6 +275,7 @@ impl StageOpenAiBackend {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
+        let emulation_active = emulation_generation_active(hook_request.as_ref(), &prompt);
         let session_id = ids.session_label.clone();
         let prefill_timer = PhaseTimer::start();
         let (prefill, mut token_signal, mut signal_window) = {
@@ -382,7 +396,8 @@ impl StageOpenAiBackend {
         }
 
         let mut collector =
-            TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk);
+            TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk)
+                .with_emulation_stop(emulation_active);
         let result = (|| {
             let decode_timer = PhaseTimer::start();
             let mut decoded_tokens = 0usize;
@@ -567,7 +582,8 @@ impl StageOpenAiBackend {
             .map(String::as_str)
             .collect::<Vec<_>>();
         let mut collector =
-            TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk);
+            TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk)
+                .with_emulation_stop(request.emulation_active);
         let wire_sampling = wire_sampling_config(&request.sampling);
         let session_id = request.ids.session_id;
         let request_id = request.ids.request_id;

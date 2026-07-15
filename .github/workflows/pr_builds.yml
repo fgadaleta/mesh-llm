@@ -1,5 +1,8 @@
 name: PR Builds
 
+# Set USE_SELF_HOSTED=true to route CUDA matrix rows to the dedicated NVIDIA
+# runner; unset or false uses GitHub-hosted runners.
+
 on:
   workflow_dispatch:
   pull_request:
@@ -280,7 +283,7 @@ jobs:
     needs: changes
     if: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.outputs.backend_changed == 'true' || needs.changes.outputs.benchmarks == 'true') && needs.changes.outputs.docs_only != 'true' }}
     name: Linux ${{ matrix.name }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJson(vars.USE_SELF_HOSTED == 'true' && matrix.self_hosted_runs_on || matrix.runs_on) }}
     container:
       image: ${{ matrix.container }}
     defaults:
@@ -294,17 +297,21 @@ jobs:
             backend: cuda
             container: nvidia/cuda:${{ vars.CUDA_VERSION || '12.6.3' }}-devel-ubuntu22.04
             cache_key: linux-cuda-slim
+            runs_on: '["ubuntu-24.04"]'
+            self_hosted_runs_on: '["self-hosted","Linux","X64","amd64","gpu-nvidia"]'
           - name: ROCm slim
             backend: rocm
             container: rocm/dev-ubuntu-24.04:7.2.3
             cache_key: linux-rocm-slim
             build_dir: .deps/llama-build/build-stage-abi-rocm-gfx1100
             amdgpu_targets: gfx1100
+            runs_on: '"ubuntu-24.04"'
           - name: Vulkan
             backend: vulkan
             container: ubuntu:24.04
             cache_key: linux-vulkan
             build_dir: .deps/llama-build/build-stage-abi-vulkan
+            runs_on: '"ubuntu-24.04"'
     env:
       RUN_LINUX_BACKEND: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.backend_changed == 'true' || needs.changes.outputs.benchmarks == 'true' }}
       LLAMA_STAGE_BACKEND: ${{ matrix.backend }}
@@ -535,14 +542,14 @@ jobs:
             ${{ env.CACHE_NAMESPACE }}-${{ runner.os }}-skippy-ci-smoke-models-
 
       - name: SDK and API crate tests
-        if: ${{ matrix.group == 'sdk-api' && (needs.changes.outputs.all_rust == 'true' || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-client') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-api-client') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-api-server') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-config') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-commands') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-events') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-hardware-profile') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-runtime-install') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-sdk') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-cli') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-tui') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-embedded-runtime') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-console-server') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-ffi') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-nodejs')) }}
+        if: ${{ matrix.group == 'sdk-api' && (needs.changes.outputs.all_rust == 'true' || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-client') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-api-client') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-api-server') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-config') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-commands') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-events') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-hardware-profile') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-runtime-install') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-native-runtime') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-routing') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-types') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-sdk') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-cli') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-tui') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-embedded-runtime') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-console-server') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-ffi') || contains(fromJson(needs.changes.outputs.affected_crates || '[]'), 'mesh-llm-nodejs')) }}
         run: |
           should_test() {
             local crate="$1"
             [ "$ALL_RUST" = "true" ] || jq -e --arg crate "$crate" 'index($crate) != null' <<<"$AFFECTED" >/dev/null
           }
 
-          for c in mesh-llm-client mesh-llm-api-client mesh-llm-api-server mesh-llm-config mesh-llm-commands mesh-llm-events mesh-llm-hardware-profile mesh-llm-runtime-install mesh-llm-cli mesh-llm-tui mesh-llm-embedded-runtime mesh-llm-sdk mesh-llm-console-server mesh-llm-ffi mesh-llm-nodejs; do
+          for c in mesh-llm-client mesh-llm-api-client mesh-llm-api-server mesh-llm-config mesh-llm-commands mesh-llm-events mesh-llm-hardware-profile mesh-llm-runtime-install mesh-llm-native-runtime mesh-llm-routing mesh-llm-types mesh-llm-cli mesh-llm-tui mesh-llm-embedded-runtime mesh-llm-sdk mesh-llm-console-server mesh-llm-ffi mesh-llm-nodejs; do
             if should_test "$c"; then
               cargo test -p "$c"
             else

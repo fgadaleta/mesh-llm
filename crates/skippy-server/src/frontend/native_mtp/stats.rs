@@ -27,7 +27,7 @@ impl NativeMtpVerification {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::frontend) struct NativeMtpN1Stats {
+pub(in crate::frontend) struct NativeMtpStats {
     pub(in crate::frontend) drafted_tokens: u64,
     pub(in crate::frontend) accepted_tokens: u64,
     pub(in crate::frontend) rejected_tokens: u64,
@@ -37,7 +37,11 @@ pub(in crate::frontend) struct NativeMtpN1Stats {
     pub(in crate::frontend) verification_compute_us: i64,
 }
 
-impl NativeMtpN1Stats {
+impl NativeMtpStats {
+    pub(in crate::frontend) fn enabled(self) -> bool {
+        self.drafted_tokens > 0 || self.verified_tokens() > 0
+    }
+
     pub(in crate::frontend) fn verified_tokens(self) -> u64 {
         self.accepted_tokens + self.rejected_tokens
     }
@@ -52,7 +56,7 @@ impl NativeMtpN1Stats {
     }
 
     pub(in crate::frontend) fn insert_attrs(self, attrs: &mut BTreeMap<String, Value>) {
-        if self.drafted_tokens == 0 && self.verified_tokens() == 0 {
+        if !self.enabled() {
             attrs.insert("llama_stage.native_mtp.enabled".to_string(), json!(false));
             return;
         }
@@ -100,19 +104,20 @@ mod tests {
     #[test]
     fn attrs_include_disabled_and_enabled_shapes() {
         let mut attrs = BTreeMap::new();
-        NativeMtpN1Stats::default().insert_attrs(&mut attrs);
+        NativeMtpStats::default().insert_attrs(&mut attrs);
         assert_eq!(
             attrs.get("llama_stage.native_mtp.enabled"),
             Some(&json!(false))
         );
+        assert!(!NativeMtpStats::default().enabled());
 
-        let stats = NativeMtpN1Stats {
+        let stats = NativeMtpStats {
             drafted_tokens: 1,
             accepted_tokens: 1,
             verification_count: 1,
             proposal_compute_us: 7,
             verification_compute_us: 9,
-            ..NativeMtpN1Stats::default()
+            ..NativeMtpStats::default()
         };
 
         let mut attrs = BTreeMap::new();
@@ -125,6 +130,7 @@ mod tests {
             attrs.get("llama_stage.native_mtp.accept_rate"),
             Some(&json!(1.0))
         );
+        assert!(stats.enabled());
     }
 
     #[test]

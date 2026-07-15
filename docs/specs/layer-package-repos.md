@@ -186,9 +186,9 @@ Minimal shape:
   },
   "generation": {
     "speculative_decoding": {
-      "default": "native-mtp-n1",
+      "default": "mtp",
       "strategies": {
-        "native-mtp-n1": {
+        "mtp": {
           "type": "native-mtp",
           "prediction_depth": 1,
           "layer_indices": [47],
@@ -310,8 +310,10 @@ declared default for a request they are trying to serve.
 
 Operators may override the package recommendation in `config.toml` with
 `speculative.strategy`. Supported values are `auto` (use package/runtime
-defaults), `native-mtp-n1` (force the current native MTP strategy), and
+defaults), `mtp` (force the current native MTP strategy), and
 `disabled` (disable native MTP for the configured model/default scope).
+
+Operators may also pass the legacy `native-mtp-n1` value; the runtime normalizes it to `mtp` for backward compatibility. New configs should use `mtp`.
 
 ## Layer Selection
 

@@ -86,6 +86,8 @@ fn prefix_cache_test_config() -> StageConfig {
         n_batch: None,
         n_ubatch: None,
         n_gpu_layers: 0,
+        mmap: None,
+        mlock: false,
         cache_type_k: "f16".to_string(),
         cache_type_v: "f16".to_string(),
         flash_attn_type: Default::default(),
@@ -649,7 +651,7 @@ fn chat_runtime_feature_guard_allows_noop_parity_fields() {
 }
 
 #[test]
-fn chat_runtime_feature_guard_rejects_structured_output() {
+fn chat_runtime_feature_guard_allows_structured_output_for_guardrails() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "test",
         "messages": [{"role": "user", "content": "hi"}],
@@ -660,11 +662,7 @@ fn chat_runtime_feature_guard_rejects_structured_output() {
     }))
     .unwrap();
 
-    let error = ensure_chat_runtime_features_supported(&request).unwrap_err();
-    assert_eq!(
-        unsupported_code(error),
-        Some("unsupported_model_feature".to_string())
-    );
+    ensure_chat_runtime_features_supported(&request).unwrap();
 }
 
 #[derive(Default)]
@@ -709,6 +707,7 @@ impl OpenAiBackend for StructuredGuardrailRecordingBackend {
                 finish_reason: Some(FinishReason::ToolCalls),
             }],
             usage: Usage::new(1, 1),
+            timings: None,
         })
     }
 
@@ -776,6 +775,29 @@ async fn guarded_structured_output_is_not_rejected_by_runtime_feature_guard() {
         seen.response_format.is_none(),
         "guarded backend should clear backend-facing response_format"
     );
+}
+
+#[test]
+fn standalone_guardrail_modes_have_expected_policies() {
+    let metrics =
+        OpenAiGuardrailsConfig::for_standalone_mode(crate::cli::OpenAiGuardrailsCliMode::Metrics)
+            .status();
+    assert_eq!(metrics.mode, "metrics");
+    assert_eq!(metrics.retry_exhaustion, "pass_last_text");
+    assert_eq!(metrics.small_model_policy, "all");
+
+    let enforce =
+        OpenAiGuardrailsConfig::for_standalone_mode(crate::cli::OpenAiGuardrailsCliMode::Enforce)
+            .status();
+    assert_eq!(enforce.mode, "enforce");
+    assert_eq!(enforce.retry_exhaustion, "error");
+    assert_eq!(enforce.small_model_policy, "all");
+
+    let disabled =
+        OpenAiGuardrailsConfig::for_standalone_mode(crate::cli::OpenAiGuardrailsCliMode::Disabled)
+            .status();
+    assert_eq!(disabled.mode, "disabled");
+    assert_eq!(disabled.small_model_policy, "small_models_only");
 }
 
 #[tokio::test]
@@ -981,6 +1003,36 @@ fn plain_chat_does_not_require_chat_output_parser() {
 }
 
 #[test]
+fn hidden_reasoning_format_requires_chat_output_parser_for_plain_chat() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+    let template_options = ChatTemplateOptions {
+        reasoning_format: Some(ChatReasoningFormat::Hidden),
+        ..ChatTemplateOptions::default()
+    };
+
+    assert!(chat_output_parser_required(&request, &template_options));
+}
+
+#[test]
+fn reasoning_format_none_leaves_plain_chat_unparsed() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+    let template_options = ChatTemplateOptions {
+        reasoning_format: Some(ChatReasoningFormat::None),
+        ..ChatTemplateOptions::default()
+    };
+
+    assert!(!chat_output_parser_required(&request, &template_options));
+}
+
+#[test]
 fn tools_require_chat_output_parser() {
     assert!(chat_output_parser_required(
         &tool_request(),
@@ -1035,6 +1087,15 @@ fn chat_response_from_parsed_message_separates_reasoning_content() {
         matched_prefix_tokens: 0,
         suffix_prefill_tokens: 0,
         cache_hit_kind: None,
+        native_mtp_stats: NativeMtpStats {
+            drafted_tokens: 7,
+            accepted_tokens: 5,
+            rejected_tokens: 2,
+            verification_count: 7,
+            proposal_compute_us: 100,
+            verification_compute_us: 200,
+            ..NativeMtpStats::default()
+        },
         text: "Checked facts first.</think>Final answer.".to_string(),
         finish_reason: FinishReason::Stop,
         detokenize_ms: 0.0,
@@ -1051,12 +1112,55 @@ fn chat_response_from_parsed_message_separates_reasoning_content() {
 
     let message = &response.choices[0].message;
     assert_eq!(message.content.as_deref(), Some("Final answer."));
+    let timings = response.timings.as_ref().expect("native MTP timings");
+    assert_eq!(timings.get("draft_n"), Some(&json!(7)));
+    assert_eq!(timings.get("draft_n_accepted"), Some(&json!(5)));
     assert_eq!(
         message.reasoning_content.as_deref(),
         Some("Checked facts first.")
     );
     assert_eq!(message.tool_calls, None);
     assert_eq!(response.choices[0].finish_reason, Some(FinishReason::Stop));
+}
+
+#[test]
+fn hidden_reasoning_visibility_removes_reasoning_content() {
+    let parsed = ParsedChatMessage {
+        content: Some("Final answer.".to_string()),
+        reasoning_content: Some("Checked facts first.".to_string()),
+        tool_calls: None,
+    };
+    let template_options = ChatTemplateOptions {
+        reasoning_format: Some(ChatReasoningFormat::Hidden),
+        ..ChatTemplateOptions::default()
+    };
+
+    let visible = apply_reasoning_visibility(Some(parsed), &template_options)
+        .expect("parsed message should remain");
+
+    assert_eq!(visible.content.as_deref(), Some("Final answer."));
+    assert_eq!(visible.reasoning_content, None);
+}
+
+#[test]
+fn auto_reasoning_visibility_keeps_reasoning_content() {
+    let parsed = ParsedChatMessage {
+        content: Some("Final answer.".to_string()),
+        reasoning_content: Some("Checked facts first.".to_string()),
+        tool_calls: None,
+    };
+    let template_options = ChatTemplateOptions {
+        reasoning_format: Some(ChatReasoningFormat::Auto),
+        ..ChatTemplateOptions::default()
+    };
+
+    let visible = apply_reasoning_visibility(Some(parsed), &template_options)
+        .expect("parsed message should remain");
+
+    assert_eq!(
+        visible.reasoning_content.as_deref(),
+        Some("Checked facts first.")
+    );
 }
 
 #[test]
@@ -1141,6 +1245,114 @@ fn parallel_tool_calls_false_keeps_first_call() {
         parsed.tool_calls[0]["function"]["arguments"],
         "{\"city\":\"Sydney\"}"
     );
+}
+
+#[test]
+fn emulated_output_final_parses_tool_call() {
+    let request = tool_request();
+    let parsed = parse_emulated_chat_output(
+        "Let me check.\nTOOL_CALL {\"name\": \"lookup\", \"arguments\": {\"city\": \"Sydney\"}}",
+        &request,
+        false,
+    )
+    .expect("emulated parse");
+
+    assert_eq!(parsed.content.as_deref(), Some("Let me check."));
+    let calls = parsed.tool_calls.expect("tool calls");
+    assert_eq!(calls[0]["function"]["name"], "lookup");
+    let args: serde_json::Value =
+        serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["city"], "Sydney");
+}
+
+#[test]
+fn emulated_output_partial_withholds_tool_calls_and_incomplete_line() {
+    let request = tool_request();
+    // Streaming: the TOOL_CALL line is not yet newline-terminated.
+    let parsed = parse_emulated_chat_output(
+        "Let me check.\nTOOL_CALL {\"name\": \"lookup\", \"argumen",
+        &request,
+        true,
+    )
+    .expect("emulated parse");
+
+    // Tool calls are withheld while streaming.
+    assert!(parsed.tool_calls.is_none());
+    // Only the completed prose line is exposed; the partial marker line is held.
+    assert_eq!(parsed.content.as_deref(), Some("Let me check."));
+}
+
+#[test]
+fn emulated_output_partial_streams_single_line_prose() {
+    let request = tool_request();
+    let parsed = parse_emulated_chat_output("The capital is Canber", &request, true)
+        .expect("emulated parse");
+
+    assert!(parsed.tool_calls.is_none());
+    assert_eq!(parsed.content.as_deref(), Some("The capital is Canber"));
+}
+
+#[test]
+fn emulated_output_partial_withholds_possible_marker_suffix() {
+    let request = tool_request();
+    let parsed =
+        parse_emulated_chat_output("Let me check. TOOL_", &request, true).expect("emulated parse");
+
+    assert!(parsed.tool_calls.is_none());
+    assert_eq!(parsed.content.as_deref(), Some("Let me check."));
+}
+
+#[test]
+fn emulated_output_partial_ignores_marker_inside_completed_thinking() {
+    let request = tool_request();
+    let parsed = parse_emulated_chat_output(
+        "<think>TOOL_CALL {\"name\":\"lookup\"}</think>The answer is Syd",
+        &request,
+        true,
+    )
+    .expect("emulated parse");
+
+    assert!(parsed.tool_calls.is_none());
+    assert_eq!(parsed.content.as_deref(), Some("The answer is Syd"));
+}
+
+#[test]
+fn emulated_output_respects_allowed_tool_names() {
+    let request = tool_request();
+    // "search" is not an allowed tool for this request (only "lookup" is).
+    let parsed = parse_emulated_chat_output(
+        "TOOL_CALL {\"name\": \"search\", \"arguments\": {}}",
+        &request,
+        false,
+    )
+    .expect("emulated parse");
+
+    assert!(parsed.tool_calls.is_none());
+}
+
+#[test]
+fn emulated_output_parallel_false_keeps_first_call() {
+    let mut request = tool_request();
+    request.parallel_tool_calls = Some(false);
+    let parsed = parse_emulated_chat_output(
+        "TOOL_CALL {\"name\": \"lookup\", \"arguments\": {\"city\": \"Sydney\"}}\n\
+         TOOL_CALL {\"name\": \"lookup\", \"arguments\": {\"city\": \"Melbourne\"}}",
+        &request,
+        false,
+    )
+    .expect("emulated parse");
+
+    let calls = parsed.tool_calls.expect("tool calls");
+    assert_eq!(calls.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn emulated_output_plain_prose_has_no_tool_calls() {
+    let request = tool_request();
+    let parsed =
+        parse_emulated_chat_output("The capital is Canberra.", &request, false).expect("parse");
+    assert!(parsed.tool_calls.is_none());
+    assert_eq!(parsed.content.as_deref(), Some("The capital is Canberra."));
 }
 
 #[test]
@@ -1246,6 +1458,8 @@ fn multimodal_stage_config(
         n_batch: None,
         n_ubatch: None,
         n_gpu_layers: fixture.n_gpu_layers,
+        mmap: None,
+        mlock: false,
         cache_type_k: "f16".to_string(),
         cache_type_v: "f16".to_string(),
         flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
@@ -1282,6 +1496,11 @@ fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
+        ngram_min: 0,
+        ngram_max: 0,
+        native_mtp_enabled: false,
+        native_mtp_max_tokens: 1,
+        native_mtp_min_tokens: 0,
         generation_limit: Arc::new(Semaphore::new(1)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: 1,
@@ -1468,10 +1687,17 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
             lane_pool: Some(lane_pool),
             prediction_returns: None,
             native_mtp_enabled: true,
+            native_mtp_max_tokens: 3,
+            native_mtp_min_tokens: 0,
         },
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
+        ngram_min: 0,
+        ngram_max: 0,
+        native_mtp_enabled: true,
+        native_mtp_max_tokens: 3,
+        native_mtp_min_tokens: 0,
         generation_limit: Arc::new(Semaphore::new(1)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: 1,
@@ -1891,9 +2117,11 @@ fn request_defaults_fill_omitted_chat_fields_only() {
     assert_eq!(sampling.repeat_penalty, 1.2);
     assert_eq!(sampling.penalty_last_n, 64);
     assert_eq!(sampling.logit_bias.len(), 2);
+    let template_options = chat_template_options(&request, &test_request_defaults()).unwrap();
+    assert_eq!(template_options.enable_thinking, None);
     assert_eq!(
-        chat_template_options(&request).unwrap().enable_thinking,
-        None
+        template_options.reasoning_format,
+        Some(ChatReasoningFormat::Hidden)
     );
     assert_eq!(request.reasoning, None);
     assert_eq!(
@@ -1981,9 +2209,11 @@ fn explicit_chat_request_values_override_request_defaults() {
     assert_eq!(sampling.repeat_penalty, 1.8);
     assert_eq!(sampling.penalty_last_n, 24);
     assert_eq!(sampling.logit_bias.len(), 1);
+    let template_options = chat_template_options(&request, &test_request_defaults()).unwrap();
+    assert_eq!(template_options.enable_thinking, None);
     assert_eq!(
-        chat_template_options(&request).unwrap().enable_thinking,
-        None
+        template_options.reasoning_format,
+        Some(ChatReasoningFormat::Hidden)
     );
     assert_eq!(
         GenerationTokenLimit::from_request(request.effective_max_tokens(), 64),
@@ -2029,7 +2259,7 @@ fn explicit_completion_request_values_override_request_defaults() {
 }
 
 #[test]
-fn request_defaults_do_not_make_structured_output_or_logprobs_executable() {
+fn request_defaults_do_not_make_logprobs_executable() {
     let mut request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "test",
         "messages": [{"role": "user", "content": "hi"}],
@@ -2060,8 +2290,43 @@ fn canonical_reasoning_does_not_override_chat_template_thinking() {
     }))
     .unwrap();
 
-    let options = chat_template_options(&request).unwrap();
+    let options =
+        chat_template_options(&request, &EmbeddedOpenAiRequestDefaults::default()).unwrap();
     assert_eq!(options.enable_thinking, None);
+    assert_eq!(options.reasoning_format, Some(ChatReasoningFormat::Hidden));
+}
+
+#[test]
+fn chat_template_options_default_to_hidden_reasoning_parser() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
+        "messages": [{"role": "user", "content": "hello"}]
+    }))
+    .unwrap();
+
+    let options = chat_template_options(&request, &EmbeddedOpenAiRequestDefaults::default())
+        .expect("template options");
+
+    assert_eq!(options.enable_thinking, None);
+    assert_eq!(options.reasoning_format, Some(ChatReasoningFormat::Hidden));
+}
+
+#[test]
+fn request_default_reasoning_format_controls_chat_parser_mode() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
+        "messages": [{"role": "user", "content": "hello"}]
+    }))
+    .unwrap();
+    let defaults = EmbeddedOpenAiRequestDefaults {
+        reasoning_format: Some(EmbeddedReasoningFormat::None),
+        ..EmbeddedOpenAiRequestDefaults::default()
+    };
+
+    let options = chat_template_options(&request, &defaults).expect("template options");
+
+    assert_eq!(options.reasoning_format, Some(ChatReasoningFormat::None));
+    assert!(!chat_output_parser_required(&request, &options));
 }
 
 #[test]
@@ -2073,8 +2338,10 @@ fn reasoning_effort_does_not_override_chat_template_thinking() {
     }))
     .unwrap();
 
-    let options = chat_template_options(&request).unwrap();
+    let options =
+        chat_template_options(&request, &EmbeddedOpenAiRequestDefaults::default()).unwrap();
     assert_eq!(options.enable_thinking, None);
+    assert_eq!(options.reasoning_format, Some(ChatReasoningFormat::Hidden));
 }
 
 #[test]
@@ -2086,8 +2353,10 @@ fn top_level_reasoning_effort_does_not_override_chat_template_thinking() {
     }))
     .unwrap();
 
-    let options = chat_template_options(&request).unwrap();
+    let options =
+        chat_template_options(&request, &EmbeddedOpenAiRequestDefaults::default()).unwrap();
     assert_eq!(options.enable_thinking, None);
+    assert_eq!(options.reasoning_format, Some(ChatReasoningFormat::Hidden));
 }
 
 #[test]
@@ -2100,8 +2369,10 @@ fn provider_enable_thinking_does_not_override_chat_template_thinking() {
     }))
     .unwrap();
 
-    let options = chat_template_options(&request).unwrap();
+    let options =
+        chat_template_options(&request, &EmbeddedOpenAiRequestDefaults::default()).unwrap();
     assert_eq!(options.enable_thinking, None);
+    assert_eq!(options.reasoning_format, Some(ChatReasoningFormat::Hidden));
 }
 
 #[test]
@@ -2113,8 +2384,10 @@ fn chat_template_kwargs_enable_thinking_does_not_override_template() {
     }))
     .unwrap();
 
-    let options = chat_template_options(&request).unwrap();
+    let options =
+        chat_template_options(&request, &EmbeddedOpenAiRequestDefaults::default()).unwrap();
     assert_eq!(options.enable_thinking, None);
+    assert_eq!(options.reasoning_format, Some(ChatReasoningFormat::Hidden));
 }
 
 #[test]
@@ -2127,7 +2400,9 @@ fn thinking_boolean_aliases_do_not_override_chat_template_thinking() {
         }))
         .unwrap();
         assert_eq!(
-            chat_template_options(&request).unwrap().enable_thinking,
+            chat_template_options(&request, &EmbeddedOpenAiRequestDefaults::default())
+                .unwrap()
+                .enable_thinking,
             None,
             "top-level alias {field}"
         );
@@ -2139,7 +2414,9 @@ fn thinking_boolean_aliases_do_not_override_chat_template_thinking() {
         }))
         .unwrap();
         assert_eq!(
-            chat_template_options(&request).unwrap().enable_thinking,
+            chat_template_options(&request, &EmbeddedOpenAiRequestDefaults::default())
+                .unwrap()
+                .enable_thinking,
             None,
             "chat_template_kwargs alias {field}"
         );
@@ -2155,7 +2432,9 @@ fn reasoning_budget_does_not_override_chat_template_thinking() {
     }))
     .unwrap();
     assert_eq!(
-        chat_template_options(&request).unwrap().enable_thinking,
+        chat_template_options(&request, &EmbeddedOpenAiRequestDefaults::default())
+            .unwrap()
+            .enable_thinking,
         None
     );
 
@@ -2167,7 +2446,9 @@ fn reasoning_budget_does_not_override_chat_template_thinking() {
     }))
     .unwrap();
     assert_eq!(
-        chat_template_options(&request).unwrap().enable_thinking,
+        chat_template_options(&request, &EmbeddedOpenAiRequestDefaults::default())
+            .unwrap()
+            .enable_thinking,
         None
     );
 }

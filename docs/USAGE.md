@@ -1,13 +1,13 @@
 # Usage Guide
 
-Use this operational reference for installation details, service mode, model
-storage, and runtime control.
+Use this operational reference for installation details, setup, service mode,
+model storage, and runtime control.
 
 For command-by-command CLI usage, model resolution rules, and JSON automation examples, see [CLI.md](./CLI.md).
 
 ## Installation details
 
-Install the latest release bundle:
+Install the latest release executable:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | bash
@@ -25,34 +25,9 @@ To opt into the latest published prerelease bundle instead:
 curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | bash -s -- --pre-release
 ```
 
-The installer probes your machine, recommends a flavor, and asks what to install.
-
-For a non-interactive install, set the flavor explicitly:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | MESH_LLM_INSTALL_FLAVOR=vulkan bash
-```
-
-On Windows:
-
-```powershell
-$env:MESH_LLM_INSTALL_FLAVOR = "vulkan"
-irm https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.ps1 | iex
-```
-
-Release bundles install the `mesh-llm` host binary plus the flavor-specific
-native runtime libraries it embeds. Normal serving runs inside the `mesh-llm`
-host process, which loads the Skippy/llama.cpp stage runtime directly.
-
-Published bundle flavors include macOS, Linux CPU, Linux ARM64 CPU, Linux ARM64
-CUDA, Linux CUDA, Linux CUDA Blackwell, Linux ROCm, Linux Vulkan, Windows CPU,
-Windows CUDA, Windows ROCm, and Windows Vulkan. Metal remains macOS-only.
-
-If you keep more than one flavor in the same `bin` directory, choose one explicitly:
-
-```bash
-mesh-llm serve --llama-flavor vulkan --model Qwen2.5-32B
-```
+The installer puts `mesh-llm` on your `PATH`. After install, run `mesh-llm setup`
+to finish runtime configuration and, on supported macOS and Linux machines,
+optionally install the background service.
 
 Source builds must use `just`:
 
@@ -81,6 +56,7 @@ For full build details, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 ## Common commands
 
 ```bash
+mesh-llm setup
 mesh-llm serve --auto
 mesh-llm serve --model Qwen2.5-32B
 mesh-llm serve --join <token>
@@ -98,46 +74,39 @@ lives in [SKIPPY_SPLITS.md](SKIPPY_SPLITS.md).
 If you run `mesh-llm` with no arguments, it prints `--help` and exits. It does not start the console or bind ports until you choose a mode.
 Bare `mesh-llm serve` loads startup models from `[[models]]` in `~/.mesh-llm/config.toml`.
 
-## Background service
+## Benchmark tuning
 
-To install Mesh LLM as a per-user background service:
+`mesh-llm benchmark tune` measures local model-serving throughput for already-downloaded local models. It resolves local targets, plans safe startup settings, creates temporary per-trial configs, starts isolated local `mesh-llm serve` children, sends OpenAI-compatible chat-completion requests, reports decode tok/s plus setup/readiness/request/shutdown/total timing stats for each context/batch/ubatch/mmap/mlock/flash-attention/speculative-decoding candidate, and keeps trial logs under `target/gpu-tune/`.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/install.sh | bash -s -- --service
-```
-
-Service installs are user-scoped:
-
-- macOS installs a `launchd` agent at `~/Library/LaunchAgents/com.mesh-llm.mesh-llm.plist`
-- Linux installs a `systemd --user` unit at `~/.config/systemd/user/mesh-llm.service`
-- Shared environment config lives in `~/.config/mesh-llm/service.env`
-- Startup models live in `~/.mesh-llm/config.toml`
-
-Platform behavior:
-
-- macOS loads `service.env` and then executes `mesh-llm serve`
-- Linux writes `mesh-llm serve` directly into `ExecStart=`
-
-The background service reads startup models from `~/.mesh-llm/config.toml`.
-
-Optional shared environment file example:
-
-```text
-MESH_LLM_NO_SELF_UPDATE=1
-```
-
-If you edit the Linux unit manually:
+Benchmark tune reports the raw highest-throughput trial, the Pareto frontier for decode tok/s versus `ctx_size`, and a recommended trial. By default, the recommendation treats candidates within `10.0%` of the raw best decode tok/s as throughput-equivalent, then chooses the largest context window among those candidates.
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user restart mesh-llm.service
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf
+mesh-llm benchmark tune --models /models/qwen3-8b.gguf,/models/mixtral.gguf --json
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --ctx-sizes 4096,8192,16384 --batch-sizes 1024,2048 --ubatch-sizes 256,512
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --mmap-values auto,true,false --mlock-values true,false
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --flash-attention on,off
+mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types auto
+mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types mtp --debug-telemetry --json
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --speculative-types draft,ngram,disabled --spec-draft-models /models/qwen3-draft.gguf --spec-draft-max-tokens 4,8,16
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --throughput-tolerance-pct 2.5
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --apply
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --apply --replace-existing
+mesh-llm benchmark tune --model /models/qwen3-8b.gguf --launch-args
 ```
 
-If you want the service to survive reboot before login:
+If `--mmap-values` is omitted, benchmark tune tries `auto`, `true`, and `false`. If `--mlock-values` is omitted, it tries `false` and only tries `true` when the current mlock limit can cover the evaluated budget. If `--flash-attention` is omitted, flash attention is not varied during the sweep; when supplied (e.g. `--flash-attention on,off`), trial count doubles and the recommendation applies the best flash attention setting.
+If `--speculative-types` is omitted, benchmark tune uses `auto`: native MTP is tried first for MTP-looking targets, locally discoverable draft models are tried when available, ngram candidates are tried as a model-free fallback, and a disabled baseline is included for comparison. Use `--speculative-types mtp,draft,ngram,disabled` to force an explicit speculative sweep, or `--no-speculative-tune` to reproduce the old disabled-baseline-only sweep.
+Use `--apply` to write the recommended settings into `~/.mesh-llm/config.toml`, and combine with `--replace-existing` to overwrite existing writable recommendation fields. `--launch-args` prints generated `mesh-llm serve` arguments for local launch without writing config.
+Use `--debug-telemetry` when proving speculative decoding behavior: each trial log includes Skippy debug telemetry, including `llama_stage.native_mtp.*` summary attributes for MTP drafted, accepted, rejected, and accept-rate counts.
 
-```bash
-sudo loginctl enable-linger "$USER"
-```
+Use `mesh-llm gpus detect` when you want to refresh the raw hardware fingerprint, bandwidth, and compute hints rather than benchmark model-serving throughput.
+
+## Setup
+
+Use `mesh-llm setup` after the executable is installed. It configures the native runtime and can install the background service on supported macOS and Linux machines.
+
+See [CLI.md](./CLI.md) for the setup flags and the service options.
 
 ## Model catalog
 
@@ -351,23 +320,23 @@ lifecycle_health_interval_ms    = 5000      # health-check interval (ms)
 
 # --- Speculative decoding ------------------------------------------------
 [defaults.speculative]
-strategy                   = "auto"          # auto disabled native-mtp-n1
+strategy                   = "auto"          # auto disabled mtp
 mode                       = "auto"          # auto off draft ngram lookahead
 draft_selection_policy     = "auto"          # auto manual heuristic
 pairing_fault              = "warn_disable"  # warn_disable fail_open fail_closed
-draft_max_tokens           = 16
-draft_min_tokens           = 1
 draft_acceptance_threshold = 0.0             # 0.0 = use runtime default
 spec_default               = "auto"          # bool or "auto"
 
 # Draft model source (per-model is more typical; these are global fallbacks)
-# draft_model_path = "/models/draft.gguf"
+# draft_model = "org/draft-GGUF:Q4_K_M"
 # draft_hf_repo    = "org/draft-GGUF"
 # draft_hf_file    = "draft-q4_k_m.gguf"
 
 # Native MTP strategy override
-# strategy = "native-mtp-n1"  # force native model MTP when available
+# strategy = "mtp"  # force native model MTP when available
 # strategy = "disabled"       # disable package/model native MTP
+# draft_max_tokens = 3        # MTP/draft max draft-token window
+# draft_min_tokens = 0        # MTP/draft min draft-token window
 
 # Draft hardware (leave unset to share host model's device)
 # draft_gpu_layers   = -1
@@ -518,7 +487,7 @@ prefill_chunk_schedule = "128,256,512,1024"
 
 [models.speculative]
 mode                   = "draft"
-draft_model_path       = "/models/qwen3-0.6b-q8.gguf"
+draft_model            = "org/qwen3-0.6b-draft:Q8_0"
 draft_selection_policy = "manual"
 pairing_fault          = "warn_disable"
 draft_max_tokens       = 8
